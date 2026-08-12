@@ -43,6 +43,10 @@ configuration without replacing an existing configuration:
 make macos
 ```
 
+To refresh an already installed stock configuration after target endpoints change,
+pull the repository and run `make macos-config`. It saves the previous file as
+`config.toml.backup` before installing the current template.
+
 The TUI discovers Herdr sessions independently on each configured host through
 `herdr session list --json`. Each running session is shown as a qualified
 `host/session` entry; discovery never starts a stopped session. A failed discovery is isolated
