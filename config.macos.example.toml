@@ -1,0 +1,24 @@
+# Run the Super-Herdr frontend on macOS so selected text is written through
+# native pbcopy. Herdr servers and persistent terminal state remain remote.
+
+[transport]
+ssh_bin = "ssh"
+batch_mode = true
+connect_timeout_seconds = 10
+command_timeout_seconds = 20
+
+[[targets]]
+name = "ws01"
+ssh = "onio-ws1"
+discover_sessions = true
+session = "rv32sim"
+socket = "/home/veba/.config/herdr/sessions/rv32sim/herdr.sock"
+herdr_bins = ["/home/veba/.local/bin/herdr"]
+
+[[targets]]
+name = "kamrui"
+ssh = "veba@100.99.10.49"
+discover_sessions = true
+session = "super-herdr-test"
+socket = "/home/veba/.config/herdr/sessions/super-herdr-test/herdr.sock"
+herdr_bins = ["/home/veba/.local/bin/herdr"]

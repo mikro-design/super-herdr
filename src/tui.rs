@@ -1,0 +1,2686 @@
+use std::collections::BTreeMap;
+use std::io::{self, IsTerminal, Read, Stdout, Write};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::DisableMouseCapture;
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Tabs};
+use ratatui::{Frame, Terminal};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep_until, timeout};
+
+use crate::config::{Config, Target};
+use crate::model::{PaneId, TargetSession, WorkspaceId};
+use crate::state::{
+    FederationState, FederationStore, NormalizedSnapshot, SupervisorOptions, TargetConnectionState,
+    TargetRuntimeState, TargetUpdateMode,
+};
+use crate::terminal::{
+    TerminalAccess, TerminalEvent, TerminalScrollDirection, parse_terminal_event, spawn_terminal,
+    terminal_input_command, terminal_release_command, terminal_scroll_command,
+};
+use crate::transport::CliSnapshotTransport;
+
+const PREFIX_KEY: u8 = 0x1d;
+const SIDEBAR_WIDTH: u16 = 28;
+const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(10);
+const INPUT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(30);
+const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const MOUSE_SCROLL_LINES: u16 = 3;
+const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+const ROUTE_EVENT_DRAIN_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Terminal,
+    Prefix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseInput {
+    code: u16,
+    column: u16,
+    row: u16,
+    release: bool,
+}
+
+impl MouseInput {
+    fn is_left_press(self) -> bool {
+        !self.release && self.code & 0b0110_0011 == 0
+    }
+
+    fn is_left_motion(self) -> bool {
+        !self.release && self.code & 0b0110_0011 == 0b0010_0000
+    }
+
+    fn is_left_release(self) -> bool {
+        self.release && self.code & 0b0110_0011 == 0
+    }
+
+    fn is_motion(self) -> bool {
+        self.code & 0b0010_0000 != 0
+    }
+
+    fn is_vertical_wheel(self) -> bool {
+        !self.release && self.code & 0b0100_0000 != 0 && self.code & 0b11 <= 1
+    }
+
+    fn scroll_direction(self) -> Option<TerminalScrollDirection> {
+        if !self.is_vertical_wheel() {
+            return None;
+        }
+        match self.code & 0b11 {
+            0 => Some(TerminalScrollDirection::Up),
+            1 => Some(TerminalScrollDirection::Down),
+            _ => None,
+        }
+    }
+
+    fn key_modifiers(self) -> u8 {
+        let mut modifiers = crossterm::event::KeyModifiers::empty();
+        if self.code & 0b0000_0100 != 0 {
+            modifiers.insert(crossterm::event::KeyModifiers::SHIFT);
+        }
+        if self.code & 0b0000_1000 != 0 {
+            modifiers.insert(crossterm::event::KeyModifiers::ALT);
+        }
+        if self.code & 0b0001_0000 != 0 {
+            modifiers.insert(crossterm::event::KeyModifiers::CONTROL);
+        }
+        modifiers.bits()
+    }
+
+    fn shift(self) -> bool {
+        self.code & 0b0000_0100 != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedInput {
+    Bytes(Vec<u8>),
+    Mouse(MouseInput),
+}
+
+#[derive(Default)]
+struct InputDecoder {
+    pending: Vec<u8>,
+    pending_since: Option<Instant>,
+}
+
+impl InputDecoder {
+    fn push(&mut self, byte: u8) -> Option<DecodedInput> {
+        if self.pending.is_empty() {
+            if byte == 0x1b {
+                self.pending.push(byte);
+                self.pending_since = Some(Instant::now());
+                return None;
+            }
+            return Some(DecodedInput::Bytes(vec![byte]));
+        }
+
+        self.pending.push(byte);
+        let is_mouse_prefix = match self.pending.as_slice() {
+            [0x1b] | [0x1b, b'['] => true,
+            bytes if bytes.starts_with(b"\x1b[<") => true,
+            _ => false,
+        };
+        if !is_mouse_prefix || self.pending.len() > 64 {
+            return Some(self.flush_bytes());
+        }
+
+        if matches!(byte, b'M' | b'm') {
+            let bytes = std::mem::take(&mut self.pending);
+            self.pending_since = None;
+            return Some(match parse_sgr_mouse(&bytes) {
+                Some(mouse) => DecodedInput::Mouse(mouse),
+                None => DecodedInput::Bytes(bytes),
+            });
+        }
+        if !matches!(byte, b'0'..=b'9' | b';' | b'<' | b'[' | 0x1b) {
+            return Some(self.flush_bytes());
+        }
+        None
+    }
+
+    fn flush_expired(&mut self) -> Option<DecodedInput> {
+        self.pending_since
+            .is_some_and(|started| started.elapsed() >= INPUT_ESCAPE_TIMEOUT)
+            .then(|| self.flush_bytes())
+    }
+
+    fn flush_bytes(&mut self) -> DecodedInput {
+        self.pending_since = None;
+        DecodedInput::Bytes(std::mem::take(&mut self.pending))
+    }
+}
+
+fn parse_sgr_mouse(bytes: &[u8]) -> Option<MouseInput> {
+    let body = bytes.strip_prefix(b"\x1b[<")?;
+    let (&terminator, body) = body.split_last()?;
+    if !matches!(terminator, b'M' | b'm') {
+        return None;
+    }
+    let body = std::str::from_utf8(body).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?.parse().ok()?;
+    let column = fields.next()?.parse().ok()?;
+    let row = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || column == 0 || row == 0 {
+        return None;
+    }
+    Some(MouseInput {
+        code,
+        column,
+        row,
+        release: terminator == b'm',
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CellPosition {
+    row: u16,
+    column: u16,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalSelection {
+    pane: PaneId,
+    anchor: CellPosition,
+    head: CellPosition,
+    dragging: bool,
+    forwarded_click: Option<MouseInput>,
+}
+
+impl TerminalSelection {
+    fn contains(&self, position: CellPosition) -> bool {
+        let start = self.anchor.min(self.head);
+        let end = self.anchor.max(self.head);
+        position >= start && position <= end
+    }
+
+    fn finish(&mut self, position: CellPosition, release: MouseInput) -> SelectionFinish {
+        self.head = position;
+        self.dragging |= self.head != self.anchor;
+        if self.dragging {
+            self.forwarded_click = None;
+            SelectionFinish::Retain
+        } else if let Some(press) = self.forwarded_click.take() {
+            SelectionFinish::ForwardClick([
+                press,
+                MouseInput {
+                    column: position.column + 1,
+                    row: position.row + 1,
+                    ..release
+                },
+            ])
+        } else {
+            SelectionFinish::Clear
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionFinish {
+    Retain,
+    ForwardClick([MouseInput; 2]),
+    Clear,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarHitArea {
+    area: Rect,
+    pane: PaneId,
+}
+
+struct SidebarRow {
+    line: Line<'static>,
+    pane: Option<PaneId>,
+}
+
+struct ActiveRoute {
+    serial: u64,
+    pane: PaneId,
+    access: TerminalAccess,
+    generation: u64,
+    rows: u16,
+    columns: u16,
+    child: Child,
+    input: Option<ChildStdin>,
+    reader: JoinHandle<()>,
+    parser: vt100::Parser,
+    last_sequence: Option<u64>,
+}
+
+impl Drop for ActiveRoute {
+    fn drop(&mut self) {
+        self.reader.abort();
+        let _ = self.child.start_kill();
+    }
+}
+
+enum RouteEvent {
+    Output { serial: u64, event: TerminalEvent },
+    Failed { serial: u64 },
+    Closed { serial: u64 },
+}
+
+struct App {
+    selected_pane: Option<PaneId>,
+    selection_explicit: bool,
+    mode: InputMode,
+    routes: BTreeMap<PaneId, ActiveRoute>,
+    next_route_serial: u64,
+    route_retry_after: BTreeMap<PaneId, Instant>,
+    control_retry_after: BTreeMap<PaneId, Instant>,
+    last_frame_area: Option<Rect>,
+    last_terminal_area: Option<Rect>,
+    selection: Option<TerminalSelection>,
+    swallow_left_gesture: bool,
+    sidebar_hit_areas: Vec<SidebarHitArea>,
+    sidebar_press: Option<PaneId>,
+    last_render_at: Option<Instant>,
+    message: Option<String>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            selected_pane: None,
+            selection_explicit: false,
+            mode: InputMode::Terminal,
+            routes: BTreeMap::new(),
+            next_route_serial: 1,
+            route_retry_after: BTreeMap::new(),
+            control_retry_after: BTreeMap::new(),
+            last_frame_area: None,
+            last_terminal_area: None,
+            selection: None,
+            swallow_left_gesture: false,
+            sidebar_hit_areas: Vec::new(),
+            sidebar_press: None,
+            last_render_at: None,
+            message: None,
+        }
+    }
+}
+
+pub async fn run(config: Config) -> Result<()> {
+    let (mut terminal, _guard) = enter_terminal()?;
+    let targets = config
+        .targets
+        .iter()
+        .cloned()
+        .map(|target| (target_key(&target), target))
+        .collect::<BTreeMap<_, _>>();
+    let options = SupervisorOptions::from_config(&config);
+    let transport_config = config.transport.clone();
+    let store = FederationStore::start(config, Arc::new(CliSnapshotTransport), options);
+    let mut updates = store.subscribe();
+    let (input_sender, mut input) = mpsc::unbounded_channel();
+    let (route_sender, mut route_events) = mpsc::unbounded_channel();
+    spawn_input_reader(input_sender);
+    let mut ticks = interval(Duration::from_millis(100));
+    let mut input_decoder = InputDecoder::default();
+    let mut app = App::default();
+    let mut should_draw = true;
+
+    let result = loop {
+        let now = Instant::now();
+        if should_draw
+            && app
+                .last_render_at
+                .is_none_or(|last_render| now.duration_since(last_render) >= MIN_RENDER_INTERVAL)
+        {
+            let state = updates.borrow().clone();
+            reconcile_selection(&state, &mut app);
+            ensure_routes(
+                &state,
+                &targets,
+                &transport_config,
+                &mut terminal,
+                &route_sender,
+                &mut app,
+            )?;
+            let frame_area: Rect = terminal
+                .size()
+                .context("failed to read terminal size")?
+                .into();
+            app.last_frame_area = Some(frame_area);
+            let (sidebar_area, _, _) = ui_areas(frame_area);
+            update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+            terminal
+                .draw(|frame| render(frame, &state, &app))
+                .context("failed to render the terminal UI")?;
+            app.last_render_at = Some(Instant::now());
+            should_draw = false;
+        }
+
+        let next_render_at = should_draw.then(|| {
+            app.last_render_at
+                .map(|last_render| last_render + MIN_RENDER_INTERVAL)
+                .unwrap_or_else(Instant::now)
+        });
+        let render_wakeup =
+            next_render_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(24 * 60 * 60));
+
+        tokio::select! {
+            biased;
+            byte = input.recv() => {
+                let Some(byte) = byte else {
+                    break Ok(());
+                };
+                if let Some(event) = input_decoder.push(byte) {
+                    if handle_decoded_input(event, &updates.borrow(), &mut app).await? {
+                        break Ok(());
+                    }
+                    should_draw = true;
+                }
+            }
+            _ = sleep_until(render_wakeup.into()), if next_render_at.is_some() => {}
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                should_draw = true;
+            }
+            event = route_events.recv() => {
+                if let Some(event) = event {
+                    handle_route_event(event, &mut app);
+                    for _ in 1..ROUTE_EVENT_DRAIN_LIMIT {
+                        let Ok(event) = route_events.try_recv() else {
+                            break;
+                        };
+                        handle_route_event(event, &mut app);
+                    }
+                    should_draw = true;
+                }
+            }
+            _ = ticks.tick() => {
+                if let Some(event) = input_decoder.flush_expired() {
+                    if handle_decoded_input(event, &updates.borrow(), &mut app).await? {
+                        break Ok(());
+                    }
+                    should_draw = true;
+                }
+                let current_size = terminal.size().context("failed to read terminal size")?;
+                let frame_area = current_size.into();
+                let (_, _, terminal_area) = ui_areas(frame_area);
+                app.last_frame_area = Some(frame_area);
+                if app.last_terminal_area != Some(terminal_area) {
+                    app.last_terminal_area = Some(terminal_area);
+                    should_draw = true;
+                }
+                let before = app.route_retry_after.len();
+                app.route_retry_after.retain(|_, retry| *retry > Instant::now());
+                if app.route_retry_after.len() != before {
+                    should_draw = true;
+                }
+                let before = app.control_retry_after.len();
+                app.control_retry_after.retain(|_, retry| *retry > Instant::now());
+                if app.control_retry_after.len() != before {
+                    should_draw = true;
+                }
+            }
+        }
+    };
+
+    release_routes(&mut app).await;
+    store.shutdown().await;
+    result
+}
+
+async fn release_routes(app: &mut App) {
+    let routes = std::mem::take(&mut app.routes);
+    for mut route in routes.into_values() {
+        if route.access == TerminalAccess::Control {
+            if let Some(input) = route.input.as_mut() {
+                if let Ok(command) = terminal_release_command() {
+                    let _ = input.write_all(&command).await;
+                }
+                let _ = input.shutdown().await;
+            }
+            if timeout(Duration::from_millis(250), route.child.wait())
+                .await
+                .is_err()
+            {
+                let _ = route.child.start_kill();
+            }
+        }
+    }
+}
+
+fn enter_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard)> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("the tui command requires an interactive terminal");
+    }
+    enable_raw_mode().context("failed to enable raw terminal mode")?;
+    let guard = TerminalGuard;
+    let mut output = io::stdout();
+    if let Err(error) = execute!(output, EnterAlternateScreen, Hide) {
+        drop(guard);
+        return Err(error).context("failed to enter the alternate screen");
+    }
+    if let Err(error) = output
+        .write_all(MOUSE_CAPTURE_ENABLE)
+        .and_then(|()| output.flush())
+    {
+        drop(guard);
+        return Err(error).context("failed to enable button-motion mouse capture");
+    }
+    let mut terminal = Terminal::new(CrosstermBackend::new(output))
+        .context("failed to initialize the terminal backend")?;
+    terminal
+        .autoresize()
+        .context("failed to size the terminal")?;
+    Ok((terminal, guard))
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            Show,
+            LeaveAlternateScreen
+        );
+        let _ = disable_raw_mode();
+    }
+}
+
+fn spawn_input_reader(sender: mpsc::UnboundedSender<u8>) {
+    thread::spawn(move || {
+        let mut input = io::stdin().lock();
+        let mut byte = [0_u8; 1];
+        while input.read_exact(&mut byte).is_ok() {
+            if sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+async fn handle_decoded_input(
+    input: DecodedInput,
+    state: &FederationState,
+    app: &mut App,
+) -> Result<bool> {
+    match input {
+        DecodedInput::Bytes(bytes) => {
+            for byte in bytes {
+                if handle_input(byte, state, app).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        DecodedInput::Mouse(mouse) => handle_mouse(mouse, state, app).await?,
+    }
+    Ok(false)
+}
+
+async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App) -> Result<()> {
+    if app.mode != InputMode::Terminal {
+        return Ok(());
+    }
+    let Some(frame_area) = app.last_frame_area else {
+        return Ok(());
+    };
+    let (sidebar_area, tab_area, terminal_area) = ui_areas(frame_area);
+    let outer = Position::new(mouse.column.saturating_sub(1), mouse.row.saturating_sub(1));
+
+    if app.swallow_left_gesture {
+        if mouse.is_left_release() {
+            finish_ui_left_gesture(app);
+        }
+        return Ok(());
+    }
+
+    if let Some(selection) = app.selection.as_ref()
+        && (mouse.is_left_motion() || mouse.is_left_release())
+    {
+        let pane = selection.pane.clone();
+        if let Some(position) = clamped_pane_position(outer, state, app, terminal_area, &pane) {
+            if mouse.is_left_motion() {
+                let selection = app.selection.as_mut().expect("selection was checked above");
+                selection.head = position;
+                selection.dragging |= selection.head != selection.anchor;
+            } else {
+                let mut selection = app.selection.take().expect("selection was checked above");
+                match selection.finish(position, mouse) {
+                    SelectionFinish::Retain => {
+                        copy_terminal_selection(&selection, app)?;
+                        app.selection = Some(selection);
+                    }
+                    SelectionFinish::ForwardClick(events) => {
+                        send_mouse_inputs(&pane, &events, state, app).await?;
+                    }
+                    SelectionFinish::Clear => {}
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if mouse.is_left_press() && sidebar_area.contains(outer) {
+        app.sidebar_press = app
+            .sidebar_hit_areas
+            .iter()
+            .find(|hit| hit.area.contains(outer))
+            .map(|hit| hit.pane.clone());
+        app.swallow_left_gesture = true;
+        return Ok(());
+    }
+    if tab_area.contains(outer) {
+        if mouse.is_left_press() {
+            if let Some(tab) = tab_at_column(
+                state,
+                app.selected_pane.as_ref(),
+                outer.x.saturating_sub(tab_area.x),
+            ) && let Some((snapshot, _)) =
+                selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+            {
+                select_tab(snapshot, &tab, app);
+            }
+            app.swallow_left_gesture = true;
+        } else if let Some(direction) = mouse.scroll_direction() {
+            cycle_tab(
+                state,
+                app,
+                match direction {
+                    TerminalScrollDirection::Up => -1,
+                    TerminalScrollDirection::Down => 1,
+                },
+            );
+        }
+        return Ok(());
+    }
+    let Some((pane, position, local_mouse)) = mouse_pane_position(mouse, state, app, terminal_area)
+    else {
+        return Ok(());
+    };
+
+    if app.selected_pane.as_ref() != Some(&pane) {
+        if mouse.is_left_press() {
+            select_pane(app, pane);
+            app.swallow_left_gesture = true;
+        }
+        return Ok(());
+    }
+
+    if mouse.is_vertical_wheel() {
+        app.selection = None;
+        return send_terminal_scroll(&pane, local_mouse, state, app).await;
+    }
+
+    if mouse.is_left_press() {
+        let forwarded_click =
+            (pane_reports_mouse(app, &pane) && !mouse.shift()).then_some(local_mouse);
+        app.selection = Some(TerminalSelection {
+            pane,
+            anchor: position,
+            head: position,
+            dragging: false,
+            forwarded_click,
+        });
+        return Ok(());
+    }
+
+    send_mouse_inputs(&pane, &[local_mouse], state, app).await
+}
+
+fn finish_ui_left_gesture(app: &mut App) {
+    app.swallow_left_gesture = false;
+    if let Some(pane) = app.sidebar_press.take() {
+        select_pane(app, pane);
+    }
+}
+
+fn pane_reports_mouse(app: &App, pane: &PaneId) -> bool {
+    app.routes.get(pane).is_some_and(|route| {
+        mouse_passthrough_enabled(
+            route.parser.screen().mouse_protocol_mode(),
+            route.input.is_some(),
+        )
+    })
+}
+
+fn mouse_passthrough_enabled(mode: vt100::MouseProtocolMode, writable: bool) -> bool {
+    writable && mode != vt100::MouseProtocolMode::None
+}
+
+fn mouse_pane_position(
+    mouse: MouseInput,
+    state: &FederationState,
+    app: &App,
+    terminal_area: Rect,
+) -> Option<(PaneId, CellPosition, MouseInput)> {
+    let outer_column = mouse.column.checked_sub(1)?;
+    let outer_row = mouse.row.checked_sub(1)?;
+    let outer = Position::new(outer_column, outer_row);
+    visible_pane_areas(state, app.selected_pane.as_ref(), terminal_area)
+        .into_iter()
+        .find_map(|(pane, area)| {
+            let selected = app.selected_pane.as_ref() == Some(&pane);
+            let inner = pane_block(
+                &pane,
+                selected,
+                app.routes.get(&pane).map(|route| route.access),
+            )
+            .inner(area);
+            inner.contains(outer).then(|| {
+                let position = CellPosition {
+                    row: outer_row - inner.y,
+                    column: outer_column - inner.x,
+                };
+                (
+                    pane,
+                    position,
+                    MouseInput {
+                        column: position.column + 1,
+                        row: position.row + 1,
+                        ..mouse
+                    },
+                )
+            })
+        })
+}
+
+fn clamped_pane_position(
+    outer: Position,
+    state: &FederationState,
+    app: &App,
+    terminal_area: Rect,
+    pane: &PaneId,
+) -> Option<CellPosition> {
+    let area = visible_pane_areas(state, app.selected_pane.as_ref(), terminal_area)
+        .into_iter()
+        .find_map(|(candidate, area)| (candidate == *pane).then_some(area))?;
+    let inner = pane_block(
+        pane,
+        app.selected_pane.as_ref() == Some(pane),
+        app.routes.get(pane).map(|route| route.access),
+    )
+    .inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    Some(CellPosition {
+        row: outer
+            .y
+            .clamp(inner.y, inner.y + inner.height - 1)
+            .saturating_sub(inner.y),
+        column: outer
+            .x
+            .clamp(inner.x, inner.x + inner.width - 1)
+            .saturating_sub(inner.x),
+    })
+}
+
+fn select_pane(app: &mut App, pane: PaneId) {
+    app.selection_explicit = true;
+    app.selection = None;
+    app.sidebar_press = None;
+    app.selected_pane = Some(pane.clone());
+    app.route_retry_after.remove(&pane);
+    app.control_retry_after.remove(&pane);
+    app.message = None;
+}
+
+async fn send_terminal_scroll(
+    pane: &PaneId,
+    mouse: MouseInput,
+    state: &FederationState,
+    app: &mut App,
+) -> Result<()> {
+    let Some(direction) = mouse.scroll_direction() else {
+        return Ok(());
+    };
+    let Some(route) = app.routes.get(pane) else {
+        return Ok(());
+    };
+    let Some(target) = state.targets.get(&pane.target_session()) else {
+        return Ok(());
+    };
+    if !target.accepts_generation(route.generation) {
+        app.routes.remove(pane);
+        app.message = Some("control route became stale".to_owned());
+        return Ok(());
+    }
+
+    let command = terminal_scroll_command(
+        direction,
+        MOUSE_SCROLL_LINES,
+        mouse.column.saturating_sub(1),
+        mouse.row.saturating_sub(1),
+        mouse.key_modifiers(),
+    )?;
+    let route = app.routes.get_mut(pane).expect("route was checked above");
+    let Some(input) = route.input.as_mut() else {
+        app.message =
+            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
+        return Ok(());
+    };
+    if input.write_all(&command).await.is_err() {
+        fall_back_to_observe(app, pane);
+    }
+    Ok(())
+}
+
+async fn send_mouse_inputs(
+    pane: &PaneId,
+    events: &[MouseInput],
+    state: &FederationState,
+    app: &mut App,
+) -> Result<()> {
+    let Some(route) = app.routes.get(pane) else {
+        return Ok(());
+    };
+    let Some(target) = state.targets.get(&pane.target_session()) else {
+        return Ok(());
+    };
+    if !target.accepts_generation(route.generation) {
+        app.routes.remove(pane);
+        app.message = Some("control route became stale".to_owned());
+        return Ok(());
+    }
+    let mode = route.parser.screen().mouse_protocol_mode();
+    let encoding = route.parser.screen().mouse_protocol_encoding();
+    let bytes = events
+        .iter()
+        .copied()
+        .filter(|event| mouse_event_allowed(mode, *event))
+        .filter_map(|event| encode_mouse_event(event, encoding))
+        .flatten()
+        .collect::<Vec<_>>();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let route = app.routes.get_mut(pane).expect("route was checked above");
+    let Some(input) = route.input.as_mut() else {
+        app.message =
+            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
+        return Ok(());
+    };
+    if input
+        .write_all(&terminal_input_command(&bytes)?)
+        .await
+        .is_err()
+    {
+        fall_back_to_observe(app, pane);
+    }
+    Ok(())
+}
+
+fn mouse_event_allowed(mode: vt100::MouseProtocolMode, mouse: MouseInput) -> bool {
+    match mode {
+        vt100::MouseProtocolMode::None => false,
+        vt100::MouseProtocolMode::Press => !mouse.release && !mouse.is_motion(),
+        vt100::MouseProtocolMode::PressRelease => !mouse.is_motion(),
+        vt100::MouseProtocolMode::ButtonMotion => !mouse.is_motion() || mouse.code & 0b11 != 0b11,
+        vt100::MouseProtocolMode::AnyMotion => true,
+    }
+}
+
+fn encode_mouse_event(
+    mouse: MouseInput,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{};{};{}{}",
+                mouse.code,
+                mouse.column,
+                mouse.row,
+                if mouse.release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        vt100::MouseProtocolEncoding::Default => {
+            let code = if mouse.release {
+                (mouse.code & !0b11) | 0b11
+            } else {
+                mouse.code
+            };
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                u8::try_from(code.checked_add(32)?).ok()?,
+                u8::try_from(mouse.column.checked_add(32)?).ok()?,
+                u8::try_from(mouse.row.checked_add(32)?).ok()?,
+            ])
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let code = if mouse.release {
+                (mouse.code & !0b11) | 0b11
+            } else {
+                mouse.code
+            };
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [code, mouse.column, mouse.row] {
+                let character = char::from_u32(u32::from(value.checked_add(32)?))?;
+                let mut encoded = [0; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            }
+            Some(bytes)
+        }
+    }
+}
+
+fn copy_terminal_selection(selection: &TerminalSelection, app: &mut App) -> Result<()> {
+    let Some(route) = app.routes.get(&selection.pane) else {
+        return Ok(());
+    };
+    let text = selected_terminal_text(route.parser.screen(), selection);
+    if text.is_empty() {
+        app.message = Some("selection is empty".to_owned());
+        return Ok(());
+    }
+    if text.len() > MAX_CLIPBOARD_BYTES {
+        app.message = Some("selection is too large to copy".to_owned());
+        return Ok(());
+    }
+    let clipboard = write_clipboard(&text)?;
+    app.message = Some(clipboard.feedback(text.chars().count()));
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardDelivery {
+    Native,
+    Osc52Requested,
+}
+
+impl ClipboardDelivery {
+    fn feedback(self, characters: usize) -> String {
+        match self {
+            Self::Native => format!("copied {characters} characters to system clipboard"),
+            Self::Osc52Requested => {
+                format!("requested terminal clipboard copy of {characters} characters (OSC 52)")
+            }
+        }
+    }
+}
+
+fn selected_terminal_text(screen: &vt100::Screen, selection: &TerminalSelection) -> String {
+    let (rows, columns) = screen.size();
+    if rows == 0 || columns == 0 {
+        return String::new();
+    }
+    let start = selection.anchor.min(selection.head);
+    let end = selection.anchor.max(selection.head);
+    let start = CellPosition {
+        row: start.row.min(rows - 1),
+        column: start.column.min(columns - 1),
+    };
+    let end = CellPosition {
+        row: end.row.min(rows - 1),
+        column: end.column.min(columns - 1),
+    };
+    let mut lines = Vec::new();
+    for row in start.row..=end.row {
+        let first_column = if row == start.row { start.column } else { 0 };
+        let last_column = if row == end.row {
+            end.column
+        } else {
+            columns - 1
+        };
+        let mut line = String::new();
+        for column in first_column..=last_column {
+            let Some(cell) = screen.cell(row, column) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            if cell.has_contents() {
+                line.push_str(cell.contents());
+            } else {
+                line.push(' ');
+            }
+        }
+        lines.push(line.trim_end_matches(' ').to_owned());
+    }
+    lines.join("\n")
+}
+
+fn write_clipboard(text: &str) -> Result<ClipboardDelivery> {
+    if !prefer_terminal_clipboard() && write_native_clipboard(text.as_bytes()) {
+        return Ok(ClipboardDelivery::Native);
+    }
+    write_osc52_clipboard(text)?;
+    Ok(ClipboardDelivery::Osc52Requested)
+}
+
+fn prefer_terminal_clipboard() -> bool {
+    prefer_terminal_clipboard_for_env(
+        std::env::var_os("SSH_CONNECTION").as_deref(),
+        std::env::var_os("SSH_TTY").as_deref(),
+        std::env::var_os("HERDR_ENV").as_deref(),
+    )
+}
+
+fn prefer_terminal_clipboard_for_env(
+    ssh_connection: Option<&std::ffi::OsStr>,
+    ssh_tty: Option<&std::ffi::OsStr>,
+    herdr_env: Option<&std::ffi::OsStr>,
+) -> bool {
+    ssh_connection.is_some() || ssh_tty.is_some() || herdr_env == Some(std::ffi::OsStr::new("1"))
+}
+
+fn write_native_clipboard(bytes: &[u8]) -> bool {
+    let mut commands: Vec<(&str, &[&str])> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            commands.push(("wl-copy", &["--type", "text/plain;charset=utf-8"]));
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            commands.push(("xclip", &["-selection", "clipboard", "-in"]));
+            commands.push(("xsel", &["--clipboard", "--input"]));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    commands.push(("pbcopy", &[]));
+
+    commands
+        .into_iter()
+        .any(|(program, arguments)| run_clipboard_command(program, arguments, bytes))
+}
+
+fn run_clipboard_command(program: &str, arguments: &[&str], bytes: &[u8]) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let write_succeeded = child
+        .stdin
+        .take()
+        .is_some_and(|mut input| input.write_all(bytes).is_ok());
+    if !write_succeeded {
+        let _ = child.kill();
+    }
+    child
+        .wait()
+        .is_ok_and(|status| write_succeeded && status.success())
+}
+
+fn write_osc52_clipboard(text: &str) -> Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut output = io::stdout().lock();
+    output
+        .write_all(b"\x1b]52;c;")
+        .and_then(|()| output.write_all(encoded.as_bytes()))
+        .and_then(|()| output.write_all(b"\x07"))
+        .and_then(|()| output.flush())
+        .context("failed to write the clipboard bridge sequence")
+}
+
+async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
+    match app.mode {
+        InputMode::Terminal if key == PREFIX_KEY => {
+            app.selection = None;
+            app.mode = InputMode::Prefix;
+        }
+        InputMode::Terminal => {
+            app.selection = None;
+            let Some(selected) = app.selected_pane.clone() else {
+                app.message = Some("no terminal pane is selected".to_owned());
+                return Ok(false);
+            };
+            let Some(route) = app.routes.get(&selected) else {
+                app.message = Some("selected pane has no control route".to_owned());
+                return Ok(false);
+            };
+            let Some(target) = state.targets.get(&route.pane.target_session()) else {
+                app.routes.remove(&selected);
+                return Ok(false);
+            };
+            if !target.accepts_generation(route.generation) {
+                app.routes.remove(&selected);
+                app.message = Some("control route became stale".to_owned());
+                return Ok(false);
+            }
+            let route = app
+                .routes
+                .get_mut(&selected)
+                .expect("route was checked above");
+            let Some(input) = route.input.as_mut() else {
+                app.message = Some(
+                    "read-only: another Herdr client owns control; retrying automatically"
+                        .to_owned(),
+                );
+                return Ok(false);
+            };
+            let command = terminal_input_command(&[key])?;
+            if input.write_all(&command).await.is_err() {
+                fall_back_to_observe(app, &selected);
+            }
+        }
+        InputMode::Prefix => {
+            match key {
+                b'q' => return Ok(true),
+                b'j' => cycle_pane(state, app, 1),
+                b'k' => cycle_pane(state, app, -1),
+                b'n' => cycle_tab(state, app, 1),
+                b'p' => cycle_tab(state, app, -1),
+                b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
+                PREFIX_KEY => {
+                    if let Some(route) = app
+                        .selected_pane
+                        .as_ref()
+                        .and_then(|pane| app.routes.get_mut(pane))
+                        && let Some(input) = route.input.as_mut()
+                    {
+                        input
+                            .write_all(&terminal_input_command(&[PREFIX_KEY])?)
+                            .await
+                            .context("failed to send the literal prefix key")?;
+                    }
+                }
+                0x1b => {}
+                _ => {
+                    app.message = Some(
+                        "prefix: 1-9 workspace, p/n tab, j/k pane, q quit, Ctrl+] literal".into(),
+                    );
+                }
+            }
+            app.mode = InputMode::Terminal;
+        }
+    }
+    Ok(false)
+}
+
+fn cycle_pane(state: &FederationState, app: &mut App, direction: isize) {
+    let panes = selectable_panes(state);
+    if panes.is_empty() {
+        app.selected_pane = None;
+        app.selection = None;
+        app.routes.clear();
+        app.route_retry_after.clear();
+        app.control_retry_after.clear();
+        return;
+    }
+    app.selection_explicit = true;
+    let current = app
+        .selected_pane
+        .as_ref()
+        .and_then(|selected| panes.iter().position(|pane| pane == selected))
+        .unwrap_or(0);
+    let next = wrapped_index(current, panes.len(), direction);
+    if app.selected_pane.as_ref() != Some(&panes[next]) {
+        select_pane(app, panes[next].clone());
+    }
+}
+
+fn cycle_tab(state: &FederationState, app: &mut App, direction: isize) {
+    let Some((snapshot, pane)) = selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+    else {
+        return;
+    };
+    let Some(workspace) = pane.workspace.as_ref() else {
+        return;
+    };
+    let tabs = snapshot
+        .tabs
+        .values()
+        .filter(|tab| tab.workspace.as_ref() == Some(workspace))
+        .map(|tab| tab.id.clone())
+        .collect::<Vec<_>>();
+    if tabs.is_empty() {
+        return;
+    }
+    let current = pane
+        .tab
+        .as_ref()
+        .and_then(|selected| tabs.iter().position(|tab| tab == selected))
+        .unwrap_or(0);
+    let next = wrapped_index(current, tabs.len(), direction);
+    select_tab(snapshot, &tabs[next], app);
+}
+
+fn select_workspace(state: &FederationState, app: &mut App, index: usize) {
+    let workspaces = state
+        .targets
+        .values()
+        .filter(|target| target.connection == TargetConnectionState::Live)
+        .filter_map(|target| target.snapshot.as_deref())
+        .flat_map(|snapshot| {
+            snapshot
+                .workspaces
+                .values()
+                .map(move |workspace| (snapshot, workspace))
+        })
+        .collect::<Vec<_>>();
+    let Some((snapshot, workspace)) = workspaces.get(index).copied() else {
+        app.message = Some(format!("workspace {} is not available", index + 1));
+        return;
+    };
+    let tab = workspace.active_tab.as_ref().or_else(|| {
+        snapshot
+            .tabs
+            .values()
+            .find(|tab| tab.workspace.as_ref() == Some(&workspace.id))
+            .map(|tab| &tab.id)
+    });
+    if let Some(tab) = tab {
+        select_tab(snapshot, tab, app);
+    }
+}
+
+fn select_tab(snapshot: &NormalizedSnapshot, tab: &crate::model::TabId, app: &mut App) {
+    let pane = snapshot
+        .layouts
+        .get(tab)
+        .map(|layout| layout.focused_pane.clone())
+        .or_else(|| {
+            snapshot
+                .panes
+                .values()
+                .find(|pane| pane.tab.as_ref() == Some(tab))
+                .map(|pane| pane.id.clone())
+        });
+    if let Some(pane) = pane {
+        select_pane(app, pane);
+    }
+}
+
+fn wrapped_index(current: usize, length: usize, direction: isize) -> usize {
+    if direction < 0 {
+        current
+            .checked_sub(direction.unsigned_abs())
+            .unwrap_or(length - 1)
+    } else {
+        current.saturating_add(direction as usize) % length
+    }
+}
+
+fn reconcile_selection(state: &FederationState, app: &mut App) {
+    let panes = selectable_panes(state);
+    let selection_is_valid = app
+        .selected_pane
+        .as_ref()
+        .is_some_and(|selected| panes.contains(selected));
+    if selection_is_valid && app.selection_explicit {
+        return;
+    }
+
+    if !selection_is_valid {
+        app.selection_explicit = false;
+    }
+
+    let startup_pane = state
+        .targets
+        .values()
+        .filter(|target| target.connection == TargetConnectionState::Live)
+        .filter_map(|target| target.snapshot.as_deref())
+        .max_by_key(|snapshot| {
+            (
+                snapshot.counts.agents,
+                snapshot.counts.workspaces,
+                snapshot.counts.panes,
+            )
+        })
+        .and_then(|snapshot| {
+            snapshot
+                .focused_pane
+                .clone()
+                .or_else(|| snapshot.panes.keys().next().cloned())
+        });
+
+    if app.selected_pane != startup_pane {
+        app.selected_pane = startup_pane;
+        app.selection = None;
+        app.route_retry_after.clear();
+        app.control_retry_after.clear();
+        app.message = None;
+    }
+}
+
+fn selectable_panes(state: &FederationState) -> Vec<PaneId> {
+    state
+        .targets
+        .values()
+        .filter(|target| target.connection == TargetConnectionState::Live)
+        .filter_map(|target| target.snapshot.as_deref())
+        .flat_map(|snapshot| snapshot.panes.keys().cloned())
+        .collect()
+}
+
+fn ensure_routes(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    route_sender: &mpsc::UnboundedSender<RouteEvent>,
+    app: &mut App,
+) -> Result<()> {
+    let Some(selected) = app.selected_pane.as_ref() else {
+        app.routes.clear();
+        return Ok(());
+    };
+    let area = terminal.size().context("failed to read terminal size")?;
+    let frame_area = area.into();
+    let (_, _, terminal_area) = ui_areas(frame_area);
+    app.last_frame_area = Some(frame_area);
+    app.last_terminal_area = Some(terminal_area);
+    let desired = visible_pane_areas(state, Some(selected), terminal_area)
+        .into_iter()
+        .filter_map(|(pane, area)| {
+            let inner = pane_block(&pane, &pane == selected, None).inner(area);
+            (inner.width > 0 && inner.height > 0).then_some((pane, inner))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let control_retry_after = &app.control_retry_after;
+    app.routes.retain(|pane, route| {
+        let Some(inner) = desired.get(pane) else {
+            return false;
+        };
+        let Some(runtime) = state.targets.get(&pane.target_session()) else {
+            return false;
+        };
+        let access = desired_access(pane, selected, control_retry_after);
+        route.access == access
+            && route.generation == runtime.connection_generation
+            && route.rows == inner.height
+            && route.columns == inner.width
+    });
+
+    for (pane, inner) in desired {
+        if app.routes.contains_key(&pane)
+            || app
+                .route_retry_after
+                .get(&pane)
+                .is_some_and(|retry| *retry > Instant::now())
+        {
+            continue;
+        }
+        let key = pane.target_session();
+        let Some(runtime) = state.targets.get(&key) else {
+            continue;
+        };
+        if runtime.connection != TargetConnectionState::Live {
+            continue;
+        }
+        let Some(target) = targets.get(&key) else {
+            if pane == *selected {
+                app.message = Some("selected target is missing from configuration".to_owned());
+            }
+            continue;
+        };
+        let Some(executable) = runtime.selected_herdr_bin.as_deref() else {
+            if pane == *selected {
+                app.message = Some("selected target has no compatible Herdr client".to_owned());
+            }
+            continue;
+        };
+        let access = desired_access(&pane, selected, &app.control_retry_after);
+        let process = match spawn_terminal(
+            target,
+            transport_config,
+            executable,
+            &pane,
+            access,
+            inner.height,
+            inner.width,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                app.route_retry_after
+                    .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
+                if pane == *selected {
+                    app.message = Some(format!("terminal route failed: {error}"));
+                    if access == TerminalAccess::Control {
+                        app.control_retry_after
+                            .insert(pane.clone(), Instant::now() + CONTROL_RETRY_DELAY);
+                    }
+                }
+                continue;
+            }
+        };
+        if access == TerminalAccess::Control && process.input.is_none() {
+            app.message = Some("terminal control route has no input stream".to_owned());
+            continue;
+        }
+        let serial = app.next_route_serial;
+        app.next_route_serial = app.next_route_serial.saturating_add(1);
+        let reader = spawn_route_reader(serial, process.output, route_sender.clone());
+        app.routes.insert(
+            pane.clone(),
+            ActiveRoute {
+                serial,
+                pane,
+                access,
+                generation: runtime.connection_generation,
+                rows: inner.height,
+                columns: inner.width,
+                child: process.child,
+                input: process.input,
+                reader,
+                parser: vt100::Parser::new(inner.height, inner.width, 2_000),
+                last_sequence: None,
+            },
+        );
+    }
+    if let Some(route) = app.routes.get(selected) {
+        app.message = match route.access {
+            TerminalAccess::Control => None,
+            TerminalAccess::Observe => Some(
+                "read-only: another Herdr client owns control; retrying automatically".to_owned(),
+            ),
+        };
+    }
+    Ok(())
+}
+
+fn desired_access(
+    pane: &PaneId,
+    selected: &PaneId,
+    control_retry_after: &BTreeMap<PaneId, Instant>,
+) -> TerminalAccess {
+    if pane != selected
+        || control_retry_after
+            .get(pane)
+            .is_some_and(|retry| *retry > Instant::now())
+    {
+        TerminalAccess::Observe
+    } else {
+        TerminalAccess::Control
+    }
+}
+
+fn spawn_route_reader(
+    serial: u64,
+    output: tokio::process::ChildStdout,
+    sender: mpsc::UnboundedSender<RouteEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut output = BufReader::new(output);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match output.read_until(b'\n', &mut line).await {
+                Ok(0) | Err(_) => {
+                    let _ = sender.send(RouteEvent::Closed { serial });
+                    return;
+                }
+                Ok(_) => match parse_terminal_event(&line) {
+                    Ok(TerminalEvent::Closed) => {
+                        let _ = sender.send(RouteEvent::Closed { serial });
+                        return;
+                    }
+                    Ok(event) => {
+                        if sender.send(RouteEvent::Output { serial, event }).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = sender.send(RouteEvent::Failed { serial });
+                        return;
+                    }
+                },
+            }
+        }
+    })
+}
+
+fn handle_route_event(event: RouteEvent, app: &mut App) {
+    match event {
+        RouteEvent::Output { serial, event } => {
+            if let Some(route) = app.routes.values_mut().find(|route| route.serial == serial)
+                && let TerminalEvent::Frame {
+                    sequence,
+                    width,
+                    height,
+                    full,
+                    bytes,
+                } = event
+            {
+                if full || route.rows != height || route.columns != width {
+                    route.parser = vt100::Parser::new(height, width, 2_000);
+                    route.rows = height;
+                    route.columns = width;
+                }
+                route.parser.process(&bytes);
+                route.last_sequence = Some(sequence);
+            }
+        }
+        RouteEvent::Failed { serial } => {
+            if let Some(pane) = route_pane_for_serial(app, serial) {
+                let access = app.routes.get(&pane).map(|route| route.access);
+                app.routes.remove(&pane);
+                match access {
+                    Some(TerminalAccess::Control) => fall_back_to_observe(app, &pane),
+                    _ => {
+                        app.route_retry_after
+                            .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
+                    }
+                }
+                if app.selected_pane.as_ref() == Some(&pane) {
+                    app.message = Some("terminal route returned an invalid frame".to_owned());
+                }
+            }
+        }
+        RouteEvent::Closed { serial } => {
+            if let Some(pane) = route_pane_for_serial(app, serial) {
+                let access = app.routes.get(&pane).map(|route| route.access);
+                app.routes.remove(&pane);
+                match access {
+                    Some(TerminalAccess::Control) => fall_back_to_observe(app, &pane),
+                    _ => {
+                        app.route_retry_after
+                            .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
+                    }
+                }
+                if app.selected_pane.as_ref() == Some(&pane) {
+                    app.message = Some(match access {
+                        Some(TerminalAccess::Control) => {
+                            "read-only: another Herdr client owns control; retrying automatically"
+                                .to_owned()
+                        }
+                        _ => "terminal observer route closed".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn fall_back_to_observe(app: &mut App, pane: &PaneId) {
+    app.routes.remove(pane);
+    app.route_retry_after.remove(pane);
+    app.control_retry_after
+        .insert(pane.clone(), Instant::now() + CONTROL_RETRY_DELAY);
+    if app.selected_pane.as_ref() == Some(pane) {
+        app.message =
+            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
+    }
+}
+
+fn route_pane_for_serial(app: &App, serial: u64) -> Option<PaneId> {
+    app.routes
+        .iter()
+        .find(|(_, route)| route.serial == serial)
+        .map(|(pane, _)| pane.clone())
+}
+
+fn render(frame: &mut Frame, state: &FederationState, app: &App) {
+    let (sidebar_area, tab_area, terminal_area) = ui_areas(frame.area());
+    if sidebar_area.width > 0 {
+        render_sidebar(frame, state, app, sidebar_area);
+    }
+    render_tabs(frame, state, app, tab_area);
+    render_terminal_surfaces(frame, state, app, terminal_area);
+}
+
+fn ui_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let sidebar_width = if area.width >= 70 {
+        SIDEBAR_WIDTH.min(area.width.saturating_sub(20))
+    } else {
+        0
+    };
+    let [sidebar, main] =
+        Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(1)]).areas(area);
+    let [tabs, terminal] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+    (sidebar, tabs, terminal)
+}
+
+fn pane_block(pane: &PaneId, selected: bool, access: Option<TerminalAccess>) -> Block<'static> {
+    let border_color = if selected {
+        Color::Blue
+    } else {
+        Color::DarkGray
+    };
+    Block::default()
+        .title(Span::styled(
+            format!(
+                " {}{} ",
+                safe_text(&pane.resource),
+                match access {
+                    Some(TerminalAccess::Control) => " [control]",
+                    Some(TerminalAccess::Observe) => " [read-only]",
+                    None => "",
+                }
+            ),
+            Style::default().fg(Color::Gray),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .padding(Padding::horizontal(1))
+}
+
+fn visible_pane_areas(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    destination: Rect,
+) -> Vec<(PaneId, Rect)> {
+    let Some((snapshot, selected_state)) = selected_snapshot_and_pane(state, selected) else {
+        return Vec::new();
+    };
+    let Some(selected) = selected else {
+        return Vec::new();
+    };
+    let Some(tab) = selected_state.tab.as_ref() else {
+        return vec![(selected.clone(), destination)];
+    };
+    let Some(layout) = snapshot.layouts.get(tab) else {
+        return vec![(selected.clone(), destination)];
+    };
+    if layout.zoomed {
+        return vec![(selected.clone(), destination)];
+    }
+
+    let panes = layout
+        .panes
+        .iter()
+        .filter(|pane| snapshot.panes.contains_key(&pane.pane))
+        .filter_map(|pane| {
+            scale_layout_rect(layout.area, pane.rect, destination)
+                .map(|area| (pane.pane.clone(), area))
+        })
+        .collect::<Vec<_>>();
+    if panes.is_empty() {
+        vec![(selected.clone(), destination)]
+    } else {
+        panes
+    }
+}
+
+fn scale_layout_rect(
+    source: crate::state::LayoutRect,
+    pane: crate::state::LayoutRect,
+    destination: Rect,
+) -> Option<Rect> {
+    if source.width == 0 || source.height == 0 || destination.width == 0 || destination.height == 0
+    {
+        return None;
+    }
+    let left = scale_edge(
+        pane.x.saturating_sub(source.x),
+        source.width,
+        destination.width,
+    );
+    let right = scale_edge(
+        pane.x.saturating_sub(source.x).saturating_add(pane.width),
+        source.width,
+        destination.width,
+    );
+    let top = scale_edge(
+        pane.y.saturating_sub(source.y),
+        source.height,
+        destination.height,
+    );
+    let bottom = scale_edge(
+        pane.y.saturating_sub(source.y).saturating_add(pane.height),
+        source.height,
+        destination.height,
+    );
+    let left = left.min(destination.width);
+    let right = right.min(destination.width);
+    let top = top.min(destination.height);
+    let bottom = bottom.min(destination.height);
+    (right > left && bottom > top).then_some(Rect::new(
+        destination.x.saturating_add(left),
+        destination.y.saturating_add(top),
+        right - left,
+        bottom - top,
+    ))
+}
+
+fn scale_edge(offset: u16, source_length: u16, destination_length: u16) -> u16 {
+    ((u32::from(offset) * u32::from(destination_length)) / u32::from(source_length)) as u16
+}
+
+#[cfg(test)]
+fn sidebar_pane_at_row(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    row: u16,
+) -> Option<PaneId> {
+    sidebar_rows(state, selected)
+        .get(usize::from(row))
+        .and_then(|row| row.pane.clone())
+}
+
+fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<SidebarRow> {
+    let selected_target = selected.map(PaneId::target_session);
+    let selected_workspace = selected_workspace(state, selected);
+    let mut rows = Vec::new();
+    let mut workspace_index = 1_usize;
+    for target in state.targets.values() {
+        let is_selected_target = selected_target.as_ref() == Some(&target.key);
+        let (symbol, color) = target_status(target);
+        let target_style = Style::default()
+            .fg(color)
+            .add_modifier(if is_selected_target {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        let mut line = Line::from(vec![
+            Span::styled(if is_selected_target { ">" } else { " " }, target_style),
+            Span::styled(format!("{symbol} "), target_style),
+            Span::styled(safe_text(&target.key.target), target_style),
+            Span::styled(
+                format!("  {}", short_session(&target.key.session)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                match target.update_mode {
+                    TargetUpdateMode::Events => " evt",
+                    TargetUpdateMode::Polling if target.event_error.is_some() => " poll!",
+                    TargetUpdateMode::Polling => " poll",
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        if is_selected_target {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        let target_pane = (target.connection == TargetConnectionState::Live)
+            .then_some(target.snapshot.as_deref())
+            .flatten()
+            .and_then(|snapshot| {
+                snapshot
+                    .focused_pane
+                    .clone()
+                    .or_else(|| snapshot.panes.keys().next().cloned())
+            });
+        rows.push(SidebarRow {
+            line,
+            pane: target_pane,
+        });
+
+        if is_selected_target && let Some(error) = target.event_error.as_deref() {
+            rows.push(SidebarRow {
+                line: Line::styled(
+                    format!("  event: {}", safe_text(error)),
+                    Style::default().fg(Color::Red),
+                ),
+                pane: None,
+            });
+        }
+        if let Some(snapshot) = target.snapshot.as_deref() {
+            for workspace in snapshot.workspaces.values() {
+                let is_selected = selected_workspace.as_ref() == Some(&workspace.id);
+                let workspace_style = Style::default()
+                    .fg(if is_selected {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    })
+                    .add_modifier(if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
+                let mut line = Line::from(vec![
+                    Span::styled(
+                        if is_selected { ">" } else { " " },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if workspace_index <= 9 {
+                            format!("{} ", workspace_index)
+                        } else {
+                            "· ".to_owned()
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        status_symbol(workspace.agent_status.as_deref()),
+                        status_style(workspace.agent_status.as_deref()),
+                    ),
+                    Span::styled(
+                        format!(
+                            " {}",
+                            display_label(&workspace.id.resource, workspace.label.as_deref())
+                        ),
+                        workspace_style,
+                    ),
+                ]);
+                if is_selected {
+                    line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                rows.push(SidebarRow {
+                    line,
+                    pane: (target.connection == TargetConnectionState::Live)
+                        .then(|| pane_for_workspace(snapshot, &workspace.id))
+                        .flatten(),
+                });
+                workspace_index = workspace_index.saturating_add(1);
+            }
+        }
+    }
+    rows
+}
+
+fn pane_for_workspace(snapshot: &NormalizedSnapshot, workspace: &WorkspaceId) -> Option<PaneId> {
+    let tab = snapshot
+        .workspaces
+        .get(workspace)
+        .and_then(|workspace| workspace.active_tab.as_ref())
+        .or_else(|| {
+            snapshot
+                .tabs
+                .values()
+                .find(|tab| tab.workspace.as_ref() == Some(workspace))
+                .map(|tab| &tab.id)
+        })?;
+    snapshot
+        .layouts
+        .get(tab)
+        .map(|layout| layout.focused_pane.clone())
+        .or_else(|| {
+            snapshot
+                .panes
+                .values()
+                .find(|pane| pane.tab.as_ref() == Some(tab))
+                .map(|pane| pane.id.clone())
+        })
+}
+
+fn tab_at_column(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    column: u16,
+) -> Option<crate::model::TabId> {
+    let (snapshot, pane) = selected_snapshot_and_pane(state, selected)?;
+    let workspace = pane.workspace.as_ref()?;
+    let tabs = snapshot
+        .tabs
+        .values()
+        .filter(|tab| tab.workspace.as_ref() == Some(workspace))
+        .collect::<Vec<_>>();
+    let mut left = 0_usize;
+    let column = usize::from(column);
+    for (index, tab) in tabs.iter().enumerate() {
+        let title = Line::from(format!(
+            " {} ",
+            display_label(&tab.id.resource, tab.label.as_deref())
+        ));
+        let right = left.saturating_add(1 + title.width() + 1);
+        if (left..right).contains(&column) {
+            return Some(tab.id.clone());
+        }
+        left = right.saturating_add(usize::from(index + 1 < tabs.len()));
+    }
+    None
+}
+
+fn sidebar_block() -> Block<'static> {
+    Block::default()
+        .title(Span::styled(" super-herdr ", Style::default().bold()))
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
+
+fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) {
+    app.sidebar_hit_areas.clear();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let content = sidebar_block().inner(area);
+    for (offset, row) in sidebar_rows(state, app.selected_pane.as_ref())
+        .into_iter()
+        .enumerate()
+    {
+        let Ok(offset) = u16::try_from(offset) else {
+            break;
+        };
+        if offset >= content.height {
+            break;
+        }
+        if let Some(pane) = row.pane {
+            app.sidebar_hit_areas.push(SidebarHitArea {
+                area: Rect::new(content.x, content.y + offset, content.width, 1),
+                pane,
+            });
+        }
+    }
+}
+
+fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
+    let lines = sidebar_rows(state, app.selected_pane.as_ref())
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).block(sidebar_block()), area);
+}
+
+fn render_tabs(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
+    let Some((snapshot, pane)) = selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+    else {
+        frame.render_widget(Paragraph::new(" no live pane"), area);
+        return;
+    };
+    let Some(workspace) = pane.workspace.as_ref() else {
+        frame.render_widget(Paragraph::new(" pane has no workspace"), area);
+        return;
+    };
+    let tabs = snapshot
+        .tabs
+        .values()
+        .filter(|tab| tab.workspace.as_ref() == Some(workspace))
+        .collect::<Vec<_>>();
+    let selected = tabs
+        .iter()
+        .position(|tab| pane.tab.as_ref() == Some(&tab.id))
+        .unwrap_or(0);
+    let titles = tabs
+        .iter()
+        .map(|tab| {
+            Line::from(format!(
+                " {} ",
+                display_label(&tab.id.resource, tab.label.as_deref())
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Tabs::new(titles)
+            .select(selected)
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(Style::default().fg(Color::White).bold())
+            .divider(Span::styled("│", Style::default().fg(Color::DarkGray))),
+        area,
+    );
+}
+
+fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
+    let panes = visible_pane_areas(state, app.selected_pane.as_ref(), area);
+    if panes.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" waiting for a live terminal route")
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
+    let mut selected_inner = None;
+    for (pane, pane_area) in panes {
+        let selected = app.selected_pane.as_ref() == Some(&pane);
+        let block = pane_block(
+            &pane,
+            selected,
+            app.routes.get(&pane).map(|route| route.access),
+        );
+        let inner = block.inner(pane_area);
+        frame.render_widget(block, pane_area);
+        if selected {
+            selected_inner = Some(inner);
+        }
+        if let Some(route) = app.routes.get(&pane) {
+            render_vt_screen(
+                frame,
+                route.parser.screen(),
+                inner,
+                selected && app.mode == InputMode::Terminal,
+                app.selection
+                    .as_ref()
+                    .filter(|selection| selection.pane == pane && selection.dragging),
+            );
+        } else if selected {
+            let message = app
+                .message
+                .as_deref()
+                .unwrap_or("waiting for a live terminal route");
+            frame.render_widget(
+                Paragraph::new(safe_text(message)).style(Style::default().fg(Color::DarkGray)),
+                inner,
+            );
+        }
+    }
+
+    if let Some(inner) = selected_inner
+        && inner.height > 0
+        && (app.mode == InputMode::Prefix || app.message.is_some())
+    {
+        let overlay = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        );
+        let (text, style) = if app.mode == InputMode::Prefix {
+            (
+                " Ctrl+]  1-9 workspace  p/n tab  j/k pane  q quit  Ctrl+] literal ".to_owned(),
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            )
+        } else {
+            (
+                format!(
+                    " {} ",
+                    safe_text(app.message.as_deref().unwrap_or_default())
+                ),
+                Style::default().fg(Color::Black).bg(Color::DarkGray),
+            )
+        };
+        frame.render_widget(Paragraph::new(text).style(style), overlay);
+    }
+}
+
+fn render_vt_screen(
+    frame: &mut Frame,
+    screen: &vt100::Screen,
+    area: Rect,
+    show_cursor: bool,
+    selection: Option<&TerminalSelection>,
+) {
+    let buffer = frame.buffer_mut();
+    for row in 0..area.height {
+        for column in 0..area.width {
+            let Some(cell) = screen.cell(row, column) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let symbol = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            let mut foreground = vt_color(cell.fgcolor());
+            let mut background = vt_color(cell.bgcolor());
+            if cell.inverse() {
+                std::mem::swap(&mut foreground, &mut background);
+            }
+            let mut style = Style::default().fg(foreground).bg(background);
+            if cell.bold() {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.dim() {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if cell.italic() {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if cell.underline() {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if selection.is_some_and(|selection| selection.contains(CellPosition { row, column })) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            buffer[(area.x + column, area.y + row)]
+                .set_symbol(symbol)
+                .set_style(style);
+        }
+    }
+    if show_cursor && !screen.hide_cursor() {
+        let (row, column) = screen.cursor_position();
+        if row < area.height && column < area.width {
+            frame.set_cursor_position(Position::new(area.x + column, area.y + row));
+        }
+    }
+}
+
+fn vt_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
+}
+
+fn selected_snapshot_and_pane<'a>(
+    state: &'a FederationState,
+    selected: Option<&PaneId>,
+) -> Option<(&'a NormalizedSnapshot, &'a crate::state::PaneState)> {
+    let selected = selected?;
+    let snapshot = state
+        .targets
+        .get(&selected.target_session())?
+        .snapshot
+        .as_deref()?;
+    let pane = snapshot.panes.get(selected)?;
+    Some((snapshot, pane))
+}
+
+fn selected_workspace(state: &FederationState, selected: Option<&PaneId>) -> Option<WorkspaceId> {
+    selected_snapshot_and_pane(state, selected).and_then(|(_, pane)| pane.workspace.clone())
+}
+
+fn target_status(target: &TargetRuntimeState) -> (&'static str, Color) {
+    match target.connection {
+        TargetConnectionState::Connecting => ("◌", Color::Yellow),
+        TargetConnectionState::Live => ("●", Color::Green),
+        TargetConnectionState::Backoff { .. } => ("!", Color::Red),
+        TargetConnectionState::Incompatible => ("×", Color::Red),
+    }
+}
+
+fn status_symbol(status: Option<&str>) -> &'static str {
+    match status {
+        Some("working") => "●",
+        Some("blocked") => "!",
+        Some("idle") => "✓",
+        _ => "·",
+    }
+}
+
+fn status_style(status: Option<&str>) -> Style {
+    let color = match status {
+        Some("working") => Color::Yellow,
+        Some("blocked") => Color::Red,
+        Some("idle") => Color::Green,
+        _ => Color::DarkGray,
+    };
+    Style::default().fg(color)
+}
+
+fn display_label(id: &str, label: Option<&str>) -> String {
+    label
+        .filter(|label| !label.is_empty())
+        .map(safe_text)
+        .unwrap_or_else(|| safe_text(id))
+}
+
+fn safe_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn short_session(session: &str) -> String {
+    const LIMIT: usize = 14;
+    let safe = safe_text(session);
+    if safe.chars().count() <= LIMIT {
+        return safe;
+    }
+    safe.chars().take(LIMIT - 1).chain(['…']).collect()
+}
+
+fn target_key(target: &Target) -> TargetSession {
+    TargetSession::new(&target.name, target.session_name())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use ratatui::style::Modifier;
+    use serde_json::json;
+
+    use super::{
+        App, CellPosition, DecodedInput, InputDecoder, MOUSE_CAPTURE_ENABLE, MouseInput,
+        PREFIX_KEY, SIDEBAR_WIDTH, SelectionFinish, TerminalSelection, clamped_pane_position,
+        cycle_tab, desired_access, encode_mouse_event, fall_back_to_observe,
+        finish_ui_left_gesture, mouse_event_allowed, mouse_passthrough_enabled,
+        prefer_terminal_clipboard_for_env, reconcile_selection, render_vt_screen, safe_text,
+        select_workspace, selected_terminal_text, sidebar_pane_at_row, tab_at_column, ui_areas,
+        update_sidebar_hit_areas, visible_pane_areas,
+    };
+    use crate::model::{PaneId, TargetSession};
+    use crate::state::{
+        FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
+    };
+    use crate::terminal::{TerminalAccess, TerminalScrollDirection};
+
+    #[test]
+    fn desktop_layout_reserves_most_space_for_the_terminal() {
+        let (sidebar, tabs, terminal) = ui_areas(ratatui::layout::Rect::new(0, 0, 120, 40));
+
+        assert_eq!(sidebar.width, SIDEBAR_WIDTH);
+        assert_eq!(tabs.height, 1);
+        assert_eq!(terminal.width, 120 - SIDEBAR_WIDTH);
+        assert_eq!(terminal.height, 39);
+    }
+
+    #[test]
+    fn narrow_layout_gives_the_terminal_full_width() {
+        let (sidebar, _, terminal) = ui_areas(ratatui::layout::Rect::new(0, 0, 60, 20));
+
+        assert_eq!(sidebar.width, 0);
+        assert_eq!(terminal.width, 60);
+    }
+
+    #[test]
+    fn federation_prefix_does_not_shadow_herdrs_prefix() {
+        assert_eq!(PREFIX_KEY, 0x1d);
+        assert_ne!(PREFIX_KEY, 0x02);
+    }
+
+    #[test]
+    fn outer_mouse_capture_reports_drags_but_not_hover_motion() {
+        assert!(MOUSE_CAPTURE_ENABLE.starts_with(b"\x1b[?1002h"));
+        assert!(MOUSE_CAPTURE_ENABLE.ends_with(b"?1006h"));
+        assert!(!MOUSE_CAPTURE_ENABLE.windows(6).any(|part| part == b"1003h"));
+    }
+
+    #[test]
+    fn read_only_routes_fall_back_to_local_mouse_selection() {
+        assert!(!mouse_passthrough_enabled(
+            vt100::MouseProtocolMode::ButtonMotion,
+            false,
+        ));
+        assert!(mouse_passthrough_enabled(
+            vt100::MouseProtocolMode::ButtonMotion,
+            true,
+        ));
+        assert!(!mouse_passthrough_enabled(
+            vt100::MouseProtocolMode::None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn nested_herdr_uses_the_outer_clients_clipboard_bridge() {
+        use std::ffi::OsStr;
+
+        assert!(prefer_terminal_clipboard_for_env(
+            None,
+            None,
+            Some(OsStr::new("1")),
+        ));
+        assert!(!prefer_terminal_clipboard_for_env(None, None, None));
+    }
+
+    #[test]
+    fn mouse_release_retains_a_completed_selection() {
+        let mut selection = TerminalSelection {
+            pane: PaneId::new("ws01", "rv32sim", "w6:p1"),
+            anchor: CellPosition { row: 2, column: 3 },
+            head: CellPosition { row: 2, column: 3 },
+            dragging: false,
+            forwarded_click: Some(MouseInput {
+                code: 0,
+                column: 4,
+                row: 3,
+                release: false,
+            }),
+        };
+        let result = selection.finish(
+            CellPosition { row: 2, column: 8 },
+            MouseInput {
+                code: 0,
+                column: 9,
+                row: 3,
+                release: true,
+            },
+        );
+
+        assert_eq!(result, SelectionFinish::Retain);
+        assert!(selection.dragging);
+        assert!(selection.forwarded_click.is_none());
+        assert!(selection.contains(CellPosition { row: 2, column: 6 }));
+    }
+
+    #[test]
+    fn input_decoder_preserves_keys_and_extracts_sgr_mouse_events() {
+        let mut decoder = InputDecoder::default();
+        assert_eq!(decoder.push(0x1b), None);
+        assert_eq!(decoder.push(b'['), None);
+        assert_eq!(
+            decoder.push(b'A'),
+            Some(DecodedInput::Bytes(b"\x1b[A".to_vec()))
+        );
+
+        let mut decoded = None;
+        for byte in b"\x1b[<64;42;9M" {
+            decoded = decoder.push(*byte).or(decoded);
+        }
+        assert_eq!(
+            decoded,
+            Some(DecodedInput::Mouse(MouseInput {
+                code: 64,
+                column: 42,
+                row: 9,
+                release: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn mouse_events_follow_the_inner_terminals_protocol() {
+        let press = MouseInput {
+            code: 0,
+            column: 7,
+            row: 3,
+            release: false,
+        };
+        let motion = MouseInput { code: 32, ..press };
+        assert!(!mouse_event_allowed(vt100::MouseProtocolMode::None, press));
+        assert!(!mouse_event_allowed(
+            vt100::MouseProtocolMode::PressRelease,
+            motion
+        ));
+        assert!(mouse_event_allowed(
+            vt100::MouseProtocolMode::ButtonMotion,
+            motion
+        ));
+        assert_eq!(
+            encode_mouse_event(press, vt100::MouseProtocolEncoding::Sgr),
+            Some(b"\x1b[<0;7;3M".to_vec())
+        );
+
+        let modified_wheel = MouseInput {
+            code: 64 | 4 | 16,
+            ..press
+        };
+        assert_eq!(
+            modified_wheel.scroll_direction(),
+            Some(TerminalScrollDirection::Up)
+        );
+        assert_eq!(
+            modified_wheel.key_modifiers(),
+            (crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::CONTROL)
+                .bits()
+        );
+    }
+
+    #[test]
+    fn copied_terminal_text_trims_padding_and_excludes_chrome() {
+        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"one   \r\ntwo");
+        let selection = TerminalSelection {
+            pane,
+            anchor: CellPosition { row: 0, column: 0 },
+            head: CellPosition { row: 1, column: 9 },
+            dragging: true,
+            forwarded_click: None,
+        };
+
+        assert_eq!(
+            selected_terminal_text(parser.screen(), &selection),
+            "one\ntwo"
+        );
+    }
+
+    #[test]
+    fn occupied_control_lease_falls_back_then_retries() {
+        let pane = PaneId::new("ws01", "dev", "w1:p1");
+        let mut app = App {
+            selected_pane: Some(pane.clone()),
+            ..App::default()
+        };
+
+        fall_back_to_observe(&mut app, &pane);
+        assert_eq!(
+            desired_access(&pane, &pane, &app.control_retry_after),
+            TerminalAccess::Observe
+        );
+
+        app.control_retry_after =
+            BTreeMap::from([(pane.clone(), Instant::now() - Duration::from_millis(1))]);
+        assert_eq!(
+            desired_access(&pane, &pane, &app.control_retry_after),
+            TerminalAccess::Control
+        );
+    }
+
+    #[test]
+    fn default_selection_skips_disconnected_targets() {
+        let unavailable_key = TargetSession::new("a", "dev");
+        let live_key = TargetSession::new("b", "dev");
+        let live_pane = PaneId::new("b", "dev", "w1:p1");
+        let snapshot = NormalizedSnapshot::from_value(
+            &live_key,
+            &json!({"panes": [{"pane_id": "w1:p1"}], "focused_pane_id": "w1:p1"}),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            unavailable_key.clone(),
+            runtime(
+                unavailable_key,
+                TargetConnectionState::Backoff { attempt: 1 },
+                None,
+            ),
+        );
+        state.targets.insert(
+            live_key.clone(),
+            runtime(live_key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let mut app = App::default();
+
+        reconcile_selection(&state, &mut app);
+
+        assert_eq!(app.selected_pane, Some(live_pane));
+    }
+
+    #[test]
+    fn startup_selection_moves_to_the_most_active_session() {
+        let idle_key = TargetSession::new("ws01", "default");
+        let active_key = TargetSession::new("ws01", "rv32sim");
+        let idle_pane = PaneId::new("ws01", "default", "w1:p1");
+        let active_pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let idle_snapshot = NormalizedSnapshot::from_value(
+            &idle_key,
+            &json!({"panes": [{"pane_id": "w1:p1"}], "focused_pane_id": "w1:p1"}),
+        );
+        let active_snapshot = NormalizedSnapshot::from_value(
+            &active_key,
+            &json!({
+                "workspaces": [{"workspace_id": "w6"}],
+                "panes": [{"pane_id": "w6:p1"}],
+                "agents": [{"pane_id": "w6:p1"}],
+                "focused_pane_id": "w6:p1"
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            idle_key.clone(),
+            runtime(idle_key, TargetConnectionState::Live, Some(idle_snapshot)),
+        );
+        let mut app = App::default();
+
+        reconcile_selection(&state, &mut app);
+        assert_eq!(app.selected_pane, Some(idle_pane.clone()));
+
+        state.targets.insert(
+            active_key.clone(),
+            runtime(
+                active_key,
+                TargetConnectionState::Live,
+                Some(active_snapshot),
+            ),
+        );
+        reconcile_selection(&state, &mut app);
+        assert_eq!(app.selected_pane, Some(active_pane));
+
+        app.selected_pane = Some(idle_pane.clone());
+        app.selection_explicit = true;
+        reconcile_selection(&state, &mut app);
+        assert_eq!(app.selected_pane, Some(idle_pane));
+    }
+
+    #[test]
+    fn strips_control_characters_from_server_labels() {
+        assert_eq!(safe_text("safe\u{1b}[31m\nname"), "safe [31m name");
+    }
+
+    #[test]
+    fn renders_terminal_cells_into_the_main_surface() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"hello");
+        let backend = ratatui::backend::TestBackend::new(10, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_vt_screen(frame, parser.screen(), frame.area(), true, None))
+            .unwrap();
+
+        let rendered = (0..5)
+            .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        assert_eq!(rendered, "hello");
+    }
+
+    #[test]
+    fn renders_active_drag_selection_as_a_visible_highlight() {
+        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let mut parser = vt100::Parser::new(1, 10, 0);
+        parser.process(b"hello");
+        let selection = TerminalSelection {
+            pane,
+            anchor: CellPosition { row: 0, column: 1 },
+            head: CellPosition { row: 0, column: 3 },
+            dragging: true,
+            forwarded_click: None,
+        };
+        let backend = ratatui::backend::TestBackend::new(10, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_vt_screen(
+                    frame,
+                    parser.screen(),
+                    frame.area(),
+                    false,
+                    Some(&selection),
+                )
+            })
+            .unwrap();
+
+        assert!(
+            !terminal.backend().buffer()[(0, 0)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        for column in 1..=3 {
+            assert!(
+                terminal.backend().buffer()[(column, 0)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+        assert!(
+            !terminal.backend().buffer()[(4, 0)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn maps_server_split_geometry_into_the_local_terminal_surface() {
+        let key = TargetSession::new("ws01", "dev");
+        let left = PaneId::new("ws01", "dev", "w1:p1");
+        let right = PaneId::new("ws01", "dev", "w1:p2");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
+                    {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1"}
+                ],
+                "layouts": [{
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "zoomed": false,
+                    "area": {"x": 10, "y": 2, "width": 100, "height": 20},
+                    "focused_pane_id": "w1:p1",
+                    "panes": [
+                        {"pane_id": "w1:p1", "focused": true, "rect": {"x": 10, "y": 2, "width": 50, "height": 20}},
+                        {"pane_id": "w1:p2", "focused": false, "rect": {"x": 60, "y": 2, "width": 50, "height": 20}}
+                    ]
+                }]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let panes = visible_pane_areas(
+            &state,
+            Some(&left),
+            ratatui::layout::Rect::new(28, 1, 92, 39),
+        );
+
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0], (left, ratatui::layout::Rect::new(28, 1, 46, 39)));
+        assert_eq!(panes[1], (right, ratatui::layout::Rect::new(74, 1, 46, 39)));
+
+        let app = App {
+            selected_pane: Some(panes[0].0.clone()),
+            ..App::default()
+        };
+        assert_eq!(
+            clamped_pane_position(
+                ratatui::layout::Position::new(0, 0),
+                &state,
+                &app,
+                ratatui::layout::Rect::new(28, 1, 92, 39),
+                &panes[0].0,
+            ),
+            Some(CellPosition { row: 0, column: 0 })
+        );
+        assert_eq!(
+            clamped_pane_position(
+                ratatui::layout::Position::new(119, 39),
+                &state,
+                &app,
+                ratatui::layout::Rect::new(28, 1, 92, 39),
+                &panes[0].0,
+            ),
+            Some(CellPosition {
+                row: 36,
+                column: 41,
+            })
+        );
+    }
+
+    #[test]
+    fn prefix_navigation_selects_tabs_and_workspaces_locally() {
+        let key = TargetSession::new("ws01", "dev");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [
+                    {"workspace_id": "w1", "active_tab_id": "w1:t1"},
+                    {"workspace_id": "w2", "active_tab_id": "w2:t1"}
+                ],
+                "tabs": [
+                    {"tab_id": "w1:t1", "workspace_id": "w1"},
+                    {"tab_id": "w1:t2", "workspace_id": "w1"},
+                    {"tab_id": "w2:t1", "workspace_id": "w2"}
+                ],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
+                    {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t2"},
+                    {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"}
+                ],
+                "layouts": [
+                    layout("w1", "w1:t1", "w1:p1"),
+                    layout("w1", "w1:t2", "w1:p2"),
+                    layout("w2", "w2:t1", "w2:p1")
+                ]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let mut app = App {
+            selected_pane: Some(PaneId::new("ws01", "dev", "w1:p1")),
+            ..App::default()
+        };
+
+        assert_eq!(
+            sidebar_pane_at_row(&state, app.selected_pane.as_ref(), 0),
+            Some(PaneId::new("ws01", "dev", "w1:p1"))
+        );
+        assert_eq!(
+            sidebar_pane_at_row(&state, app.selected_pane.as_ref(), 2),
+            Some(PaneId::new("ws01", "dev", "w2:p1"))
+        );
+        update_sidebar_hit_areas(&state, &mut app, ratatui::layout::Rect::new(0, 0, 28, 10));
+        assert_eq!(app.sidebar_hit_areas.len(), 3);
+        assert_eq!(
+            app.sidebar_hit_areas[2].area,
+            ratatui::layout::Rect::new(0, 3, 27, 1)
+        );
+        assert_eq!(
+            app.sidebar_hit_areas[2].pane,
+            PaneId::new("ws01", "dev", "w2:p1")
+        );
+        assert_eq!(
+            tab_at_column(&state, app.selected_pane.as_ref(), 1),
+            Some(crate::model::TabId::new("ws01", "dev", "w1:t1"))
+        );
+        assert_eq!(
+            tab_at_column(&state, app.selected_pane.as_ref(), 10),
+            Some(crate::model::TabId::new("ws01", "dev", "w1:t2"))
+        );
+
+        cycle_tab(&state, &mut app, 1);
+        assert_eq!(app.selected_pane, Some(PaneId::new("ws01", "dev", "w1:p2")));
+
+        select_workspace(&state, &mut app, 1);
+        assert_eq!(app.selected_pane, Some(PaneId::new("ws01", "dev", "w2:p1")));
+    }
+
+    #[test]
+    fn sidebar_activates_the_original_pressed_item_on_release() {
+        let old = PaneId::new("ws01", "dev", "w1:p1");
+        let pressed = PaneId::new("ws01", "dev", "w2:p1");
+        let mut app = App {
+            selected_pane: Some(old),
+            sidebar_press: Some(pressed.clone()),
+            swallow_left_gesture: true,
+            ..App::default()
+        };
+
+        finish_ui_left_gesture(&mut app);
+
+        assert_eq!(app.selected_pane, Some(pressed));
+        assert!(app.selection_explicit);
+        assert!(!app.swallow_left_gesture);
+        assert!(app.sidebar_press.is_none());
+    }
+
+    fn layout(workspace: &str, tab: &str, pane: &str) -> serde_json::Value {
+        json!({
+            "workspace_id": workspace,
+            "tab_id": tab,
+            "zoomed": false,
+            "area": {"x": 0, "y": 0, "width": 80, "height": 24},
+            "focused_pane_id": pane,
+            "panes": [{
+                "pane_id": pane,
+                "focused": true,
+                "rect": {"x": 0, "y": 0, "width": 80, "height": 24}
+            }]
+        })
+    }
+
+    fn runtime(
+        key: TargetSession,
+        connection: TargetConnectionState,
+        snapshot: Option<NormalizedSnapshot>,
+    ) -> TargetRuntimeState {
+        TargetRuntimeState {
+            key,
+            endpoint: "test".to_owned(),
+            connection,
+            update_mode: crate::state::TargetUpdateMode::Polling,
+            event_error: None,
+            connection_generation: 1,
+            selected_herdr_bin: Some("herdr".to_owned()),
+            snapshot: snapshot.map(Arc::new),
+            last_error: None,
+            last_success: None,
+            retry_at: None,
+        }
+    }
+}
