@@ -36,6 +36,13 @@ Kamrui continue to own all persistent Herdr sessions. Running the frontend throu
 plain SSH can only request OSC 52 from the local terminal emulator and cannot
 guarantee that the desktop clipboard accepts it.
 
+After cloning on macOS, one command installs the binary and creates the default
+configuration without replacing an existing configuration:
+
+```sh
+make macos
+```
+
 The TUI discovers Herdr sessions independently on each configured host through
 `herdr session list --json`. Each running session is shown as a qualified
 `host/session` entry; discovery never starts a stopped session. A failed discovery is isolated
