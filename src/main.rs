@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use super_herdr::clipboard;
 use super_herdr::config::Config;
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
@@ -43,6 +44,17 @@ enum Commands {
     },
     /// Open the federated terminal UI.
     Tui,
+    /// Inspect clipboard copy and paste capabilities without reading clipboard contents.
+    Clipboard {
+        #[command(subcommand)]
+        command: ClipboardCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClipboardCommands {
+    /// Report the active native or terminal-mediated clipboard paths.
+    Check,
 }
 
 #[tokio::main]
@@ -58,9 +70,21 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Commands::Tui);
+    if matches!(
+        &command,
+        Commands::Clipboard {
+            command: ClipboardCommands::Check
+        }
+    ) {
+        for line in clipboard::diagnostic_lines() {
+            println!("{line}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let (config, path) = Config::load(cli.config.as_deref())?;
 
-    match cli.command.unwrap_or(Commands::Tui) {
+    match command {
         Commands::Check => {
             println!(
                 "{}: {} valid target(s)",
@@ -148,5 +172,6 @@ async fn run() -> Result<ExitCode> {
             tui::run(expand_discovered_sessions(config).await).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Clipboard { .. } => unreachable!("clipboard commands return before config load"),
     }
 }

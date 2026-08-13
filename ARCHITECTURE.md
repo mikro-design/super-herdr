@@ -61,6 +61,13 @@ an independently qualified target and uses the reported public socket path. A
 stopped session is omitted and is never started automatically. Discovery
 failure falls back to the configured session and remains isolated to that host.
 
+The desktop persists only versioned UI intent, currently the last explicitly
+selected qualified pane. Writes use a private state directory and atomic file
+replacement. Terminal contents, clipboard payloads, SSH material, connection
+leases, and server snapshots are never persisted. Restoration waits through
+target reconnects and succeeds only when the exact target/session/local-ID tuple
+is live; stale IDs are ignored without mutating the Herdr server.
+
 ## Terminal data plane
 
 One selected pane owns keyboard input. Observe streams may remain open for visible
@@ -112,11 +119,17 @@ forces OSC 52 so a nested Super-Herdr uses the outer Herdr client's clipboard
 forwarding rather than a host-local graphical clipboard.
 Selection is rendered with the color-independent reverse-video modifier so a
 `NO_COLOR` environment cannot make the marked range invisible.
-Local-to-remote clipboard reads and image
-bridging remain a later slice. For an image or file, the intended broker uploads
-bytes to a per-target temporary directory using SSH/SFTP, verifies size and digest,
-and injects the resulting remote path. Remote agents never need desktop clipboard
-access.
+Local-to-remote text paste is an explicit desktop-broker action. The broker reads
+from `pbpaste`, `wl-paste`, `xclip`, or `xsel`, applies a 1 MiB limit, honors the
+selected terminal's bracketed-paste mode, and routes only the resulting terminal
+input through Herdr's public control stream. It is deliberately unavailable when
+Super-Herdr itself runs through SSH because the remote process cannot directly
+read the client's clipboard; the local terminal remains the paste mediator in
+that topology. PNG image bridging reads explicitly from the desktop clipboard,
+uploads at most 32 MiB to a private per-target temporary directory, verifies the
+remote byte count and SHA-256 digest, and injects only the resulting path through
+the selected terminal route. File-list clipboard upload remains a later extension
+of the same broker. Remote agents never need desktop clipboard access.
 
 Herdr 0.8's documented `terminal session` stream currently exposes terminal
 frames, closure, input, resize, scroll, and release, but not the server-to-client

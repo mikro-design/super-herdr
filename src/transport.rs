@@ -588,25 +588,37 @@ pub fn build_herdr_command(
 ) -> Command {
     let herdr_args = herdr_args(target, operation_args);
     if let Some(destination) = &target.ssh {
-        let mut command = Command::new(&transport.ssh_bin);
-        if transport.batch_mode {
-            command.arg("-o").arg("BatchMode=yes");
-        }
-        command
-            .arg("-o")
-            .arg(format!(
-                "ConnectTimeout={}",
-                transport.connect_timeout_seconds
-            ))
-            .arg("--")
-            .arg(destination)
-            .arg(render_remote_command(executable, &herdr_args));
-        command
+        build_ssh_command(
+            destination,
+            transport,
+            render_remote_command(executable, &herdr_args),
+        )
     } else {
         let mut command = Command::new(executable);
         command.args(herdr_args);
         command
     }
+}
+
+pub fn build_ssh_command(
+    destination: &str,
+    transport: &TransportConfig,
+    remote_command: String,
+) -> Command {
+    let mut command = Command::new(&transport.ssh_bin);
+    if transport.batch_mode {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    command
+        .arg("-o")
+        .arg(format!(
+            "ConnectTimeout={}",
+            transport.connect_timeout_seconds
+        ))
+        .arg("--")
+        .arg(destination)
+        .arg(remote_command);
+    command
 }
 
 fn herdr_args(target: &Target, operation_args: &[String]) -> Vec<String> {

@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Stdout, Write};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::DisableMouseCapture;
 use crossterm::execute;
@@ -25,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep_until, timeout};
 
+use crate::clipboard;
 use crate::config::{Config, Target};
 use crate::model::{PaneId, TargetSession, WorkspaceId};
 use crate::state::{
@@ -36,6 +35,7 @@ use crate::terminal::{
     terminal_input_command, terminal_release_command, terminal_scroll_command,
 };
 use crate::transport::CliSnapshotTransport;
+use crate::ui_state::{UiState, UiStateStore};
 
 const PREFIX_KEY: u8 = 0x1d;
 const SIDEBAR_WIDTH: u16 = 28;
@@ -43,6 +43,7 @@ const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(10);
 const INPUT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(30);
 const CLIPBOARD_FEEDBACK_DURATION: Duration = Duration::from_secs(3);
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MOUSE_SCROLL_LINES: u16 = 3;
 const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
@@ -331,6 +332,8 @@ enum RouteEvent {
 struct App {
     selected_pane: Option<PaneId>,
     selection_explicit: bool,
+    restore_pending: Option<PaneId>,
+    state_store: Option<UiStateStore>,
     mode: InputMode,
     routes: BTreeMap<PaneId, ActiveRoute>,
     next_route_serial: u64,
@@ -353,6 +356,8 @@ impl Default for App {
         Self {
             selected_pane: None,
             selection_explicit: false,
+            restore_pending: None,
+            state_store: None,
             mode: InputMode::Terminal,
             routes: BTreeMap::new(),
             next_route_serial: 1,
@@ -390,7 +395,13 @@ pub async fn run(config: Config) -> Result<()> {
     let mut ticks = interval(Duration::from_millis(100));
     let mut selection_ticks = interval(SELECTION_AUTOSCROLL_INTERVAL);
     let mut input_decoder = InputDecoder::default();
-    let mut app = App::default();
+    let state_store = UiStateStore::discover()?;
+    let restore_pending = state_store.load().unwrap_or_default().selected_pane;
+    let mut app = App {
+        restore_pending,
+        state_store: Some(state_store),
+        ..App::default()
+    };
     let mut should_draw = true;
 
     let result = loop {
@@ -439,7 +450,13 @@ pub async fn run(config: Config) -> Result<()> {
                     break Ok(());
                 };
                 if let Some(event) = input_decoder.push(byte) {
-                    if handle_decoded_input(event, &updates.borrow(), &mut app).await? {
+                    if handle_decoded_input(
+                        event,
+                        &updates.borrow(),
+                        &targets,
+                        &transport_config,
+                        &mut app,
+                    ).await? {
                         break Ok(());
                     }
                     should_draw = true;
@@ -471,7 +488,13 @@ pub async fn run(config: Config) -> Result<()> {
             }
             _ = ticks.tick() => {
                 if let Some(event) = input_decoder.flush_expired() {
-                    if handle_decoded_input(event, &updates.borrow(), &mut app).await? {
+                    if handle_decoded_input(
+                        event,
+                        &updates.borrow(),
+                        &targets,
+                        &transport_config,
+                        &mut app,
+                    ).await? {
                         break Ok(());
                     }
                     should_draw = true;
@@ -586,12 +609,14 @@ fn spawn_input_reader(sender: mpsc::UnboundedSender<u8>) {
 async fn handle_decoded_input(
     input: DecodedInput,
     state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<bool> {
     match input {
         DecodedInput::Bytes(bytes) => {
             for byte in bytes {
-                if handle_input(byte, state, app).await? {
+                if handle_input(byte, state, targets, transport_config, app).await? {
                     return Ok(true);
                 }
             }
@@ -933,6 +958,7 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
 
 fn select_pane(app: &mut App, pane: PaneId) {
     app.selection_explicit = true;
+    app.restore_pending = None;
     app.selection = None;
     app.selection_autoscroll = None;
     app.sidebar_press = None;
@@ -940,6 +966,11 @@ fn select_pane(app: &mut App, pane: PaneId) {
     app.route_retry_after.remove(&pane);
     app.control_retry_after.remove(&pane);
     app.message = None;
+    if let Some(store) = app.state_store.as_ref()
+        && store.save(&UiState::selected_pane(pane)).is_err()
+    {
+        app.message = Some("failed to persist the selected pane".to_owned());
+    }
 }
 
 async fn send_terminal_scroll(
@@ -1099,29 +1130,12 @@ fn copy_terminal_selection(selection: &mut TerminalSelection, app: &mut App) -> 
         app.message = Some("selection is too large to copy".to_owned());
         return Ok(());
     }
-    let clipboard = write_clipboard(&text)?;
+    let clipboard = clipboard::write_text(&text)?;
     app.clipboard_feedback = Some(ClipboardFeedback {
         text: clipboard.feedback(text.chars().count()),
         expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
     });
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClipboardDelivery {
-    Native,
-    Osc52Requested,
-}
-
-impl ClipboardDelivery {
-    fn feedback(self, characters: usize) -> String {
-        match self {
-            Self::Native => format!("copied {characters} characters to system clipboard"),
-            Self::Osc52Requested => {
-                format!("requested terminal clipboard copy of {characters} characters (OSC 52)")
-            }
-        }
-    }
 }
 
 fn selected_terminal_text(selection: &TerminalSelection) -> String {
@@ -1184,84 +1198,13 @@ fn capture_screen_rows(screen: &vt100::Screen) -> Vec<CapturedRow> {
         .collect()
 }
 
-fn write_clipboard(text: &str) -> Result<ClipboardDelivery> {
-    if !prefer_terminal_clipboard() && write_native_clipboard(text.as_bytes()) {
-        return Ok(ClipboardDelivery::Native);
-    }
-    write_osc52_clipboard(text)?;
-    Ok(ClipboardDelivery::Osc52Requested)
-}
-
-fn prefer_terminal_clipboard() -> bool {
-    prefer_terminal_clipboard_for_env(
-        std::env::var_os("SSH_CONNECTION").as_deref(),
-        std::env::var_os("SSH_TTY").as_deref(),
-        std::env::var_os("HERDR_ENV").as_deref(),
-    )
-}
-
-fn prefer_terminal_clipboard_for_env(
-    ssh_connection: Option<&std::ffi::OsStr>,
-    ssh_tty: Option<&std::ffi::OsStr>,
-    herdr_env: Option<&std::ffi::OsStr>,
-) -> bool {
-    ssh_connection.is_some() || ssh_tty.is_some() || herdr_env == Some(std::ffi::OsStr::new("1"))
-}
-
-fn write_native_clipboard(bytes: &[u8]) -> bool {
-    let mut commands: Vec<(&str, &[&str])> = Vec::new();
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            commands.push(("wl-copy", &["--type", "text/plain;charset=utf-8"]));
-        }
-        if std::env::var_os("DISPLAY").is_some() {
-            commands.push(("xclip", &["-selection", "clipboard", "-in"]));
-            commands.push(("xsel", &["--clipboard", "--input"]));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    commands.push(("pbcopy", &[]));
-
-    commands
-        .into_iter()
-        .any(|(program, arguments)| run_clipboard_command(program, arguments, bytes))
-}
-
-fn run_clipboard_command(program: &str, arguments: &[&str], bytes: &[u8]) -> bool {
-    let Ok(mut child) = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let write_succeeded = child
-        .stdin
-        .take()
-        .is_some_and(|mut input| input.write_all(bytes).is_ok());
-    if !write_succeeded {
-        let _ = child.kill();
-    }
-    child
-        .wait()
-        .is_ok_and(|status| write_succeeded && status.success())
-}
-
-fn write_osc52_clipboard(text: &str) -> Result<()> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let mut output = io::stdout().lock();
-    output
-        .write_all(b"\x1b]52;c;")
-        .and_then(|()| output.write_all(encoded.as_bytes()))
-        .and_then(|()| output.write_all(b"\x07"))
-        .and_then(|()| output.flush())
-        .context("failed to write the clipboard bridge sequence")
-}
-
-async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
+async fn handle_input(
+    key: u8,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<bool> {
     match app.mode {
         InputMode::Terminal if key == PREFIX_KEY => {
             app.selection = None;
@@ -1311,6 +1254,8 @@ async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result
                 b'k' => cycle_pane(state, app, -1),
                 b'n' => cycle_tab(state, app, 1),
                 b'p' => cycle_tab(state, app, -1),
+                b'v' => paste_system_clipboard(state, app).await?,
+                b'i' => paste_clipboard_image(state, targets, transport_config, app).await?,
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
                 PREFIX_KEY => {
                     if let Some(route) = app
@@ -1328,7 +1273,8 @@ async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result
                 0x1b => {}
                 _ => {
                     app.message = Some(
-                        "prefix: 1-9 workspace, p/n tab, j/k pane, q quit, Ctrl+] literal".into(),
+                        "prefix: 1-9 workspace, p/n tab, j/k pane, v paste, i image, q quit, Ctrl+] literal"
+                            .into(),
                     );
                 }
             }
@@ -1336,6 +1282,165 @@ async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result
         }
     }
     Ok(false)
+}
+
+async fn paste_system_clipboard(state: &FederationState, app: &mut App) -> Result<()> {
+    let Some(selected) = app.selected_pane.clone() else {
+        app.message = Some("no terminal pane is selected".to_owned());
+        return Ok(());
+    };
+    let Some(route) = app.routes.get(&selected) else {
+        app.message = Some("selected pane has no control route".to_owned());
+        return Ok(());
+    };
+    if route.input.is_none() {
+        app.message = Some("read-only: another Herdr client owns control; cannot paste".to_owned());
+        return Ok(());
+    }
+    let Some(target) = state.targets.get(&selected.target_session()) else {
+        app.message = Some("selected target is unavailable".to_owned());
+        return Ok(());
+    };
+    if !target.accepts_generation(route.generation) {
+        app.routes.remove(&selected);
+        app.message = Some("control route became stale".to_owned());
+        return Ok(());
+    }
+    let bracketed = route.parser.screen().bracketed_paste();
+    let text = match clipboard::read_text(MAX_CLIPBOARD_BYTES).await {
+        Ok(text) => text,
+        Err(error) => {
+            app.message = Some(format!("clipboard paste unavailable: {error}"));
+            return Ok(());
+        }
+    };
+    if text.is_empty() {
+        app.message = Some("system clipboard contains no text".to_owned());
+        return Ok(());
+    }
+    let characters = text.chars().count();
+    let payload = terminal_paste_payload(text.as_bytes(), bracketed)?;
+    let command = terminal_input_command(&payload)?;
+    let Some(input) = app
+        .routes
+        .get_mut(&selected)
+        .and_then(|route| route.input.as_mut())
+    else {
+        app.message = Some("terminal control route closed before paste".to_owned());
+        return Ok(());
+    };
+    if input.write_all(&command).await.is_err() {
+        fall_back_to_observe(app, &selected);
+        return Ok(());
+    }
+    app.clipboard_feedback = Some(ClipboardFeedback {
+        text: format!("pasted {characters} characters from system clipboard"),
+        expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
+    });
+    Ok(())
+}
+
+async fn paste_clipboard_image(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<()> {
+    let Some(selected) = app.selected_pane.clone() else {
+        app.message = Some("no terminal pane is selected".to_owned());
+        return Ok(());
+    };
+    let key = selected.target_session();
+    let Some(runtime) = state.targets.get(&key) else {
+        app.message = Some("selected target is unavailable".to_owned());
+        return Ok(());
+    };
+    let Some(target) = targets.get(&key) else {
+        app.message = Some("selected target is missing from configuration".to_owned());
+        return Ok(());
+    };
+    let Some(route) = app.routes.get(&selected) else {
+        app.message = Some("selected pane has no control route".to_owned());
+        return Ok(());
+    };
+    if route.input.is_none() {
+        app.message =
+            Some("read-only: another Herdr client owns control; cannot paste image".to_owned());
+        return Ok(());
+    }
+    if !runtime.accepts_generation(route.generation) {
+        app.routes.remove(&selected);
+        app.message = Some("control route became stale".to_owned());
+        return Ok(());
+    }
+    let image = match clipboard::read_png(MAX_CLIPBOARD_IMAGE_BYTES).await {
+        Ok(image) => image,
+        Err(error) => {
+            app.message = Some(format!("clipboard image unavailable: {error}"));
+            return Ok(());
+        }
+    };
+    let upload = match clipboard::upload_png(target, transport_config, &image).await {
+        Ok(upload) => upload,
+        Err(error) => {
+            app.message = Some(format!("clipboard image upload failed: {error}"));
+            return Ok(());
+        }
+    };
+    let Some(route) = app.routes.get(&selected) else {
+        app.message = Some("terminal control route closed during image upload".to_owned());
+        return Ok(());
+    };
+    if !runtime.accepts_generation(route.generation) {
+        app.routes.remove(&selected);
+        app.message = Some("control route became stale during image upload".to_owned());
+        return Ok(());
+    }
+    let payload = terminal_paste_payload(
+        upload.path.as_bytes(),
+        route.parser.screen().bracketed_paste(),
+    )?;
+    let command = terminal_input_command(&payload)?;
+    let Some(input) = app
+        .routes
+        .get_mut(&selected)
+        .and_then(|route| route.input.as_mut())
+    else {
+        app.message = Some("terminal control route closed before image path paste".to_owned());
+        return Ok(());
+    };
+    if input.write_all(&command).await.is_err() {
+        fall_back_to_observe(app, &selected);
+        return Ok(());
+    }
+    app.clipboard_feedback = Some(ClipboardFeedback {
+        text: format!(
+            "uploaded and verified {} clipboard image bytes; pasted remote path",
+            upload.bytes
+        ),
+        expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
+    });
+    Ok(())
+}
+
+fn terminal_paste_payload(text: &[u8], bracketed: bool) -> Result<Vec<u8>> {
+    const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+    const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+    if text
+        .windows(BRACKETED_PASTE_END.len())
+        .any(|window| window == BRACKETED_PASTE_END)
+    {
+        bail!("clipboard text contains a bracketed-paste terminator");
+    }
+    if !bracketed {
+        return Ok(text.to_vec());
+    }
+    let mut payload =
+        Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
+    payload.extend_from_slice(BRACKETED_PASTE_START);
+    payload.extend_from_slice(text);
+    payload.extend_from_slice(BRACKETED_PASTE_END);
+    Ok(payload)
 }
 
 fn cycle_pane(state: &FederationState, app: &mut App, direction: isize) {
@@ -1445,6 +1550,20 @@ fn wrapped_index(current: usize, length: usize, direction: isize) -> usize {
 
 fn reconcile_selection(state: &FederationState, app: &mut App) {
     let panes = selectable_panes(state);
+    if let Some(persisted) = app.restore_pending.clone() {
+        match state.targets.get(&persisted.target_session()) {
+            Some(target) if target.connection == TargetConnectionState::Live => {
+                app.restore_pending = None;
+                if panes.contains(&persisted) {
+                    app.selected_pane = Some(persisted);
+                    app.selection_explicit = true;
+                    return;
+                }
+            }
+            Some(_) => {}
+            None => app.restore_pending = None,
+        }
+    }
     let selection_is_valid = app
         .selected_pane
         .as_ref()
@@ -2280,7 +2399,8 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
         );
         let (text, style) = if app.mode == InputMode::Prefix {
             (
-                " Ctrl+]  1-9 workspace  p/n tab  j/k pane  q quit  Ctrl+] literal ".to_owned(),
+                " Ctrl+]  1-9 workspace  p/n tab  j/k pane  v paste  i image  q quit  Ctrl+] literal "
+                    .to_owned(),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             )
         } else {
@@ -2464,9 +2584,9 @@ mod tests {
         SelectionFinish, TerminalSelection, capture_screen_rows, capture_selection_viewport,
         clamped_pane_position, cycle_tab, desired_access, displayed_message, encode_mouse_event,
         fall_back_to_observe, finish_ui_left_gesture, mouse_event_allowed,
-        mouse_passthrough_enabled, prefer_terminal_clipboard_for_env, reconcile_selection,
-        render_vt_screen, safe_text, select_workspace, selected_terminal_text, sidebar_pane_at_row,
-        tab_at_column, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
+        mouse_passthrough_enabled, reconcile_selection, render_vt_screen, safe_text,
+        select_workspace, selected_terminal_text, sidebar_pane_at_row, tab_at_column,
+        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
         viewport_shift_distance, visible_pane_areas,
     };
     use crate::model::{PaneId, TargetSession};
@@ -2520,18 +2640,6 @@ mod tests {
             vt100::MouseProtocolMode::None,
             true,
         ));
-    }
-
-    #[test]
-    fn nested_herdr_uses_the_outer_clients_clipboard_bridge() {
-        use std::ffi::OsStr;
-
-        assert!(prefer_terminal_clipboard_for_env(
-            None,
-            None,
-            Some(OsStr::new("1")),
-        ));
-        assert!(!prefer_terminal_clipboard_for_env(None, None, None));
     }
 
     #[test]
@@ -2628,6 +2736,19 @@ mod tests {
             (crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::CONTROL)
                 .bits()
         );
+    }
+
+    #[test]
+    fn clipboard_paste_honors_the_inner_terminals_bracketed_paste_mode() {
+        assert_eq!(
+            terminal_paste_payload(b"hello\nworld", false).unwrap(),
+            b"hello\nworld"
+        );
+        assert_eq!(
+            terminal_paste_payload(b"hello\nworld", true).unwrap(),
+            b"\x1b[200~hello\nworld\x1b[201~"
+        );
+        assert!(terminal_paste_payload(b"unsafe\x1b[201~suffix", true).is_err());
     }
 
     #[test]
@@ -2847,6 +2968,51 @@ mod tests {
         app.selection_explicit = true;
         reconcile_selection(&state, &mut app);
         assert_eq!(app.selected_pane, Some(idle_pane));
+    }
+
+    #[test]
+    fn restores_only_an_exact_live_qualified_pane() {
+        let key = TargetSession::new("ws01", "rv32sim");
+        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({"panes": [{"pane_id": "w6:p1"}], "focused_pane_id": "w6:p1"}),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let mut app = App {
+            restore_pending: Some(pane.clone()),
+            ..App::default()
+        };
+
+        reconcile_selection(&state, &mut app);
+
+        assert_eq!(app.selected_pane, Some(pane));
+        assert!(app.selection_explicit);
+        assert!(app.restore_pending.is_none());
+    }
+
+    #[test]
+    fn retains_restore_intent_while_its_target_is_reconnecting() {
+        let key = TargetSession::new("ws01", "rv32sim");
+        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Connecting, None),
+        );
+        let mut app = App {
+            restore_pending: Some(pane.clone()),
+            ..App::default()
+        };
+
+        reconcile_selection(&state, &mut app);
+
+        assert_eq!(app.restore_pending, Some(pane));
+        assert!(app.selected_pane.is_none());
     }
 
     #[test]
