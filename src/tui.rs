@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -34,7 +35,7 @@ use crate::terminal::{
     TerminalAccess, TerminalEvent, TerminalScrollDirection, parse_terminal_event, spawn_terminal,
     terminal_input_command, terminal_release_command, terminal_scroll_command,
 };
-use crate::transport::CliSnapshotTransport;
+use crate::transport::{CliSnapshotTransport, expand_discovered_sessions};
 use crate::ui_state::{UiState, UiStateStore};
 
 const PREFIX_KEY: u8 = 0x1d;
@@ -49,6 +50,7 @@ const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ROUTE_EVENT_DRAIN_LIMIT: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
+const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -291,6 +293,165 @@ struct ClipboardFeedback {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetFormField {
+    Name,
+    Ssh,
+    Session,
+    DiscoverSessions,
+}
+
+impl TargetFormField {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Ssh,
+            Self::Ssh => Self::Session,
+            Self::Session => Self::DiscoverSessions,
+            Self::DiscoverSessions => Self::Name,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TargetForm {
+    original_name: Option<String>,
+    name: String,
+    ssh: String,
+    session: String,
+    discover_sessions: bool,
+    socket: Option<String>,
+    herdr_bins: Vec<String>,
+    field: TargetFormField,
+    error: Option<String>,
+}
+
+impl TargetForm {
+    fn add() -> Self {
+        Self {
+            original_name: None,
+            name: String::new(),
+            ssh: String::new(),
+            session: String::new(),
+            discover_sessions: true,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+            field: TargetFormField::Name,
+            error: None,
+        }
+    }
+
+    fn edit(target: &Target) -> Self {
+        Self {
+            original_name: Some(target.name.clone()),
+            name: target.name.clone(),
+            ssh: target.ssh.clone().unwrap_or_default(),
+            session: target.session.clone().unwrap_or_default(),
+            discover_sessions: target.discover_sessions,
+            socket: target.socket.clone(),
+            herdr_bins: target.herdr_bins.clone(),
+            field: TargetFormField::Name,
+            error: None,
+        }
+    }
+
+    fn target(&self) -> Target {
+        Target {
+            name: self.name.clone(),
+            ssh: (!self.ssh.is_empty()).then(|| self.ssh.clone()),
+            discover_sessions: self.discover_sessions,
+            session: (!self.session.is_empty()).then(|| self.session.clone()),
+            socket: self.socket.clone(),
+            herdr_bins: self.herdr_bins.clone(),
+        }
+    }
+
+    fn active_text_mut(&mut self) -> Option<&mut String> {
+        match self.field {
+            TargetFormField::Name => Some(&mut self.name),
+            TargetFormField::Ssh => Some(&mut self.ssh),
+            TargetFormField::Session => Some(&mut self.session),
+            TargetFormField::DiscoverSessions => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TargetManagerMode {
+    List,
+    Form(TargetForm),
+    ConfirmRemove { name: String },
+}
+
+#[derive(Debug, Clone)]
+struct TargetManager {
+    targets: Vec<Target>,
+    selected: usize,
+    mode: TargetManagerMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentFilter {
+    All,
+    Attention,
+    Active,
+}
+
+impl AgentFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Attention,
+            Self::Attention => Self::Active,
+            Self::Active => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Attention => "attention",
+            Self::Active => "active",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentNavigator {
+    filter: AgentFilter,
+    selected: usize,
+}
+
+impl Default for AgentNavigator {
+    fn default() -> Self {
+        Self {
+            filter: AgentFilter::All,
+            selected: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentJumpEntry {
+    pane: PaneId,
+    agent: String,
+    workspace: String,
+    status: String,
+    interactive_ready: bool,
+}
+
+impl TargetManager {
+    fn new(targets: Vec<Target>) -> Self {
+        Self {
+            targets,
+            selected: 0,
+            mode: TargetManagerMode::List,
+        }
+    }
+
+    fn selected_target(&self) -> Option<&Target> {
+        self.targets.get(self.selected)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SidebarHitArea {
     area: Rect,
@@ -329,6 +490,14 @@ enum RouteEvent {
     Closed { serial: u64 },
 }
 
+enum ConfigRefresh {
+    Ready {
+        configured: Config,
+        expanded: Config,
+    },
+    Failed(String),
+}
+
 struct App {
     selected_pane: Option<PaneId>,
     selection_explicit: bool,
@@ -349,6 +518,11 @@ struct App {
     last_render_at: Option<Instant>,
     message: Option<String>,
     clipboard_feedback: Option<ClipboardFeedback>,
+    config_path: Option<PathBuf>,
+    configured_targets: Vec<Target>,
+    configuration_dirty: bool,
+    target_manager: Option<TargetManager>,
+    agent_navigator: Option<AgentNavigator>,
 }
 
 impl Default for App {
@@ -373,33 +547,51 @@ impl Default for App {
             last_render_at: None,
             message: None,
             clipboard_feedback: None,
+            config_path: None,
+            configured_targets: Vec::new(),
+            configuration_dirty: false,
+            target_manager: None,
+            agent_navigator: None,
         }
     }
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
+    let configured_targets = config.targets.clone();
+    let mut active_config = expand_discovered_sessions(config).await;
     let (mut terminal, _guard) = enter_terminal()?;
-    let targets = config
+    let mut targets = active_config
         .targets
         .iter()
         .cloned()
         .map(|target| (target_key(&target), target))
         .collect::<BTreeMap<_, _>>();
-    let options = SupervisorOptions::from_config(&config);
-    let transport_config = config.transport.clone();
-    let store = FederationStore::start(config, Arc::new(CliSnapshotTransport), options);
-    let mut updates = store.subscribe();
+    let options = SupervisorOptions::from_config(&active_config);
+    let mut transport_config = active_config.transport.clone();
+    let initial_store = FederationStore::start(
+        active_config.clone(),
+        Arc::new(CliSnapshotTransport),
+        options,
+    );
+    let mut updates = initial_store.subscribe();
+    let mut store = Some(initial_store);
     let (input_sender, mut input) = mpsc::unbounded_channel();
     let (route_sender, mut route_events) = mpsc::unbounded_channel();
+    let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
     spawn_input_reader(input_sender);
     let mut ticks = interval(Duration::from_millis(100));
     let mut selection_ticks = interval(SELECTION_AUTOSCROLL_INTERVAL);
+    let mut config_refresh_ticks = interval(CONFIG_REFRESH_INTERVAL);
+    config_refresh_ticks.tick().await;
+    let mut config_refresh_inflight = false;
     let mut input_decoder = InputDecoder::default();
     let state_store = UiStateStore::discover()?;
     let restore_pending = state_store.load().unwrap_or_default().selected_pane;
     let mut app = App {
         restore_pending,
         state_store: Some(state_store),
+        config_path: Some(config_path.clone()),
+        configured_targets,
         ..App::default()
     };
     let mut should_draw = true;
@@ -469,6 +661,50 @@ pub async fn run(config: Config) -> Result<()> {
                 }
                 should_draw = true;
             }
+            refresh = config_refreshes.recv() => {
+                config_refresh_inflight = false;
+                match refresh {
+                    Some(ConfigRefresh::Ready { configured, expanded }) => {
+                        app.configured_targets = configured.targets.clone();
+                        if expanded != active_config {
+                            release_routes(&mut app).await;
+                            if let Some(old_store) = store.take() {
+                                old_store.shutdown().await;
+                            }
+                            targets = expanded
+                                .targets
+                                .iter()
+                                .cloned()
+                                .map(|target| (target_key(&target), target))
+                                .collect();
+                            transport_config = expanded.transport.clone();
+                            let options = SupervisorOptions::from_config(&expanded);
+                            let new_store = FederationStore::start(
+                                expanded.clone(),
+                                Arc::new(CliSnapshotTransport),
+                                options,
+                            );
+                            updates = new_store.subscribe();
+                            store = Some(new_store);
+                            active_config = expanded;
+                            app.message = Some("refreshed configured hosts and running sessions".to_owned());
+                        }
+                        if let Some(manager) = app.target_manager.as_mut()
+                            && matches!(&manager.mode, TargetManagerMode::List)
+                        {
+                            manager.targets = app.configured_targets.clone();
+                            manager.selected = manager
+                                .selected
+                                .min(manager.targets.len().saturating_sub(1));
+                        }
+                    }
+                    Some(ConfigRefresh::Failed(error)) => {
+                        app.message = Some(format!("configuration refresh failed: {error}"));
+                    }
+                    None => {}
+                }
+                should_draw = true;
+            }
             event = route_events.recv() => {
                 if let Some(event) = event {
                     handle_route_event(event, &mut app);
@@ -487,6 +723,11 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
             _ = ticks.tick() => {
+                if app.configuration_dirty && !config_refresh_inflight {
+                    app.configuration_dirty = false;
+                    config_refresh_inflight = true;
+                    spawn_config_refresh(config_path.clone(), config_refresh_sender.clone());
+                }
                 if let Some(event) = input_decoder.flush_expired() {
                     if handle_decoded_input(
                         event,
@@ -526,11 +767,16 @@ pub async fn run(config: Config) -> Result<()> {
                     should_draw = true;
                 }
             }
+            _ = config_refresh_ticks.tick() => {
+                app.configuration_dirty = true;
+            }
         }
     };
 
     release_routes(&mut app).await;
-    store.shutdown().await;
+    if let Some(store) = store {
+        store.shutdown().await;
+    }
     result
 }
 
@@ -606,6 +852,22 @@ fn spawn_input_reader(sender: mpsc::UnboundedSender<u8>) {
     });
 }
 
+fn spawn_config_refresh(path: PathBuf, sender: mpsc::UnboundedSender<ConfigRefresh>) {
+    tokio::spawn(async move {
+        let refresh = match Config::load(Some(&path)) {
+            Ok((configured, _)) => {
+                let expanded = expand_discovered_sessions(configured.clone()).await;
+                ConfigRefresh::Ready {
+                    configured,
+                    expanded,
+                }
+            }
+            Err(error) => ConfigRefresh::Failed(error.to_string()),
+        };
+        let _ = sender.send(refresh);
+    });
+}
+
 async fn handle_decoded_input(
     input: DecodedInput,
     state: &FederationState,
@@ -627,7 +889,10 @@ async fn handle_decoded_input(
 }
 
 async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App) -> Result<()> {
-    if app.mode != InputMode::Terminal {
+    if app.mode != InputMode::Terminal
+        || app.target_manager.is_some()
+        || app.agent_navigator.is_some()
+    {
         return Ok(());
     }
     let Some(frame_area) = app.last_frame_area else {
@@ -1205,6 +1470,12 @@ async fn handle_input(
     transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<bool> {
+    if app.target_manager.is_some() {
+        return handle_target_manager_input(key, app);
+    }
+    if app.agent_navigator.is_some() {
+        return handle_agent_navigator_input(key, state, app);
+    }
     match app.mode {
         InputMode::Terminal if key == PREFIX_KEY => {
             app.selection = None;
@@ -1256,6 +1527,10 @@ async fn handle_input(
                 b'p' => cycle_tab(state, app, -1),
                 b'v' => paste_system_clipboard(state, app).await?,
                 b'i' => paste_clipboard_image(state, targets, transport_config, app).await?,
+                b'h' => {
+                    app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
+                }
+                b'a' => app.agent_navigator = Some(AgentNavigator::default()),
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
                 PREFIX_KEY => {
                     if let Some(route) = app
@@ -1273,7 +1548,7 @@ async fn handle_input(
                 0x1b => {}
                 _ => {
                     app.message = Some(
-                        "prefix: 1-9 workspace, p/n tab, j/k pane, v paste, i image, q quit, Ctrl+] literal"
+                        "prefix: 1-9 workspace, p/n tab, j/k pane, a agents, h hosts, v paste, i image, q quit, Ctrl+] literal"
                             .into(),
                     );
                 }
@@ -1282,6 +1557,249 @@ async fn handle_input(
         }
     }
     Ok(false)
+}
+
+fn handle_target_manager_input(key: u8, app: &mut App) -> Result<bool> {
+    let Some(mut manager) = app.target_manager.take() else {
+        return Ok(false);
+    };
+    match &mut manager.mode {
+        TargetManagerMode::List => match key {
+            b'q' | 0x1b => return Ok(false),
+            b'j' => {
+                if !manager.targets.is_empty() {
+                    manager.selected = (manager.selected + 1).min(manager.targets.len() - 1);
+                }
+            }
+            b'k' => manager.selected = manager.selected.saturating_sub(1),
+            b'a' => manager.mode = TargetManagerMode::Form(TargetForm::add()),
+            b'e' | b'\r' | b'\n' => {
+                if let Some(target) = manager.selected_target() {
+                    manager.mode = TargetManagerMode::Form(TargetForm::edit(target));
+                }
+            }
+            b'd' => {
+                if let Some(target) = manager.selected_target() {
+                    manager.mode = TargetManagerMode::ConfirmRemove {
+                        name: target.name.clone(),
+                    };
+                }
+            }
+            _ => {}
+        },
+        TargetManagerMode::Form(form) => match key {
+            0x1b => manager.mode = TargetManagerMode::List,
+            b'\t' => {
+                form.field = form.field.next();
+                form.error = None;
+            }
+            b'\r' | b'\n' => {
+                let Some(path) = app.config_path.clone() else {
+                    form.error = Some("configuration path is unavailable".to_owned());
+                    app.target_manager = Some(manager);
+                    return Ok(false);
+                };
+                let target = form.target();
+                let original_name = form.original_name.clone();
+                let result = match original_name.as_deref() {
+                    Some(name) => Config::replace_target_file(Some(&path), name, target),
+                    None => Config::add_target_file(Some(&path), target),
+                };
+                match result {
+                    Ok(_) => {
+                        let (config, _) = Config::load(Some(&path))?;
+                        let updated_name = form.name.clone();
+                        manager.targets = config.targets.clone();
+                        manager.selected = manager
+                            .targets
+                            .iter()
+                            .position(|target| target.name == updated_name)
+                            .unwrap_or_default();
+                        manager.mode = TargetManagerMode::List;
+                        app.configured_targets = config.targets;
+                        app.configuration_dirty = true;
+                        app.message = Some(format!(
+                            "saved target {updated_name:?}; refreshing federation"
+                        ));
+                    }
+                    Err(error) => form.error = Some(error.to_string()),
+                }
+            }
+            0x08 | 0x7f => {
+                if let Some(text) = form.active_text_mut() {
+                    text.pop();
+                }
+                form.error = None;
+            }
+            b' ' if form.field == TargetFormField::DiscoverSessions => {
+                form.discover_sessions = !form.discover_sessions;
+                form.error = None;
+            }
+            0x20..=0x7e => {
+                if let Some(text) = form.active_text_mut() {
+                    text.push(char::from(key));
+                }
+                form.error = None;
+            }
+            _ => {}
+        },
+        TargetManagerMode::ConfirmRemove { name } => match key {
+            b'y' => {
+                let Some(path) = app.config_path.clone() else {
+                    app.message = Some("configuration path is unavailable".to_owned());
+                    manager.mode = TargetManagerMode::List;
+                    app.target_manager = Some(manager);
+                    return Ok(false);
+                };
+                let removed_name = name.clone();
+                match Config::remove_target_file(Some(&path), &removed_name) {
+                    Ok(_) => {
+                        let (config, _) = Config::load(Some(&path))?;
+                        manager.targets = config.targets.clone();
+                        manager.selected = manager
+                            .selected
+                            .min(manager.targets.len().saturating_sub(1));
+                        manager.mode = TargetManagerMode::List;
+                        app.configured_targets = config.targets;
+                        app.configuration_dirty = true;
+                        app.message = Some(format!(
+                            "removed target {removed_name:?}; no Herdr session was touched"
+                        ));
+                    }
+                    Err(error) => {
+                        app.message = Some(error.to_string());
+                        manager.mode = TargetManagerMode::List;
+                    }
+                }
+            }
+            b'n' | b'q' | 0x1b => manager.mode = TargetManagerMode::List,
+            _ => {}
+        },
+    }
+    app.target_manager = Some(manager);
+    Ok(false)
+}
+
+fn handle_agent_navigator_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
+    let Some(mut navigator) = app.agent_navigator.take() else {
+        return Ok(false);
+    };
+    let entries = agent_jump_entries(state, navigator.filter);
+    match key {
+        b'q' | 0x1b => return Ok(false),
+        b'j' => {
+            if !entries.is_empty() {
+                navigator.selected = (navigator.selected + 1).min(entries.len() - 1);
+            }
+        }
+        b'k' => navigator.selected = navigator.selected.saturating_sub(1),
+        b'f' => {
+            navigator.filter = navigator.filter.next();
+            navigator.selected = 0;
+        }
+        b'\r' | b'\n' => {
+            if let Some(entry) = entries.get(navigator.selected) {
+                select_pane(app, entry.pane.clone());
+                app.message = Some(format!(
+                    "jumped to {} on {}/{}",
+                    entry.agent, entry.pane.target, entry.pane.session
+                ));
+            }
+            return Ok(false);
+        }
+        _ => {}
+    }
+    navigator.selected = navigator.selected.min(entries.len().saturating_sub(1));
+    app.agent_navigator = Some(navigator);
+    Ok(false)
+}
+
+fn agent_jump_entries(state: &FederationState, filter: AgentFilter) -> Vec<AgentJumpEntry> {
+    let mut entries = state
+        .targets
+        .values()
+        .filter(|target| target.connection == TargetConnectionState::Live)
+        .filter_map(|target| target.snapshot.as_deref())
+        .flat_map(|snapshot| {
+            snapshot.agents.values().filter_map(move |agent| {
+                let pane = snapshot.panes.get(&agent.pane);
+                let status = agent
+                    .status
+                    .as_deref()
+                    .or_else(|| pane.and_then(|pane| pane.agent_status.as_deref()))
+                    .unwrap_or("unknown");
+                let interactive_ready = agent.interactive_ready.unwrap_or(false);
+                let include = match filter {
+                    AgentFilter::All => true,
+                    AgentFilter::Attention => agent_needs_attention(status, interactive_ready),
+                    AgentFilter::Active => {
+                        agent_needs_attention(status, interactive_ready) || agent_is_working(status)
+                    }
+                };
+                include.then(|| {
+                    let workspace = pane
+                        .and_then(|pane| pane.workspace.as_ref())
+                        .and_then(|workspace| snapshot.workspaces.get(workspace))
+                        .map(|workspace| {
+                            display_label(&workspace.id.resource, workspace.label.as_deref())
+                        })
+                        .unwrap_or_else(|| "unassigned".to_owned());
+                    AgentJumpEntry {
+                        pane: agent.pane.clone(),
+                        agent: agent
+                            .name
+                            .as_deref()
+                            .or(agent.agent.as_deref())
+                            .or_else(|| pane.and_then(|pane| pane.agent.as_deref()))
+                            .map(safe_text)
+                            .unwrap_or_else(|| safe_text(&agent.pane.resource)),
+                        workspace,
+                        status: safe_text(status),
+                        interactive_ready,
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        agent_priority(&left.status, left.interactive_ready)
+            .cmp(&agent_priority(&right.status, right.interactive_ready))
+            .then_with(|| left.pane.target.cmp(&right.pane.target))
+            .then_with(|| left.pane.session.cmp(&right.pane.session))
+            .then_with(|| left.workspace.cmp(&right.workspace))
+            .then_with(|| left.agent.cmp(&right.agent))
+    });
+    entries
+}
+
+fn agent_needs_attention(status: &str, interactive_ready: bool) -> bool {
+    interactive_ready
+        || matches!(
+            status.to_ascii_lowercase().as_str(),
+            "blocked" | "waiting" | "waiting_for_input" | "needs_input" | "ready"
+        )
+}
+
+fn agent_is_working(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "working" | "running" | "busy" | "active"
+    )
+}
+
+fn agent_priority(status: &str, interactive_ready: bool) -> u8 {
+    if agent_needs_attention(status, interactive_ready) {
+        0
+    } else if agent_is_working(status) {
+        1
+    } else if matches!(
+        status.to_ascii_lowercase().as_str(),
+        "idle" | "completed" | "done"
+    ) {
+        3
+    } else {
+        2
+    }
 }
 
 async fn paste_system_clipboard(state: &FederationState, app: &mut App) -> Result<()> {
@@ -1967,6 +2485,188 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
     }
     render_tabs(frame, state, app, tab_area);
     render_terminal_surfaces(frame, state, app, terminal_area);
+    if let Some(manager) = app.target_manager.as_ref() {
+        render_target_manager(frame, manager);
+    } else if let Some(navigator) = app.agent_navigator.as_ref() {
+        render_agent_navigator(frame, state, navigator);
+    }
+}
+
+fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
+    let area = centered_popup(frame.area(), 68, 18);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" target manager ", Style::default().bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = match &manager.mode {
+        TargetManagerMode::List => {
+            let mut lines = vec![
+                Line::styled(
+                    "j/k select   a add   e/Enter edit   d remove   q close",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Line::default(),
+            ];
+            for (index, target) in manager.targets.iter().enumerate() {
+                let selected = index == manager.selected;
+                let scope = if target.discover_sessions {
+                    "running sessions"
+                } else {
+                    target.session_name()
+                };
+                let line = Line::from(format!(
+                    "{} {:<18} {:<22} {}",
+                    if selected { ">" } else { " " },
+                    safe_text(&target.name),
+                    safe_text(target.endpoint()),
+                    safe_text(scope)
+                ));
+                lines.push(if selected {
+                    line.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else {
+                    line
+                });
+            }
+            if manager.targets.is_empty() {
+                lines.push(Line::from("No targets configured. Press a to add one."));
+            }
+            lines
+        }
+        TargetManagerMode::Form(form) => {
+            let field_line = |field, label: &str, value: String| {
+                let line = Line::from(format!("{label:<27} {value}"));
+                if form.field == field {
+                    line.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else {
+                    line
+                }
+            };
+            let mut lines = vec![
+                Line::styled(
+                    if form.original_name.is_some() {
+                        "Edit host   Tab next field   Enter save   Esc cancel"
+                    } else {
+                        "Add host   Tab next field   Enter save   Esc cancel"
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Line::default(),
+                field_line(TargetFormField::Name, "Super-Herdr name", form.name.clone()),
+                field_line(
+                    TargetFormField::Ssh,
+                    "SSH alias (blank = local)",
+                    form.ssh.clone(),
+                ),
+                field_line(
+                    TargetFormField::Session,
+                    "Session/fallback (optional)",
+                    form.session.clone(),
+                ),
+                field_line(
+                    TargetFormField::DiscoverSessions,
+                    "Discover running sessions",
+                    if form.discover_sessions { "[x]" } else { "[ ]" }.to_owned(),
+                ),
+                Line::default(),
+                Line::styled(
+                    "Space toggles discovery. SSH authentication remains in OpenSSH.",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if let Some(error) = form.error.as_deref() {
+                lines.push(Line::styled(
+                    safe_text(error),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines
+        }
+        TargetManagerMode::ConfirmRemove { name } => vec![
+            Line::from(format!(
+                "Remove target {:?} from Super-Herdr configuration?",
+                safe_text(name)
+            )),
+            Line::default(),
+            Line::styled(
+                "y remove   n/Esc cancel",
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::default(),
+            Line::from("This does not stop, restart, or alter any Herdr session."),
+        ],
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn centered_popup(area: Rect, maximum_width: u16, maximum_height: u16) -> Rect {
+    let width = maximum_width.min(area.width.saturating_sub(2)).max(1);
+    let height = maximum_height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn render_agent_navigator(frame: &mut Frame, state: &FederationState, navigator: &AgentNavigator) {
+    let area = centered_popup(frame.area(), 76, 22);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" agent navigator ", Style::default().bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let entries = agent_jump_entries(state, navigator.filter);
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "j/k select   Enter jump   f filter [{}]   q close",
+                navigator.filter.label()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::default(),
+    ];
+    for (index, entry) in entries.iter().enumerate() {
+        let ready = if entry.interactive_ready {
+            " input"
+        } else {
+            ""
+        };
+        let line = Line::from(format!(
+            "{} {:<14} {:<12} {:<18} {}{}",
+            if index == navigator.selected {
+                ">"
+            } else {
+                " "
+            },
+            entry.agent,
+            entry.status,
+            format!("{}/{}", entry.pane.target, entry.pane.session),
+            entry.workspace,
+            ready,
+        ));
+        lines.push(if index == navigator.selected {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        });
+    }
+    if entries.is_empty() {
+        lines.push(Line::from(format!(
+            "No agents match the {} filter.",
+            navigator.filter.label()
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn ui_areas(area: Rect) -> (Rect, Rect, Rect) {
@@ -2399,7 +3099,7 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
         );
         let (text, style) = if app.mode == InputMode::Prefix {
             (
-                " Ctrl+]  1-9 workspace  p/n tab  j/k pane  v paste  i image  q quit  Ctrl+] literal "
+                " Ctrl+]  1-9 workspace  p/n tab  j/k pane  a agents  h hosts  v paste  i image  q quit "
                     .to_owned(),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             )
@@ -2572,6 +3272,7 @@ fn target_key(target: &Target) -> TargetSession {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2579,16 +3280,18 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        App, CellPosition, ClipboardFeedback, DecodedInput, InputDecoder, MOUSE_CAPTURE_ENABLE,
-        MouseInput, PREFIX_KEY, SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection,
-        SelectionFinish, TerminalSelection, capture_screen_rows, capture_selection_viewport,
-        clamped_pane_position, cycle_tab, desired_access, displayed_message, encode_mouse_event,
-        fall_back_to_observe, finish_ui_left_gesture, mouse_event_allowed,
+        AgentFilter, App, CellPosition, ClipboardFeedback, DecodedInput, InputDecoder,
+        MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, SIDEBAR_WIDTH, SelectionAutoscroll,
+        SelectionAutoscrollDirection, SelectionFinish, TargetManager, TerminalSelection,
+        agent_jump_entries, capture_screen_rows, capture_selection_viewport, clamped_pane_position,
+        cycle_tab, desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
+        finish_ui_left_gesture, handle_target_manager_input, mouse_event_allowed,
         mouse_passthrough_enabled, reconcile_selection, render_vt_screen, safe_text,
         select_workspace, selected_terminal_text, sidebar_pane_at_row, tab_at_column,
         terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
         viewport_shift_distance, visible_pane_areas,
     };
+    use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession};
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
@@ -2617,6 +3320,93 @@ mod tests {
     fn federation_prefix_does_not_shadow_herdrs_prefix() {
         assert_eq!(PREFIX_KEY, 0x1d);
         assert_ne!(PREFIX_KEY, 0x02);
+    }
+
+    #[test]
+    fn target_manager_adds_a_host_through_the_shared_config_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let existing = Target {
+            name: "existing".to_owned(),
+            ssh: Some("existing-host".to_owned()),
+            discover_sessions: true,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        Config::add_target_file(Some(&path), existing.clone()).unwrap();
+        let mut app = App {
+            config_path: Some(path.clone()),
+            configured_targets: vec![existing.clone()],
+            target_manager: Some(TargetManager::new(vec![existing])),
+            ..App::default()
+        };
+
+        handle_target_manager_input(b'a', &mut app).unwrap();
+        for byte in b"build" {
+            handle_target_manager_input(*byte, &mut app).unwrap();
+        }
+        handle_target_manager_input(b'\t', &mut app).unwrap();
+        for byte in b"build-host" {
+            handle_target_manager_input(*byte, &mut app).unwrap();
+        }
+        handle_target_manager_input(b'\r', &mut app).unwrap();
+
+        let config = Config::load(Some(&path)).unwrap().0;
+        assert_eq!(config.targets.len(), 2);
+        assert_eq!(config.targets[1].name, "build");
+        assert_eq!(config.targets[1].endpoint(), "build-host");
+        assert!(config.targets[1].discover_sessions);
+        assert!(app.configuration_dirty);
+        assert_eq!(fs::metadata(path).unwrap().permissions().readonly(), false);
+    }
+
+    #[test]
+    fn agent_navigator_prioritizes_attention_and_filters_globally() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [
+                    {"workspace_id": "w1", "name": "compiler"},
+                    {"workspace_id": "w2", "name": "simulator"}
+                ],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "agent": "builder", "agent_status": "working"},
+                    {"pane_id": "w2:p1", "workspace_id": "w2", "agent": "tester", "agent_status": "blocked"},
+                    {"pane_id": "w2:p2", "workspace_id": "w2", "agent": "reviewer", "agent_status": "idle"}
+                ],
+                "agents": [
+                    {"pane_id": "w1:p1", "name": "builder", "agent_status": "working"},
+                    {"pane_id": "w2:p1", "name": "tester", "agent_status": "blocked"},
+                    {"pane_id": "w2:p2", "name": "reviewer", "agent_status": "idle"}
+                ]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let all = agent_jump_entries(&state, AgentFilter::All);
+        assert_eq!(
+            all.iter()
+                .map(|entry| entry.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["tester", "builder", "reviewer"]
+        );
+        let attention = agent_jump_entries(&state, AgentFilter::Attention);
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].agent, "tester");
+        let active = agent_jump_entries(&state, AgentFilter::Active);
+        assert_eq!(
+            active
+                .iter()
+                .map(|entry| entry.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["tester", "builder"]
+        );
     }
 
     #[test]

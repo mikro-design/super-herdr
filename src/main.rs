@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use super_herdr::clipboard;
@@ -91,6 +91,56 @@ enum TargetCommands {
         /// Herdr client candidate on the target; repeat for fallbacks.
         #[arg(long = "herdr-bin", value_name = "COMMAND")]
         herdr_bins: Vec<String>,
+    },
+    /// Edit one configured Herdr host.
+    Edit {
+        /// Current stable target name.
+        name: String,
+        /// Replace the stable target name.
+        #[arg(long, value_name = "NAME")]
+        rename: Option<String>,
+        /// Replace the OpenSSH destination or alias.
+        #[arg(long, value_name = "DESTINATION", conflicts_with = "local")]
+        ssh: Option<String>,
+        /// Change this to a local target.
+        #[arg(long, conflicts_with = "ssh")]
+        local: bool,
+        /// Discover every running Herdr session.
+        #[arg(long, conflicts_with = "single_session")]
+        discover_sessions: bool,
+        /// Disable session discovery and use one session.
+        #[arg(long, conflicts_with = "discover_sessions")]
+        single_session: bool,
+        /// Replace the named session or discovery fallback.
+        #[arg(long, value_name = "NAME", conflicts_with = "clear_session")]
+        session: Option<String>,
+        /// Remove an explicitly configured session fallback.
+        #[arg(long)]
+        clear_session: bool,
+        /// Replace the Herdr API socket path.
+        #[arg(long, value_name = "PATH", conflicts_with = "clear_socket")]
+        socket: Option<String>,
+        /// Remove an explicitly configured socket path.
+        #[arg(long)]
+        clear_socket: bool,
+        /// Replace client candidates; repeat to define fallback order.
+        #[arg(
+            long = "herdr-bin",
+            value_name = "COMMAND",
+            conflicts_with = "default_herdr_bin"
+        )]
+        herdr_bins: Vec<String>,
+        /// Reset the client candidate list to `herdr`.
+        #[arg(long)]
+        default_herdr_bin: bool,
+    },
+    /// Remove a configured host without touching its Herdr sessions.
+    Remove {
+        /// Stable target name to remove.
+        name: String,
+        /// Confirm removal from Super-Herdr configuration.
+        #[arg(long)]
+        yes: bool,
     },
     /// List configured Herdr hosts without connecting to them.
     List,
@@ -214,7 +264,7 @@ async fn run() -> Result<ExitCode> {
             })
         }
         Commands::Tui => {
-            tui::run(expand_discovered_sessions(config).await).await?;
+            tui::run(config, path).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Clipboard { .. } => unreachable!("clipboard commands return before config load"),
@@ -251,6 +301,89 @@ fn run_target_command(
             let path = Config::add_target_file(config_path, target)?;
             println!("added target {name:?} to {}", path.display());
             println!("run `super-herdr probe` to verify it");
+            Ok(ExitCode::SUCCESS)
+        }
+        TargetCommands::Edit {
+            name,
+            rename,
+            ssh,
+            local,
+            discover_sessions,
+            single_session,
+            session,
+            clear_session,
+            socket,
+            clear_socket,
+            herdr_bins,
+            default_herdr_bin,
+        } => {
+            let (config, _) = Config::load(config_path)?;
+            let mut target = config
+                .targets
+                .iter()
+                .find(|target| target.name == name)
+                .cloned()
+                .with_context(|| format!("target {name:?} is not configured"))?;
+            let changed = rename.is_some()
+                || ssh.is_some()
+                || local
+                || discover_sessions
+                || single_session
+                || session.is_some()
+                || clear_session
+                || socket.is_some()
+                || clear_socket
+                || !herdr_bins.is_empty()
+                || default_herdr_bin;
+            if !changed {
+                anyhow::bail!("target edit requires at least one change option");
+            }
+            if let Some(rename) = rename {
+                target.name = rename;
+            }
+            if let Some(ssh) = ssh {
+                target.ssh = Some(ssh);
+            } else if local {
+                target.ssh = None;
+            }
+            if discover_sessions {
+                target.discover_sessions = true;
+            } else if single_session {
+                target.discover_sessions = false;
+            }
+            if let Some(session) = session {
+                target.session = Some(session);
+            } else if clear_session {
+                target.session = None;
+            }
+            if let Some(socket) = socket {
+                target.socket = Some(socket);
+            } else if clear_socket {
+                target.socket = None;
+            }
+            if !herdr_bins.is_empty() {
+                target.herdr_bins = herdr_bins;
+            } else if default_herdr_bin {
+                target.herdr_bins = vec!["herdr".to_owned()];
+            }
+            let updated_name = target.name.clone();
+            let path = Config::replace_target_file(config_path, &name, target)?;
+            println!(
+                "updated target {name:?} as {updated_name:?} in {}",
+                path.display()
+            );
+            println!("run `super-herdr probe` to verify it");
+            Ok(ExitCode::SUCCESS)
+        }
+        TargetCommands::Remove { name, yes } => {
+            if !yes {
+                anyhow::bail!(
+                    "refusing to remove target {name:?} without --yes; Herdr is not affected"
+                );
+            }
+            let path = Config::remove_target_file(config_path, &name)?;
+            println!("removed target {name:?} from {}", path.display());
+            println!("no Herdr session was stopped or restarted");
             Ok(ExitCode::SUCCESS)
         }
         TargetCommands::List => {

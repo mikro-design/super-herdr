@@ -57,9 +57,17 @@ memory for currently visible panes.
 
 Before starting per-session supervisors, a host configured for discovery invokes
 the documented `herdr session list --json` command. Each returned session becomes
-an independently qualified target and uses the reported public socket path. A
-stopped session is omitted and is never started automatically. Discovery
-failure falls back to the configured session and remains isolated to that host.
+an independently qualified target and uses the reported public socket path. Host
+registries are refreshed concurrently every ten seconds. When the qualified
+session set changes, Super-Herdr replaces its own supervisors and terminal
+routes; it never starts, stops, or restarts Herdr. A stopped session is omitted.
+Discovery failure falls back to the configured session and remains isolated to
+that host.
+
+The frontend watches the durable TOML configuration through the same bounded
+refresh path. CLI and TUI target management use one atomic file store. A refresh
+may reconnect Super-Herdr routes but cannot mutate server-owned workspaces,
+sessions, or processes.
 
 The desktop persists only versioned UI intent, currently the last explicitly
 selected qualified pane. Writes use a private state directory and atomic file

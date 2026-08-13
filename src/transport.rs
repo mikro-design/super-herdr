@@ -70,35 +70,63 @@ struct SessionList {
 /// A discovery failure is isolated to that host by retaining its configured
 /// fallback session target.
 pub async fn expand_discovered_sessions(config: crate::config::Config) -> crate::config::Config {
-    let mut expanded = Vec::new();
-    for target in &config.targets {
-        if !target.discover_sessions {
-            expanded.push(target.clone());
-            continue;
-        }
-        match timeout(
-            Duration::from_secs(config.transport.command_timeout_seconds),
-            discover_sessions(target, &config.transport),
-        )
-        .await
-        {
-            Ok(Ok(sessions)) if !sessions.is_empty() => {
-                expanded.extend(sessions.into_iter().map(|session| Target {
-                    name: target.name.clone(),
-                    ssh: target.ssh.clone(),
-                    discover_sessions: false,
-                    session: Some(session.name),
-                    socket: Some(session.socket_path),
-                    herdr_bins: target.herdr_bins.clone(),
-                }));
-            }
-            _ => expanded.push(target.clone()),
+    let transport = config.transport.clone();
+    let originals = config.targets;
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, target) in originals.iter().cloned().enumerate() {
+        let transport = transport.clone();
+        tasks.spawn(async move {
+            let expanded = expand_discovered_target(target, &transport).await;
+            (index, expanded)
+        });
+    }
+    let mut per_target = vec![None; originals.len()];
+    while let Some(result) = tasks.join_next().await {
+        if let Ok((index, expanded)) = result {
+            per_target[index] = Some(expanded);
         }
     }
+    let expanded = per_target
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, expanded)| expanded.unwrap_or_else(|| vec![originals[index].clone()]))
+        .collect();
     crate::config::Config {
-        transport: config.transport,
+        transport,
         targets: expanded,
     }
+}
+
+async fn expand_discovered_target(target: Target, transport: &TransportConfig) -> Vec<Target> {
+    if !target.discover_sessions {
+        return vec![target];
+    }
+    match timeout(
+        Duration::from_secs(transport.command_timeout_seconds),
+        discover_sessions(&target, transport),
+    )
+    .await
+    {
+        Ok(Ok(sessions)) => targets_for_discovered_sessions(&target, sessions),
+        _ => vec![target],
+    }
+}
+
+fn targets_for_discovered_sessions(
+    target: &Target,
+    sessions: Vec<DiscoveredSession>,
+) -> Vec<Target> {
+    sessions
+        .into_iter()
+        .map(|session| Target {
+            name: target.name.clone(),
+            ssh: target.ssh.clone(),
+            discover_sessions: false,
+            session: Some(session.name),
+            socket: Some(session.socket_path),
+            herdr_bins: target.herdr_bins.clone(),
+        })
+        .collect()
 }
 
 async fn discover_sessions(
@@ -681,8 +709,9 @@ mod tests {
 
     use super::{
         EVENT_SUBSCRIPTIONS, SessionList, api_failure, event_subscription_request, parse_last_json,
-        quote_posix, valid_discovered_session,
+        quote_posix, targets_for_discovered_sessions, valid_discovered_session,
     };
+    use crate::config::Target;
 
     #[test]
     fn quotes_remote_arguments_without_shell_injection() {
@@ -706,6 +735,20 @@ mod tests {
 
         assert_eq!(sessions.sessions.len(), 1);
         assert!(valid_discovered_session(&sessions.sessions[0]));
+    }
+
+    #[test]
+    fn an_empty_running_session_registry_removes_the_active_fallback() {
+        let target = Target {
+            name: "development".to_owned(),
+            ssh: Some("development-host".to_owned()),
+            discover_sessions: true,
+            session: Some("fallback".to_owned()),
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+
+        assert!(targets_for_discovered_sessions(&target, Vec::new()).is_empty());
     }
 
     #[test]
