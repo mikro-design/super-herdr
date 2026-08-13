@@ -115,6 +115,10 @@ inside another terminal multiplexer.
 Sidebar hit rectangles are derived from the rendered block's inner area and stored
 with that frame. A press owns its resolved item until release, matching Herdr's
 interaction model instead of recomputing a row from potentially newer state.
+The sidebar is a scrollable viewport over every qualified host/session/workspace
+row. Wheel input over that viewport changes only its local offset; selecting a
+pane resumes automatic tracking of the corresponding workspace. Hit rectangles
+are derived after applying the offset so clipped rows cannot receive clicks.
 Rendering is capped at 60 Hz, terminal-frame events are drained in bounded batches,
 and input is prioritized so busy panes cannot starve navigation.
 

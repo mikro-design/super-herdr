@@ -13,10 +13,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Tabs};
+use ratatui::widgets::{
+    Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Tabs,
+};
 use ratatui::{Frame, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -463,6 +466,7 @@ struct SidebarHitArea {
 struct SidebarRow {
     line: Line<'static>,
     pane: Option<PaneId>,
+    selection_anchor: bool,
 }
 
 struct ActiveRoute {
@@ -521,6 +525,9 @@ struct App {
     selection: Option<TerminalSelection>,
     selection_autoscroll: Option<SelectionAutoscroll>,
     swallow_left_gesture: bool,
+    sidebar_offset: usize,
+    sidebar_follow_selected: bool,
+    sidebar_last_selected: Option<PaneId>,
     sidebar_hit_areas: Vec<SidebarHitArea>,
     sidebar_press: Option<PaneId>,
     last_render_at: Option<Instant>,
@@ -552,6 +559,9 @@ impl Default for App {
             selection: None,
             selection_autoscroll: None,
             swallow_left_gesture: false,
+            sidebar_offset: 0,
+            sidebar_follow_selected: true,
+            sidebar_last_selected: None,
             sidebar_hit_areas: Vec::new(),
             sidebar_press: None,
             last_render_at: None,
@@ -999,13 +1009,17 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
         return Ok(());
     }
 
-    if mouse.is_left_press() && sidebar_area.contains(outer) {
-        app.sidebar_press = app
-            .sidebar_hit_areas
-            .iter()
-            .find(|hit| hit.area.contains(outer))
-            .map(|hit| hit.pane.clone());
-        app.swallow_left_gesture = true;
+    if sidebar_area.contains(outer) {
+        if let Some(direction) = mouse.scroll_direction() {
+            scroll_sidebar(state, app, sidebar_area, direction);
+        } else if mouse.is_left_press() {
+            app.sidebar_press = app
+                .sidebar_hit_areas
+                .iter()
+                .find(|hit| hit.area.contains(outer))
+                .map(|hit| hit.pane.clone());
+            app.swallow_left_gesture = true;
+        }
         return Ok(());
     }
     if tab_area.contains(outer) {
@@ -1259,6 +1273,7 @@ fn select_pane(app: &mut App, pane: PaneId) {
     app.selection = None;
     app.selection_autoscroll = None;
     app.sidebar_press = None;
+    app.sidebar_follow_selected = true;
     app.selected_pane = Some(pane.clone());
     app.route_retry_after.remove(&pane);
     app.control_retry_after.remove(&pane);
@@ -3183,6 +3198,7 @@ fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<Sideb
         rows.push(SidebarRow {
             line,
             pane: target_pane,
+            selection_anchor: is_selected_target && selected_workspace.is_none(),
         });
 
         if is_selected_target && let Some(error) = target.event_error.as_deref() {
@@ -3192,6 +3208,7 @@ fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<Sideb
                     Style::default().fg(Color::Red),
                 ),
                 pane: None,
+                selection_anchor: false,
             });
         }
         if let Some(snapshot) = target.snapshot.as_deref() {
@@ -3241,6 +3258,7 @@ fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<Sideb
                     pane: (target.connection == TargetConnectionState::Live)
                         .then(|| pane_for_workspace(snapshot, &workspace.id))
                         .flatten(),
+                    selection_anchor: is_selected,
                 });
                 workspace_index = workspace_index.saturating_add(1);
             }
@@ -3309,14 +3327,69 @@ fn sidebar_block() -> Block<'static> {
         .border_style(Style::default().fg(Color::DarkGray))
 }
 
+fn sidebar_content_height(area: Rect) -> usize {
+    usize::from(sidebar_block().inner(area).height)
+}
+
+fn sidebar_max_offset(row_count: usize, area: Rect) -> usize {
+    row_count.saturating_sub(sidebar_content_height(area))
+}
+
+fn scroll_sidebar(
+    state: &FederationState,
+    app: &mut App,
+    area: Rect,
+    direction: TerminalScrollDirection,
+) {
+    let row_count = sidebar_rows(state, app.selected_pane.as_ref()).len();
+    let maximum = sidebar_max_offset(row_count, area);
+    let amount = usize::from(MOUSE_SCROLL_LINES);
+    let next_offset = match direction {
+        TerminalScrollDirection::Up => app.sidebar_offset.saturating_sub(amount),
+        TerminalScrollDirection::Down => app.sidebar_offset.saturating_add(amount).min(maximum),
+    };
+    if next_offset != app.sidebar_offset {
+        app.sidebar_offset = next_offset;
+        app.sidebar_follow_selected = false;
+    }
+}
+
+fn reconcile_sidebar_viewport(rows: &[SidebarRow], app: &mut App, area: Rect) {
+    if app.sidebar_last_selected.as_ref() != app.selected_pane.as_ref() {
+        app.sidebar_follow_selected = true;
+        app.sidebar_last_selected = app.selected_pane.clone();
+    }
+
+    let height = sidebar_content_height(area);
+    let maximum = rows.len().saturating_sub(height);
+    app.sidebar_offset = app.sidebar_offset.min(maximum);
+    if height == 0 || !app.sidebar_follow_selected {
+        return;
+    }
+
+    let Some(selected_row) = rows.iter().position(|row| row.selection_anchor) else {
+        return;
+    };
+    if selected_row < app.sidebar_offset {
+        app.sidebar_offset = selected_row;
+    } else if selected_row >= app.sidebar_offset.saturating_add(height) {
+        app.sidebar_offset = selected_row.saturating_add(1).saturating_sub(height);
+    }
+    app.sidebar_offset = app.sidebar_offset.min(maximum);
+}
+
 fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) {
     app.sidebar_hit_areas.clear();
     if area.width == 0 || area.height == 0 {
         return;
     }
     let content = sidebar_block().inner(area);
-    for (offset, row) in sidebar_rows(state, app.selected_pane.as_ref())
+    let rows = sidebar_rows(state, app.selected_pane.as_ref());
+    reconcile_sidebar_viewport(&rows, app, area);
+    for (offset, row) in rows
         .into_iter()
+        .skip(app.sidebar_offset)
+        .take(usize::from(content.height))
         .enumerate()
     {
         let Ok(offset) = u16::try_from(offset) else {
@@ -3339,7 +3412,33 @@ fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: R
         .into_iter()
         .map(|row| row.line)
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines).block(sidebar_block()), area);
+    let row_count = lines.len();
+    let offset = u16::try_from(app.sidebar_offset).unwrap_or(u16::MAX);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((offset, 0))
+            .block(sidebar_block()),
+        area,
+    );
+    if row_count > sidebar_content_height(area) {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .track_style(Style::default().fg(Color::DarkGray))
+            .thumb_style(Style::default().fg(Color::Blue));
+        let mut scrollbar_state =
+            ScrollbarState::new(row_count).position(app.sidebar_offset.min(row_count - 1));
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn render_tabs(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
@@ -3628,11 +3727,12 @@ mod tests {
         TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
         capture_selection_viewport, clamped_pane_position, cycle_tab, desired_access,
         displayed_message, encode_mouse_event, fall_back_to_observe, finish_ui_left_gesture,
-        handle_input, handle_target_manager_input, mouse_event_allowed, mouse_passthrough_enabled,
-        pane_direction_score, reconcile_selection, render_vt_screen, safe_text,
-        select_neighbor_pane, select_workspace, selected_terminal_text, sidebar_pane_at_row,
-        tab_at_column, terminal_paste_payload, ui_areas, update_selection_after_frame,
-        update_sidebar_hit_areas, viewport_shift_distance, visible_pane_areas,
+        handle_input, handle_mouse, handle_target_manager_input, mouse_event_allowed,
+        mouse_passthrough_enabled, pane_direction_score, reconcile_selection, render_vt_screen,
+        safe_text, select_neighbor_pane, select_pane, select_workspace, selected_terminal_text,
+        sidebar_block, sidebar_content_height, sidebar_pane_at_row, tab_at_column,
+        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
+        viewport_shift_distance, visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession};
@@ -4459,6 +4559,73 @@ mod tests {
         assert!(app.sidebar_press.is_none());
     }
 
+    #[tokio::test]
+    async fn sidebar_scrolls_all_workspaces_and_keeps_mouse_targets_aligned() {
+        let state = overflowing_sidebar_state(15);
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 6);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            selected_pane: Some(PaneId::new("host-a", "dev", "w01:p1")),
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let visible_height = sidebar_content_height(sidebar_area);
+        let last_initial_pane = format!("w{:02}:p1", visible_height - 1);
+        assert_eq!(app.sidebar_offset, 0);
+        assert_eq!(app.sidebar_hit_areas.len(), visible_height);
+        assert_eq!(
+            app.sidebar_hit_areas.last().map(|hit| &hit.pane),
+            Some(&PaneId::new("host-a", "dev", &last_initial_pane))
+        );
+
+        handle_mouse(
+            MouseInput {
+                code: 65,
+                column: 2,
+                row: 2,
+                release: false,
+            },
+            &state,
+            &mut app,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.sidebar_offset, 3);
+        assert!(!app.sidebar_follow_selected);
+
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        assert_eq!(app.sidebar_offset, 3);
+        assert_eq!(
+            app.sidebar_hit_areas[0].area,
+            ratatui::layout::Rect::new(0, sidebar_block().inner(sidebar_area).y, 27, 1,)
+        );
+        assert_eq!(
+            app.sidebar_hit_areas[0].pane,
+            PaneId::new("host-a", "dev", "w03:p1")
+        );
+
+        select_pane(&mut app, PaneId::new("host-a", "dev", "w15:p1"));
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        assert_eq!(app.sidebar_offset, 16 - visible_height);
+        assert_eq!(
+            app.sidebar_hit_areas.last().map(|hit| &hit.pane),
+            Some(&PaneId::new("host-a", "dev", "w15:p1"))
+        );
+
+        let shorter_sidebar = ratatui::layout::Rect::new(0, 0, 28, 3);
+        update_sidebar_hit_areas(&state, &mut app, shorter_sidebar);
+        assert_eq!(
+            app.sidebar_offset,
+            16 - sidebar_content_height(shorter_sidebar)
+        );
+        assert_eq!(
+            app.sidebar_hit_areas.last().map(|hit| &hit.pane),
+            Some(&PaneId::new("host-a", "dev", "w15:p1"))
+        );
+    }
+
     fn layout(workspace: &str, tab: &str, pane: &str) -> serde_json::Value {
         json!({
             "workspace_id": workspace,
@@ -4472,6 +4639,49 @@ mod tests {
                 "rect": {"x": 0, "y": 0, "width": 80, "height": 24}
             }]
         })
+    }
+
+    fn overflowing_sidebar_state(workspace_count: usize) -> FederationState {
+        let key = TargetSession::new("host-a", "dev");
+        let mut workspaces = Vec::new();
+        let mut tabs = Vec::new();
+        let mut panes = Vec::new();
+        let mut layouts = Vec::new();
+        for index in 1..=workspace_count {
+            let workspace = format!("w{index:02}");
+            let tab = format!("{workspace}:t1");
+            let pane = format!("{workspace}:p1");
+            workspaces.push(json!({
+                "workspace_id": workspace,
+                "active_tab_id": tab,
+            }));
+            tabs.push(json!({
+                "tab_id": tab,
+                "workspace_id": workspace,
+            }));
+            panes.push(json!({
+                "pane_id": pane,
+                "workspace_id": workspace,
+                "tab_id": tab,
+            }));
+            layouts.push(layout(&workspace, &tab, &pane));
+        }
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "focused_pane_id": "w01:p1",
+                "workspaces": workspaces,
+                "tabs": tabs,
+                "panes": panes,
+                "layouts": layouts,
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        state
     }
 
     fn layout_with_panes(
