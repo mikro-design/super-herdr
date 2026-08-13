@@ -48,7 +48,6 @@ const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ROUTE_EVENT_DRAIN_LIMIT: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
-const SELECTION_SCROLL_FRAME_TIMEOUT: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -283,7 +282,7 @@ struct SelectionAutoscroll {
     pane: PaneId,
     direction: SelectionAutoscrollDirection,
     column: u16,
-    awaiting_frame_since: Option<Instant>,
+    pending_lines: usize,
 }
 
 struct ClipboardFeedback {
@@ -642,11 +641,14 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
                         selection.head != selection.anchor || autoscroll_direction.is_some();
                     selection.dragging
                 };
-                let awaiting_frame_since = app.selection_autoscroll.as_ref().and_then(|current| {
-                    (current.pane == pane && Some(current.direction) == autoscroll_direction)
-                        .then_some(current.awaiting_frame_since)
-                        .flatten()
-                });
+                let pending_lines = app
+                    .selection_autoscroll
+                    .as_ref()
+                    .and_then(|current| {
+                        (current.pane == pane && Some(current.direction) == autoscroll_direction)
+                            .then_some(current.pending_lines)
+                    })
+                    .unwrap_or(0);
                 app.selection_autoscroll =
                     dragging
                         .then_some(autoscroll_direction)
@@ -655,7 +657,7 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
                             pane,
                             direction,
                             column: position.column,
-                            awaiting_frame_since,
+                            pending_lines,
                         });
             } else {
                 app.selection_autoscroll = None;
@@ -894,13 +896,6 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
         app.selection_autoscroll = None;
         return Ok(false);
     }
-    if let Some(sent_at) = autoscroll.awaiting_frame_since {
-        if sent_at.elapsed() < SELECTION_SCROLL_FRAME_TIMEOUT {
-            return Ok(false);
-        }
-        app.selection_autoscroll = None;
-        return Ok(false);
-    }
     let Some(route) = app.routes.get(&autoscroll.pane) else {
         app.selection_autoscroll = None;
         return Ok(false);
@@ -931,7 +926,7 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
         && current.pane == autoscroll.pane
         && current.direction == autoscroll.direction
     {
-        current.awaiting_frame_since = Some(Instant::now());
+        current.pending_lines = current.pending_lines.saturating_add(1);
     }
     Ok(false)
 }
@@ -1698,9 +1693,7 @@ fn handle_route_event(event: RouteEvent, app: &mut App) {
             let pending_direction = app
                 .selection_autoscroll
                 .as_ref()
-                .filter(|autoscroll| {
-                    autoscroll.pane == pane && autoscroll.awaiting_frame_since.is_some()
-                })
+                .filter(|autoscroll| autoscroll.pane == pane && autoscroll.pending_lines > 0)
                 .map(|autoscroll| autoscroll.direction);
             let before = pending_direction.and_then(|_| {
                 app.routes
@@ -1771,10 +1764,9 @@ fn update_selection_after_frame(
     before: Option<&[CapturedRow]>,
     after: Vec<CapturedRow>,
 ) {
-    let shifted = pending_direction.is_some_and(|direction| {
-        before.is_some_and(|before| viewport_shifted(before, &after, direction))
+    let shift = pending_direction.and_then(|direction| {
+        before.and_then(|before| viewport_shift_distance(before, &after, direction))
     });
-    let changed = before.is_some_and(|before| before != after);
 
     let Some(selection) = app
         .selection
@@ -1784,11 +1776,12 @@ fn update_selection_after_frame(
         app.selection_autoscroll = None;
         return;
     };
-    if shifted {
+    if let Some(lines) = shift {
         let direction = pending_direction.expect("shifted viewport has a direction");
+        let lines = i64::try_from(lines).unwrap_or(i64::MAX);
         selection.viewport_offset += match direction {
-            SelectionAutoscrollDirection::Up => 1,
-            SelectionAutoscrollDirection::Down => -1,
+            SelectionAutoscrollDirection::Up => lines,
+            SelectionAutoscrollDirection::Down => -lines,
         };
         let viewport_row = match direction {
             SelectionAutoscrollDirection::Up => 0,
@@ -1804,33 +1797,30 @@ fn update_selection_after_frame(
             CellPosition::from_viewport(viewport_row, column, selection.viewport_offset);
         capture_selection_rows(selection, after);
         if let Some(autoscroll) = app.selection_autoscroll.as_mut() {
-            autoscroll.awaiting_frame_since = None;
+            autoscroll.pending_lines = autoscroll
+                .pending_lines
+                .saturating_sub(usize::try_from(lines).unwrap_or(usize::MAX));
         }
     } else {
         capture_selection_rows(selection, after);
-        if changed && pending_direction.is_some() {
-            // The public scroll command was routed to the inner application or its
-            // alternate screen rather than moving Herdr's host scrollback.
-            app.selection_autoscroll = None;
-        }
     }
 }
 
-fn viewport_shifted(
+fn viewport_shift_distance(
     before: &[CapturedRow],
     after: &[CapturedRow],
     direction: SelectionAutoscrollDirection,
-) -> bool {
+) -> Option<usize> {
     if before.len() != after.len() || before.is_empty() || before == after {
-        return false;
+        return None;
     }
     if before.len() == 1 {
-        return true;
+        return Some(1);
     }
-    match direction {
-        SelectionAutoscrollDirection::Up => before[..before.len() - 1] == after[1..],
-        SelectionAutoscrollDirection::Down => before[1..] == after[..after.len() - 1],
-    }
+    (1..before.len()).find(|lines| match direction {
+        SelectionAutoscrollDirection::Up => before[..before.len() - lines] == after[*lines..],
+        SelectionAutoscrollDirection::Down => before[*lines..] == after[..after.len() - lines],
+    })
 }
 
 fn fall_back_to_observe(app: &mut App, pane: &PaneId) {
@@ -2477,7 +2467,7 @@ mod tests {
         mouse_passthrough_enabled, prefer_terminal_clipboard_for_env, reconcile_selection,
         render_vt_screen, safe_text, select_workspace, selected_terminal_text, sidebar_pane_at_row,
         tab_at_column, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
-        viewport_shifted, visible_pane_areas,
+        viewport_shift_distance, visible_pane_areas,
     };
     use crate::model::{PaneId, TargetSession};
     use crate::state::{
@@ -2696,11 +2686,10 @@ mod tests {
         let current = rows(b"line3\r\nline4\r\nline5");
         let one_up = rows(b"old2\r\nline3\r\nline4");
         let two_up = rows(b"old1\r\nold2\r\nline3");
-        assert!(viewport_shifted(
-            &current,
-            &one_up,
-            SelectionAutoscrollDirection::Up
-        ));
+        assert_eq!(
+            viewport_shift_distance(&current, &one_up, SelectionAutoscrollDirection::Up),
+            Some(1)
+        );
 
         let mut selection = TerminalSelection {
             pane: pane.clone(),
@@ -2718,7 +2707,7 @@ mod tests {
                 pane: pane.clone(),
                 direction: SelectionAutoscrollDirection::Up,
                 column: 0,
-                awaiting_frame_since: Some(Instant::now()),
+                pending_lines: 1,
             }),
             ..App::default()
         };
