@@ -156,6 +156,7 @@ async fn discover_sessions_once(
 
 fn valid_discovered_session(session: &DiscoveredSession) -> bool {
     !session.name.is_empty()
+        && !session.name.contains('/')
         && !session.name.chars().any(char::is_control)
         && std::path::Path::new(&session.socket_path).is_absolute()
         && !session.socket_path.contains(':')
@@ -699,7 +700,7 @@ mod tests {
     #[test]
     fn parses_and_validates_public_session_list_json() {
         let sessions: SessionList = serde_json::from_str(
-            r#"{"sessions":[{"name":"default","running":true,"session_dir":"/home/user/.config/herdr","socket_path":"/home/user/.config/herdr/herdr.sock"}]}"#,
+            r#"{"sessions":[{"name":"default","running":true,"session_dir":"/srv/herdr","socket_path":"/srv/herdr/herdr.sock"}]}"#,
         )
         .unwrap();
 
@@ -717,6 +718,9 @@ mod tests {
         };
         assert!(!valid_discovered_session(&session));
         session.socket_path = "/tmp/remote:socket".to_owned();
+        assert!(!valid_discovered_session(&session));
+        session.socket_path = "/tmp/herdr.sock".to_owned();
+        session.name = "bad/name".to_owned();
         assert!(!valid_discovered_session(&session));
     }
 

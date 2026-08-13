@@ -68,22 +68,16 @@ provided Makefile targets.
 ```sh
 git pull
 make macos
+super-herdr target add development --ssh development-host --discover-sessions
+super-herdr target list
 super-herdr clipboard check
-super-herdr check
+super-herdr probe
 super-herdr
 ```
 
-`make macos` installs the binary and creates
-`~/.config/super-herdr/config.toml` from `config.macos.example.toml` only when no
-configuration already exists.
-
-To replace an installed stock configuration after target endpoints change:
-
-```sh
-make macos-config
-```
-
-The previous configuration is retained as `config.toml.backup`.
+Replace `development-host` with an alias that already works with ordinary
+OpenSSH. `make macos` installs the binary and preserves any existing
+configuration. The first `target add` creates a private configuration file.
 
 ### Linux desktop
 
@@ -92,13 +86,15 @@ Install `wl-clipboard` for Wayland or `xclip`/`xsel` for X11, then run:
 ```sh
 git pull
 make linux
+super-herdr target add development --ssh development-host --discover-sessions
+super-herdr target list
 super-herdr clipboard check
-super-herdr check
+super-herdr probe
 super-herdr
 ```
 
-`make linux` preserves an existing configuration and otherwise installs
-`config.example.toml` as the starting point.
+`make linux` preserves an existing configuration. As on macOS, replace the
+example SSH alias with one defined on the desktop where Super-Herdr runs.
 
 ### Development checkout
 
@@ -117,6 +113,62 @@ The default configuration path is
 `~/.config/super-herdr/config.toml`. It can be overridden with either
 `--config PATH` or `SUPER_HERDR_CONFIG`.
 
+### Add a machine from the command line
+
+First verify that the desktop can reach the machine using its normal SSH alias:
+
+```sh
+ssh -o BatchMode=yes development-host true
+```
+
+Then add it and discover every Herdr session that is already running there:
+
+```sh
+super-herdr target add development \
+  --ssh development-host \
+  --discover-sessions
+
+super-herdr target list
+super-herdr probe
+```
+
+`development` is Super-Herdr's stable label for the machine;
+`development-host` is the OpenSSH destination. Super-Herdr stores the alias, not
+an SSH password or private key. SSH authentication, host keys, jump hosts, and
+network routing remain in OpenSSH configuration.
+
+To monitor just one named Herdr session instead of discovering all running
+sessions:
+
+```sh
+super-herdr target add build --ssh build-host --session toolchains
+```
+
+To add Herdr running on the same desktop:
+
+```sh
+super-herdr target add desktop --local --discover-sessions
+```
+
+The optional advanced overrides are `--socket /absolute/path/to/herdr.sock` and
+repeatable `--herdr-bin COMMAND`. Normally neither is necessary: session
+discovery supplies the socket path and `herdr` is resolved on the target's
+command search path.
+
+`target add` validates the complete TOML configuration and replaces it
+atomically with mode `0600`; when appending to an existing file it retains the
+existing text and comments. It only changes Super-Herdr configuration. It does
+not connect to, create, start, stop, or restart a Herdr session. Run `probe`
+afterward to test connectivity.
+
+JSON is not the configuration format. TOML remains the durable, human-editable
+source of truth. JSON output is available only where it helps automation, such
+as `probe --json`.
+
+### Edit TOML directly
+
+The equivalent hand-written configuration is:
+
 ```toml
 [transport]
 ssh_bin = "ssh"
@@ -128,20 +180,11 @@ command_timeout_seconds = 20
 name = "development"
 ssh = "development-host"
 discover_sessions = true
-session = "work"
-socket = "/home/user/.config/herdr/sessions/work/herdr.sock"
-herdr_bins = [
-  "/home/user/.local/bin/herdr",
-]
 
 [[targets]]
 name = "build"
 ssh = "build-host"
 discover_sessions = true
-session = "toolchains"
-herdr_bins = [
-  "/home/user/.local/bin/herdr",
-]
 ```
 
 Here, `development-host` and `build-host` are example entries in
@@ -159,7 +202,8 @@ Target fields:
   documented `events.subscribe` updates. SSH targets forward this Unix socket
   through OpenSSH.
 - `herdr_bins`: compatible Herdr client candidates in preference order. Only a
-  protocol mismatch advances to the next candidate.
+  protocol mismatch advances to the next candidate. The default is `herdr` from
+  the target's command search path; configure an absolute path only when needed.
 
 Each discovered session is supervised independently. A failed target does not
 freeze or tear down other targets.
@@ -167,6 +211,8 @@ freeze or tear down other targets.
 ## Commands
 
 ```sh
+super-herdr target add NAME --ssh SSH_ALIAS --discover-sessions
+super-herdr target list
 super-herdr check
 super-herdr probe
 super-herdr probe --json
@@ -178,6 +224,8 @@ super-herdr tui
 Running `super-herdr` without a subcommand opens the TUI.
 
 - `check` parses the configuration and reports its targets.
+- `target add` atomically adds a local or SSH host to the TOML configuration.
+- `target list` shows configured hosts without contacting them.
 - `probe` queries configured sessions concurrently and reports failures per
   target.
 - `clipboard check` reports the active copy, text-paste, and image-paste paths.
@@ -307,6 +355,8 @@ cargo clippy -j 4 -- -D warnings
 
 ## Current limitations and next slices
 
+- Target addition is currently command-line driven. An interactive TUI dialog
+  will use the same configuration layer in the next slice.
 - Running session discovery occurs at startup; live session-registry refresh is
   still planned.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG

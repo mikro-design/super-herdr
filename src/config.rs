@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -14,7 +15,7 @@ pub struct Config {
     pub targets: Vec<Target>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     #[serde(default = "default_ssh_bin")]
@@ -38,19 +39,19 @@ impl Default for TransportConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
     /// Discover all Herdr sessions on this host at startup.
     #[serde(default)]
     pub discover_sessions: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// Documented Herdr API socket. Enables event subscriptions when present.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
     /// Ordered client candidates. A protocol mismatch advances to the next one.
     #[serde(default = "default_herdr_bins")]
@@ -87,6 +88,44 @@ impl Config {
         Ok(config)
     }
 
+    pub fn add_target_file(explicit_path: Option<&Path>, target: Target) -> Result<PathBuf> {
+        let path = resolve_path(explicit_path)?;
+        let existing = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+
+        let contents = if let Some(mut text) = existing {
+            let mut config = Self::parse(&text)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            config.targets.push(target.clone());
+            config.validate()?;
+
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push('\n');
+            text.push_str(&toml::to_string_pretty(&TargetAppend {
+                targets: vec![&target],
+            })?);
+            text
+        } else {
+            let config = Self {
+                transport: TransportConfig::default(),
+                targets: vec![target],
+            };
+            config.validate()?;
+            toml::to_string_pretty(&config)?
+        };
+
+        Self::parse(&contents).context("generated configuration is invalid")?;
+        write_private_atomic(&path, contents.as_bytes())?;
+        Ok(path)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.targets.is_empty() {
             bail!("configuration must contain at least one [[targets]] entry");
@@ -103,8 +142,11 @@ impl Config {
 
         let mut names = HashSet::new();
         for target in &self.targets {
-            if target.name.trim().is_empty() {
-                bail!("target name must not be empty");
+            if target.name.trim().is_empty()
+                || target.name.contains('/')
+                || target.name.chars().any(char::is_control)
+            {
+                bail!("target name must be non-empty and contain no '/' or control characters");
             }
             if !names.insert(target.name.as_str()) {
                 bail!("duplicate target name {:?}", target.name);
@@ -125,8 +167,10 @@ impl Config {
             {
                 bail!("target {:?} has an invalid SSH destination", target.name);
             }
-            if target.session.as_ref().is_some_and(String::is_empty) {
-                bail!("target {:?} has an empty session name", target.name);
+            if target.session.as_ref().is_some_and(|session| {
+                session.is_empty() || session.contains('/') || session.chars().any(char::is_control)
+            }) {
+                bail!("target {:?} has an invalid session name", target.name);
             }
             if let Some(socket) = &target.socket {
                 if socket.is_empty()
@@ -145,6 +189,62 @@ impl Config {
         }
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct TargetAppend<'a> {
+    targets: Vec<&'a Target>,
+}
+
+fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .context("configuration path has no parent directory")?;
+    let directory_exists = directory.exists();
+    fs::create_dir_all(directory).context("failed to create the configuration directory")?;
+    if !directory_exists {
+        set_directory_permissions(directory)?;
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".config-")
+        .tempfile_in(directory)
+        .context("failed to create a temporary configuration file")?;
+    set_file_permissions(temporary.path())?;
+    temporary
+        .write_all(contents)
+        .context("failed to write configuration")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("failed to synchronize configuration")?;
+    temporary
+        .persist(path)
+        .context("failed to atomically replace configuration")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .context("failed to secure the configuration directory")
+}
+
+#[cfg(not(unix))]
+fn set_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .context("failed to secure the configuration file")
+}
+
+#[cfg(not(unix))]
+fn set_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn resolve_path(explicit_path: Option<&Path>) -> Result<PathBuf> {
@@ -184,7 +284,9 @@ const fn default_command_timeout() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use std::fs;
+
+    use super::{Config, Target};
 
     #[test]
     fn parses_local_and_ssh_targets() {
@@ -195,20 +297,20 @@ mod tests {
 
                 [[targets]]
                 name = "remote"
-                ssh = "user@host"
+                ssh = "host-alias"
                 session = "dev"
-                socket = "/home/user/.config/herdr/sessions/dev/herdr.sock"
+                socket = "/srv/herdr/sessions/dev/herdr.sock"
             "#,
         )
         .unwrap();
 
         assert_eq!(config.targets[0].endpoint(), "local");
-        assert_eq!(config.targets[1].endpoint(), "user@host");
+        assert_eq!(config.targets[1].endpoint(), "host-alias");
         assert!(!config.targets[0].discover_sessions);
         assert_eq!(config.targets[1].session_name(), "dev");
         assert_eq!(
             config.targets[1].socket.as_deref(),
-            Some("/home/user/.config/herdr/sessions/dev/herdr.sock")
+            Some("/srv/herdr/sessions/dev/herdr.sock")
         );
         assert_eq!(
             config.targets[1].candidate_bins().collect::<Vec<_>>(),
@@ -288,5 +390,74 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("invalid socket path"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_qualified_names() {
+        let error = Config::parse(
+            r#"
+                [[targets]]
+                name = "bad/name"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("target name"));
+    }
+
+    #[test]
+    fn atomically_creates_and_appends_targets_without_losing_comments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let first = Target {
+            name: "development".to_owned(),
+            ssh: Some("development-host".to_owned()),
+            discover_sessions: true,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        Config::add_target_file(Some(&path), first).unwrap();
+
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.insert_str(0, "# retained operator note\n");
+        fs::write(&path, text).unwrap();
+
+        let second = Target {
+            name: "build".to_owned(),
+            ssh: Some("build-host".to_owned()),
+            discover_sessions: false,
+            session: Some("toolchains".to_owned()),
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        Config::add_target_file(Some(&path), second).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# retained operator note\n"));
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.targets.len(), 2);
+        assert_eq!(config.targets[1].name, "build");
+    }
+
+    #[test]
+    fn rejects_duplicate_target_add_without_changing_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let target = Target {
+            name: "development".to_owned(),
+            ssh: Some("development-host".to_owned()),
+            discover_sessions: true,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        Config::add_target_file(Some(&path), target.clone()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = Config::add_target_file(Some(&path), target).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate target"));
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 }

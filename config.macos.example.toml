@@ -1,5 +1,6 @@
 # Run the Super-Herdr frontend on macOS so selected text is written through
 # native pbcopy. Herdr servers and persistent terminal state remain remote.
+# Prefer `super-herdr target add`; this file documents the equivalent TOML.
 
 [transport]
 ssh_bin = "ssh"
@@ -11,14 +12,8 @@ command_timeout_seconds = 20
 name = "development"
 ssh = "development-host"
 discover_sessions = true
-session = "work"
-socket = "/home/user/.config/herdr/sessions/work/herdr.sock"
-herdr_bins = ["/home/user/.local/bin/herdr"]
 
 [[targets]]
 name = "build"
 ssh = "build-host"
 discover_sessions = true
-session = "toolchains"
-socket = "/home/user/.config/herdr/sessions/toolchains/herdr.sock"
-herdr_bins = ["/home/user/.local/bin/herdr"]

@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use super_herdr::clipboard;
-use super_herdr::config::Config;
+use super_herdr::config::{Config, Target};
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
 use super_herdr::tui;
@@ -49,12 +49,51 @@ enum Commands {
         #[command(subcommand)]
         command: ClipboardCommands,
     },
+    /// Add or inspect configured Herdr hosts.
+    Target {
+        #[command(subcommand)]
+        command: TargetCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum ClipboardCommands {
     /// Report the active native or terminal-mediated clipboard paths.
     Check,
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetCommands {
+    /// Add a local or SSH Herdr host to the TOML configuration.
+    Add {
+        /// Stable name used to qualify this host's Herdr IDs.
+        name: String,
+        /// OpenSSH destination or alias.
+        #[arg(
+            long,
+            value_name = "DESTINATION",
+            required_unless_present = "local",
+            conflicts_with = "local"
+        )]
+        ssh: Option<String>,
+        /// Run Herdr directly on this desktop instead of over SSH.
+        #[arg(long, conflicts_with = "ssh")]
+        local: bool,
+        /// Discover all running Herdr sessions when Super-Herdr starts.
+        #[arg(long)]
+        discover_sessions: bool,
+        /// Use one named session, or retain it as the discovery fallback.
+        #[arg(long, value_name = "NAME")]
+        session: Option<String>,
+        /// Absolute Herdr API socket path on the target.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Herdr client candidate on the target; repeat for fallbacks.
+        #[arg(long = "herdr-bin", value_name = "COMMAND")]
+        herdr_bins: Vec<String>,
+    },
+    /// List configured Herdr hosts without connecting to them.
+    List,
 }
 
 #[tokio::main]
@@ -82,6 +121,12 @@ async fn run() -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    let command = match command {
+        Commands::Target { command } => {
+            return run_target_command(cli.config.as_deref(), command);
+        }
+        command => command,
+    };
     let (config, path) = Config::load(cli.config.as_deref())?;
 
     match command {
@@ -173,5 +218,57 @@ async fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Clipboard { .. } => unreachable!("clipboard commands return before config load"),
+        Commands::Target { .. } => unreachable!("target commands return before config load"),
+    }
+}
+
+fn run_target_command(
+    config_path: Option<&std::path::Path>,
+    command: TargetCommands,
+) -> Result<ExitCode> {
+    match command {
+        TargetCommands::Add {
+            name,
+            ssh,
+            local: _,
+            discover_sessions,
+            session,
+            socket,
+            herdr_bins,
+        } => {
+            let target = Target {
+                name: name.clone(),
+                ssh,
+                discover_sessions,
+                session,
+                socket,
+                herdr_bins: if herdr_bins.is_empty() {
+                    vec!["herdr".to_owned()]
+                } else {
+                    herdr_bins
+                },
+            };
+            let path = Config::add_target_file(config_path, target)?;
+            println!("added target {name:?} to {}", path.display());
+            println!("run `super-herdr probe` to verify it");
+            Ok(ExitCode::SUCCESS)
+        }
+        TargetCommands::List => {
+            let (config, path) = Config::load(config_path)?;
+            println!(
+                "{}: {} configured target(s)",
+                path.display(),
+                config.targets.len()
+            );
+            for target in &config.targets {
+                let scope = if target.discover_sessions {
+                    "all running sessions"
+                } else {
+                    target.session_name()
+                };
+                println!("  {}: {} / {scope}", target.name, target.endpoint());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }

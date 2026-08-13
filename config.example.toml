@@ -1,5 +1,6 @@
 # Super-Herdr runs on the desktop and connects to each Herdr host. For a target
 # on the same machine, omit `ssh` and the Herdr command is executed directly.
+# Prefer `super-herdr target add`; this file documents the equivalent TOML.
 
 [transport]
 ssh_bin = "ssh"
@@ -11,19 +12,12 @@ command_timeout_seconds = 20
 name = "development"
 ssh = "development-host"
 discover_sessions = true
-session = "work"
-# Optional: enables event-driven updates. For SSH targets this is the socket path
-# on the remote host; Super-Herdr forwards it through OpenSSH.
-socket = "/home/user/.config/herdr/sessions/work/herdr.sock"
-# Try clients in order; only a protocol mismatch advances to the next candidate.
-herdr_bins = [
-  "/home/user/.local/bin/herdr",
-  "/home/user/.local/bin/herdr-0.7.5",
-]
+# Optional overrides:
+#session = "default"
+#socket = "/absolute/path/to/herdr.sock"
+#herdr_bins = ["/absolute/path/to/herdr"]
 
 #[[targets]]
 #name = "build"
 #ssh = "build-host"
 #discover_sessions = true
-#session = "toolchains"
-#herdr_bins = ["/home/user/.local/bin/herdr"]
