@@ -70,7 +70,7 @@ provided Makefile targets.
 ### Prebuilt binaries
 
 Each tagged release publishes stripped binaries with SHA-256 checksums on the
-[releases page](https://github.com/rbarzic/super-herdr/releases). Pick the
+[releases page](https://github.com/mikro-design/super-herdr/releases). Pick the
 archive matching your platform:
 
 - `aarch64-apple-darwin` — macOS Apple Silicon
@@ -79,17 +79,32 @@ archive matching your platform:
 - `aarch64-unknown-linux-gnu` — Linux ARM64
 
 ```sh
-# Replace <tag> and <target> with the version and platform you want.
-curl -LO https://github.com/rbarzic/super-herdr/releases/download/<tag>/super-herdr-<tag>-<target>.tar.gz
-curl -LO https://github.com/rbarzic/super-herdr/releases/download/<tag>/super-herdr-<tag>-<target>.tar.gz.sha256
-sha256sum -c super-herdr-<tag>-<target>.tar.gz.sha256
-tar xzf super-herdr-<tag>-<target>.tar.gz
-install -m 0755 super-herdr-<tag>-<target>/super-herdr ~/.cargo/bin/
+# Set these to an available release and one of the targets listed above.
+tag=v0.2.0
+target=aarch64-apple-darwin
+archive="super-herdr-${tag}-${target}.tar.gz"
+release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
+
+curl -fLO "${release_url}/${archive}"
+curl -fLO "${release_url}/${archive}.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "${archive}.sha256"
+else
+  shasum -a 256 -c "${archive}.sha256"
+fi
+tar xzf "${archive}"
+install -d ~/.cargo/bin
+install -m 0755 "super-herdr-${tag}-${target}/super-herdr" ~/.cargo/bin/
 super-herdr --version
 ```
 
 Install into any directory on your `PATH`; `~/.cargo/bin` matches what
 `make macos`/`make linux` use below.
+
+Pull requests and manual workflow runs execute the quality gates and build all
+four archives without publishing a release. To publish, push a `v<version>` tag
+whose version exactly matches `Cargo.toml`; for example, package version `0.2.0`
+must be tagged `v0.2.0`.
 
 ### macOS
 
