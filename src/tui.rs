@@ -48,6 +48,7 @@ const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ROUTE_EVENT_DRAIN_LIMIT: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
+const SELECTION_SCROLL_FRAME_TIMEOUT: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -202,19 +203,29 @@ struct CellPosition {
 }
 
 impl CellPosition {
-    fn from_viewport(row: u16, column: u16, scrollback: usize) -> Self {
+    fn from_viewport(row: u16, column: u16, viewport_offset: i64) -> Self {
         Self {
-            row: i64::from(row) - i64::try_from(scrollback).unwrap_or(i64::MAX),
+            row: i64::from(row) - viewport_offset,
             column,
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedCell {
+    Text(String),
+    WideContinuation,
+}
+
+type CapturedRow = Vec<CapturedCell>;
 
 #[derive(Debug, Clone)]
 struct TerminalSelection {
     pane: PaneId,
     anchor: CellPosition,
     head: CellPosition,
+    viewport_offset: i64,
+    captured_rows: BTreeMap<i64, CapturedRow>,
     dragging: bool,
     forwarded_click: Option<MouseInput>,
 }
@@ -272,6 +283,7 @@ struct SelectionAutoscroll {
     pane: PaneId,
     direction: SelectionAutoscrollDirection,
     column: u16,
+    awaiting_frame_since: Option<Instant>,
 }
 
 struct ClipboardFeedback {
@@ -454,7 +466,7 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
             _ = selection_ticks.tick() => {
-                if tick_selection_autoscroll(&mut app) {
+                if tick_selection_autoscroll(&mut app).await? {
                     should_draw = true;
                 }
             }
@@ -614,14 +626,11 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
         if let Some(viewport_position) =
             clamped_pane_position(outer, state, app, terminal_area, &pane)
         {
-            let scrollback = app
-                .routes
-                .get(&pane)
-                .map_or(0, |route| route.parser.screen().scrollback());
+            let viewport_offset = selection.viewport_offset;
             let position = CellPosition::from_viewport(
                 u16::try_from(viewport_position.row).unwrap_or_default(),
                 viewport_position.column,
-                scrollback,
+                viewport_offset,
             );
             if mouse.is_left_motion() {
                 let autoscroll_direction =
@@ -633,6 +642,11 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
                         selection.head != selection.anchor || autoscroll_direction.is_some();
                     selection.dragging
                 };
+                let awaiting_frame_since = app.selection_autoscroll.as_ref().and_then(|current| {
+                    (current.pane == pane && Some(current.direction) == autoscroll_direction)
+                        .then_some(current.awaiting_frame_since)
+                        .flatten()
+                });
                 app.selection_autoscroll =
                     dragging
                         .then_some(autoscroll_direction)
@@ -641,13 +655,14 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
                             pane,
                             direction,
                             column: position.column,
+                            awaiting_frame_since,
                         });
             } else {
                 app.selection_autoscroll = None;
                 let mut selection = app.selection.take().expect("selection was checked above");
                 match selection.finish(position, viewport_position, mouse) {
                     SelectionFinish::Retain => {
-                        copy_terminal_selection(&selection, app)?;
+                        copy_terminal_selection(&mut selection, app)?;
                         app.selection = Some(selection);
                     }
                     SelectionFinish::ForwardClick(events) => {
@@ -709,30 +724,31 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
     if mouse.is_vertical_wheel() {
         app.selection = None;
         app.selection_autoscroll = None;
-        reset_route_scrollback(app, &pane);
         return send_terminal_scroll(&pane, local_mouse, state, app).await;
     }
 
     if mouse.is_left_press() {
         let forwarded_click =
             (pane_reports_mouse(app, &pane) && !mouse.shift()).then_some(local_mouse);
-        let scrollback = app
-            .routes
-            .get(&pane)
-            .map_or(0, |route| route.parser.screen().scrollback());
         let position = CellPosition::from_viewport(
             u16::try_from(position.row).unwrap_or_default(),
             position.column,
-            scrollback,
+            0,
         );
         app.selection_autoscroll = None;
-        app.selection = Some(TerminalSelection {
+        let mut selection = TerminalSelection {
             pane,
             anchor: position,
             head: position,
+            viewport_offset: 0,
+            captured_rows: BTreeMap::new(),
             dragging: false,
             forwarded_click,
-        });
+        };
+        if let Some(route) = app.routes.get(&selection.pane) {
+            capture_selection_viewport(&mut selection, route.parser.screen());
+        }
+        app.selection = Some(selection);
         return Ok(());
     }
 
@@ -866,9 +882,9 @@ fn pane_inner_area(
     (inner.width > 0 && inner.height > 0).then_some(inner)
 }
 
-fn tick_selection_autoscroll(app: &mut App) -> bool {
+async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
     let Some(autoscroll) = app.selection_autoscroll.clone() else {
-        return false;
+        return Ok(false);
     };
     if !app
         .selection
@@ -876,63 +892,51 @@ fn tick_selection_autoscroll(app: &mut App) -> bool {
         .is_some_and(|selection| selection.pane == autoscroll.pane && selection.dragging)
     {
         app.selection_autoscroll = None;
-        return false;
+        return Ok(false);
     }
-    let Some(route) = app.routes.get_mut(&autoscroll.pane) else {
+    if let Some(sent_at) = autoscroll.awaiting_frame_since {
+        if sent_at.elapsed() < SELECTION_SCROLL_FRAME_TIMEOUT {
+            return Ok(false);
+        }
         app.selection_autoscroll = None;
-        return false;
-    };
-    let Some(head) = advance_selection_viewport(
-        route.parser.screen_mut(),
-        autoscroll.direction,
-        autoscroll.column,
-    ) else {
+        return Ok(false);
+    }
+    let Some(route) = app.routes.get(&autoscroll.pane) else {
         app.selection_autoscroll = None;
-        return false;
+        return Ok(false);
     };
-    if let Some(selection) = app.selection.as_mut() {
-        selection.head = head;
-    }
-    true
-}
-
-fn advance_selection_viewport(
-    screen: &mut vt100::Screen,
-    direction: SelectionAutoscrollDirection,
-    column: u16,
-) -> Option<CellPosition> {
-    let before = screen.scrollback();
-    let requested = match direction {
-        SelectionAutoscrollDirection::Up => before.saturating_add(1),
-        SelectionAutoscrollDirection::Down => before.saturating_sub(1),
+    let direction = match autoscroll.direction {
+        SelectionAutoscrollDirection::Up => TerminalScrollDirection::Up,
+        SelectionAutoscrollDirection::Down => TerminalScrollDirection::Down,
     };
-    screen.set_scrollback(requested);
-    let scrollback = screen.scrollback();
-    if scrollback == before {
-        return None;
-    }
-    let (rows, _) = screen.size();
-    let viewport_row = match direction {
+    let row = match autoscroll.direction {
         SelectionAutoscrollDirection::Up => 0,
-        SelectionAutoscrollDirection::Down => rows.saturating_sub(1),
+        SelectionAutoscrollDirection::Down => route.rows.saturating_sub(1),
     };
-    Some(CellPosition::from_viewport(
-        viewport_row,
-        column,
-        scrollback,
-    ))
-}
-
-fn reset_route_scrollback(app: &mut App, pane: &PaneId) {
-    if let Some(route) = app.routes.get_mut(pane) {
-        route.parser.screen_mut().set_scrollback(0);
+    let command = terminal_scroll_command(direction, 1, autoscroll.column, row, 0)?;
+    let Some(input) = app
+        .routes
+        .get_mut(&autoscroll.pane)
+        .and_then(|route| route.input.as_mut())
+    else {
+        app.selection_autoscroll = None;
+        return Ok(false);
+    };
+    if input.write_all(&command).await.is_err() {
+        fall_back_to_observe(app, &autoscroll.pane);
+        app.selection_autoscroll = None;
+        return Ok(false);
     }
+    if let Some(current) = app.selection_autoscroll.as_mut()
+        && current.pane == autoscroll.pane
+        && current.direction == autoscroll.direction
+    {
+        current.awaiting_frame_since = Some(Instant::now());
+    }
+    Ok(false)
 }
 
 fn select_pane(app: &mut App, pane: PaneId) {
-    if let Some(previous) = app.selected_pane.clone() {
-        reset_route_scrollback(app, &previous);
-    }
     app.selection_explicit = true;
     app.selection = None;
     app.selection_autoscroll = None;
@@ -1086,11 +1090,12 @@ fn encode_mouse_event(
     }
 }
 
-fn copy_terminal_selection(selection: &TerminalSelection, app: &mut App) -> Result<()> {
-    let Some(route) = app.routes.get_mut(&selection.pane) else {
+fn copy_terminal_selection(selection: &mut TerminalSelection, app: &mut App) -> Result<()> {
+    let Some(route) = app.routes.get(&selection.pane) else {
         return Ok(());
     };
-    let text = selected_terminal_text(&mut route.parser, selection);
+    capture_selection_viewport(selection, route.parser.screen());
+    let text = selected_terminal_text(selection);
     if text.is_empty() {
         app.message = Some("selection is empty".to_owned());
         return Ok(());
@@ -1124,68 +1129,64 @@ impl ClipboardDelivery {
     }
 }
 
-fn selected_terminal_text(parser: &mut vt100::Parser, selection: &TerminalSelection) -> String {
-    let screen = parser.screen_mut();
-    let (rows, columns) = screen.size();
-    if rows == 0 || columns == 0 {
-        return String::new();
-    }
-    let original_scrollback = screen.scrollback();
-    screen.set_scrollback(usize::MAX);
-    let maximum_scrollback = screen.scrollback();
-    screen.set_scrollback(original_scrollback);
-
+fn selected_terminal_text(selection: &TerminalSelection) -> String {
     let start = selection.anchor.min(selection.head);
     let end = selection.anchor.max(selection.head);
-    let start = CellPosition {
-        row: start.row.clamp(
-            -i64::try_from(maximum_scrollback).unwrap_or(i64::MAX),
-            i64::from(rows - 1),
-        ),
-        column: start.column.min(columns - 1),
-    };
-    let end = CellPosition {
-        row: end.row.clamp(
-            -i64::try_from(maximum_scrollback).unwrap_or(i64::MAX),
-            i64::from(rows - 1),
-        ),
-        column: end.column.min(columns - 1),
-    };
     let mut lines = Vec::new();
     for row in start.row..=end.row {
-        let first_column = if row == start.row { start.column } else { 0 };
-        let last_column = if row == end.row {
+        let Some(cells) = selection.captured_rows.get(&row) else {
+            lines.push(String::new());
+            continue;
+        };
+        let first_column = usize::from(if row == start.row { start.column } else { 0 });
+        let last_column = usize::from(if row == end.row {
             end.column
         } else {
-            columns - 1
-        };
-        let (scrollback, viewport_row) = if row < 0 {
-            (usize::try_from(-row).unwrap_or(usize::MAX), 0)
-        } else {
-            (0, u16::try_from(row).unwrap_or(rows - 1))
-        };
-        screen.set_scrollback(scrollback);
-        if screen.scrollback() != scrollback {
-            continue;
-        }
+            u16::try_from(cells.len().saturating_sub(1)).unwrap_or(u16::MAX)
+        })
+        .min(cells.len().saturating_sub(1));
         let mut line = String::new();
-        for column in first_column..=last_column {
-            let Some(cell) = screen.cell(viewport_row, column) else {
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            if cell.has_contents() {
-                line.push_str(cell.contents());
-            } else {
-                line.push(' ');
+        if first_column <= last_column {
+            for cell in &cells[first_column..=last_column] {
+                if let CapturedCell::Text(text) = cell {
+                    line.push_str(text);
+                }
             }
         }
         lines.push(line.trim_end_matches(' ').to_owned());
     }
-    screen.set_scrollback(original_scrollback);
     lines.join("\n")
+}
+
+fn capture_selection_viewport(selection: &mut TerminalSelection, screen: &vt100::Screen) {
+    capture_selection_rows(selection, capture_screen_rows(screen));
+}
+
+fn capture_selection_rows(selection: &mut TerminalSelection, rows: Vec<CapturedRow>) {
+    for (viewport_row, row) in rows.into_iter().enumerate() {
+        let Ok(viewport_row) = u16::try_from(viewport_row) else {
+            break;
+        };
+        let logical_row = i64::from(viewport_row) - selection.viewport_offset;
+        selection.captured_rows.insert(logical_row, row);
+    }
+}
+
+fn capture_screen_rows(screen: &vt100::Screen) -> Vec<CapturedRow> {
+    let (rows, columns) = screen.size();
+    (0..rows)
+        .map(|row| {
+            (0..columns)
+                .map(|column| match screen.cell(row, column) {
+                    Some(cell) if cell.is_wide_continuation() => CapturedCell::WideContinuation,
+                    Some(cell) if cell.has_contents() => {
+                        CapturedCell::Text(cell.contents().to_owned())
+                    }
+                    _ => CapturedCell::Text(" ".to_owned()),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn write_clipboard(text: &str) -> Result<ClipboardDelivery> {
@@ -1270,9 +1271,6 @@ async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result
         InputMode::Terminal if key == PREFIX_KEY => {
             app.selection = None;
             app.selection_autoscroll = None;
-            if let Some(selected) = app.selected_pane.clone() {
-                reset_route_scrollback(app, &selected);
-            }
             app.mode = InputMode::Prefix;
         }
         InputMode::Terminal => {
@@ -1282,7 +1280,6 @@ async fn handle_input(key: u8, state: &FederationState, app: &mut App) -> Result
                 app.message = Some("no terminal pane is selected".to_owned());
                 return Ok(false);
             };
-            reset_route_scrollback(app, &selected);
             let Some(route) = app.routes.get(&selected) else {
                 app.message = Some("selected pane has no control route".to_owned());
                 return Ok(false);
@@ -1685,15 +1682,36 @@ fn spawn_route_reader(
 fn handle_route_event(event: RouteEvent, app: &mut App) {
     match event {
         RouteEvent::Output { serial, event } => {
-            if let Some(route) = app.routes.values_mut().find(|route| route.serial == serial)
-                && let TerminalEvent::Frame {
-                    sequence,
-                    width,
-                    height,
-                    full,
-                    bytes,
-                } = event
-            {
+            let Some(pane) = route_pane_for_serial(app, serial) else {
+                return;
+            };
+            let TerminalEvent::Frame {
+                sequence,
+                width,
+                height,
+                full,
+                bytes,
+            } = event
+            else {
+                return;
+            };
+            let pending_direction = app
+                .selection_autoscroll
+                .as_ref()
+                .filter(|autoscroll| {
+                    autoscroll.pane == pane && autoscroll.awaiting_frame_since.is_some()
+                })
+                .map(|autoscroll| autoscroll.direction);
+            let before = pending_direction.and_then(|_| {
+                app.routes
+                    .get(&pane)
+                    .map(|route| capture_screen_rows(route.parser.screen()))
+            });
+            let after = {
+                let route = app
+                    .routes
+                    .get_mut(&pane)
+                    .expect("route was resolved by serial");
                 if full || route.rows != height || route.columns != width {
                     route.parser = vt100::Parser::new(height, width, 2_000);
                     route.rows = height;
@@ -1701,7 +1719,9 @@ fn handle_route_event(event: RouteEvent, app: &mut App) {
                 }
                 route.parser.process(&bytes);
                 route.last_sequence = Some(sequence);
-            }
+                capture_screen_rows(route.parser.screen())
+            };
+            update_selection_after_frame(app, &pane, pending_direction, before.as_deref(), after);
         }
         RouteEvent::Failed { serial } => {
             if let Some(pane) = route_pane_for_serial(app, serial) {
@@ -1741,6 +1761,75 @@ fn handle_route_event(event: RouteEvent, app: &mut App) {
                 }
             }
         }
+    }
+}
+
+fn update_selection_after_frame(
+    app: &mut App,
+    pane: &PaneId,
+    pending_direction: Option<SelectionAutoscrollDirection>,
+    before: Option<&[CapturedRow]>,
+    after: Vec<CapturedRow>,
+) {
+    let shifted = pending_direction.is_some_and(|direction| {
+        before.is_some_and(|before| viewport_shifted(before, &after, direction))
+    });
+    let changed = before.is_some_and(|before| before != after);
+
+    let Some(selection) = app
+        .selection
+        .as_mut()
+        .filter(|selection| &selection.pane == pane)
+    else {
+        app.selection_autoscroll = None;
+        return;
+    };
+    if shifted {
+        let direction = pending_direction.expect("shifted viewport has a direction");
+        selection.viewport_offset += match direction {
+            SelectionAutoscrollDirection::Up => 1,
+            SelectionAutoscrollDirection::Down => -1,
+        };
+        let viewport_row = match direction {
+            SelectionAutoscrollDirection::Up => 0,
+            SelectionAutoscrollDirection::Down => {
+                u16::try_from(after.len().saturating_sub(1)).unwrap_or(u16::MAX)
+            }
+        };
+        let column = app
+            .selection_autoscroll
+            .as_ref()
+            .map_or(selection.head.column, |autoscroll| autoscroll.column);
+        selection.head =
+            CellPosition::from_viewport(viewport_row, column, selection.viewport_offset);
+        capture_selection_rows(selection, after);
+        if let Some(autoscroll) = app.selection_autoscroll.as_mut() {
+            autoscroll.awaiting_frame_since = None;
+        }
+    } else {
+        capture_selection_rows(selection, after);
+        if changed && pending_direction.is_some() {
+            // The public scroll command was routed to the inner application or its
+            // alternate screen rather than moving Herdr's host scrollback.
+            app.selection_autoscroll = None;
+        }
+    }
+}
+
+fn viewport_shifted(
+    before: &[CapturedRow],
+    after: &[CapturedRow],
+    direction: SelectionAutoscrollDirection,
+) -> bool {
+    if before.len() != after.len() || before.is_empty() || before == after {
+        return false;
+    }
+    if before.len() == 1 {
+        return true;
+    }
+    match direction {
+        SelectionAutoscrollDirection::Up => before[..before.len() - 1] == after[1..],
+        SelectionAutoscrollDirection::Down => before[1..] == after[..after.len() - 1],
     }
 }
 
@@ -2265,7 +2354,7 @@ fn render_vt_screen(
                 selection.contains(CellPosition::from_viewport(
                     row,
                     column,
-                    screen.scrollback(),
+                    selection.viewport_offset,
                 ))
             }) {
                 style = style.add_modifier(Modifier::REVERSED);
@@ -2381,13 +2470,14 @@ mod tests {
 
     use super::{
         App, CellPosition, ClipboardFeedback, DecodedInput, InputDecoder, MOUSE_CAPTURE_ENABLE,
-        MouseInput, PREFIX_KEY, SIDEBAR_WIDTH, SelectionAutoscrollDirection, SelectionFinish,
-        TerminalSelection, advance_selection_viewport, clamped_pane_position, cycle_tab,
-        desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
-        finish_ui_left_gesture, mouse_event_allowed, mouse_passthrough_enabled,
-        prefer_terminal_clipboard_for_env, reconcile_selection, render_vt_screen, safe_text,
-        select_workspace, selected_terminal_text, sidebar_pane_at_row, tab_at_column, ui_areas,
-        update_sidebar_hit_areas, visible_pane_areas,
+        MouseInput, PREFIX_KEY, SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection,
+        SelectionFinish, TerminalSelection, capture_screen_rows, capture_selection_viewport,
+        clamped_pane_position, cycle_tab, desired_access, displayed_message, encode_mouse_event,
+        fall_back_to_observe, finish_ui_left_gesture, mouse_event_allowed,
+        mouse_passthrough_enabled, prefer_terminal_clipboard_for_env, reconcile_selection,
+        render_vt_screen, safe_text, select_workspace, selected_terminal_text, sidebar_pane_at_row,
+        tab_at_column, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
+        viewport_shifted, visible_pane_areas,
     };
     use crate::model::{PaneId, TargetSession};
     use crate::state::{
@@ -2460,6 +2550,8 @@ mod tests {
             pane: PaneId::new("ws01", "rv32sim", "w6:p1"),
             anchor: CellPosition { row: 2, column: 3 },
             head: CellPosition { row: 2, column: 3 },
+            viewport_offset: 0,
+            captured_rows: BTreeMap::new(),
             dragging: false,
             forwarded_click: Some(MouseInput {
                 code: 0,
@@ -2553,57 +2645,104 @@ mod tests {
         let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
         let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process(b"one   \r\ntwo");
-        let selection = TerminalSelection {
+        let mut selection = TerminalSelection {
             pane,
             anchor: CellPosition { row: 0, column: 0 },
             head: CellPosition { row: 1, column: 9 },
+            viewport_offset: 0,
+            captured_rows: BTreeMap::new(),
             dragging: true,
             forwarded_click: None,
         };
+        capture_selection_viewport(&mut selection, parser.screen());
 
-        assert_eq!(selected_terminal_text(&mut parser, &selection), "one\ntwo");
+        assert_eq!(selected_terminal_text(&selection), "one\ntwo");
     }
 
     #[test]
     fn copied_terminal_text_spans_scrollback_and_the_live_viewport() {
         let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
-        let mut parser = vt100::Parser::new(3, 12, 10);
-        parser.process(b"old1\r\nold2\r\nline3\r\nline4\r\nline5");
-        let selection = TerminalSelection {
+        let mut current = vt100::Parser::new(3, 12, 0);
+        current.process(b"line3\r\nline4\r\nline5");
+        let mut older = vt100::Parser::new(3, 12, 0);
+        older.process(b"old1\r\nold2\r\nline3");
+        let mut selection = TerminalSelection {
             pane,
             anchor: CellPosition { row: -2, column: 0 },
             head: CellPosition { row: 2, column: 11 },
+            viewport_offset: 0,
+            captured_rows: BTreeMap::new(),
             dragging: true,
             forwarded_click: None,
         };
+        capture_selection_viewport(&mut selection, current.screen());
+        selection.viewport_offset = 2;
+        capture_selection_viewport(&mut selection, older.screen());
 
         assert_eq!(
-            selected_terminal_text(&mut parser, &selection),
+            selected_terminal_text(&selection),
             "old1\nold2\nline3\nline4\nline5"
         );
-        assert_eq!(parser.screen().scrollback(), 0);
     }
 
     #[test]
-    fn selection_edge_ticks_scroll_and_extend_until_each_boundary() {
-        let mut parser = vt100::Parser::new(3, 12, 10);
-        parser.process(b"old1\r\nold2\r\nline3\r\nline4\r\nline5");
+    fn routed_scroll_frames_extend_selection_and_retain_traversed_rows() {
+        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let rows = |text: &[u8]| {
+            let mut parser = vt100::Parser::new(3, 12, 0);
+            parser.process(text);
+            capture_screen_rows(parser.screen())
+        };
+        let current = rows(b"line3\r\nline4\r\nline5");
+        let one_up = rows(b"old2\r\nline3\r\nline4");
+        let two_up = rows(b"old1\r\nold2\r\nline3");
+        assert!(viewport_shifted(
+            &current,
+            &one_up,
+            SelectionAutoscrollDirection::Up
+        ));
 
-        assert_eq!(
-            advance_selection_viewport(parser.screen_mut(), SelectionAutoscrollDirection::Up, 4,),
-            Some(CellPosition { row: -1, column: 4 })
+        let mut selection = TerminalSelection {
+            pane: pane.clone(),
+            anchor: CellPosition { row: 2, column: 11 },
+            head: CellPosition { row: 0, column: 0 },
+            viewport_offset: 0,
+            captured_rows: BTreeMap::new(),
+            dragging: true,
+            forwarded_click: None,
+        };
+        super::capture_selection_rows(&mut selection, current.clone());
+        let mut app = App {
+            selection: Some(selection),
+            selection_autoscroll: Some(SelectionAutoscroll {
+                pane: pane.clone(),
+                direction: SelectionAutoscrollDirection::Up,
+                column: 0,
+                awaiting_frame_since: Some(Instant::now()),
+            }),
+            ..App::default()
+        };
+
+        update_selection_after_frame(
+            &mut app,
+            &pane,
+            Some(SelectionAutoscrollDirection::Up),
+            Some(&current),
+            one_up.clone(),
         );
-        assert_eq!(
-            advance_selection_viewport(parser.screen_mut(), SelectionAutoscrollDirection::Up, 4,),
-            Some(CellPosition { row: -2, column: 4 })
+        assert_eq!(app.selection.as_ref().unwrap().viewport_offset, 1);
+        update_selection_after_frame(
+            &mut app,
+            &pane,
+            Some(SelectionAutoscrollDirection::Up),
+            Some(&one_up),
+            two_up,
         );
+        let selection = app.selection.as_ref().unwrap();
+        assert_eq!(selection.viewport_offset, 2);
         assert_eq!(
-            advance_selection_viewport(parser.screen_mut(), SelectionAutoscrollDirection::Up, 4,),
-            None
-        );
-        assert_eq!(
-            advance_selection_viewport(parser.screen_mut(), SelectionAutoscrollDirection::Down, 4,),
-            Some(CellPosition { row: 1, column: 4 })
+            selected_terminal_text(selection),
+            "old1\nold2\nline3\nline4\nline5"
         );
     }
 
@@ -2752,6 +2891,8 @@ mod tests {
             pane,
             anchor: CellPosition { row: 0, column: 1 },
             head: CellPosition { row: 0, column: 3 },
+            viewport_offset: 0,
+            captured_rows: BTreeMap::new(),
             dragging: true,
             forwarded_click: None,
         };
