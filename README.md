@@ -336,9 +336,11 @@ Unsupported or custom Herdr TUI chords are rejected with a status message; they
 are never leaked into the running pane. Protocol 19 has no public operation for
 dispatching an arbitrary key through Herdr's client-side keymap.
 
-The sidebar, tabs, and visible split panes are clickable. A click changes only
-Super-Herdr's local selection; it does not change another Herdr client's global
-focus.
+The sidebar, tabs, and visible split panes are clickable. Scroll the mouse wheel
+over the sidebar to reach hosts and workspaces beyond the current viewport. A
+keyboard or mouse selection automatically brings its workspace back into view.
+A click changes only Super-Herdr's local selection; it does not change another
+Herdr client's global focus.
 
 The target manager uses `j`/`k` to select a configured machine, `a` to add, `e`
 or `Enter` to edit, and `d` to remove with confirmation. In its form, `Tab`

@@ -17,7 +17,8 @@ cargo clippy -j 4 -- -D warnings
 Automated coverage must include qualified multi-host IDs, target failure
 isolation, atomic configuration writes, session discovery, terminal control and
 observe routing, mouse encoding, multipage selection, clipboard size/integrity
-checks, and persisted UI selection.
+checks, persisted UI selection, and sidebar overflow with offset-aware mouse
+targets.
 
 ## Manual desktop matrix
 
@@ -42,6 +43,9 @@ For every applicable row, verify:
 8. Adding, editing, or removing a target refreshes the TUI without restarting Herdr.
 9. Starting or stopping a Herdr session is reflected by registry refresh.
 10. The agent navigator filters and jumps across at least two hosts.
+11. With more workspace rows than fit onscreen, sidebar wheel scrolling reaches
+    every row, clicks select the displayed item, and keyboard selection plus
+    terminal resizing keep the selected workspace visible.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put
