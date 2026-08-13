@@ -31,7 +31,7 @@ jobs:
             archive_ext: tar.gz
 
           # macOS Intel
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             use_cross: false
             archive_ext: tar.gz
