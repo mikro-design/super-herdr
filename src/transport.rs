@@ -629,6 +629,34 @@ pub fn build_herdr_command(
     }
 }
 
+pub async fn run_herdr_operation(
+    target: &Target,
+    transport: &TransportConfig,
+    executable: &str,
+    operation_args: &[String],
+    command_timeout: Duration,
+) -> Result<(), SnapshotError> {
+    let mut command = build_herdr_command(target, transport, executable, operation_args);
+    let status = timeout(
+        command_timeout,
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| SnapshotError::timed_out(command_timeout))?
+    .map_err(|_| SnapshotError::unavailable("failed to start the Herdr action"))?;
+    if !status.success() {
+        return Err(SnapshotError::unavailable(format!(
+            "Herdr action exited with {status} (diagnostic output redacted)"
+        )));
+    }
+    Ok(())
+}
+
 pub fn build_ssh_command(
     destination: &str,
     transport: &TransportConfig,
@@ -708,8 +736,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EVENT_SUBSCRIPTIONS, SessionList, api_failure, event_subscription_request, parse_last_json,
-        quote_posix, targets_for_discovered_sessions, valid_discovered_session,
+        EVENT_SUBSCRIPTIONS, SessionList, api_failure, event_subscription_request, herdr_args,
+        parse_last_json, quote_posix, targets_for_discovered_sessions, valid_discovered_session,
     };
     use crate::config::Target;
 
@@ -718,6 +746,31 @@ mod tests {
         assert_eq!(quote_posix("plain"), "'plain'");
         assert_eq!(quote_posix("a'b"), "'a'\"'\"'b'");
         assert_eq!(quote_posix("$(touch bad)"), "'$(touch bad)'");
+    }
+
+    #[test]
+    fn herdr_actions_are_qualified_with_the_selected_session() {
+        let target = Target {
+            name: "development".to_owned(),
+            ssh: Some("development-host".to_owned()),
+            discover_sessions: false,
+            session: Some("work".to_owned()),
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+
+        assert_eq!(
+            herdr_args(
+                &target,
+                &[
+                    "pane".to_owned(),
+                    "zoom".to_owned(),
+                    "w1:p1".to_owned(),
+                    "--toggle".to_owned(),
+                ],
+            ),
+            ["--session", "work", "pane", "zoom", "w1:p1", "--toggle"]
+        );
     }
 
     #[test]

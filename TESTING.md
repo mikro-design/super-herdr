@@ -33,7 +33,8 @@ For every applicable row, verify:
 
 1. `super-herdr clipboard check` reports capabilities without reading payloads.
 2. `super-herdr probe` isolates an unreachable target while live targets remain usable.
-3. `Ctrl+B` reaches Herdr unchanged and `Ctrl+]` remains Super-Herdr's prefix.
+3. `Ctrl+B` opens Herdr-action mode, its supported chords affect only the
+   selected qualified session, and `Ctrl+]` remains Super-Herdr's prefix.
 4. Normal clicks reach mouse-aware programs; dragging selects locally.
 5. Edge dragging continues multipage selection without further pointer movement.
 6. Selection excludes sidebar, borders, and terminal padding.

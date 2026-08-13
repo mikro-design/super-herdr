@@ -260,8 +260,9 @@ Running `super-herdr` without a subcommand opens the TUI.
 
 ## TUI controls
 
-Normal keyboard input goes to the selected Herdr pane. Herdr's `Ctrl+B` prefix is
-left untouched. Super-Herdr uses `Ctrl+]` as its own prefix:
+Normal keyboard input goes to the selected Herdr pane. Super-Herdr uses
+`Ctrl+]` as its federation prefix and reserves `Ctrl+B` for Herdr-compatible
+workspace actions:
 
 | Input | Action |
 | --- | --- |
@@ -275,6 +276,26 @@ left untouched. Super-Herdr uses `Ctrl+]` as its own prefix:
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |
+
+Herdr's public terminal-session interface is a raw pane stream; it does not
+expose Herdr's own TUI key dispatcher. Super-Herdr therefore maps supported
+`Ctrl+B` chords to the equivalent documented Herdr CLI operations instead of
+sending the control byte into the shell or agent:
+
+| Herdr input | Action in the selected qualified session |
+| --- | --- |
+| `Ctrl+B`, then `h` / `j` / `k` / `l` | Select the neighboring pane using Herdr's layout |
+| `Ctrl+B`, then `p` / `n` | Select previous / next tab |
+| `Ctrl+B`, then `1`–`9` | Select a numbered tab |
+| `Ctrl+B`, then `c` | Create and focus a tab through `herdr tab create` |
+| `Ctrl+B`, then `v` / `-` | Split right / down through `herdr pane split` |
+| `Ctrl+B`, then `z` | Toggle pane zoom through `herdr pane zoom` |
+| `Ctrl+B`, then `?` | Show supported Herdr actions |
+| `Escape` after `Ctrl+B` | Cancel the Herdr prefix |
+
+Unsupported or custom Herdr TUI chords are rejected with a status message; they
+are never leaked into the running pane. Protocol 19 has no public operation for
+dispatching an arbitrary key through Herdr's client-side keymap.
 
 The sidebar, tabs, and visible split panes are clickable. A click changes only
 Super-Herdr's local selection; it does not change another Herdr client's global

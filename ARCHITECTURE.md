@@ -87,8 +87,13 @@ re-established.
 The current frontend uses Ratatui with an independent VT parser. It renders a
 host/session/workspace sidebar, tab strip, and the visible split panes from Herdr's public
 layout rectangles. `Ctrl+]` is the federation prefix for switching qualified
-panes, leaving Herdr's `Ctrl+B` prefix untouched. The selected pane gets a control
-stream without `--takeover`; other visible
+panes. Because the documented terminal-session API is a raw pane stream rather
+than Herdr's client-side key dispatcher, `Ctrl+B` enters a Herdr-action mode in
+Super-Herdr. Read-only navigation is resolved against the normalized layout;
+supported mutations invoke the equivalent documented Herdr CLI operation for
+the qualified target and session. Unknown chords are rejected instead of being
+sent to the pane process. The selected pane gets a control stream without
+`--takeover`; other visible
 panes get observer streams. If the control stream is refused or closes, the
 selected pane immediately falls back to observation and periodically retries a
 normal control lease without interrupting the Herdr server.

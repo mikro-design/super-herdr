@@ -35,10 +35,11 @@ use crate::terminal::{
     TerminalAccess, TerminalEvent, TerminalScrollDirection, parse_terminal_event, spawn_terminal,
     terminal_input_command, terminal_release_command, terminal_scroll_command,
 };
-use crate::transport::{CliSnapshotTransport, expand_discovered_sessions};
+use crate::transport::{CliSnapshotTransport, expand_discovered_sessions, run_herdr_operation};
 use crate::ui_state::{UiState, UiStateStore};
 
 const PREFIX_KEY: u8 = 0x1d;
+const HERDR_PREFIX_KEY: u8 = 0x02;
 const SIDEBAR_WIDTH: u16 = 28;
 const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(10);
 const INPUT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(30);
@@ -56,6 +57,7 @@ const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 enum InputMode {
     Terminal,
     Prefix,
+    HerdrPrefix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +500,12 @@ enum ConfigRefresh {
     Failed(String),
 }
 
+struct HerdrActionEvent {
+    result: Result<(), String>,
+    description: String,
+    follow_server_focus: bool,
+}
+
 struct App {
     selected_pane: Option<PaneId>,
     selection_explicit: bool,
@@ -523,6 +531,8 @@ struct App {
     configuration_dirty: bool,
     target_manager: Option<TargetManager>,
     agent_navigator: Option<AgentNavigator>,
+    herdr_action_sender: Option<mpsc::UnboundedSender<HerdrActionEvent>>,
+    herdr_action_inflight: bool,
 }
 
 impl Default for App {
@@ -552,6 +562,8 @@ impl Default for App {
             configuration_dirty: false,
             target_manager: None,
             agent_navigator: None,
+            herdr_action_sender: None,
+            herdr_action_inflight: false,
         }
     }
 }
@@ -578,6 +590,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let (input_sender, mut input) = mpsc::unbounded_channel();
     let (route_sender, mut route_events) = mpsc::unbounded_channel();
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
+    let (herdr_action_sender, mut herdr_action_events) = mpsc::unbounded_channel();
     spawn_input_reader(input_sender);
     let mut ticks = interval(Duration::from_millis(100));
     let mut selection_ticks = interval(SELECTION_AUTOSCROLL_INTERVAL);
@@ -592,6 +605,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         state_store: Some(state_store),
         config_path: Some(config_path.clone()),
         configured_targets,
+        herdr_action_sender: Some(herdr_action_sender),
         ..App::default()
     };
     let mut should_draw = true;
@@ -704,6 +718,24 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                     None => {}
                 }
                 should_draw = true;
+            }
+            action = herdr_action_events.recv() => {
+                if let Some(action) = action {
+                    app.herdr_action_inflight = false;
+                    match action.result {
+                        Ok(()) => {
+                            app.message = Some(format!("Herdr: {}", action.description));
+                            if action.follow_server_focus {
+                                app.selection_explicit = false;
+                                app.selected_pane = None;
+                            }
+                        }
+                        Err(error) => {
+                            app.message = Some(format!("Herdr action failed: {error}"));
+                        }
+                    }
+                    should_draw = true;
+                }
             }
             event = route_events.recv() => {
                 if let Some(event) = event {
@@ -1482,6 +1514,11 @@ async fn handle_input(
             app.selection_autoscroll = None;
             app.mode = InputMode::Prefix;
         }
+        InputMode::Terminal if key == HERDR_PREFIX_KEY => {
+            app.selection = None;
+            app.selection_autoscroll = None;
+            app.mode = InputMode::HerdrPrefix;
+        }
         InputMode::Terminal => {
             app.selection = None;
             app.selection_autoscroll = None;
@@ -1555,8 +1592,192 @@ async fn handle_input(
             }
             app.mode = InputMode::Terminal;
         }
+        InputMode::HerdrPrefix => {
+            handle_herdr_prefix(key, state, targets, transport_config, app)?;
+            app.mode = InputMode::Terminal;
+        }
     }
     Ok(false)
+}
+
+fn handle_herdr_prefix(
+    key: u8,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<()> {
+    match key {
+        b'h' => select_neighbor_pane(state, app, PaneDirection::Left),
+        b'j' => select_neighbor_pane(state, app, PaneDirection::Down),
+        b'k' => select_neighbor_pane(state, app, PaneDirection::Up),
+        b'l' => select_neighbor_pane(state, app, PaneDirection::Right),
+        b'p' => cycle_tab(state, app, -1),
+        b'n' => cycle_tab(state, app, 1),
+        b'1'..=b'9' => select_tab_index(state, app, usize::from(key - b'1')),
+        b'c' => {
+            let Some((_, pane)) = selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+            else {
+                app.message = Some("Herdr: no workspace is selected".to_owned());
+                return Ok(());
+            };
+            let Some(workspace) = pane.workspace.as_ref() else {
+                app.message = Some("Herdr: selected pane has no workspace".to_owned());
+                return Ok(());
+            };
+            spawn_selected_herdr_action(
+                state,
+                targets,
+                transport_config,
+                app,
+                vec![
+                    "tab".to_owned(),
+                    "create".to_owned(),
+                    "--workspace".to_owned(),
+                    workspace.resource.clone(),
+                    "--focus".to_owned(),
+                ],
+                "created tab".to_owned(),
+                true,
+            );
+        }
+        b'v' => spawn_pane_action(
+            state,
+            targets,
+            transport_config,
+            app,
+            HerdrPaneAction {
+                prefix: &["pane", "split"],
+                suffix: &["--direction", "right", "--focus"],
+                description: "split pane vertically",
+                follow_server_focus: true,
+            },
+        ),
+        b'-' => spawn_pane_action(
+            state,
+            targets,
+            transport_config,
+            app,
+            HerdrPaneAction {
+                prefix: &["pane", "split"],
+                suffix: &["--direction", "down", "--focus"],
+                description: "split pane horizontally",
+                follow_server_focus: true,
+            },
+        ),
+        b'z' => spawn_pane_action(
+            state,
+            targets,
+            transport_config,
+            app,
+            HerdrPaneAction {
+                prefix: &["pane", "zoom"],
+                suffix: &["--toggle"],
+                description: "toggled pane zoom",
+                follow_server_focus: false,
+            },
+        ),
+        b'?' => {
+            app.message = Some(
+                "Herdr Ctrl+B: h/j/k/l pane, p/n tab, 1-9 tab, c new tab, v/- split, z zoom"
+                    .to_owned(),
+            );
+        }
+        0x1b => {}
+        _ => {
+            app.message = Some(
+                "Herdr Ctrl+B chord is not exposed by Herdr's public API; press Ctrl+B ? for supported actions"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+struct HerdrPaneAction<'a> {
+    prefix: &'a [&'a str],
+    suffix: &'a [&'a str],
+    description: &'a str,
+    follow_server_focus: bool,
+}
+
+fn spawn_pane_action(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+    action: HerdrPaneAction<'_>,
+) {
+    let Some(pane) = app.selected_pane.as_ref() else {
+        app.message = Some("Herdr: no pane is selected".to_owned());
+        return;
+    };
+    let mut args = action
+        .prefix
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    args.push(pane.resource.clone());
+    args.extend(action.suffix.iter().map(|argument| (*argument).to_owned()));
+    spawn_selected_herdr_action(
+        state,
+        targets,
+        transport_config,
+        app,
+        args,
+        action.description.to_owned(),
+        action.follow_server_focus,
+    );
+}
+
+fn spawn_selected_herdr_action(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+    args: Vec<String>,
+    description: String,
+    follow_server_focus: bool,
+) {
+    if app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    let Some(selected) = app.selected_pane.as_ref() else {
+        app.message = Some("Herdr: no pane is selected".to_owned());
+        return;
+    };
+    let key = selected.target_session();
+    let Some(target) = targets.get(&key).cloned() else {
+        app.message = Some("Herdr: selected target is unavailable".to_owned());
+        return;
+    };
+    let Some(executable) = state
+        .targets
+        .get(&key)
+        .and_then(|target| target.selected_herdr_bin.clone())
+    else {
+        app.message = Some("Herdr: no compatible client is selected".to_owned());
+        return;
+    };
+    let Some(sender) = app.herdr_action_sender.clone() else {
+        app.message = Some("Herdr action routing is unavailable".to_owned());
+        return;
+    };
+    let transport = transport_config.clone();
+    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
+    app.herdr_action_inflight = true;
+    app.message = Some(format!("Herdr: {description}…"));
+    tokio::spawn(async move {
+        let result = run_herdr_operation(&target, &transport, &executable, &args, command_timeout)
+            .await
+            .map_err(|error| error.message);
+        let _ = sender.send(HerdrActionEvent {
+            result,
+            description,
+            follow_server_focus,
+        });
+    });
 }
 
 fn handle_target_manager_input(key: u8, app: &mut App) -> Result<bool> {
@@ -2008,6 +2229,122 @@ fn cycle_tab(state: &FederationState, app: &mut App, direction: isize) {
         .unwrap_or(0);
     let next = wrapped_index(current, tabs.len(), direction);
     select_tab(snapshot, &tabs[next], app);
+}
+
+fn select_tab_index(state: &FederationState, app: &mut App, index: usize) {
+    let Some((snapshot, pane)) = selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+    else {
+        return;
+    };
+    let Some(workspace) = pane.workspace.as_ref() else {
+        return;
+    };
+    let tabs = snapshot
+        .tabs
+        .values()
+        .filter(|tab| tab.workspace.as_ref() == Some(workspace))
+        .collect::<Vec<_>>();
+    let Some(tab) = tabs.get(index) else {
+        app.message = Some(format!("Herdr: tab {} is not available", index + 1));
+        return;
+    };
+    select_tab(snapshot, &tab.id, app);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+fn select_neighbor_pane(state: &FederationState, app: &mut App, direction: PaneDirection) {
+    let Some((snapshot, pane)) = selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+    else {
+        return;
+    };
+    let Some(tab) = pane.tab.as_ref() else {
+        return;
+    };
+    let Some(layout) = snapshot.layouts.get(tab) else {
+        app.message = Some("Herdr: selected tab has no pane layout".to_owned());
+        return;
+    };
+    let Some(current) = layout
+        .panes
+        .iter()
+        .find(|layout_pane| layout_pane.pane == pane.id)
+    else {
+        return;
+    };
+    let next = layout
+        .panes
+        .iter()
+        .filter(|candidate| candidate.pane != pane.id)
+        .filter_map(|candidate| {
+            pane_direction_score(current.rect, candidate.rect, direction)
+                .map(|score| (score, candidate.pane.clone()))
+        })
+        .min_by_key(|(score, pane)| (*score, pane.clone()));
+    if let Some((_, pane)) = next {
+        select_pane(app, pane);
+    } else {
+        app.message = Some(format!("Herdr: no pane to the {}", direction.label()));
+    }
+}
+
+impl PaneDirection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "top",
+            Self::Down => "bottom",
+        }
+    }
+}
+
+fn pane_direction_score(
+    current: crate::state::LayoutRect,
+    candidate: crate::state::LayoutRect,
+    direction: PaneDirection,
+) -> Option<(u32, u32)> {
+    let current_right = u32::from(current.x) + u32::from(current.width);
+    let candidate_right = u32::from(candidate.x) + u32::from(candidate.width);
+    let current_bottom = u32::from(current.y) + u32::from(current.height);
+    let candidate_bottom = u32::from(candidate.y) + u32::from(candidate.height);
+    let current_x = u32::from(current.x);
+    let candidate_x = u32::from(candidate.x);
+    let current_y = u32::from(current.y);
+    let candidate_y = u32::from(candidate.y);
+    match direction {
+        PaneDirection::Left if candidate_right <= current_x => Some((
+            current_x - candidate_right,
+            interval_distance(current_y, current_bottom, candidate_y, candidate_bottom),
+        )),
+        PaneDirection::Right if candidate_x >= current_right => Some((
+            candidate_x - current_right,
+            interval_distance(current_y, current_bottom, candidate_y, candidate_bottom),
+        )),
+        PaneDirection::Up if candidate_bottom <= current_y => Some((
+            current_y - candidate_bottom,
+            interval_distance(current_x, current_right, candidate_x, candidate_right),
+        )),
+        PaneDirection::Down if candidate_y >= current_bottom => Some((
+            candidate_y - current_bottom,
+            interval_distance(current_x, current_right, candidate_x, candidate_right),
+        )),
+        _ => None,
+    }
+}
+
+fn interval_distance(first_start: u32, first_end: u32, second_start: u32, second_end: u32) -> u32 {
+    if first_end < second_start {
+        second_start - first_end
+    } else {
+        first_start.saturating_sub(second_end)
+    }
 }
 
 fn select_workspace(state: &FederationState, app: &mut App, index: usize) {
@@ -3089,7 +3426,8 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
 
     if let Some(inner) = selected_inner
         && inner.height > 0
-        && (app.mode == InputMode::Prefix || displayed_message.is_some())
+        && (matches!(app.mode, InputMode::Prefix | InputMode::HerdrPrefix)
+            || displayed_message.is_some())
     {
         let overlay = Rect::new(
             inner.x,
@@ -3097,17 +3435,21 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
             inner.width,
             1,
         );
-        let (text, style) = if app.mode == InputMode::Prefix {
-            (
+        let (text, style) = match app.mode {
+            InputMode::Prefix => (
                 " Ctrl+]  1-9 workspace  p/n tab  j/k pane  a agents  h hosts  v paste  i image  q quit "
                     .to_owned(),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
-            )
-        } else {
-            (
+            ),
+            InputMode::HerdrPrefix => (
+                " Herdr Ctrl+B  h/j/k/l pane  p/n tab  1-9 tab  c new tab  v/- split  z zoom  ? help "
+                    .to_owned(),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ),
+            InputMode::Terminal => (
                 format!(" {} ", safe_text(displayed_message.unwrap_or_default())),
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
-            )
+            ),
         };
         frame.render_widget(Paragraph::new(text).style(style), overlay);
     }
@@ -3280,16 +3622,17 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentFilter, App, CellPosition, ClipboardFeedback, DecodedInput, InputDecoder,
-        MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, SIDEBAR_WIDTH, SelectionAutoscroll,
-        SelectionAutoscrollDirection, SelectionFinish, TargetManager, TerminalSelection,
-        agent_jump_entries, capture_screen_rows, capture_selection_viewport, clamped_pane_position,
-        cycle_tab, desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
-        finish_ui_left_gesture, handle_target_manager_input, mouse_event_allowed,
-        mouse_passthrough_enabled, reconcile_selection, render_vt_screen, safe_text,
-        select_workspace, selected_terminal_text, sidebar_pane_at_row, tab_at_column,
-        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
-        viewport_shift_distance, visible_pane_areas,
+        AgentFilter, App, CellPosition, ClipboardFeedback, DecodedInput, HERDR_PREFIX_KEY,
+        InputDecoder, InputMode, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection,
+        SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish,
+        TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
+        capture_selection_viewport, clamped_pane_position, cycle_tab, desired_access,
+        displayed_message, encode_mouse_event, fall_back_to_observe, finish_ui_left_gesture,
+        handle_input, handle_target_manager_input, mouse_event_allowed, mouse_passthrough_enabled,
+        pane_direction_score, reconcile_selection, render_vt_screen, safe_text,
+        select_neighbor_pane, select_workspace, selected_terminal_text, sidebar_pane_at_row,
+        tab_at_column, terminal_paste_payload, ui_areas, update_selection_after_frame,
+        update_sidebar_hit_areas, viewport_shift_distance, visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession};
@@ -3319,7 +3662,82 @@ mod tests {
     #[test]
     fn federation_prefix_does_not_shadow_herdrs_prefix() {
         assert_eq!(PREFIX_KEY, 0x1d);
-        assert_ne!(PREFIX_KEY, 0x02);
+        assert_eq!(HERDR_PREFIX_KEY, 0x02);
+        assert_ne!(PREFIX_KEY, HERDR_PREFIX_KEY);
+    }
+
+    #[tokio::test]
+    async fn ctrl_b_enters_herdr_action_mode_instead_of_the_raw_terminal() {
+        let mut app = App::default();
+        let state = FederationState::default();
+        let targets = BTreeMap::new();
+        let transport = crate::config::TransportConfig::default();
+
+        handle_input(HERDR_PREFIX_KEY, &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+
+        assert_eq!(app.mode, InputMode::HerdrPrefix);
+        assert!(app.routes.is_empty());
+
+        handle_input(b'?', &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+        assert_eq!(app.mode, InputMode::Terminal);
+        assert!(app.message.as_deref().unwrap().contains("Herdr Ctrl+B"));
+    }
+
+    #[test]
+    fn ctrl_b_directional_navigation_uses_the_server_layout() {
+        let key = TargetSession::new("host-a", "work");
+        let left = PaneId::new("host-a", "work", "w1:p1");
+        let right = PaneId::new("host-a", "work", "w1:p2");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
+                    {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1"}
+                ],
+                "layouts": [layout_with_panes(
+                    "w1",
+                    "w1:t1",
+                    "w1:p1",
+                    &[("w1:p1", 0, 0, 40, 20), ("w1:p2", 40, 0, 40, 20)]
+                )]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let mut app = App {
+            selected_pane: Some(left),
+            ..App::default()
+        };
+
+        select_neighbor_pane(&state, &mut app, PaneDirection::Right);
+
+        assert_eq!(app.selected_pane, Some(right));
+        assert_eq!(
+            pane_direction_score(
+                crate::state::LayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 20,
+                },
+                crate::state::LayoutRect {
+                    x: 40,
+                    y: 0,
+                    width: 40,
+                    height: 20,
+                },
+                PaneDirection::Right,
+            ),
+            Some((0, 0))
+        );
     }
 
     #[test]
@@ -4053,6 +4471,26 @@ mod tests {
                 "focused": true,
                 "rect": {"x": 0, "y": 0, "width": 80, "height": 24}
             }]
+        })
+    }
+
+    fn layout_with_panes(
+        workspace: &str,
+        tab: &str,
+        focused: &str,
+        panes: &[(&str, u16, u16, u16, u16)],
+    ) -> serde_json::Value {
+        json!({
+            "workspace_id": workspace,
+            "tab_id": tab,
+            "zoomed": false,
+            "area": {"x": 0, "y": 0, "width": 80, "height": 20},
+            "focused_pane_id": focused,
+            "panes": panes.iter().map(|(pane, x, y, width, height)| json!({
+                "pane_id": pane,
+                "focused": *pane == focused,
+                "rect": {"x": x, "y": y, "width": width, "height": height}
+            })).collect::<Vec<_>>()
         })
     }
 
