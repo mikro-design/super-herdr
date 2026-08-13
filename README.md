@@ -63,6 +63,30 @@ provided Makefile targets.
 
 ## Install
 
+### Prebuilt binaries
+
+Each tagged release publishes stripped binaries with SHA-256 checksums on the
+[releases page](https://github.com/rbarzic/super-herdr/releases). Pick the
+archive matching your platform:
+
+- `aarch64-apple-darwin` — macOS Apple Silicon
+- `x86_64-apple-darwin` — macOS Intel
+- `x86_64-unknown-linux-gnu` — Linux x86_64
+- `aarch64-unknown-linux-gnu` — Linux ARM64
+
+```sh
+# Replace <tag> and <target> with the version and platform you want.
+curl -LO https://github.com/rbarzic/super-herdr/releases/download/<tag>/super-herdr-<tag>-<target>.tar.gz
+curl -LO https://github.com/rbarzic/super-herdr/releases/download/<tag>/super-herdr-<tag>-<target>.tar.gz.sha256
+sha256sum -c super-herdr-<tag>-<target>.tar.gz.sha256
+tar xzf super-herdr-<tag>-<target>.tar.gz
+install -m 0755 super-herdr-<tag>-<target>/super-herdr ~/.cargo/bin/
+super-herdr --version
+```
+
+Install into any directory on your `PATH`; `~/.cargo/bin` matches what
+`make macos`/`make linux` use below.
+
 ### macOS
 
 ```sh
