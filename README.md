@@ -24,6 +24,10 @@ It never takes over, stops, starts, or restarts a Herdr session.
   fallback.
 - Atomic persistence and restoration of the last explicitly selected qualified
   pane.
+- Command-line and in-TUI target management backed by one atomic TOML store.
+- Live configuration and running-session discovery refresh without restarting
+  Herdr.
+- A global agent navigator with attention and active-work filters.
 
 ## Recommended topology
 
@@ -185,6 +189,23 @@ existing text and comments. It only changes Super-Herdr configuration. It does
 not connect to, create, start, stop, or restart a Herdr session. Run `probe`
 afterward to test connectivity.
 
+Edit an existing target without changing its Herdr processes:
+
+```sh
+super-herdr target edit development --ssh replacement-host
+super-herdr target edit build --single-session --session toolchains
+super-herdr target edit desktop --local --discover-sessions
+```
+
+Remove a target from Super-Herdr only:
+
+```sh
+super-herdr target remove build --yes
+```
+
+Removal requires `--yes`, refuses to remove the final configured target, and
+does not stop or restart anything on the target machine.
+
 JSON is not the configuration format. TOML remains the durable, human-editable
 source of truth. JSON output is available only where it helps automation, such
 as `probe --json`.
@@ -219,7 +240,8 @@ Target fields:
 - `name`: stable federation name. It forms part of every qualified ID.
 - `ssh`: OpenSSH destination or alias. Omit it for a local target.
 - `discover_sessions`: run documented `herdr session list --json` at startup and
-  add every running session from this host. Stopped sessions are never started.
+  every ten seconds, adding every running session from this host. Stopped
+  sessions are never started.
 - `session`: session used directly, or retained as the fallback if discovery
   fails.
 - `socket`: optional absolute Herdr socket path on the target. It enables
@@ -236,6 +258,8 @@ freeze or tear down other targets.
 
 ```sh
 super-herdr target add NAME --ssh SSH_ALIAS --discover-sessions
+super-herdr target edit NAME --ssh NEW_SSH_ALIAS
+super-herdr target remove NAME --yes
 super-herdr target list
 super-herdr check
 super-herdr probe
@@ -249,6 +273,8 @@ Running `super-herdr` without a subcommand opens the TUI.
 
 - `check` parses the configuration and reports its targets.
 - `target add` atomically adds a local or SSH host to the TOML configuration.
+- `target edit` changes one named target block and validates the complete result.
+- `target remove` removes only Super-Herdr configuration and requires `--yes`.
 - `target list` shows configured hosts without contacting them.
 - `probe` queries configured sessions concurrently and reports failures per
   target.
@@ -258,23 +284,57 @@ Running `super-herdr` without a subcommand opens the TUI.
 
 ## TUI controls
 
-Normal keyboard input goes to the selected Herdr pane. Herdr's `Ctrl+B` prefix is
-left untouched. Super-Herdr uses `Ctrl+]` as its own prefix:
+Normal keyboard input goes to the selected Herdr pane. Super-Herdr uses
+`Ctrl+]` as its federation prefix and reserves `Ctrl+B` for Herdr-compatible
+workspace actions:
 
 | Input | Action |
 | --- | --- |
 | `Ctrl+]`, then `j` / `k` | Select next / previous qualified pane |
 | `Ctrl+]`, then `p` / `n` | Select previous / next tab |
 | `Ctrl+]`, then `1`–`9` | Select a numbered workspace |
+| `Ctrl+]`, then `a` | Open the global agent navigator |
+| `Ctrl+]`, then `h` | Open the target manager |
 | `Ctrl+]`, then `v` | Paste desktop clipboard text into the selected pane |
 | `Ctrl+]`, then `i` | Upload a clipboard PNG and paste its verified target path |
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |
 
+Herdr's public terminal-session interface is a raw pane stream; it does not
+expose Herdr's own TUI key dispatcher. Super-Herdr therefore maps supported
+`Ctrl+B` chords to the equivalent documented Herdr CLI operations instead of
+sending the control byte into the shell or agent:
+
+| Herdr input | Action in the selected qualified session |
+| --- | --- |
+| `Ctrl+B`, then `h` / `j` / `k` / `l` | Select the neighboring pane using Herdr's layout |
+| `Ctrl+B`, then `p` / `n` | Select previous / next tab |
+| `Ctrl+B`, then `1`–`9` | Select a numbered tab |
+| `Ctrl+B`, then `c` | Create and focus a tab through `herdr tab create` |
+| `Ctrl+B`, then `v` / `-` | Split right / down through `herdr pane split` |
+| `Ctrl+B`, then `z` | Toggle pane zoom through `herdr pane zoom` |
+| `Ctrl+B`, then `?` | Show supported Herdr actions |
+| `Escape` after `Ctrl+B` | Cancel the Herdr prefix |
+
+Unsupported or custom Herdr TUI chords are rejected with a status message; they
+are never leaked into the running pane. Protocol 19 has no public operation for
+dispatching an arbitrary key through Herdr's client-side keymap.
+
 The sidebar, tabs, and visible split panes are clickable. A click changes only
 Super-Herdr's local selection; it does not change another Herdr client's global
 focus.
+
+The target manager uses `j`/`k` to select a configured machine, `a` to add, `e`
+or `Enter` to edit, and `d` to remove with confirmation. In its form, `Tab`
+moves between fields, `Space` toggles running-session discovery, and `Enter`
+saves. A blank SSH field means the Herdr installation is local to the desktop.
+Advanced socket and client-path overrides remain available through `target add`
+and `target edit`.
+
+The agent navigator combines agents from every live target. It sorts blocked,
+waiting, or input-ready agents first. Use `j`/`k` to select, `f` to cycle between
+`all`, `attention`, and `active`, and `Enter` to jump to the agent's pane.
 
 Mouse behavior inside the selected terminal:
 
@@ -327,9 +387,15 @@ Clipboard payloads and terminal contents are never logged.
 ## Session discovery, events, and persistence
 
 With `discover_sessions = true`, Super-Herdr invokes the documented
-`herdr session list --json` command once at startup. Each running session becomes
-an independently qualified target. Discovery failures retain the configured
+`herdr session list --json` command at startup and refreshes the registry every
+ten seconds. Hosts are queried concurrently. Each running session becomes an
+independently qualified target; additions and disappearances replace only
+Super-Herdr's per-session supervisors. Discovery failures retain the configured
 fallback session and remain isolated to that host.
+
+The same refresh loop detects atomic changes to the TOML configuration,
+including edits made by another terminal. The TUI remains responsive while SSH
+discovery runs. No refresh starts, stops, or restarts a Herdr session.
 
 When `socket` is configured, resource, layout, and agent-status events request an
 immediate authoritative snapshot. If subscription setup or the stream fails, the
@@ -379,10 +445,10 @@ cargo clippy -j 4 -- -D warnings
 
 ## Current limitations and next slices
 
-- Target addition is currently command-line driven. An interactive TUI dialog
-  will use the same configuration layer in the next slice.
-- Running session discovery occurs at startup; live session-registry refresh is
-  still planned.
+- The target-manager form covers the common name, SSH alias, session, and
+  discovery fields. Advanced socket/client-path editing remains CLI-driven.
+- The agent navigator uses Herdr's current status fields; unread activity and a
+  durable notification history are not implemented.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG
   images only.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are
@@ -391,7 +457,9 @@ cargo clippy -j 4 -- -D warnings
 - Optional server-side focus actions and richer capability/host-key diagnostics
   remain planned.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the domain model and invariants.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the domain model and invariants,
+[TESTING.md](TESTING.md) for the release test matrix, and
+[ROADMAP.md](ROADMAP.md) for dependency-ordered follow-up work.
 
 ## Licensing
 

@@ -57,9 +57,17 @@ memory for currently visible panes.
 
 Before starting per-session supervisors, a host configured for discovery invokes
 the documented `herdr session list --json` command. Each returned session becomes
-an independently qualified target and uses the reported public socket path. A
-stopped session is omitted and is never started automatically. Discovery
-failure falls back to the configured session and remains isolated to that host.
+an independently qualified target and uses the reported public socket path. Host
+registries are refreshed concurrently every ten seconds. When the qualified
+session set changes, Super-Herdr replaces its own supervisors and terminal
+routes; it never starts, stops, or restarts Herdr. A stopped session is omitted.
+Discovery failure falls back to the configured session and remains isolated to
+that host.
+
+The frontend watches the durable TOML configuration through the same bounded
+refresh path. CLI and TUI target management use one atomic file store. A refresh
+may reconnect Super-Herdr routes but cannot mutate server-owned workspaces,
+sessions, or processes.
 
 The desktop persists only versioned UI intent, currently the last explicitly
 selected qualified pane. Writes use a private state directory and atomic file
@@ -79,8 +87,13 @@ re-established.
 The current frontend uses Ratatui with an independent VT parser. It renders a
 host/session/workspace sidebar, tab strip, and the visible split panes from Herdr's public
 layout rectangles. `Ctrl+]` is the federation prefix for switching qualified
-panes, leaving Herdr's `Ctrl+B` prefix untouched. The selected pane gets a control
-stream without `--takeover`; other visible
+panes. Because the documented terminal-session API is a raw pane stream rather
+than Herdr's client-side key dispatcher, `Ctrl+B` enters a Herdr-action mode in
+Super-Herdr. Read-only navigation is resolved against the normalized layout;
+supported mutations invoke the equivalent documented Herdr CLI operation for
+the qualified target and session. Unknown chords are rejected instead of being
+sent to the pane process. The selected pane gets a control stream without
+`--takeover`; other visible
 panes get observer streams. If the control stream is refused or closes, the
 selected pane immediately falls back to observation and periodically retries a
 normal control lease without interrupting the Herdr server.

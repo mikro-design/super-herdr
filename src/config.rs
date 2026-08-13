@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -15,7 +16,7 @@ pub struct Config {
     pub targets: Vec<Target>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     #[serde(default = "default_ssh_bin")]
@@ -39,7 +40,7 @@ impl Default for TransportConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub name: String,
@@ -126,6 +127,18 @@ impl Config {
         Ok(path)
     }
 
+    pub fn replace_target_file(
+        explicit_path: Option<&Path>,
+        existing_name: &str,
+        replacement: Target,
+    ) -> Result<PathBuf> {
+        mutate_target_file(explicit_path, existing_name, Some(replacement))
+    }
+
+    pub fn remove_target_file(explicit_path: Option<&Path>, name: &str) -> Result<PathBuf> {
+        mutate_target_file(explicit_path, name, None)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.targets.is_empty() {
             bail!("configuration must contain at least one [[targets]] entry");
@@ -194,6 +207,97 @@ impl Config {
 #[derive(Serialize)]
 struct TargetAppend<'a> {
     targets: Vec<&'a Target>,
+}
+
+#[derive(Deserialize)]
+struct OwnedTargetAppend {
+    targets: Vec<Target>,
+}
+
+fn mutate_target_file(
+    explicit_path: Option<&Path>,
+    existing_name: &str,
+    replacement: Option<Target>,
+) -> Result<PathBuf> {
+    let path = resolve_path(explicit_path)?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut config =
+        Config::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+    let index = config
+        .targets
+        .iter()
+        .position(|target| target.name == existing_name)
+        .with_context(|| format!("target {existing_name:?} is not configured"))?;
+
+    match replacement.as_ref() {
+        Some(target) => config.targets[index] = target.clone(),
+        None if config.targets.len() == 1 => {
+            bail!("cannot remove the final configured target");
+        }
+        None => {
+            config.targets.remove(index);
+        }
+    }
+    config.validate()?;
+
+    let range = target_section(&text, existing_name)?;
+    let replacement_text = replacement
+        .as_ref()
+        .map(|target| {
+            toml::to_string_pretty(&TargetAppend {
+                targets: vec![target],
+            })
+        })
+        .transpose()?;
+    let mut updated = String::with_capacity(
+        text.len() - range.len() + replacement_text.as_ref().map_or(0, String::len),
+    );
+    updated.push_str(&text[..range.start]);
+    if let Some(replacement_text) = replacement_text {
+        updated.push_str(&replacement_text);
+    }
+    updated.push_str(&text[range.end..]);
+    Config::parse(&updated).context("generated configuration is invalid")?;
+    write_private_atomic(&path, updated.as_bytes())?;
+    Ok(path)
+}
+
+fn target_section(text: &str, name: &str) -> Result<Range<usize>> {
+    for range in target_sections(text) {
+        let section = &text[range.clone()];
+        let Ok(parsed) = toml::from_str::<OwnedTargetAppend>(section) else {
+            continue;
+        };
+        if parsed.targets.len() == 1 && parsed.targets[0].name == name {
+            return Ok(range);
+        }
+    }
+    bail!("could not locate target {name:?} in the configuration text")
+}
+
+fn target_sections(text: &str) -> Vec<Range<usize>> {
+    let mut headers = Vec::new();
+    let mut offset = 0_usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            headers.push((offset, trimmed == "[[targets]]"));
+        }
+        offset += line.len();
+    }
+    headers
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, is_target))| *is_target)
+        .map(|(index, (start, _))| {
+            let end = headers
+                .get(index + 1)
+                .map(|(offset, _)| *offset)
+                .unwrap_or(text.len());
+            *start..end
+        })
+        .collect()
 }
 
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
@@ -458,6 +562,74 @@ mod tests {
         let error = Config::add_target_file(Some(&path), target).unwrap_err();
 
         assert!(error.to_string().contains("duplicate target"));
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn replaces_and_removes_named_target_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# top-level comment
+[transport]
+command_timeout_seconds = 7
+
+[[targets]]
+name = "development"
+ssh = "old-host"
+
+[[targets]]
+name = "build"
+ssh = "build-host"
+"#,
+        )
+        .unwrap();
+        let replacement = Target {
+            name: "development".to_owned(),
+            ssh: Some("new-host".to_owned()),
+            discover_sessions: true,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+
+        Config::replace_target_file(Some(&path), "development", replacement).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# top-level comment\n"));
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.transport.command_timeout_seconds, 7);
+        assert_eq!(config.targets[0].endpoint(), "new-host");
+        assert!(config.targets[0].discover_sessions);
+
+        Config::remove_target_file(Some(&path), "build").unwrap();
+        let config = Config::load(Some(&path)).unwrap().0;
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.targets[0].name, "development");
+    }
+
+    #[test]
+    fn refuses_to_remove_the_final_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::add_target_file(
+            Some(&path),
+            Target {
+                name: "only".to_owned(),
+                ssh: None,
+                discover_sessions: false,
+                session: None,
+                socket: None,
+                herdr_bins: vec!["herdr".to_owned()],
+            },
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = Config::remove_target_file(Some(&path), "only").unwrap_err();
+
+        assert!(error.to_string().contains("final configured target"));
         assert_eq!(fs::read(path).unwrap(), before);
     }
 }
