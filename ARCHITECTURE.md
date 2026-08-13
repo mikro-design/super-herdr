@@ -11,9 +11,9 @@ and image-paste integration.
 ```text
 desktop
   super-herdr UI + clipboard broker
-       |-- SSH --> ws01: Herdr session rv32sim
-       |-- SSH --> ws02: Herdr session development
-       `-- SSH --> build03: Herdr session toolchains
+       |-- SSH --> development host: Herdr session work
+       |-- SSH --> build host: Herdr session toolchains
+       `-- local --> optional desktop Herdr sessions
 ```
 
 Super-Herdr is the federation authority. Herdr remains the authority for state

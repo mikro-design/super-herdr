@@ -8,17 +8,17 @@ connect_timeout_seconds = 10
 command_timeout_seconds = 20
 
 [[targets]]
-name = "ws01"
-ssh = "veba@100.87.78.39"
+name = "development"
+ssh = "development-host"
 discover_sessions = true
-session = "rv32sim"
-socket = "/home/veba/.config/herdr/sessions/rv32sim/herdr.sock"
-herdr_bins = ["/home/veba/.local/bin/herdr"]
+session = "work"
+socket = "/home/user/.config/herdr/sessions/work/herdr.sock"
+herdr_bins = ["/home/user/.local/bin/herdr"]
 
 [[targets]]
-name = "kamrui"
-ssh = "veba@100.99.10.49"
+name = "build"
+ssh = "build-host"
 discover_sessions = true
-session = "super-herdr-test"
-socket = "/home/veba/.config/herdr/sessions/super-herdr-test/herdr.sock"
-herdr_bins = ["/home/veba/.local/bin/herdr"]
+session = "toolchains"
+socket = "/home/user/.config/herdr/sessions/toolchains/herdr.sock"
+herdr_bins = ["/home/user/.local/bin/herdr"]

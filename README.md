@@ -33,8 +33,8 @@ that frontend to every Herdr host over SSH:
 ```text
 macOS or Linux desktop
   Super-Herdr TUI and clipboard broker
-    ├── SSH → ws01 → persistent Herdr sessions
-    ├── SSH → Kamrui → persistent Herdr sessions
+    ├── SSH → development host → persistent Herdr sessions
+    ├── SSH → build host → persistent Herdr sessions
     └── local → optional desktop Herdr sessions
 ```
 
@@ -125,24 +125,27 @@ connect_timeout_seconds = 10
 command_timeout_seconds = 20
 
 [[targets]]
-name = "ws01"
-ssh = "veba@100.87.78.39"
+name = "development"
+ssh = "development-host"
 discover_sessions = true
-session = "rv32sim"
-socket = "/home/veba/.config/herdr/sessions/rv32sim/herdr.sock"
+session = "work"
+socket = "/home/user/.config/herdr/sessions/work/herdr.sock"
 herdr_bins = [
-  "/home/veba/.local/bin/herdr",
+  "/home/user/.local/bin/herdr",
 ]
 
 [[targets]]
-name = "kamrui"
-ssh = "veba@100.99.10.49"
+name = "build"
+ssh = "build-host"
 discover_sessions = true
-session = "super-herdr-test"
+session = "toolchains"
 herdr_bins = [
-  "/home/veba/.local/bin/herdr",
+  "/home/user/.local/bin/herdr",
 ]
 ```
+
+Here, `development-host` and `build-host` are example entries in
+`~/.ssh/config`; replace them with aliases defined for your own machines.
 
 Target fields:
 

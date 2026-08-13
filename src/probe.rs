@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn summarizes_snapshot_without_assuming_optional_fields() {
-        let config = Config::parse("[[targets]]\nname = 'ws01'").unwrap();
+        let config = Config::parse("[[targets]]\nname = 'host-a'").unwrap();
         let report = successful_report(
             &config.targets[0],
             1,
@@ -214,6 +214,6 @@ mod tests {
         assert_eq!(report.panes, 1);
         assert_eq!(report.agents, 0);
         assert_eq!(report.herdr_bin.as_deref(), Some("herdr-0.7"));
-        assert_eq!(report.workspace_ids[0].to_string(), "ws01/default/w1");
+        assert_eq!(report.workspace_ids[0].to_string(), "host-a/default/w1");
     }
 }

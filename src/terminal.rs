@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn puts_terminal_target_before_options_as_required_by_herdr_cli() {
         let args = terminal_operation_args(
-            &PaneId::new("ws01", "dev", "w1:p1"),
+            &PaneId::new("host-a", "dev", "w1:p1"),
             super::TerminalAccess::Control,
             24,
             80,

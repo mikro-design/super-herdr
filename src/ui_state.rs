@@ -140,7 +140,7 @@ mod tests {
     fn atomically_round_trips_a_qualified_pane() {
         let directory = tempfile::tempdir().unwrap();
         let store = UiStateStore::at(directory.path().join("ui-state.json"));
-        let state = UiState::selected_pane(PaneId::new("ws01", "rv32sim", "w6:p1"));
+        let state = UiState::selected_pane(PaneId::new("host-a", "work", "w6:p1"));
 
         store.save(&state).unwrap();
 

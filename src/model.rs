@@ -90,17 +90,17 @@ mod tests {
 
     #[test]
     fn qualifies_server_local_ids() {
-        let left = WorkspaceId::new("ws01", "dev", "w1");
-        let right = WorkspaceId::new("ws02", "dev", "w1");
+        let left = WorkspaceId::new("host-a", "dev", "w1");
+        let right = WorkspaceId::new("host-b", "dev", "w1");
 
         assert_ne!(left, right);
-        assert_eq!(left.to_string(), "ws01/dev/w1");
-        assert_eq!(left.target_session(), TargetSession::new("ws01", "dev"));
+        assert_eq!(left.to_string(), "host-a/dev/w1");
+        assert_eq!(left.target_session(), TargetSession::new("host-a", "dev"));
     }
 
     #[test]
     fn exposes_only_the_server_local_part_for_routing() {
-        let pane = PaneId::new("ws01", "dev", "w1:p1");
+        let pane = PaneId::new("host-a", "dev", "w1:p1");
 
         assert_eq!(pane.server_local_id(), "w1:p1");
     }

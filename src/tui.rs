@@ -2645,7 +2645,7 @@ mod tests {
     #[test]
     fn mouse_release_retains_a_completed_selection() {
         let mut selection = TerminalSelection {
-            pane: PaneId::new("ws01", "rv32sim", "w6:p1"),
+            pane: PaneId::new("host-a", "work", "w6:p1"),
             anchor: CellPosition { row: 2, column: 3 },
             head: CellPosition { row: 2, column: 3 },
             viewport_offset: 0,
@@ -2753,7 +2753,7 @@ mod tests {
 
     #[test]
     fn copied_terminal_text_trims_padding_and_excludes_chrome() {
-        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let pane = PaneId::new("host-a", "work", "w6:p1");
         let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process(b"one   \r\ntwo");
         let mut selection = TerminalSelection {
@@ -2772,7 +2772,7 @@ mod tests {
 
     #[test]
     fn copied_terminal_text_spans_scrollback_and_the_live_viewport() {
-        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let pane = PaneId::new("host-a", "work", "w6:p1");
         let mut current = vt100::Parser::new(3, 12, 0);
         current.process(b"line3\r\nline4\r\nline5");
         let mut older = vt100::Parser::new(3, 12, 0);
@@ -2798,7 +2798,7 @@ mod tests {
 
     #[test]
     fn routed_scroll_frames_extend_selection_and_retain_traversed_rows() {
-        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let pane = PaneId::new("host-a", "work", "w6:p1");
         let rows = |text: &[u8]| {
             let mut parser = vt100::Parser::new(3, 12, 0);
             parser.process(text);
@@ -2875,7 +2875,7 @@ mod tests {
 
     #[test]
     fn occupied_control_lease_falls_back_then_retries() {
-        let pane = PaneId::new("ws01", "dev", "w1:p1");
+        let pane = PaneId::new("host-a", "dev", "w1:p1");
         let mut app = App {
             selected_pane: Some(pane.clone()),
             ..App::default()
@@ -2926,10 +2926,10 @@ mod tests {
 
     #[test]
     fn startup_selection_moves_to_the_most_active_session() {
-        let idle_key = TargetSession::new("ws01", "default");
-        let active_key = TargetSession::new("ws01", "rv32sim");
-        let idle_pane = PaneId::new("ws01", "default", "w1:p1");
-        let active_pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let idle_key = TargetSession::new("host-a", "default");
+        let active_key = TargetSession::new("host-a", "work");
+        let idle_pane = PaneId::new("host-a", "default", "w1:p1");
+        let active_pane = PaneId::new("host-a", "work", "w6:p1");
         let idle_snapshot = NormalizedSnapshot::from_value(
             &idle_key,
             &json!({"panes": [{"pane_id": "w1:p1"}], "focused_pane_id": "w1:p1"}),
@@ -2972,8 +2972,8 @@ mod tests {
 
     #[test]
     fn restores_only_an_exact_live_qualified_pane() {
-        let key = TargetSession::new("ws01", "rv32sim");
-        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let key = TargetSession::new("host-a", "work");
+        let pane = PaneId::new("host-a", "work", "w6:p1");
         let snapshot = NormalizedSnapshot::from_value(
             &key,
             &json!({"panes": [{"pane_id": "w6:p1"}], "focused_pane_id": "w6:p1"}),
@@ -2997,8 +2997,8 @@ mod tests {
 
     #[test]
     fn retains_restore_intent_while_its_target_is_reconnecting() {
-        let key = TargetSession::new("ws01", "rv32sim");
-        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let key = TargetSession::new("host-a", "work");
+        let pane = PaneId::new("host-a", "work", "w6:p1");
         let mut state = FederationState::default();
         state.targets.insert(
             key.clone(),
@@ -3039,7 +3039,7 @@ mod tests {
 
     #[test]
     fn renders_active_drag_selection_as_a_visible_highlight() {
-        let pane = PaneId::new("ws01", "rv32sim", "w6:p1");
+        let pane = PaneId::new("host-a", "work", "w6:p1");
         let mut parser = vt100::Parser::new(1, 10, 0);
         parser.process(b"hello");
         let selection = TerminalSelection {
@@ -3087,9 +3087,9 @@ mod tests {
 
     #[test]
     fn maps_server_split_geometry_into_the_local_terminal_surface() {
-        let key = TargetSession::new("ws01", "dev");
-        let left = PaneId::new("ws01", "dev", "w1:p1");
-        let right = PaneId::new("ws01", "dev", "w1:p2");
+        let key = TargetSession::new("host-a", "dev");
+        let left = PaneId::new("host-a", "dev", "w1:p1");
+        let right = PaneId::new("host-a", "dev", "w1:p2");
         let snapshot = NormalizedSnapshot::from_value(
             &key,
             &json!({
@@ -3157,7 +3157,7 @@ mod tests {
 
     #[test]
     fn prefix_navigation_selects_tabs_and_workspaces_locally() {
-        let key = TargetSession::new("ws01", "dev");
+        let key = TargetSession::new("host-a", "dev");
         let snapshot = NormalizedSnapshot::from_value(
             &key,
             &json!({
@@ -3188,17 +3188,17 @@ mod tests {
             runtime(key, TargetConnectionState::Live, Some(snapshot)),
         );
         let mut app = App {
-            selected_pane: Some(PaneId::new("ws01", "dev", "w1:p1")),
+            selected_pane: Some(PaneId::new("host-a", "dev", "w1:p1")),
             ..App::default()
         };
 
         assert_eq!(
             sidebar_pane_at_row(&state, app.selected_pane.as_ref(), 0),
-            Some(PaneId::new("ws01", "dev", "w1:p1"))
+            Some(PaneId::new("host-a", "dev", "w1:p1"))
         );
         assert_eq!(
             sidebar_pane_at_row(&state, app.selected_pane.as_ref(), 2),
-            Some(PaneId::new("ws01", "dev", "w2:p1"))
+            Some(PaneId::new("host-a", "dev", "w2:p1"))
         );
         update_sidebar_hit_areas(&state, &mut app, ratatui::layout::Rect::new(0, 0, 28, 10));
         assert_eq!(app.sidebar_hit_areas.len(), 3);
@@ -3208,28 +3208,34 @@ mod tests {
         );
         assert_eq!(
             app.sidebar_hit_areas[2].pane,
-            PaneId::new("ws01", "dev", "w2:p1")
+            PaneId::new("host-a", "dev", "w2:p1")
         );
         assert_eq!(
             tab_at_column(&state, app.selected_pane.as_ref(), 1),
-            Some(crate::model::TabId::new("ws01", "dev", "w1:t1"))
+            Some(crate::model::TabId::new("host-a", "dev", "w1:t1"))
         );
         assert_eq!(
             tab_at_column(&state, app.selected_pane.as_ref(), 10),
-            Some(crate::model::TabId::new("ws01", "dev", "w1:t2"))
+            Some(crate::model::TabId::new("host-a", "dev", "w1:t2"))
         );
 
         cycle_tab(&state, &mut app, 1);
-        assert_eq!(app.selected_pane, Some(PaneId::new("ws01", "dev", "w1:p2")));
+        assert_eq!(
+            app.selected_pane,
+            Some(PaneId::new("host-a", "dev", "w1:p2"))
+        );
 
         select_workspace(&state, &mut app, 1);
-        assert_eq!(app.selected_pane, Some(PaneId::new("ws01", "dev", "w2:p1")));
+        assert_eq!(
+            app.selected_pane,
+            Some(PaneId::new("host-a", "dev", "w2:p1"))
+        );
     }
 
     #[test]
     fn sidebar_activates_the_original_pressed_item_on_release() {
-        let old = PaneId::new("ws01", "dev", "w1:p1");
-        let pressed = PaneId::new("ws01", "dev", "w2:p1");
+        let old = PaneId::new("host-a", "dev", "w1:p1");
+        let pressed = PaneId::new("host-a", "dev", "w2:p1");
         let mut app = App {
             selected_pane: Some(old),
             sidebar_press: Some(pressed.clone()),

@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn normalizes_capabilities_and_qualified_resource_ids() {
-        let key = TargetSession::new("ws01", "dev");
+        let key = TargetSession::new("host-a", "dev");
         let normalized = NormalizedSnapshot::from_value(&key, &snapshot("w1:p1").snapshot);
 
         assert!(normalized.capabilities.contains("events"));
@@ -902,22 +902,22 @@ mod tests {
         assert!(
             normalized
                 .panes
-                .contains_key(&PaneId::new("ws01", "dev", "w1:p1"))
+                .contains_key(&PaneId::new("host-a", "dev", "w1:p1"))
         );
         assert_eq!(
             normalized
                 .agents
-                .get(&PaneId::new("ws01", "dev", "w1:p1"))
+                .get(&PaneId::new("host-a", "dev", "w1:p1"))
                 .and_then(|agent| agent.status.as_deref()),
             Some("working")
         );
         assert_eq!(normalized.counts.panes, 1);
         let layout = normalized
             .layouts
-            .get(&crate::model::TabId::new("ws01", "dev", "w1:t1"))
+            .get(&crate::model::TabId::new("host-a", "dev", "w1:t1"))
             .unwrap();
         assert_eq!(layout.area.width, 100);
-        assert_eq!(layout.panes[0].pane, PaneId::new("ws01", "dev", "w1:p1"));
+        assert_eq!(layout.panes[0].pane, PaneId::new("host-a", "dev", "w1:p1"));
     }
 
     #[tokio::test]
@@ -925,17 +925,17 @@ mod tests {
         let config = Config::parse(
             r#"
                 [[targets]]
-                name = "ws01"
+                name = "host-a"
                 session = "dev"
 
                 [[targets]]
-                name = "ws02"
+                name = "host-b"
                 session = "dev"
             "#,
         )
         .unwrap();
-        let first_key = TargetSession::new("ws01", "dev");
-        let second_key = TargetSession::new("ws02", "dev");
+        let first_key = TargetSession::new("host-a", "dev");
+        let second_key = TargetSession::new("host-b", "dev");
         let (first_tx, first_rx) = mpsc::unbounded_channel();
         let (second_tx, second_rx) = mpsc::unbounded_channel();
         let transport = Arc::new(FakeTransport {
@@ -970,7 +970,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .panes
-                .contains_key(&PaneId::new("ws01", "dev", "w1:p1"))
+                .contains_key(&PaneId::new("host-a", "dev", "w1:p1"))
         );
         assert!(
             initial.targets[&second_key]
@@ -978,7 +978,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .panes
-                .contains_key(&PaneId::new("ws02", "dev", "w1:p1"))
+                .contains_key(&PaneId::new("host-b", "dev", "w1:p1"))
         );
 
         first_tx
@@ -1005,7 +1005,7 @@ mod tests {
                 .is_some_and(|snapshot| {
                     snapshot
                         .panes
-                        .contains_key(&PaneId::new("ws02", "dev", "w1:p2"))
+                        .contains_key(&PaneId::new("host-b", "dev", "w1:p2"))
                 })
         })
         .await;
@@ -1032,13 +1032,13 @@ mod tests {
         let config = Config::parse(
             r#"
                 [[targets]]
-                name = "ws01"
+                name = "host-a"
                 session = "dev"
                 socket = "/tmp/fake-herdr.sock"
             "#,
         )
         .unwrap();
-        let key = TargetSession::new("ws01", "dev");
+        let key = TargetSession::new("host-a", "dev");
         let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let transport = Arc::new(FakeTransport {
@@ -1062,7 +1062,7 @@ mod tests {
                 .is_some_and(|snapshot| {
                     snapshot
                         .panes
-                        .contains_key(&PaneId::new("ws01", "dev", "w1:p1"))
+                        .contains_key(&PaneId::new("host-a", "dev", "w1:p1"))
                 })
         })
         .await;
@@ -1076,7 +1076,7 @@ mod tests {
                 .is_some_and(|snapshot| {
                     snapshot
                         .panes
-                        .contains_key(&PaneId::new("ws01", "dev", "w1:p2"))
+                        .contains_key(&PaneId::new("host-a", "dev", "w1:p2"))
                 })
         })
         .await;
