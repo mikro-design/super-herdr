@@ -77,6 +77,13 @@ impl ResourceAction {
         )
     }
 
+    pub fn is_destructive(&self) -> bool {
+        matches!(
+            self,
+            Self::CloseWorkspace { .. } | Self::CloseTab { .. } | Self::ClosePane { .. }
+        )
+    }
+
     pub fn target_session(&self) -> Option<TargetSession> {
         match self {
             Self::JumpToPane { pane, .. }
@@ -103,7 +110,7 @@ impl ResourceAction {
                 format!("Rename workspace {current_label:?}")
             }
             Self::CloseWorkspace { label, .. } => format!("Close workspace {label:?}"),
-            Self::CreateTab { .. } => "Create tab in selected workspace".to_owned(),
+            Self::CreateTab { .. } => "Create tab".to_owned(),
             Self::RenameTab { current_label, .. } => format!("Rename tab {current_label:?}"),
             Self::CloseTab { label, .. } => format!("Close tab {label:?}"),
             Self::SplitPane { direction, .. } => format!("Split pane {}", direction.label()),
@@ -141,6 +148,7 @@ mod tests {
         );
         assert_eq!(action.palette_scope(), "build/toolchains");
         assert!(action.mutates_herdr());
+        assert!(action.is_destructive());
     }
 
     #[test]

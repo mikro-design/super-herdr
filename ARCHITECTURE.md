@@ -87,6 +87,11 @@ baseline; later phase changes create one unread event. Repeated snapshots are
 deduplicated. An agent is recorded as disappeared only when its target remains
 live and an authoritative snapshot removes it; target disconnects never create
 false disappearance events. Selecting the qualified pane marks its events read.
+The sidebar dedicates its lower half to the independently scrollable attention
+feed: agents waiting now precede newest-first transition history. Each actionable
+row retains its qualified pane identity for click-to-jump routing. The full
+attention center remains available for filtering, unread management, and history
+cleanup.
 
 ## Terminal data plane
 
@@ -119,9 +124,11 @@ session, and a workspace-close failure remains isolated to its target.
 The action palette is backed by typed `ResourceAction` values rather than raw
 command strings. An action retains its qualified target/session/resource until
 execution; only the final transport step extracts the server-local ID for the
-documented Herdr CLI. Search, keyboard shortcuts, and future mouse context menus
-therefore share one routing model. Destructive workspace, tab, and pane actions
-must pass through the same qualified confirmation path.
+documented Herdr CLI. Search, keyboard shortcuts, and mouse context menus share
+one routing model. A right-click captures the exact qualified session,
+workspace, tab, or pane under the pointer; it never reconstructs identity from a
+display label. Destructive workspace, tab, and pane actions must pass through
+the same qualified confirmation path.
 
 The outer TUI captures SGR mouse input and translates terminal coordinates back
 to the selected pane. A left press is held until the gesture is resolved: release
@@ -131,7 +138,9 @@ that pane's ANSI stream. Wheel gestures use the public `terminal.scroll`
 controller command so the Herdr server owns application/alternate-screen/host-
 scrollback routing. A click on another visible split changes only Super-Herdr's
 local selection and consumes the full gesture. Host/session/workspace rows and
-tabs are also locally clickable. When mouse reporting is disabled, left-button
+tabs are also locally clickable. Right-click is reserved for Super-Herdr's
+qualified resource menu and is not forwarded to the selected terminal. When
+mouse reporting is disabled, left-button
 drags select text and remain clamped to the originating terminal surface.
 Observer-only routes select locally because they have no input channel.
 The outer capture requests button-motion (`1002`) rather than all-motion (`1003`),
@@ -140,10 +149,12 @@ inside another terminal multiplexer.
 Sidebar hit rectangles are derived from the rendered block's inner area and stored
 with that frame. A press owns its resolved item until release, matching Herdr's
 interaction model instead of recomputing a row from potentially newer state.
-The sidebar is a scrollable viewport over every qualified host/session/workspace
-row. Wheel input over that viewport changes only its local offset; selecting a
-pane resumes automatic tracking of the corresponding workspace. Hit rectangles
-are derived after applying the offset so clipped rows cannot receive clicks.
+The sidebar is split equally between two independently scrollable viewports. The
+upper viewport contains every qualified host/session/workspace row; the lower
+contains agents waiting now and recent attention transitions. Wheel input changes
+only the offset of the viewport under the pointer. Selecting a pane resumes
+automatic tracking of the corresponding workspace. Hit rectangles are derived
+after applying each offset so clipped rows cannot receive clicks.
 Rendering is capped at 60 Hz, terminal-frame events are drained in bounded batches,
 and input is prioritized so busy panes cannot starve navigation.
 

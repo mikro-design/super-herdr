@@ -29,12 +29,14 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Live configuration and running-session discovery refresh without restarting
   Herdr.
 - A global agent navigator with attention and active-work filters.
-- A persistent sidebar list of blocked, waiting, and input-ready agents across
-  all live hosts, with click-to-jump routing.
+- A persistent lower-sidebar attention feed for blocked/waiting agents and recent
+  transitions across all live hosts, with click-to-jump routing.
 - A durable metadata-only attention history with unread counts, transition
   deduplication, and qualified jump-and-mark-read behavior.
 - A fuzzy-searchable action palette for navigation and qualified workspace,
   tab, and pane lifecycle operations.
+- Right-click session, workspace, tab, and pane menus backed by those same
+  qualified lifecycle actions and close confirmations.
 
 ## Recommended topology
 
@@ -329,6 +331,7 @@ workspace actions:
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |
+| Right-click session/workspace/tab/pane | Open its qualified action menu |
 
 Workspace close is deliberately confirmed with its Super-Herdr host name,
 Herdr session, display label, and server-local workspace ID. It closes only that
@@ -377,17 +380,26 @@ saves. A blank SSH field means the Herdr installation is local to the desktop.
 Advanced socket and client-path overrides remain available through `target add`
 and `target edit`.
 
-The sidebar keeps blocked, waiting, or input-ready agents visible above the
-host/session tree. Every row is qualified by host and session and can be clicked
-to jump directly to its pane. `Ctrl+]`, then `a` opens the full navigator on the
-`attention` filter; use `j`/`k` to select, `f` to cycle between `attention`,
-`active`, and `all`, and `Enter` to jump to the agent's pane.
+The sidebar reserves its upper half for host/session/workspace navigation and its
+lower half for attention. The lower feed shows agents waiting now followed by
+newest-first transition history; it scrolls independently, and every agent/event
+row retains its qualified host/session/pane for click-to-jump routing. `Ctrl+]`,
+then `a` opens the full navigator on the `attention` filter; use `j`/`k` to
+select, `f` to cycle between `attention`, `active`, and `all`, and `Enter` to jump
+to the agent's pane.
 
 Agent status changes are recorded as payload-free attention events. `Ctrl+]`,
 then `e` opens the newest-first history: use `j`/`k` to select, `Enter` to jump
 and mark that qualified pane's events read, `r` to mark everything read, and `c`
 to clear events already read. Repeated snapshots do not create duplicate events,
 and a disconnected target does not falsely mark its agents as disappeared.
+
+Right-clicking a session, workspace, tab, or pane opens a pointer-anchored menu.
+Use the mouse, `j`/`k`, or the arrow keys to choose an action and `Enter` to run
+it. Workspace, tab, and pane closure still goes through the same qualified
+confirmation used by the action palette; no context action stops or restarts a
+Herdr session. Right-click is reserved for this qualified Super-Herdr menu and is
+not forwarded to the program inside the selected pane.
 
 Mouse behavior inside the selected terminal:
 

@@ -12,20 +12,22 @@ Work is ordered by dependency and product risk.
 - In-TUI target add/edit/remove manager.
 - Concurrent live configuration and running-session registry refresh.
 - Global agent navigator with all/attention/active filters.
-- Persistent cross-host waiting-agent list with qualified click-to-jump rows.
+- Persistent lower-sidebar attention feed with current waiting agents, recent
+  transitions, independent scrolling, and qualified click-to-jump rows.
 - Durable payload-free attention history with unread transition tracking and
   deduplication across restarts.
 - Fuzzy-searchable action palette with qualified workspace, tab, and pane
   lifecycle operations.
+- Qualified mouse context menus for sessions, workspaces, tabs, and panes, backed
+  by the shared resource-action and close-confirmation paths.
 
 ## Next
 
-1. Add mouse context menus backed by the shared resource-action layer.
-2. Add mouse activation and richer validation to target-manager forms.
-3. Execute and record the full desktop matrix in `TESTING.md`.
-4. Add opt-in native desktop delivery for metadata-only attention events.
-5. Add signed release artifacts and package-manager installation.
-6. Select an explicit project license before inviting external contributions.
+1. Add mouse activation and richer validation to target-manager forms.
+2. Execute and record the full desktop matrix in `TESTING.md`.
+3. Add opt-in native desktop delivery for metadata-only attention events.
+4. Add signed release artifacts and package-manager installation.
+5. Select an explicit project license before inviting external contributions.
 
 ## Later
 

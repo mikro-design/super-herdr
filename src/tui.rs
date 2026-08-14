@@ -90,6 +90,10 @@ impl MouseInput {
         self.release && self.code & 0b0110_0011 == 0
     }
 
+    fn is_right_press(self) -> bool {
+        !self.release && self.code & 0b0110_0011 == 2
+    }
+
     fn is_motion(self) -> bool {
         self.code & 0b0010_0000 != 0
     }
@@ -524,13 +528,23 @@ impl TargetManager {
 #[derive(Debug, Clone)]
 struct SidebarHitArea {
     area: Rect,
-    pane: PaneId,
+    pane: Option<PaneId>,
+    context: Option<ContextTarget>,
 }
 
 struct SidebarRow {
     line: Line<'static>,
     pane: Option<PaneId>,
+    context: Option<ContextTarget>,
     selection_anchor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextTarget {
+    Session(TargetSession),
+    Workspace(WorkspaceId),
+    Tab(TabId),
+    Pane(PaneId),
 }
 
 struct ActiveRoute {
@@ -581,6 +595,15 @@ struct CommandPalette {
     selected: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    title: String,
+    actions: Vec<ResourceAction>,
+    selected: usize,
+    anchor: Position,
+    pressed: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TextPromptAction {
     CreateWorkspace { target: TargetSession },
@@ -618,6 +641,7 @@ struct App {
     selection_autoscroll: Option<SelectionAutoscroll>,
     swallow_left_gesture: bool,
     sidebar_offset: usize,
+    attention_sidebar_offset: usize,
     sidebar_follow_selected: bool,
     sidebar_last_selected: Option<PaneId>,
     sidebar_hit_areas: Vec<SidebarHitArea>,
@@ -634,6 +658,7 @@ struct App {
     attention_store: Option<AttentionStore>,
     attention_center: Option<AttentionCenter>,
     command_palette: Option<CommandPalette>,
+    context_menu: Option<ContextMenu>,
     text_prompt: Option<TextPrompt>,
     close_confirmation: Option<CloseConfirmation>,
     herdr_action_sender: Option<mpsc::UnboundedSender<HerdrActionEvent>>,
@@ -658,6 +683,7 @@ impl Default for App {
             selection_autoscroll: None,
             swallow_left_gesture: false,
             sidebar_offset: 0,
+            attention_sidebar_offset: 0,
             sidebar_follow_selected: true,
             sidebar_last_selected: None,
             sidebar_hit_areas: Vec::new(),
@@ -674,6 +700,7 @@ impl Default for App {
             attention_store: None,
             attention_center: None,
             command_palette: None,
+            context_menu: None,
             text_prompt: None,
             close_confirmation: None,
             herdr_action_sender: None,
@@ -1044,7 +1071,7 @@ async fn handle_decoded_input(
 ) -> Result<bool> {
     match input {
         DecodedInput::Bytes(bytes) => {
-            if app.command_palette.is_some() {
+            if app.command_palette.is_some() || app.context_menu.is_some() {
                 let navigation = match bytes.as_slice() {
                     b"\x1b[A" => Some(0x10),
                     b"\x1b[B" => Some(0x0e),
@@ -1060,13 +1087,16 @@ async fn handle_decoded_input(
                 }
             }
         }
-        DecodedInput::Mouse(mouse) => handle_mouse(mouse, state, app).await?,
+        DecodedInput::Mouse(mouse) => {
+            handle_mouse(mouse, state, targets, transport_config, app).await?
+        }
         DecodedInput::Paste(bytes) => {
             if app.mode != InputMode::Terminal
                 || app.target_manager.is_some()
                 || app.agent_navigator.is_some()
                 || app.attention_center.is_some()
                 || app.command_palette.is_some()
+                || app.context_menu.is_some()
                 || app.text_prompt.is_some()
                 || app.close_confirmation.is_some()
             {
@@ -1102,7 +1132,17 @@ async fn handle_decoded_input(
     Ok(false)
 }
 
-async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App) -> Result<()> {
+async fn handle_mouse(
+    mouse: MouseInput,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<()> {
+    if app.context_menu.is_some() {
+        handle_context_menu_mouse(mouse, state, targets, transport_config, app);
+        return Ok(());
+    }
     if app.mode != InputMode::Terminal
         || app.target_manager.is_some()
         || app.agent_navigator.is_some()
@@ -1187,19 +1227,50 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
 
     if sidebar_area.contains(outer) {
         if let Some(direction) = mouse.scroll_direction() {
-            scroll_sidebar(state, app, sidebar_area, direction);
+            let (sessions_area, attention_area) = sidebar_areas(sidebar_area);
+            if attention_area.contains(outer) {
+                scroll_attention_sidebar(state, app, sidebar_area, direction);
+            } else if sessions_area.contains(outer) {
+                scroll_session_sidebar(state, app, sidebar_area, direction);
+            }
+        } else if mouse.is_right_press() {
+            if let Some((pane, target)) = app
+                .sidebar_hit_areas
+                .iter()
+                .find(|hit| hit.area.contains(outer))
+                .map(|hit| (hit.pane.clone(), hit.context.clone()))
+                && let Some(target) = target
+            {
+                if let Some(pane) = pane {
+                    select_pane(app, pane);
+                }
+                open_context_menu(state, target, outer, app);
+            }
         } else if mouse.is_left_press() {
             app.sidebar_press = app
                 .sidebar_hit_areas
                 .iter()
                 .find(|hit| hit.area.contains(outer))
-                .map(|hit| hit.pane.clone());
+                .and_then(|hit| hit.pane.clone());
             app.swallow_left_gesture = true;
         }
         return Ok(());
     }
     if tab_area.contains(outer) {
-        if mouse.is_left_press() {
+        if mouse.is_right_press() {
+            if let Some(tab) = tab_at_column(
+                state,
+                app.selected_pane.as_ref(),
+                outer.x.saturating_sub(tab_area.x),
+            ) {
+                if let Some((snapshot, _)) =
+                    selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+                {
+                    select_tab(snapshot, &tab, app);
+                }
+                open_context_menu(state, ContextTarget::Tab(tab), outer, app);
+            }
+        } else if mouse.is_left_press() {
             if let Some(tab) = tab_at_column(
                 state,
                 app.selected_pane.as_ref(),
@@ -1226,6 +1297,14 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
     else {
         return Ok(());
     };
+
+    if mouse.is_right_press() {
+        if app.selected_pane.as_ref() != Some(&pane) {
+            select_pane(app, pane.clone());
+        }
+        open_context_menu(state, ContextTarget::Pane(pane), outer, app);
+        return Ok(());
+    }
 
     if app.selected_pane.as_ref() != Some(&pane) {
         if mouse.is_left_press() {
@@ -1447,8 +1526,7 @@ fn refresh_attention(state: &FederationState, app: &mut App) {
     let previous_unread = app.attention.unread_count();
     if app.attention.observe(state) {
         if app.attention.unread_count() > previous_unread {
-            app.sidebar_offset = 0;
-            app.sidebar_follow_selected = false;
+            app.attention_sidebar_offset = 0;
         }
         persist_attention(app);
     }
@@ -1715,6 +1793,9 @@ async fn handle_input(
     transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<bool> {
+    if app.context_menu.is_some() {
+        return handle_context_menu_input(key, state, targets, transport_config, app);
+    }
     if app.close_confirmation.is_some() {
         return handle_close_confirmation_input(key, state, targets, transport_config, app);
     }
@@ -2213,6 +2294,108 @@ fn command_palette_actions(
     actions
 }
 
+fn context_menu_for_target(
+    state: &FederationState,
+    target: ContextTarget,
+    anchor: Position,
+) -> Option<ContextMenu> {
+    let (title, actions) = match target {
+        ContextTarget::Session(target) => {
+            actionable_snapshot(state, &target)?;
+            (
+                format!("session {target}"),
+                vec![ResourceAction::CreateWorkspace { target }],
+            )
+        }
+        ContextTarget::Workspace(workspace) => {
+            let snapshot = actionable_snapshot(state, &workspace.target_session())?;
+            let resource = snapshot.workspaces.get(&workspace)?;
+            let label = display_label(&resource.id.resource, resource.label.as_deref());
+            (
+                format!("workspace {label} · {}", workspace.target_session()),
+                vec![
+                    ResourceAction::CreateTab {
+                        workspace: workspace.clone(),
+                    },
+                    ResourceAction::RenameWorkspace {
+                        workspace: workspace.clone(),
+                        current_label: label.clone(),
+                    },
+                    ResourceAction::CloseWorkspace { workspace, label },
+                ],
+            )
+        }
+        ContextTarget::Tab(tab) => {
+            let snapshot = actionable_snapshot(state, &tab.target_session())?;
+            let resource = snapshot.tabs.get(&tab)?;
+            let label = display_label(&resource.id.resource, resource.label.as_deref());
+            (
+                format!("tab {label} · {}", tab.target_session()),
+                vec![
+                    ResourceAction::RenameTab {
+                        tab: tab.clone(),
+                        current_label: label.clone(),
+                    },
+                    ResourceAction::CloseTab { tab, label },
+                ],
+            )
+        }
+        ContextTarget::Pane(pane) => {
+            let snapshot = actionable_snapshot(state, &pane.target_session())?;
+            let resource = snapshot.panes.get(&pane)?;
+            let label = display_label(&resource.id.resource, resource.label.as_deref());
+            (
+                format!("pane {label} · {}", pane.target_session()),
+                vec![
+                    ResourceAction::SplitPane {
+                        pane: pane.clone(),
+                        direction: SplitDirection::Right,
+                    },
+                    ResourceAction::SplitPane {
+                        pane: pane.clone(),
+                        direction: SplitDirection::Down,
+                    },
+                    ResourceAction::TogglePaneZoom { pane: pane.clone() },
+                    ResourceAction::ClosePane { pane, label },
+                ],
+            )
+        }
+    };
+    Some(ContextMenu {
+        title,
+        actions,
+        selected: 0,
+        anchor,
+        pressed: None,
+    })
+}
+
+fn actionable_snapshot<'a>(
+    state: &'a FederationState,
+    target: &TargetSession,
+) -> Option<&'a NormalizedSnapshot> {
+    let runtime = state.targets.get(target)?;
+    (runtime.connection == TargetConnectionState::Live && runtime.selected_herdr_bin.is_some())
+        .then_some(runtime.snapshot.as_deref())
+        .flatten()
+}
+
+fn open_context_menu(
+    state: &FederationState,
+    target: ContextTarget,
+    anchor: Position,
+    app: &mut App,
+) {
+    app.selection = None;
+    app.selection_autoscroll = None;
+    if let Some(menu) = context_menu_for_target(state, target, anchor) {
+        app.context_menu = Some(menu);
+        app.message = None;
+    } else {
+        app.message = Some("that resource is not currently actionable".to_owned());
+    }
+}
+
 fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
     let candidate = candidate.to_lowercase().chars().collect::<Vec<_>>();
     let query = query.trim().to_lowercase().chars().collect::<Vec<_>>();
@@ -2304,6 +2487,104 @@ fn handle_command_palette_input(
     palette.selected = palette.selected.min(count.saturating_sub(1));
     app.command_palette = Some(palette);
     Ok(false)
+}
+
+fn handle_context_menu_input(
+    key: u8,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<bool> {
+    let Some(mut menu) = app.context_menu.take() else {
+        return Ok(false);
+    };
+    match key {
+        b'q' | 0x1b => return Ok(false),
+        b'j' | b'\t' | 0x0e => {
+            if !menu.actions.is_empty() {
+                menu.selected = (menu.selected + 1) % menu.actions.len();
+            }
+        }
+        b'k' | 0x10 => {
+            if !menu.actions.is_empty() {
+                menu.selected = menu
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(menu.actions.len() - 1);
+            }
+        }
+        b'\r' | b'\n' => {
+            if let Some(action) = menu.actions.get(menu.selected).cloned() {
+                execute_resource_action(action, state, targets, transport_config, app);
+            }
+            return Ok(false);
+        }
+        _ => {}
+    }
+    app.context_menu = Some(menu);
+    Ok(false)
+}
+
+fn handle_context_menu_mouse(
+    mouse: MouseInput,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) {
+    let Some(frame_area) = app.last_frame_area else {
+        app.context_menu = None;
+        return;
+    };
+    let Some(menu) = app.context_menu.as_ref() else {
+        return;
+    };
+    let outer = Position::new(mouse.column.saturating_sub(1), mouse.row.saturating_sub(1));
+    let action_at_pointer = context_menu_action_at(frame_area, menu, outer);
+
+    if let Some(direction) = mouse.scroll_direction() {
+        let menu = app
+            .context_menu
+            .as_mut()
+            .expect("context menu was checked above");
+        if !menu.actions.is_empty() {
+            menu.selected = match direction {
+                TerminalScrollDirection::Up => menu.selected.saturating_sub(1),
+                TerminalScrollDirection::Down => (menu.selected + 1).min(menu.actions.len() - 1),
+            };
+        }
+        return;
+    }
+    if mouse.is_left_press() {
+        if let Some(index) = action_at_pointer {
+            let menu = app
+                .context_menu
+                .as_mut()
+                .expect("context menu was checked above");
+            menu.selected = index;
+            menu.pressed = Some(index);
+        } else {
+            app.context_menu = None;
+        }
+        return;
+    }
+    if mouse.is_left_release() {
+        let action = app.context_menu.as_ref().and_then(|menu| {
+            (menu.pressed == action_at_pointer)
+                .then_some(action_at_pointer)
+                .flatten()
+                .and_then(|index| menu.actions.get(index).cloned())
+        });
+        if let Some(action) = action {
+            app.context_menu = None;
+            execute_resource_action(action, state, targets, transport_config, app);
+        } else if let Some(menu) = app.context_menu.as_mut() {
+            menu.pressed = None;
+        }
+    } else if mouse.is_right_press() {
+        app.context_menu = None;
+    }
 }
 
 fn execute_resource_action(
@@ -3793,6 +4074,8 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
         render_agent_navigator(frame, state, navigator);
     } else if let Some(center) = app.attention_center.as_ref() {
         render_attention_center(frame, &app.attention, center);
+    } else if let Some(menu) = app.context_menu.as_ref() {
+        render_context_menu(frame, menu);
     } else if let Some(palette) = app.command_palette.as_ref() {
         render_command_palette(frame, state, app.selected_pane.as_ref(), palette);
     } else if let Some(prompt) = app.text_prompt.as_ref() {
@@ -3800,6 +4083,97 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
     } else if let Some(confirmation) = app.close_confirmation.as_ref() {
         render_close_confirmation(frame, confirmation);
     }
+}
+
+fn context_menu_block(title: &str) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(
+            format!(" {} ", safe_text(title)),
+            Style::default().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1))
+}
+
+fn context_menu_area(frame_area: Rect, menu: &ContextMenu) -> Rect {
+    let label_width = menu
+        .actions
+        .iter()
+        .map(|action| action.palette_label().chars().count())
+        .max()
+        .unwrap_or_default();
+    let desired_width = menu
+        .title
+        .chars()
+        .count()
+        .max(label_width)
+        .saturating_add(6);
+    let width = u16::try_from(desired_width)
+        .unwrap_or(u16::MAX)
+        .min(frame_area.width)
+        .max(1);
+    let desired_height = menu.actions.len().saturating_add(2);
+    let height = u16::try_from(desired_height)
+        .unwrap_or(u16::MAX)
+        .min(frame_area.height)
+        .max(1);
+    let maximum_x = frame_area
+        .x
+        .saturating_add(frame_area.width.saturating_sub(width));
+    let maximum_y = frame_area
+        .y
+        .saturating_add(frame_area.height.saturating_sub(height));
+    Rect::new(
+        menu.anchor.x.clamp(frame_area.x, maximum_x),
+        menu.anchor.y.clamp(frame_area.y, maximum_y),
+        width,
+        height,
+    )
+}
+
+fn context_menu_action_at(
+    frame_area: Rect,
+    menu: &ContextMenu,
+    position: Position,
+) -> Option<usize> {
+    let area = context_menu_area(frame_area, menu);
+    let inner = context_menu_block(&menu.title).inner(area);
+    if !inner.contains(position) {
+        return None;
+    }
+    let index = usize::from(position.y.saturating_sub(inner.y));
+    (index < menu.actions.len()).then_some(index)
+}
+
+fn render_context_menu(frame: &mut Frame, menu: &ContextMenu) {
+    let area = context_menu_area(frame.area(), menu);
+    frame.render_widget(Clear, area);
+    let block = context_menu_block(&menu.title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = menu
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let style = if action.is_destructive() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            let line = Line::from(vec![
+                Span::raw(if index == menu.selected { "> " } else { "  " }),
+                Span::styled(safe_text(&action.palette_label()), style),
+            ]);
+            if index == menu.selected {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_command_palette(
@@ -4177,13 +4551,7 @@ fn render_attention_center(
             .min(events.len().saturating_sub(available));
         for (index, event) in events.iter().enumerate().skip(start).take(available) {
             let marker = if event.unread { "●" } else { " " };
-            let event_color = match event.kind {
-                AttentionEventKind::NeedsAttention => Color::Red,
-                AttentionEventKind::Working => Color::Yellow,
-                AttentionEventKind::Completed => Color::Green,
-                AttentionEventKind::StatusChanged => Color::Cyan,
-                AttentionEventKind::Disappeared => Color::DarkGray,
-            };
+            let event_color = attention_event_color(event.kind);
             let line = Line::from(vec![
                 Span::styled(
                     format!("{marker} {:>4}  ", attention_event_age(event)),
@@ -4376,73 +4744,13 @@ fn sidebar_pane_at_row(
 
 #[cfg(test)]
 fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<SidebarRow> {
-    sidebar_rows_with_attention(state, selected, None)
+    sidebar_session_rows(state, selected)
 }
 
-fn sidebar_rows_with_attention(
-    state: &FederationState,
-    selected: Option<&PaneId>,
-    attention: Option<&AttentionIndex>,
-) -> Vec<SidebarRow> {
+fn sidebar_session_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<SidebarRow> {
     let selected_target = selected.map(PaneId::target_session);
     let selected_workspace = selected_workspace(state, selected);
     let mut rows = Vec::new();
-    let waiting_agents = agent_jump_entries(state, AgentFilter::Attention);
-    let unread = attention.map_or(0, AttentionIndex::unread_count);
-    if !waiting_agents.is_empty() || unread > 0 {
-        rows.push(SidebarRow {
-            line: Line::styled(
-                if unread > 0 && !waiting_agents.is_empty() {
-                    format!(" attention {unread} new · {} waiting", waiting_agents.len())
-                } else if unread > 0 {
-                    format!(" attention {unread} new  ^]e")
-                } else {
-                    format!(" waiting agents ({})  ^]a", waiting_agents.len())
-                },
-                Style::default().fg(Color::Red).bold(),
-            ),
-            pane: None,
-            selection_anchor: false,
-        });
-        for entry in waiting_agents {
-            let is_selected = selected == Some(&entry.pane);
-            let style = Style::default()
-                .fg(Color::Red)
-                .add_modifier(if is_selected {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                });
-            let unread =
-                attention.is_some_and(|attention| attention.has_unread_for_pane(&entry.pane));
-            let mut line = Line::from(vec![
-                Span::styled(if is_selected { ">" } else { " " }, style),
-                Span::styled(if unread { "● " } else { "! " }, style),
-                Span::styled(entry.agent, style),
-                Span::styled(
-                    format!(
-                        "  {}/{}",
-                        entry.pane.target,
-                        short_session(&entry.pane.session)
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            if is_selected {
-                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
-            }
-            rows.push(SidebarRow {
-                line,
-                pane: Some(entry.pane),
-                selection_anchor: is_selected,
-            });
-        }
-        rows.push(SidebarRow {
-            line: Line::styled(" sessions", Style::default().fg(Color::DarkGray)),
-            pane: None,
-            selection_anchor: false,
-        });
-    }
     let mut workspace_index = 1_usize;
     for target in state.targets.values() {
         let is_selected_target = selected_target.as_ref() == Some(&target.key);
@@ -4486,9 +4794,9 @@ fn sidebar_rows_with_attention(
         rows.push(SidebarRow {
             line,
             pane: target_pane,
+            context: Some(ContextTarget::Session(target.key.clone())),
             selection_anchor: is_selected_target && selected_workspace.is_none(),
         });
-
         if is_selected_target && let Some(error) = target.event_error.as_deref() {
             rows.push(SidebarRow {
                 line: Line::styled(
@@ -4496,6 +4804,7 @@ fn sidebar_rows_with_attention(
                     Style::default().fg(Color::Red),
                 ),
                 pane: None,
+                context: None,
                 selection_anchor: false,
             });
         }
@@ -4546,6 +4855,7 @@ fn sidebar_rows_with_attention(
                     pane: (target.connection == TargetConnectionState::Live)
                         .then(|| pane_for_workspace(snapshot, &workspace.id))
                         .flatten(),
+                    context: Some(ContextTarget::Workspace(workspace.id.clone())),
                     selection_anchor: is_selected,
                 });
                 workspace_index = workspace_index.saturating_add(1);
@@ -4553,6 +4863,147 @@ fn sidebar_rows_with_attention(
         }
     }
     rows
+}
+
+fn sidebar_attention_rows(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    attention: &AttentionIndex,
+) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    let waiting = agent_jump_entries(state, AgentFilter::Attention);
+    if !waiting.is_empty() {
+        rows.push(SidebarRow {
+            line: Line::styled(
+                format!(" waiting now ({})", waiting.len()),
+                Style::default().fg(Color::Red).bold(),
+            ),
+            pane: None,
+            context: None,
+            selection_anchor: false,
+        });
+        for entry in waiting {
+            let is_selected = selected == Some(&entry.pane);
+            let unread = attention.has_unread_for_pane(&entry.pane);
+            let line = Line::from(vec![
+                Span::styled(
+                    if unread { " ● " } else { " ! " },
+                    Style::default().fg(Color::Red),
+                ),
+                Span::styled(
+                    safe_text(&entry.agent),
+                    Style::default().fg(Color::Red).bold(),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}/{}",
+                        safe_text(&entry.pane.target),
+                        short_session(&entry.pane.session)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            rows.push(SidebarRow {
+                line: if is_selected {
+                    line.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else {
+                    line
+                },
+                pane: Some(entry.pane.clone()),
+                context: Some(ContextTarget::Pane(entry.pane)),
+                selection_anchor: is_selected,
+            });
+        }
+    }
+
+    rows.push(SidebarRow {
+        line: Line::styled(
+            format!(" history · {} unread  ^]e", attention.unread_count()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        pane: None,
+        context: None,
+        selection_anchor: false,
+    });
+    for event in attention.events().rev() {
+        let is_selected = selected == Some(&event.pane);
+        let line = Line::from(vec![
+            Span::styled(
+                if event.unread { " ● " } else { "   " },
+                Style::default().fg(if event.unread {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(
+                format!("{:>4} ", attention_event_age(event)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{} ", attention_event_symbol(event.kind)),
+                Style::default().fg(attention_event_color(event.kind)),
+            ),
+            Span::styled(
+                safe_text(&event.agent),
+                Style::default().add_modifier(if event.unread {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(
+                format!(
+                    "  {}/{}",
+                    safe_text(&event.pane.target),
+                    short_session(&event.pane.session)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        rows.push(SidebarRow {
+            line: if is_selected {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            },
+            pane: Some(event.pane.clone()),
+            context: Some(ContextTarget::Pane(event.pane.clone())),
+            selection_anchor: is_selected,
+        });
+    }
+    if attention.events().next().is_none() {
+        rows.push(SidebarRow {
+            line: Line::styled(
+                " No recent transitions",
+                Style::default().fg(Color::DarkGray),
+            ),
+            pane: None,
+            context: None,
+            selection_anchor: false,
+        });
+    }
+    rows
+}
+
+fn attention_event_symbol(kind: AttentionEventKind) -> &'static str {
+    match kind {
+        AttentionEventKind::NeedsAttention => "!",
+        AttentionEventKind::Working => "▶",
+        AttentionEventKind::Completed => "✓",
+        AttentionEventKind::StatusChanged => "•",
+        AttentionEventKind::Disappeared => "×",
+    }
+}
+
+fn attention_event_color(kind: AttentionEventKind) -> Color {
+    match kind {
+        AttentionEventKind::NeedsAttention => Color::Red,
+        AttentionEventKind::Working => Color::Yellow,
+        AttentionEventKind::Completed => Color::Green,
+        AttentionEventKind::StatusChanged => Color::Cyan,
+        AttentionEventKind::Disappeared => Color::DarkGray,
+    }
 }
 
 fn pane_for_workspace(snapshot: &NormalizedSnapshot, workspace: &WorkspaceId) -> Option<PaneId> {
@@ -4619,22 +5070,53 @@ fn sidebar_block() -> Block<'static> {
         .border_style(Style::default().fg(Color::DarkGray))
 }
 
+fn attention_sidebar_block(attention: &AttentionIndex) -> Block<'static> {
+    let title = if attention.unread_count() > 0 {
+        format!(" attention · {} new ", attention.unread_count())
+    } else {
+        " attention ".to_owned()
+    };
+    Block::default()
+        .title(Span::styled(title, Style::default().bold()))
+        .borders(Borders::TOP | Borders::RIGHT)
+        .border_style(Style::default().fg(if attention.unread_count() > 0 {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }))
+}
+
+fn sidebar_areas(area: Rect) -> (Rect, Rect) {
+    let [sessions, attention] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+    (sessions, attention)
+}
+
 fn sidebar_content_height(area: Rect) -> usize {
-    usize::from(sidebar_block().inner(area).height)
+    let (sessions, _) = sidebar_areas(area);
+    usize::from(sidebar_block().inner(sessions).height)
+}
+
+fn attention_sidebar_content_height(area: Rect, attention: &AttentionIndex) -> usize {
+    let (_, attention_area) = sidebar_areas(area);
+    usize::from(
+        attention_sidebar_block(attention)
+            .inner(attention_area)
+            .height,
+    )
 }
 
 fn sidebar_max_offset(row_count: usize, area: Rect) -> usize {
     row_count.saturating_sub(sidebar_content_height(area))
 }
 
-fn scroll_sidebar(
+fn scroll_session_sidebar(
     state: &FederationState,
     app: &mut App,
     area: Rect,
     direction: TerminalScrollDirection,
 ) {
-    let row_count =
-        sidebar_rows_with_attention(state, app.selected_pane.as_ref(), Some(&app.attention)).len();
+    let row_count = sidebar_session_rows(state, app.selected_pane.as_ref()).len();
     let maximum = sidebar_max_offset(row_count, area);
     let amount = usize::from(MOUSE_SCROLL_LINES);
     let next_offset = match direction {
@@ -4645,6 +5127,24 @@ fn scroll_sidebar(
         app.sidebar_offset = next_offset;
         app.sidebar_follow_selected = false;
     }
+}
+
+fn scroll_attention_sidebar(
+    state: &FederationState,
+    app: &mut App,
+    area: Rect,
+    direction: TerminalScrollDirection,
+) {
+    let row_count = sidebar_attention_rows(state, app.selected_pane.as_ref(), &app.attention).len();
+    let maximum = row_count.saturating_sub(attention_sidebar_content_height(area, &app.attention));
+    let amount = usize::from(MOUSE_SCROLL_LINES);
+    app.attention_sidebar_offset = match direction {
+        TerminalScrollDirection::Up => app.attention_sidebar_offset.saturating_sub(amount),
+        TerminalScrollDirection::Down => app
+            .attention_sidebar_offset
+            .saturating_add(amount)
+            .min(maximum),
+    };
 }
 
 fn reconcile_sidebar_viewport(rows: &[SidebarRow], app: &mut App, area: Rect) {
@@ -4676,63 +5176,132 @@ fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) 
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let content = sidebar_block().inner(area);
-    let rows = sidebar_rows_with_attention(state, app.selected_pane.as_ref(), Some(&app.attention));
-    reconcile_sidebar_viewport(&rows, app, area);
-    for (offset, row) in rows
+    let (sessions_area, attention_area) = sidebar_areas(area);
+    let sessions_content = sidebar_block().inner(sessions_area);
+    let session_rows = sidebar_session_rows(state, app.selected_pane.as_ref());
+    reconcile_sidebar_viewport(&session_rows, app, area);
+    append_sidebar_hit_areas(
+        &mut app.sidebar_hit_areas,
+        session_rows,
+        app.sidebar_offset,
+        sessions_content,
+    );
+
+    let attention_content = attention_sidebar_block(&app.attention).inner(attention_area);
+    let attention_rows = sidebar_attention_rows(state, app.selected_pane.as_ref(), &app.attention);
+    app.attention_sidebar_offset = app.attention_sidebar_offset.min(
+        attention_rows
+            .len()
+            .saturating_sub(usize::from(attention_content.height)),
+    );
+    append_sidebar_hit_areas(
+        &mut app.sidebar_hit_areas,
+        attention_rows,
+        app.attention_sidebar_offset,
+        attention_content,
+    );
+}
+
+fn append_sidebar_hit_areas(
+    hit_areas: &mut Vec<SidebarHitArea>,
+    rows: Vec<SidebarRow>,
+    offset: usize,
+    content: Rect,
+) {
+    for (visible_offset, row) in rows
         .into_iter()
-        .skip(app.sidebar_offset)
+        .skip(offset)
         .take(usize::from(content.height))
         .enumerate()
     {
-        let Ok(offset) = u16::try_from(offset) else {
+        let Ok(visible_offset) = u16::try_from(visible_offset) else {
             break;
         };
-        if offset >= content.height {
+        if visible_offset >= content.height {
             break;
         }
-        if let Some(pane) = row.pane {
-            app.sidebar_hit_areas.push(SidebarHitArea {
-                area: Rect::new(content.x, content.y + offset, content.width, 1),
-                pane,
+        if row.pane.is_some() || row.context.is_some() {
+            hit_areas.push(SidebarHitArea {
+                area: Rect::new(content.x, content.y + visible_offset, content.width, 1),
+                pane: row.pane,
+                context: row.context,
             });
         }
     }
 }
 
 fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
-    let lines =
-        sidebar_rows_with_attention(state, app.selected_pane.as_ref(), Some(&app.attention))
-            .into_iter()
-            .map(|row| row.line)
-            .collect::<Vec<_>>();
-    let row_count = lines.len();
-    let offset = u16::try_from(app.sidebar_offset).unwrap_or(u16::MAX);
+    let (sessions_area, attention_area) = sidebar_areas(area);
+    let session_lines = sidebar_session_rows(state, app.selected_pane.as_ref())
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>();
+    let session_row_count = session_lines.len();
+    let session_offset = u16::try_from(app.sidebar_offset).unwrap_or(u16::MAX);
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((offset, 0))
+        Paragraph::new(session_lines)
+            .scroll((session_offset, 0))
             .block(sidebar_block()),
-        area,
+        sessions_area,
     );
-    if row_count > sidebar_content_height(area) {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓"))
-            .track_symbol(Some("│"))
-            .thumb_symbol("█")
-            .track_style(Style::default().fg(Color::DarkGray))
-            .thumb_style(Style::default().fg(Color::Blue));
-        let mut scrollbar_state =
-            ScrollbarState::new(row_count).position(app.sidebar_offset.min(row_count - 1));
-        frame.render_stateful_widget(
-            scrollbar,
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
-        );
+    render_sidebar_scrollbar(
+        frame,
+        sessions_area,
+        session_row_count,
+        sidebar_content_height(area),
+        app.sidebar_offset,
+        Color::Blue,
+    );
+
+    let attention_lines = sidebar_attention_rows(state, app.selected_pane.as_ref(), &app.attention)
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>();
+    let attention_row_count = attention_lines.len();
+    let attention_offset = u16::try_from(app.attention_sidebar_offset).unwrap_or(u16::MAX);
+    frame.render_widget(
+        Paragraph::new(attention_lines)
+            .scroll((attention_offset, 0))
+            .block(attention_sidebar_block(&app.attention)),
+        attention_area,
+    );
+    render_sidebar_scrollbar(
+        frame,
+        attention_area,
+        attention_row_count,
+        attention_sidebar_content_height(area, &app.attention),
+        app.attention_sidebar_offset,
+        Color::Red,
+    );
+}
+
+fn render_sidebar_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    row_count: usize,
+    content_height: usize,
+    offset: usize,
+    color: Color,
+) {
+    if row_count <= content_height || row_count == 0 {
+        return;
     }
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .track_style(Style::default().fg(Color::DarkGray))
+        .thumb_style(Style::default().fg(color));
+    let mut scrollbar_state = ScrollbarState::new(row_count).position(offset.min(row_count - 1));
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scrollbar_state,
+    );
 }
 
 fn render_tabs(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
@@ -5015,23 +5584,25 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentFilter, AgentNavigator, App, AttentionCenter, CellPosition, ClipboardFeedback,
-        DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode, MAX_CLIPBOARD_BYTES,
-        MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection, SIDEBAR_WIDTH,
-        SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish, TargetManager,
-        TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
-        clamped_pane_position, cycle_tab, desired_access, displayed_message, encode_mouse_event,
-        fall_back_to_observe, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
-        handle_attention_center_input, handle_decoded_input, handle_input, handle_mouse,
-        handle_target_manager_input, mouse_event_allowed, mouse_passthrough_enabled,
-        pane_direction_score, reconcile_selection, refresh_attention, render_vt_screen, safe_text,
-        select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_block,
-        sidebar_content_height, sidebar_pane_at_row, sidebar_rows, sidebar_rows_with_attention,
-        tab_at_column, terminal_paste_payload, ui_areas, update_selection_after_frame,
-        update_sidebar_hit_areas, viewport_shift_distance, visible_pane_areas,
+        AgentFilter, AgentNavigator, App, AttentionCenter, AttentionIndex, CellPosition,
+        ClipboardFeedback, ContextTarget, DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode,
+        MAX_CLIPBOARD_BYTES, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection,
+        SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish,
+        TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
+        capture_selection_viewport, clamped_pane_position, context_menu_for_target, cycle_tab,
+        desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
+        filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
+        handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
+        handle_input, handle_mouse, handle_target_manager_input, mouse_event_allowed,
+        mouse_passthrough_enabled, pane_direction_score, reconcile_selection, refresh_attention,
+        render_vt_screen, safe_text, select_neighbor_pane, select_pane, select_workspace,
+        selected_terminal_text, sidebar_areas, sidebar_attention_rows, sidebar_block,
+        sidebar_content_height, sidebar_pane_at_row, tab_at_column, terminal_paste_payload,
+        ui_areas, update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
+        visible_pane_areas,
     };
     use crate::config::{Config, Target};
-    use crate::model::{PaneId, TargetSession};
+    use crate::model::{PaneId, TargetSession, WorkspaceId};
     use crate::resource_action::ResourceAction;
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
@@ -5054,6 +5625,21 @@ mod tests {
 
         assert_eq!(sidebar.width, 0);
         assert_eq!(terminal.width, 60);
+    }
+
+    #[test]
+    fn attention_feed_occupies_the_lower_half_of_the_sidebar() {
+        let area = ratatui::layout::Rect::new(0, 0, SIDEBAR_WIDTH, 40);
+        let (sessions, attention) = sidebar_areas(area);
+
+        assert_eq!(
+            sessions,
+            ratatui::layout::Rect::new(0, 0, SIDEBAR_WIDTH, 20)
+        );
+        assert_eq!(
+            attention,
+            ratatui::layout::Rect::new(0, 20, SIDEBAR_WIDTH, 20)
+        );
     }
 
     #[test]
@@ -5163,6 +5749,41 @@ mod tests {
     fn command_palette_search_is_case_insensitive_and_fuzzy() {
         assert!(fuzzy_score("Close workspace Simulator", "CWSim").is_some());
         assert!(fuzzy_score("Open agent navigator", "target remove").is_none());
+    }
+
+    #[test]
+    fn workspace_context_menu_keeps_its_resource_qualified() {
+        let key = TargetSession::new("host-b", "work");
+        let workspace = WorkspaceId::new("host-b", "work", "w2");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w2", "label": "simulator"}],
+                "tabs": [{"tab_id": "w2:t1", "workspace_id": "w2"}],
+                "panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Workspace(workspace.clone()),
+            ratatui::layout::Position::new(4, 5),
+        )
+        .unwrap();
+
+        assert!(menu.title.contains("host-b/work"));
+        assert!(menu.actions.iter().all(|action| {
+            action.target_session() == Some(TargetSession::new("host-b", "work"))
+        }));
+        assert!(menu.actions.contains(&ResourceAction::CloseWorkspace {
+            workspace,
+            label: "simulator".to_owned(),
+        }));
     }
 
     #[tokio::test]
@@ -5332,14 +5953,14 @@ mod tests {
             ["tester", "builder"]
         );
 
-        let rows = sidebar_rows(&state, None);
-        assert_eq!(rows[0].line.to_string(), " waiting agents (1)  ^]a");
+        let rows = sidebar_attention_rows(&state, None, &AttentionIndex::default());
+        assert_eq!(rows[0].line.to_string(), " waiting now (1)");
         assert_eq!(rows[1].pane, Some(PaneId::new("host-a", "work", "w2:p1")));
         assert!(rows[1].line.to_string().contains("tester"));
         assert!(rows[1].line.to_string().contains("host-a/work"));
         assert!(
             rows.iter()
-                .take_while(|row| row.line.to_string() != " sessions")
+                .take_while(|row| !row.line.to_string().starts_with(" history"))
                 .all(|row| !row.line.to_string().contains("builder"))
         );
     }
@@ -5382,9 +6003,20 @@ mod tests {
         assert_eq!(app.attention.events().count(), 1);
         assert_eq!(app.attention.unread_count(), 1);
 
-        let rows = sidebar_rows_with_attention(&blocked, None, Some(&app.attention));
-        assert!(rows[0].line.to_string().contains("attention 1 new"));
+        let rows = sidebar_attention_rows(&blocked, None, &app.attention);
+        assert!(rows[0].line.to_string().contains("waiting now"));
         assert!(rows[1].line.to_string().contains("● builder"));
+        assert!(
+            rows.iter()
+                .any(|row| { row.line.to_string().contains("history · 1 unread") })
+        );
+        let sidebar_area = ratatui::layout::Rect::new(0, 0, SIDEBAR_WIDTH, 30);
+        update_sidebar_hit_areas(&blocked, &mut app, sidebar_area);
+        let attention_area = sidebar_areas(sidebar_area).1;
+        assert!(app.sidebar_hit_areas.iter().any(|hit| {
+            hit.area.y >= attention_area.y
+                && hit.pane.as_ref() == Some(&PaneId::new("host-a", "work", "w1:p1"))
+        }));
 
         app.attention_center = Some(AttentionCenter::default());
         handle_attention_center_input(b'\r', &blocked, &mut app).unwrap();
@@ -5545,6 +6177,70 @@ mod tests {
             modified_wheel.key_modifiers(),
             (crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::CONTROL)
                 .bits()
+        );
+    }
+
+    #[tokio::test]
+    async fn right_click_opens_exact_pane_actions_and_preserves_close_confirmation() {
+        let key = TargetSession::new("host-a", "dev");
+        let pane = PaneId::new("host-a", "dev", "w1:p1");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w1"}],
+                "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "shell"}],
+                "layouts": [layout("w1", "w1:t1", "w1:p1")]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let terminal_area = ui_areas(frame_area).2;
+        let pane_area = visible_pane_areas(&state, Some(&pane), terminal_area)[0].1;
+        let inner = super::pane_block(&pane, true, None).inner(pane_area);
+        let mut app = App {
+            selected_pane: Some(pane.clone()),
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+        let targets = BTreeMap::new();
+        let transport = crate::config::TransportConfig::default();
+
+        handle_mouse(
+            MouseInput {
+                code: 2,
+                column: inner.x + 1,
+                row: inner.y + 1,
+                release: false,
+            },
+            &state,
+            &targets,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+
+        let menu = app.context_menu.as_mut().unwrap();
+        assert!(menu.title.contains("host-a/dev"));
+        menu.selected = menu
+            .actions
+            .iter()
+            .position(ResourceAction::is_destructive)
+            .unwrap();
+        handle_context_menu_input(b'\r', &state, &targets, &transport, &mut app).unwrap();
+        assert_eq!(
+            app.close_confirmation,
+            Some(super::CloseConfirmation {
+                action: ResourceAction::ClosePane {
+                    pane,
+                    label: "shell".to_owned(),
+                },
+            })
         );
     }
 
@@ -6018,7 +6714,7 @@ mod tests {
         );
         assert_eq!(
             app.sidebar_hit_areas[2].pane,
-            PaneId::new("host-a", "dev", "w2:p1")
+            Some(PaneId::new("host-a", "dev", "w2:p1"))
         );
         assert_eq!(
             tab_at_column(&state, app.selected_pane.as_ref(), 1),
@@ -6078,9 +6774,13 @@ mod tests {
         assert_eq!(app.sidebar_offset, 0);
         assert_eq!(app.sidebar_hit_areas.len(), visible_height);
         assert_eq!(
-            app.sidebar_hit_areas.last().map(|hit| &hit.pane),
+            app.sidebar_hit_areas
+                .last()
+                .and_then(|hit| hit.pane.as_ref()),
             Some(&PaneId::new("host-a", "dev", &last_initial_pane))
         );
+        let targets = BTreeMap::new();
+        let transport = crate::config::TransportConfig::default();
 
         handle_mouse(
             MouseInput {
@@ -6090,6 +6790,8 @@ mod tests {
                 release: false,
             },
             &state,
+            &targets,
+            &transport,
             &mut app,
         )
         .await
@@ -6101,18 +6803,25 @@ mod tests {
         assert_eq!(app.sidebar_offset, 3);
         assert_eq!(
             app.sidebar_hit_areas[0].area,
-            ratatui::layout::Rect::new(0, sidebar_block().inner(sidebar_area).y, 27, 1,)
+            ratatui::layout::Rect::new(
+                0,
+                sidebar_block().inner(sidebar_areas(sidebar_area).0).y,
+                27,
+                1,
+            )
         );
         assert_eq!(
             app.sidebar_hit_areas[0].pane,
-            PaneId::new("host-a", "dev", "w03:p1")
+            Some(PaneId::new("host-a", "dev", "w03:p1"))
         );
 
         select_pane(&mut app, PaneId::new("host-a", "dev", "w15:p1"));
         update_sidebar_hit_areas(&state, &mut app, sidebar_area);
         assert_eq!(app.sidebar_offset, 16 - visible_height);
         assert_eq!(
-            app.sidebar_hit_areas.last().map(|hit| &hit.pane),
+            app.sidebar_hit_areas
+                .last()
+                .and_then(|hit| hit.pane.as_ref()),
             Some(&PaneId::new("host-a", "dev", "w15:p1"))
         );
 
@@ -6123,7 +6832,9 @@ mod tests {
             16 - sidebar_content_height(shorter_sidebar)
         );
         assert_eq!(
-            app.sidebar_hit_areas.last().map(|hit| &hit.pane),
+            app.sidebar_hit_areas
+                .last()
+                .and_then(|hit| hit.pane.as_ref()),
             Some(&PaneId::new("host-a", "dev", "w15:p1"))
         );
     }
