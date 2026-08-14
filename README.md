@@ -28,6 +28,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Live configuration and running-session discovery refresh without restarting
   Herdr.
 - A global agent navigator with attention and active-work filters.
+- A fuzzy-searchable action palette for navigation and qualified workspace,
+  tab, and pane lifecycle operations.
 
 ## Recommended topology
 
@@ -311,6 +313,8 @@ workspace actions:
 | `Ctrl+]`, then `j` / `k` | Select next / previous qualified pane |
 | `Ctrl+]`, then `p` / `n` | Select previous / next tab |
 | `Ctrl+]`, then `1`–`9` | Select a numbered workspace |
+| `Ctrl+]`, then `Space` | Search navigation and resource actions |
+| `Ctrl+]`, then `d` | Close the selected Herdr workspace after qualified host/session confirmation |
 | `Ctrl+]`, then `a` | Open the global agent navigator |
 | `Ctrl+]`, then `h` | Open the target manager |
 | `Ctrl+]`, then `v` | Paste desktop clipboard text into the selected pane |
@@ -318,6 +322,20 @@ workspace actions:
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |
+
+Workspace close is deliberately confirmed with its Super-Herdr host name,
+Herdr session, display label, and server-local workspace ID. It closes only that
+workspace and its tabs and panes; Super-Herdr never stops or restarts the Herdr
+session.
+
+The action palette searches both action names and qualified target/session
+scopes. Type to filter, use `Down`/`Tab`/`Ctrl+N` and `Up`/`Ctrl+P` to navigate,
+press `Enter` to run the selected action, and press `Escape` to close it. It can
+jump to any live session, workspace, tab, pane, or agent; create or rename
+workspaces; create, rename, or close tabs; and split, zoom, or close the selected
+pane. Workspace, tab, and pane closure always requires confirmation. Lifecycle
+operations use the documented Herdr CLI and affect only the qualified session
+shown in the palette.
 
 Herdr's public terminal-session interface is a raw pane stream; it does not
 expose Herdr's own TUI key dispatcher. Super-Herdr therefore maps supported

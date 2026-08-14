@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod config;
 pub mod model;
 pub mod probe;
+mod resource_action;
 pub mod state;
 pub mod terminal;
 pub mod transport;

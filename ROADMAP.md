@@ -12,14 +12,17 @@ Work is ordered by dependency and product risk.
 - In-TUI target add/edit/remove manager.
 - Concurrent live configuration and running-session registry refresh.
 - Global agent navigator with all/attention/active filters.
+- Fuzzy-searchable action palette with qualified workspace, tab, and pane
+  lifecycle operations.
 
 ## Next
 
-1. Add unread activity tracking and a durable, payload-free notification index.
-2. Add mouse activation and richer validation to target-manager forms.
-3. Execute and record the full desktop matrix in `TESTING.md`.
-4. Add signed release artifacts and package-manager installation.
-5. Select an explicit project license before inviting external contributions.
+1. Add mouse context menus backed by the shared resource-action layer.
+2. Add unread activity tracking and a durable, payload-free notification index.
+3. Add mouse activation and richer validation to target-manager forms.
+4. Execute and record the full desktop matrix in `TESTING.md`.
+5. Add signed release artifacts and package-manager installation.
+6. Select an explicit project license before inviting external contributions.
 
 ## Later
 
