@@ -52,6 +52,9 @@ For every applicable row, verify:
 12. The action palette fuzzy-searches across at least two qualified sessions;
     create and rename affect only the displayed session, and workspace, tab, and
     pane closure require confirmation showing the exact qualified resource.
+13. Blocked, waiting, and input-ready agents from every live host appear at the
+    top of the sidebar; clicking a qualified row jumps to its pane, and
+    `Ctrl+] a` opens the navigator on the attention filter.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put

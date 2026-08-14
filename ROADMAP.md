@@ -12,6 +12,7 @@ Work is ordered by dependency and product risk.
 - In-TUI target add/edit/remove manager.
 - Concurrent live configuration and running-session registry refresh.
 - Global agent navigator with all/attention/active filters.
+- Persistent cross-host waiting-agent list with qualified click-to-jump rows.
 - Fuzzy-searchable action palette with qualified workspace, tab, and pane
   lifecycle operations.
 

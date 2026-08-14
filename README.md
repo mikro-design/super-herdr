@@ -28,6 +28,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Live configuration and running-session discovery refresh without restarting
   Herdr.
 - A global agent navigator with attention and active-work filters.
+- A persistent sidebar list of blocked, waiting, and input-ready agents across
+  all live hosts, with click-to-jump routing.
 - A fuzzy-searchable action palette for navigation and qualified workspace,
   tab, and pane lifecycle operations.
 
@@ -371,9 +373,11 @@ saves. A blank SSH field means the Herdr installation is local to the desktop.
 Advanced socket and client-path overrides remain available through `target add`
 and `target edit`.
 
-The agent navigator combines agents from every live target. It sorts blocked,
-waiting, or input-ready agents first. Use `j`/`k` to select, `f` to cycle between
-`all`, `attention`, and `active`, and `Enter` to jump to the agent's pane.
+The sidebar keeps blocked, waiting, or input-ready agents visible above the
+host/session tree. Every row is qualified by host and session and can be clicked
+to jump directly to its pane. `Ctrl+]`, then `a` opens the full navigator on the
+`attention` filter; use `j`/`k` to select, `f` to cycle between `attention`,
+`active`, and `all`, and `Enter` to jump to the agent's pane.
 
 Mouse behavior inside the selected terminal:
 

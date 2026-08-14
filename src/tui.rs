@@ -429,7 +429,7 @@ struct AgentNavigator {
 impl Default for AgentNavigator {
     fn default() -> Self {
         Self {
-            filter: AgentFilter::All,
+            filter: AgentFilter::Attention,
             selected: 0,
         }
     }
@@ -3954,6 +3954,53 @@ fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<Sideb
     let selected_target = selected.map(PaneId::target_session);
     let selected_workspace = selected_workspace(state, selected);
     let mut rows = Vec::new();
+    let waiting_agents = agent_jump_entries(state, AgentFilter::Attention);
+    if !waiting_agents.is_empty() {
+        rows.push(SidebarRow {
+            line: Line::styled(
+                format!(" waiting agents ({})  ^]a", waiting_agents.len()),
+                Style::default().fg(Color::Red).bold(),
+            ),
+            pane: None,
+            selection_anchor: false,
+        });
+        for entry in waiting_agents {
+            let is_selected = selected == Some(&entry.pane);
+            let style = Style::default()
+                .fg(Color::Red)
+                .add_modifier(if is_selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
+            let mut line = Line::from(vec![
+                Span::styled(if is_selected { ">" } else { " " }, style),
+                Span::styled("! ", style),
+                Span::styled(entry.agent, style),
+                Span::styled(
+                    format!(
+                        "  {}/{}",
+                        entry.pane.target,
+                        short_session(&entry.pane.session)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            if is_selected {
+                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            rows.push(SidebarRow {
+                line,
+                pane: Some(entry.pane),
+                selection_anchor: is_selected,
+            });
+        }
+        rows.push(SidebarRow {
+            line: Line::styled(" sessions", Style::default().fg(Color::DarkGray)),
+            pane: None,
+            selection_anchor: false,
+        });
+    }
     let mut workspace_index = 1_usize;
     for target in state.targets.values() {
         let is_selected_target = selected_target.as_ref() == Some(&target.key);
@@ -4524,19 +4571,19 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentFilter, App, CellPosition, ClipboardFeedback, DecodedInput, HERDR_PREFIX_KEY,
-        InputDecoder, InputMode, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection,
-        SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish,
-        TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
+        AgentFilter, AgentNavigator, App, CellPosition, ClipboardFeedback, DecodedInput,
+        HERDR_PREFIX_KEY, InputDecoder, InputMode, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY,
+        PaneDirection, SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection,
+        SelectionFinish, TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
         capture_selection_viewport, clamped_pane_position, cycle_tab, desired_access,
         displayed_message, encode_mouse_event, fall_back_to_observe, filtered_palette_actions,
         finish_ui_left_gesture, fuzzy_score, handle_decoded_input, handle_input, handle_mouse,
         handle_target_manager_input, mouse_event_allowed, mouse_passthrough_enabled,
         pane_direction_score, reconcile_selection, render_vt_screen, safe_text,
         select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_block,
-        sidebar_content_height, sidebar_pane_at_row, tab_at_column, terminal_paste_payload,
-        ui_areas, update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
-        visible_pane_areas,
+        sidebar_content_height, sidebar_pane_at_row, sidebar_rows, tab_at_column,
+        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
+        viewport_shift_distance, visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession};
@@ -4830,6 +4877,7 @@ mod tests {
         let attention = agent_jump_entries(&state, AgentFilter::Attention);
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].agent, "tester");
+        assert_eq!(AgentNavigator::default().filter, AgentFilter::Attention);
         let active = agent_jump_entries(&state, AgentFilter::Active);
         assert_eq!(
             active
@@ -4837,6 +4885,17 @@ mod tests {
                 .map(|entry| entry.agent.as_str())
                 .collect::<Vec<_>>(),
             ["tester", "builder"]
+        );
+
+        let rows = sidebar_rows(&state, None);
+        assert_eq!(rows[0].line.to_string(), " waiting agents (1)  ^]a");
+        assert_eq!(rows[1].pane, Some(PaneId::new("host-a", "work", "w2:p1")));
+        assert!(rows[1].line.to_string().contains("tester"));
+        assert!(rows[1].line.to_string().contains("host-a/work"));
+        assert!(
+            rows.iter()
+                .take_while(|row| row.line.to_string() != " sessions")
+                .all(|row| !row.line.to_string().contains("builder"))
         );
     }
 
