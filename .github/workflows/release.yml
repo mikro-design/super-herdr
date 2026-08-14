@@ -63,7 +63,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            use_cross: false
+            use_cross: true
             strip: strip
 
           - os: ubuntu-latest
@@ -93,13 +93,18 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install Linux ARM64 build tools
+      - name: Install cross
         if: matrix.use_cross
+        shell: bash
+        run: |
+          cargo install cross --locked --version 0.2.5 --jobs 4
+
+      - name: Install Linux ARM64 strip tool
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install --yes binutils-aarch64-linux-gnu
-          cargo install cross --locked --version 0.2.5 --jobs 4
 
       - name: Build
         shell: bash
@@ -108,6 +113,18 @@ jobs:
             cross build --release --locked --jobs 4 --target "${{ matrix.target }}"
           else
             cargo build --release --locked --jobs 4 --target "${{ matrix.target }}"
+          fi
+
+      - name: Verify Linux GLIBC baseline
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/super-herdr"
+          highest="$(readelf --version-info "${binary}" | sed -n 's/.*Name: \(GLIBC_[0-9.]*\).*/\1/p' | sort -V | tail -n 1)"
+          baseline="GLIBC_2.28"
+          if [[ -z "${highest}" ]] || [[ "$(printf '%s\n' "${highest}" "${baseline}" | sort -V | tail -n 1)" != "${baseline}" ]]; then
+            echo "${{ matrix.target }} requires ${highest:-an unknown GLIBC version}; maximum supported is ${baseline}" >&2
+            exit 1
           fi
 
       - name: Strip binary

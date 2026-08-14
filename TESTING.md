@@ -18,7 +18,8 @@ Automated coverage must include qualified multi-host IDs, target failure
 isolation, atomic configuration writes, session discovery, terminal control and
 observe routing, mouse encoding, multipage selection, clipboard size/integrity
 checks, persisted UI selection, and sidebar overflow with offset-aware mouse
-targets.
+targets. Linux release jobs must reject binaries whose highest required GLIBC
+symbol version exceeds 2.28.
 
 ## Manual desktop matrix
 
