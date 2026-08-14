@@ -78,9 +78,12 @@ archive matching your platform:
 - `x86_64-unknown-linux-gnu` — Linux x86_64
 - `aarch64-unknown-linux-gnu` — Linux ARM64
 
+Linux release binaries are built with `cross` and CI rejects artifacts requiring
+newer than GLIBC 2.28.
+
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.2.0
+tag=v0.2.1
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -103,8 +106,8 @@ Install into any directory on your `PATH`; `~/.cargo/bin` matches what
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.2.0`
-must be tagged `v0.2.0`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.2.1`
+must be tagged `v0.2.1`.
 
 ### macOS
 
