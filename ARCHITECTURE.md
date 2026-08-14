@@ -98,6 +98,19 @@ panes get observer streams. If the control stream is refused or closes, the
 selected pane immediately falls back to observation and periodically retries a
 normal control lease without interrupting the Herdr server.
 
+Closing a workspace is a qualified federation action: `Ctrl+] d` captures the
+selected target, session, and server-local workspace ID, presents all of that
+scope for confirmation, and only then invokes the documented
+`herdr workspace close` operation. The action never stops or restarts a Herdr
+session, and a workspace-close failure remains isolated to its target.
+
+The action palette is backed by typed `ResourceAction` values rather than raw
+command strings. An action retains its qualified target/session/resource until
+execution; only the final transport step extracts the server-local ID for the
+documented Herdr CLI. Search, keyboard shortcuts, and future mouse context menus
+therefore share one routing model. Destructive workspace, tab, and pane actions
+must pass through the same qualified confirmation path.
+
 The outer TUI captures SGR mouse input and translates terminal coordinates back
 to the selected pane. A left press is held until the gesture is resolved: release
 without movement becomes an application click, while movement becomes local text

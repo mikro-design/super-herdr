@@ -29,7 +29,8 @@ use tokio::time::{interval, sleep_until, timeout};
 
 use crate::clipboard;
 use crate::config::{Config, Target};
-use crate::model::{PaneId, TargetSession, WorkspaceId};
+use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
+use crate::resource_action::{ResourceAction, SplitDirection};
 use crate::state::{
     FederationState, FederationStore, NormalizedSnapshot, SupervisorOptions, TargetConnectionState,
     TargetRuntimeState, TargetUpdateMode,
@@ -510,6 +511,33 @@ struct HerdrActionEvent {
     follow_server_focus: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextPromptAction {
+    CreateWorkspace { target: TargetSession },
+    RenameWorkspace { workspace: WorkspaceId },
+    RenameTab { tab: TabId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextPrompt {
+    title: String,
+    label: String,
+    value: String,
+    action: TextPromptAction,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseConfirmation {
+    action: ResourceAction,
+}
+
 struct App {
     selected_pane: Option<PaneId>,
     selection_explicit: bool,
@@ -538,6 +566,9 @@ struct App {
     configuration_dirty: bool,
     target_manager: Option<TargetManager>,
     agent_navigator: Option<AgentNavigator>,
+    command_palette: Option<CommandPalette>,
+    text_prompt: Option<TextPrompt>,
+    close_confirmation: Option<CloseConfirmation>,
     herdr_action_sender: Option<mpsc::UnboundedSender<HerdrActionEvent>>,
     herdr_action_inflight: bool,
 }
@@ -572,6 +603,9 @@ impl Default for App {
             configuration_dirty: false,
             target_manager: None,
             agent_navigator: None,
+            command_palette: None,
+            text_prompt: None,
+            close_confirmation: None,
             herdr_action_sender: None,
             herdr_action_inflight: false,
         }
@@ -919,6 +953,16 @@ async fn handle_decoded_input(
 ) -> Result<bool> {
     match input {
         DecodedInput::Bytes(bytes) => {
+            if app.command_palette.is_some() {
+                let navigation = match bytes.as_slice() {
+                    b"\x1b[A" => Some(0x10),
+                    b"\x1b[B" => Some(0x0e),
+                    _ => None,
+                };
+                if let Some(key) = navigation {
+                    return handle_input(key, state, targets, transport_config, app).await;
+                }
+            }
             for byte in bytes {
                 if handle_input(byte, state, targets, transport_config, app).await? {
                     return Ok(true);
@@ -934,6 +978,9 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
     if app.mode != InputMode::Terminal
         || app.target_manager.is_some()
         || app.agent_navigator.is_some()
+        || app.command_palette.is_some()
+        || app.text_prompt.is_some()
+        || app.close_confirmation.is_some()
     {
         return Ok(());
     }
@@ -1517,6 +1564,15 @@ async fn handle_input(
     transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<bool> {
+    if app.close_confirmation.is_some() {
+        return handle_close_confirmation_input(key, state, targets, transport_config, app);
+    }
+    if app.text_prompt.is_some() {
+        return handle_text_prompt_input(key, state, targets, transport_config, app);
+    }
+    if app.command_palette.is_some() {
+        return handle_command_palette_input(key, state, targets, transport_config, app);
+    }
     if app.target_manager.is_some() {
         return handle_target_manager_input(key, app);
     }
@@ -1583,6 +1639,8 @@ async fn handle_input(
                     app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
                 }
                 b'a' => app.agent_navigator = Some(AgentNavigator::default()),
+                b'd' => request_workspace_close(state, app),
+                b' ' => app.command_palette = Some(CommandPalette::default()),
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
                 PREFIX_KEY => {
                     if let Some(route) = app
@@ -1600,7 +1658,7 @@ async fn handle_input(
                 0x1b => {}
                 _ => {
                     app.message = Some(
-                        "prefix: 1-9 workspace, p/n tab, j/k pane, a agents, h hosts, v paste, i image, q quit, Ctrl+] literal"
+                        "prefix: Space actions, 1-9 workspace, p/n tab, j/k pane, d close workspace, a agents, h hosts, v paste, i image, q quit, Ctrl+] literal"
                             .into(),
                     );
                 }
@@ -1716,6 +1774,12 @@ struct HerdrPaneAction<'a> {
     follow_server_focus: bool,
 }
 
+struct HerdrOperation {
+    args: Vec<String>,
+    description: String,
+    follow_server_focus: bool,
+}
+
 fn spawn_pane_action(
     state: &FederationState,
     targets: &BTreeMap<TargetSession, Target>,
@@ -1754,22 +1818,44 @@ fn spawn_selected_herdr_action(
     description: String,
     follow_server_focus: bool,
 ) {
-    if app.herdr_action_inflight {
-        app.message = Some("Herdr action already in progress".to_owned());
-        return;
-    }
     let Some(selected) = app.selected_pane.as_ref() else {
         app.message = Some("Herdr: no pane is selected".to_owned());
         return;
     };
     let key = selected.target_session();
-    let Some(target) = targets.get(&key).cloned() else {
+    spawn_qualified_herdr_action(
+        state,
+        targets,
+        transport_config,
+        app,
+        &key,
+        HerdrOperation {
+            args,
+            description,
+            follow_server_focus,
+        },
+    );
+}
+
+fn spawn_qualified_herdr_action(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+    key: &TargetSession,
+    operation: HerdrOperation,
+) {
+    if app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    let Some(target) = targets.get(key).cloned() else {
         app.message = Some("Herdr: selected target is unavailable".to_owned());
         return;
     };
     let Some(executable) = state
         .targets
-        .get(&key)
+        .get(key)
         .and_then(|target| target.selected_herdr_bin.clone())
     else {
         app.message = Some("Herdr: no compatible client is selected".to_owned());
@@ -1782,17 +1868,565 @@ fn spawn_selected_herdr_action(
     let transport = transport_config.clone();
     let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
     app.herdr_action_inflight = true;
-    app.message = Some(format!("Herdr: {description}…"));
+    app.message = Some(format!("Herdr: {}…", operation.description));
     tokio::spawn(async move {
-        let result = run_herdr_operation(&target, &transport, &executable, &args, command_timeout)
-            .await
-            .map_err(|error| error.message);
+        let result = run_herdr_operation(
+            &target,
+            &transport,
+            &executable,
+            &operation.args,
+            command_timeout,
+        )
+        .await
+        .map_err(|error| error.message);
         let _ = sender.send(HerdrActionEvent {
             result,
-            description,
-            follow_server_focus,
+            description: operation.description,
+            follow_server_focus: operation.follow_server_focus,
         });
     });
+}
+
+fn request_workspace_close(state: &FederationState, app: &mut App) {
+    if app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    let Some((snapshot, pane)) = selected_snapshot_and_pane(state, app.selected_pane.as_ref())
+    else {
+        app.message = Some("Herdr: no workspace is selected".to_owned());
+        return;
+    };
+    let Some(workspace_id) = pane.workspace.as_ref() else {
+        app.message = Some("Herdr: selected pane has no workspace".to_owned());
+        return;
+    };
+    let Some(workspace) = snapshot.workspaces.get(workspace_id) else {
+        app.message = Some("Herdr: selected workspace is unavailable".to_owned());
+        return;
+    };
+    app.close_confirmation = Some(CloseConfirmation {
+        action: ResourceAction::CloseWorkspace {
+            workspace: workspace.id.clone(),
+            label: display_label(&workspace.id.resource, workspace.label.as_deref()),
+        },
+    });
+    app.message = None;
+}
+
+fn command_palette_actions(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+) -> Vec<ResourceAction> {
+    let mut actions = vec![
+        ResourceAction::OpenTargetManager,
+        ResourceAction::OpenAgentNavigator,
+    ];
+
+    let selected_is_actionable = selected.is_some_and(|pane| {
+        state
+            .targets
+            .get(&pane.target_session())
+            .is_some_and(|target| {
+                target.connection == TargetConnectionState::Live
+                    && target.selected_herdr_bin.is_some()
+            })
+    });
+    if selected_is_actionable
+        && let Some((snapshot, pane)) = selected_snapshot_and_pane(state, selected)
+    {
+        if let Some(workspace_id) = pane.workspace.as_ref()
+            && let Some(workspace) = snapshot.workspaces.get(workspace_id)
+        {
+            let label = display_label(&workspace.id.resource, workspace.label.as_deref());
+            actions.push(ResourceAction::RenameWorkspace {
+                workspace: workspace.id.clone(),
+                current_label: label.clone(),
+            });
+            actions.push(ResourceAction::CloseWorkspace {
+                workspace: workspace.id.clone(),
+                label,
+            });
+            actions.push(ResourceAction::CreateTab {
+                workspace: workspace.id.clone(),
+            });
+        }
+        if let Some(tab_id) = pane.tab.as_ref()
+            && let Some(tab) = snapshot.tabs.get(tab_id)
+        {
+            let label = display_label(&tab.id.resource, tab.label.as_deref());
+            actions.push(ResourceAction::RenameTab {
+                tab: tab.id.clone(),
+                current_label: label.clone(),
+            });
+            actions.push(ResourceAction::CloseTab {
+                tab: tab.id.clone(),
+                label,
+            });
+        }
+        let pane_label = display_label(&pane.id.resource, pane.label.as_deref());
+        actions.extend([
+            ResourceAction::SplitPane {
+                pane: pane.id.clone(),
+                direction: SplitDirection::Right,
+            },
+            ResourceAction::SplitPane {
+                pane: pane.id.clone(),
+                direction: SplitDirection::Down,
+            },
+            ResourceAction::TogglePaneZoom {
+                pane: pane.id.clone(),
+            },
+            ResourceAction::ClosePane {
+                pane: pane.id.clone(),
+                label: pane_label,
+            },
+        ]);
+    }
+
+    for runtime in state.targets.values() {
+        if runtime.connection != TargetConnectionState::Live || runtime.selected_herdr_bin.is_none()
+        {
+            continue;
+        }
+        let Some(snapshot) = runtime.snapshot.as_deref() else {
+            continue;
+        };
+        actions.push(ResourceAction::CreateWorkspace {
+            target: runtime.key.clone(),
+        });
+        if let Some(pane) = snapshot
+            .focused_pane
+            .clone()
+            .or_else(|| snapshot.panes.keys().next().cloned())
+        {
+            actions.push(ResourceAction::JumpToPane {
+                pane,
+                label: format!("session {}", runtime.key.session),
+            });
+        }
+        for workspace in snapshot.workspaces.values() {
+            let Some(pane) = pane_for_workspace(snapshot, &workspace.id) else {
+                continue;
+            };
+            actions.push(ResourceAction::JumpToPane {
+                pane,
+                label: format!(
+                    "workspace {}",
+                    display_label(&workspace.id.resource, workspace.label.as_deref())
+                ),
+            });
+        }
+        for tab in snapshot.tabs.values() {
+            let Some(pane) = pane_for_tab(snapshot, &tab.id) else {
+                continue;
+            };
+            actions.push(ResourceAction::JumpToPane {
+                pane,
+                label: format!(
+                    "tab {}",
+                    display_label(&tab.id.resource, tab.label.as_deref())
+                ),
+            });
+        }
+        for pane in snapshot.panes.values() {
+            actions.push(ResourceAction::JumpToPane {
+                pane: pane.id.clone(),
+                label: format!(
+                    "pane {}",
+                    display_label(&pane.id.resource, pane.label.as_deref())
+                ),
+            });
+        }
+        for agent in snapshot.agents.values() {
+            if !snapshot.panes.contains_key(&agent.pane) {
+                continue;
+            }
+            let name = agent
+                .name
+                .as_deref()
+                .or(agent.agent.as_deref())
+                .unwrap_or("agent");
+            actions.push(ResourceAction::JumpToPane {
+                pane: agent.pane.clone(),
+                label: format!("agent {}", safe_text(name)),
+            });
+        }
+    }
+    actions
+}
+
+fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
+    let candidate = candidate.to_lowercase().chars().collect::<Vec<_>>();
+    let query = query.trim().to_lowercase().chars().collect::<Vec<_>>();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let mut cursor = 0;
+    let mut score = 0;
+    let mut previous = None;
+    for expected in query {
+        let position = candidate
+            .iter()
+            .enumerate()
+            .skip(cursor)
+            .find(|(_, character)| **character == expected)
+            .map(|(position, _)| position)?;
+        score += position.saturating_sub(cursor);
+        if previous.is_some_and(|previous| position != previous + 1) {
+            score += 2;
+        }
+        previous = Some(position);
+        cursor = position + 1;
+    }
+    Some(score + candidate.len().saturating_sub(cursor) / 8)
+}
+
+fn filtered_palette_actions(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    query: &str,
+) -> Vec<ResourceAction> {
+    let mut actions = command_palette_actions(state, selected)
+        .into_iter()
+        .filter_map(|action| fuzzy_score(&action.search_text(), query).map(|score| (score, action)))
+        .collect::<Vec<_>>();
+    actions.sort_by(|(left_score, left), (right_score, right)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| left.palette_label().cmp(&right.palette_label()))
+            .then_with(|| left.palette_scope().cmp(&right.palette_scope()))
+    });
+    actions.into_iter().map(|(_, action)| action).collect()
+}
+
+fn handle_command_palette_input(
+    key: u8,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<bool> {
+    let Some(mut palette) = app.command_palette.take() else {
+        return Ok(false);
+    };
+    let actions = filtered_palette_actions(state, app.selected_pane.as_ref(), &palette.query);
+    match key {
+        0x1b => return Ok(false),
+        b'\r' | b'\n' => {
+            if let Some(action) = actions.get(palette.selected).cloned() {
+                execute_resource_action(action, state, targets, transport_config, app);
+                return Ok(false);
+            }
+        }
+        b'\t' | 0x0e => {
+            if !actions.is_empty() {
+                palette.selected = (palette.selected + 1) % actions.len();
+            }
+        }
+        0x10 => {
+            if !actions.is_empty() {
+                palette.selected = palette.selected.checked_sub(1).unwrap_or(actions.len() - 1);
+            }
+        }
+        0x08 | 0x7f => {
+            palette.query.pop();
+            palette.selected = 0;
+        }
+        0x15 => {
+            palette.query.clear();
+            palette.selected = 0;
+        }
+        0x20..=0x7e => {
+            palette.query.push(char::from(key));
+            palette.selected = 0;
+        }
+        _ => {}
+    }
+    let count = filtered_palette_actions(state, app.selected_pane.as_ref(), &palette.query).len();
+    palette.selected = palette.selected.min(count.saturating_sub(1));
+    app.command_palette = Some(palette);
+    Ok(false)
+}
+
+fn execute_resource_action(
+    action: ResourceAction,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) {
+    if action.mutates_herdr() && app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    match action {
+        ResourceAction::JumpToPane { pane, .. } => select_pane(app, pane),
+        ResourceAction::OpenTargetManager => {
+            app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
+        }
+        ResourceAction::OpenAgentNavigator => {
+            app.agent_navigator = Some(AgentNavigator::default());
+        }
+        ResourceAction::CreateWorkspace { target } => {
+            app.text_prompt = Some(TextPrompt {
+                title: "create Herdr workspace".to_owned(),
+                label: format!("Workspace label on {target}"),
+                value: String::new(),
+                action: TextPromptAction::CreateWorkspace { target },
+                error: None,
+            });
+        }
+        ResourceAction::RenameWorkspace {
+            workspace,
+            current_label,
+        } => {
+            app.text_prompt = Some(TextPrompt {
+                title: "rename Herdr workspace".to_owned(),
+                label: format!("New label for {current_label:?}"),
+                value: String::new(),
+                action: TextPromptAction::RenameWorkspace { workspace },
+                error: None,
+            });
+        }
+        ResourceAction::RenameTab { tab, current_label } => {
+            app.text_prompt = Some(TextPrompt {
+                title: "rename Herdr tab".to_owned(),
+                label: format!("New label for {current_label:?}"),
+                value: String::new(),
+                action: TextPromptAction::RenameTab { tab },
+                error: None,
+            });
+        }
+        ResourceAction::CloseWorkspace { .. }
+        | ResourceAction::CloseTab { .. }
+        | ResourceAction::ClosePane { .. } => {
+            app.close_confirmation = Some(CloseConfirmation { action });
+        }
+        ResourceAction::CreateTab { workspace } => {
+            let target_session = workspace.target_session();
+            spawn_qualified_herdr_action(
+                state,
+                targets,
+                transport_config,
+                app,
+                &target_session,
+                HerdrOperation {
+                    args: vec![
+                        "tab".to_owned(),
+                        "create".to_owned(),
+                        "--workspace".to_owned(),
+                        workspace.resource,
+                        "--focus".to_owned(),
+                    ],
+                    description: format!("created tab on {target_session}"),
+                    follow_server_focus: true,
+                },
+            );
+        }
+        ResourceAction::SplitPane { pane, direction } => {
+            let target_session = pane.target_session();
+            spawn_qualified_herdr_action(
+                state,
+                targets,
+                transport_config,
+                app,
+                &target_session,
+                HerdrOperation {
+                    args: vec![
+                        "pane".to_owned(),
+                        "split".to_owned(),
+                        pane.resource,
+                        "--direction".to_owned(),
+                        direction.cli_value().to_owned(),
+                        "--focus".to_owned(),
+                    ],
+                    description: format!("split pane {} on {target_session}", direction.label()),
+                    follow_server_focus: true,
+                },
+            );
+        }
+        ResourceAction::TogglePaneZoom { pane } => {
+            let target_session = pane.target_session();
+            spawn_qualified_herdr_action(
+                state,
+                targets,
+                transport_config,
+                app,
+                &target_session,
+                HerdrOperation {
+                    args: vec![
+                        "pane".to_owned(),
+                        "zoom".to_owned(),
+                        pane.resource,
+                        "--toggle".to_owned(),
+                    ],
+                    description: format!("toggled pane zoom on {target_session}"),
+                    follow_server_focus: false,
+                },
+            );
+        }
+    }
+}
+
+fn handle_text_prompt_input(
+    key: u8,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<bool> {
+    let Some(mut prompt) = app.text_prompt.take() else {
+        return Ok(false);
+    };
+    match key {
+        0x1b => return Ok(false),
+        b'\r' | b'\n' => {
+            let value = prompt.value.trim().to_owned();
+            if value.is_empty() {
+                prompt.error = Some("A non-empty label is required".to_owned());
+            } else {
+                let (target_session, args, description, follow_server_focus) = match prompt.action {
+                    TextPromptAction::CreateWorkspace { target } => (
+                        target.clone(),
+                        vec![
+                            "workspace".to_owned(),
+                            "create".to_owned(),
+                            "--label".to_owned(),
+                            value.clone(),
+                            "--focus".to_owned(),
+                        ],
+                        format!("created workspace {value:?} on {target}"),
+                        true,
+                    ),
+                    TextPromptAction::RenameWorkspace { workspace } => {
+                        let target = workspace.target_session();
+                        (
+                            target.clone(),
+                            vec![
+                                "workspace".to_owned(),
+                                "rename".to_owned(),
+                                workspace.resource,
+                                value.clone(),
+                            ],
+                            format!("renamed workspace to {value:?} on {target}"),
+                            false,
+                        )
+                    }
+                    TextPromptAction::RenameTab { tab } => {
+                        let target = tab.target_session();
+                        (
+                            target.clone(),
+                            vec![
+                                "tab".to_owned(),
+                                "rename".to_owned(),
+                                tab.resource,
+                                value.clone(),
+                            ],
+                            format!("renamed tab to {value:?} on {target}"),
+                            false,
+                        )
+                    }
+                };
+                spawn_qualified_herdr_action(
+                    state,
+                    targets,
+                    transport_config,
+                    app,
+                    &target_session,
+                    HerdrOperation {
+                        args,
+                        description,
+                        follow_server_focus,
+                    },
+                );
+                return Ok(false);
+            }
+        }
+        0x08 | 0x7f => {
+            prompt.value.pop();
+            prompt.error = None;
+        }
+        0x15 => {
+            prompt.value.clear();
+            prompt.error = None;
+        }
+        0x20..=0x7e => {
+            prompt.value.push(char::from(key));
+            prompt.error = None;
+        }
+        _ => {}
+    }
+    app.text_prompt = Some(prompt);
+    Ok(false)
+}
+
+fn handle_close_confirmation_input(
+    key: u8,
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<bool> {
+    let Some(confirmation) = app.close_confirmation.take() else {
+        return Ok(false);
+    };
+    match key {
+        b'y' => {
+            let (target_session, args, description) = match confirmation.action {
+                ResourceAction::CloseWorkspace { workspace, label } => {
+                    let target = workspace.target_session();
+                    (
+                        target.clone(),
+                        vec![
+                            "workspace".to_owned(),
+                            "close".to_owned(),
+                            workspace.resource,
+                        ],
+                        format!("closed workspace {label:?} on {target}"),
+                    )
+                }
+                ResourceAction::CloseTab { tab, label } => {
+                    let target = tab.target_session();
+                    (
+                        target.clone(),
+                        vec!["tab".to_owned(), "close".to_owned(), tab.resource],
+                        format!("closed tab {label:?} on {target}"),
+                    )
+                }
+                ResourceAction::ClosePane { pane, label } => {
+                    let target = pane.target_session();
+                    (
+                        target.clone(),
+                        vec!["pane".to_owned(), "close".to_owned(), pane.resource],
+                        format!("closed pane {label:?} on {target}"),
+                    )
+                }
+                action => {
+                    app.message = Some(format!(
+                        "refused non-destructive action {:?} in close confirmation",
+                        action.palette_label()
+                    ));
+                    return Ok(false);
+                }
+            };
+            spawn_qualified_herdr_action(
+                state,
+                targets,
+                transport_config,
+                app,
+                &target_session,
+                HerdrOperation {
+                    args,
+                    description,
+                    follow_server_focus: true,
+                },
+            );
+        }
+        b'n' | b'q' | 0x1b => {}
+        _ => app.close_confirmation = Some(confirmation),
+    }
+    Ok(false)
 }
 
 fn handle_target_manager_input(key: u8, app: &mut App) -> Result<bool> {
@@ -2841,7 +3475,172 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
         render_target_manager(frame, manager);
     } else if let Some(navigator) = app.agent_navigator.as_ref() {
         render_agent_navigator(frame, state, navigator);
+    } else if let Some(palette) = app.command_palette.as_ref() {
+        render_command_palette(frame, state, app.selected_pane.as_ref(), palette);
+    } else if let Some(prompt) = app.text_prompt.as_ref() {
+        render_text_prompt(frame, prompt);
+    } else if let Some(confirmation) = app.close_confirmation.as_ref() {
+        render_close_confirmation(frame, confirmation);
     }
+}
+
+fn render_command_palette(
+    frame: &mut Frame,
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    palette: &CommandPalette,
+) {
+    let area = centered_popup(frame.area(), 82, 22);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" actions ", Style::default().bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let actions = filtered_palette_actions(state, selected, &palette.query);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(safe_text(&palette.query)),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::styled(
+            "Type to search   Tab/Ctrl+N next   Ctrl+P previous   Enter run   Esc close",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::default(),
+    ];
+    let available = usize::from(inner.height).saturating_sub(lines.len());
+    if actions.is_empty() {
+        lines.push(Line::styled(
+            "No matching actions",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if available > 0 {
+        let selected = palette.selected.min(actions.len() - 1);
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(available)
+            .min(actions.len().saturating_sub(available));
+        for (index, action) in actions.iter().enumerate().skip(start).take(available) {
+            let line = Line::from(vec![
+                Span::raw(if index == selected { "> " } else { "  " }),
+                Span::raw(safe_text(&action.palette_label())),
+                Span::styled(
+                    format!("  {}", safe_text(&action.palette_scope())),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            lines.push(if index == selected {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            });
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_text_prompt(frame: &mut Frame, prompt: &TextPrompt) {
+    let area = centered_popup(frame.area(), 72, 10);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} ", safe_text(&prompt.title)),
+            Style::default().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = vec![
+        Line::from(safe_text(&prompt.label)),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(safe_text(&prompt.value)),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::default(),
+        Line::styled(
+            "Enter apply   Ctrl+U clear   Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(error) = prompt.error.as_deref() {
+        lines.push(Line::styled(
+            safe_text(error),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn close_confirmation_details(
+    action: &ResourceAction,
+) -> Option<(&'static str, &str, TargetSession, &str, &'static str)> {
+    match action {
+        ResourceAction::CloseWorkspace { workspace, label } => Some((
+            "workspace",
+            label,
+            workspace.target_session(),
+            &workspace.resource,
+            "This closes its tabs and panes; the Herdr session remains running.",
+        )),
+        ResourceAction::CloseTab { tab, label } => Some((
+            "tab",
+            label,
+            tab.target_session(),
+            &tab.resource,
+            "This closes every pane in the tab; the Herdr session remains running.",
+        )),
+        ResourceAction::ClosePane { pane, label } => Some((
+            "pane",
+            label,
+            pane.target_session(),
+            &pane.resource,
+            "This closes the pane and its process; the Herdr session remains running.",
+        )),
+        _ => None,
+    }
+}
+
+fn render_close_confirmation(frame: &mut Frame, confirmation: &CloseConfirmation) {
+    let Some((kind, label, target_session, resource, warning)) =
+        close_confirmation_details(&confirmation.action)
+    else {
+        return;
+    };
+    let area = centered_popup(frame.area(), 72, 11);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" close Herdr {kind} "),
+            Style::default().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Close {kind} {label:?}?")),
+            Line::default(),
+            Line::from(format!(
+                "Host/session: {}",
+                safe_text(&target_session.to_string())
+            )),
+            Line::from(format!("Herdr {kind} ID: {}", safe_text(resource))),
+            Line::default(),
+            Line::styled("y close   n/Esc cancel", Style::default().fg(Color::Yellow)),
+            Line::from(warning),
+        ]),
+        inner,
+    );
 }
 
 fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
@@ -3279,6 +4078,10 @@ fn pane_for_workspace(snapshot: &NormalizedSnapshot, workspace: &WorkspaceId) ->
                 .find(|tab| tab.workspace.as_ref() == Some(workspace))
                 .map(|tab| &tab.id)
         })?;
+    pane_for_tab(snapshot, tab)
+}
+
+fn pane_for_tab(snapshot: &NormalizedSnapshot, tab: &TabId) -> Option<PaneId> {
     snapshot
         .layouts
         .get(tab)
@@ -3536,7 +4339,7 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
         );
         let (text, style) = match app.mode {
             InputMode::Prefix => (
-                " Ctrl+]  1-9 workspace  p/n tab  j/k pane  a agents  h hosts  v paste  i image  q quit "
+                " Ctrl+]  Space actions  1-9 workspace  p/n tab  j/k pane  d close  a agents  h hosts  v paste  i image  q quit "
                     .to_owned(),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
@@ -3726,16 +4529,18 @@ mod tests {
         SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish,
         TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
         capture_selection_viewport, clamped_pane_position, cycle_tab, desired_access,
-        displayed_message, encode_mouse_event, fall_back_to_observe, finish_ui_left_gesture,
-        handle_input, handle_mouse, handle_target_manager_input, mouse_event_allowed,
-        mouse_passthrough_enabled, pane_direction_score, reconcile_selection, render_vt_screen,
-        safe_text, select_neighbor_pane, select_pane, select_workspace, selected_terminal_text,
-        sidebar_block, sidebar_content_height, sidebar_pane_at_row, tab_at_column,
-        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
-        viewport_shift_distance, visible_pane_areas,
+        displayed_message, encode_mouse_event, fall_back_to_observe, filtered_palette_actions,
+        finish_ui_left_gesture, fuzzy_score, handle_decoded_input, handle_input, handle_mouse,
+        handle_target_manager_input, mouse_event_allowed, mouse_passthrough_enabled,
+        pane_direction_score, reconcile_selection, render_vt_screen, safe_text,
+        select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_block,
+        sidebar_content_height, sidebar_pane_at_row, tab_at_column, terminal_paste_payload,
+        ui_areas, update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
+        visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession};
+    use crate::resource_action::ResourceAction;
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
     };
@@ -3785,6 +4590,114 @@ mod tests {
             .unwrap();
         assert_eq!(app.mode, InputMode::Terminal);
         assert!(app.message.as_deref().unwrap().contains("Herdr Ctrl+B"));
+    }
+
+    #[tokio::test]
+    async fn federation_prefix_qualifies_workspace_close_before_confirmation() {
+        let first_key = TargetSession::new("host-a", "work");
+        let second_key = TargetSession::new("host-b", "work");
+        let snapshot = |key: &TargetSession, label: &str| {
+            NormalizedSnapshot::from_value(
+                key,
+                &json!({
+                    "workspaces": [{
+                        "workspace_id": "w1",
+                        "active_tab_id": "w1:t1",
+                        "label": label
+                    }],
+                    "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                    "panes": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "tab_id": "w1:t1"
+                    }]
+                }),
+            )
+        };
+        let mut state = FederationState::default();
+        state.targets.insert(
+            first_key.clone(),
+            runtime(
+                first_key.clone(),
+                TargetConnectionState::Live,
+                Some(snapshot(&first_key, "first")),
+            ),
+        );
+        state.targets.insert(
+            second_key.clone(),
+            runtime(
+                second_key.clone(),
+                TargetConnectionState::Live,
+                Some(snapshot(&second_key, "second")),
+            ),
+        );
+        let targets = BTreeMap::new();
+        let transport = crate::config::TransportConfig::default();
+        let mut app = App {
+            selected_pane: Some(PaneId::new("host-b", "work", "w1:p1")),
+            ..App::default()
+        };
+
+        handle_input(PREFIX_KEY, &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_input(b'd', &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+
+        let confirmation = app.close_confirmation.as_ref().unwrap();
+        let ResourceAction::CloseWorkspace { workspace, label } = &confirmation.action else {
+            panic!("expected a workspace-close action");
+        };
+        assert_eq!(workspace.to_string(), "host-b/work/w1");
+        assert_eq!(label, "second");
+        assert_eq!(app.mode, InputMode::Terminal);
+
+        handle_input(b'n', &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+        assert!(app.close_confirmation.is_none());
+        assert!(!app.herdr_action_inflight);
+
+        let actions = filtered_palette_actions(&state, app.selected_pane.as_ref(), "jump second");
+        assert_eq!(actions.len(), 1);
+        let ResourceAction::JumpToPane { pane, .. } = &actions[0] else {
+            panic!("expected a jump action");
+        };
+        assert_eq!(pane.to_string(), "host-b/work/w1:p1");
+    }
+
+    #[test]
+    fn command_palette_search_is_case_insensitive_and_fuzzy() {
+        assert!(fuzzy_score("Close workspace Simulator", "CWSim").is_some());
+        assert!(fuzzy_score("Open agent navigator", "target remove").is_none());
+    }
+
+    #[tokio::test]
+    async fn command_palette_consumes_arrow_navigation_as_one_input() {
+        let state = FederationState::default();
+        let targets = BTreeMap::new();
+        let transport = crate::config::TransportConfig::default();
+        let mut app = App::default();
+
+        handle_input(PREFIX_KEY, &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_input(b' ', &state, &targets, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_decoded_input(
+            DecodedInput::Bytes(b"\x1b[B".to_vec()),
+            &state,
+            &targets,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.command_palette.as_ref().unwrap().selected, 1);
+        assert!(app.message.is_none());
     }
 
     #[test]

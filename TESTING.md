@@ -47,6 +47,9 @@ For every applicable row, verify:
 11. With more workspace rows than fit onscreen, sidebar wheel scrolling reaches
     every row, clicks select the displayed item, and keyboard selection plus
     terminal resizing keep the selected workspace visible.
+12. The action palette fuzzy-searches across at least two qualified sessions;
+    create and rename affect only the displayed session, and workspace, tab, and
+    pane closure require confirmation showing the exact qualified resource.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put
