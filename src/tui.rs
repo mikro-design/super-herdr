@@ -3,11 +3,11 @@ use std::io::{self, IsTerminal, Read, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep_until, timeout};
 
+use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex, AttentionStore};
 use crate::clipboard;
 use crate::config::{Config, Target};
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
@@ -39,7 +40,9 @@ use crate::terminal::{
     TerminalAccess, TerminalEvent, TerminalScrollDirection, parse_terminal_event, spawn_terminal,
     terminal_input_command, terminal_release_command, terminal_scroll_command,
 };
-use crate::transport::{CliSnapshotTransport, expand_discovered_sessions, run_herdr_operation};
+use crate::transport::{
+    CliSnapshotTransport, expand_discovered_sessions, run_herdr_operation, send_pane_input,
+};
 use crate::ui_state::{UiState, UiStateStore};
 
 const PREFIX_KEY: u8 = 0x1d;
@@ -52,6 +55,8 @@ const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MOUSE_SCROLL_LINES: u16 = 3;
 const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ROUTE_EVENT_DRAIN_LIMIT: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
@@ -127,16 +132,61 @@ impl MouseInput {
 enum DecodedInput {
     Bytes(Vec<u8>),
     Mouse(MouseInput),
+    Paste(Vec<u8>),
+    PasteTooLarge,
 }
 
 #[derive(Default)]
 struct InputDecoder {
     pending: Vec<u8>,
     pending_since: Option<Instant>,
+    paste: Option<PasteBuffer>,
+}
+
+#[derive(Default)]
+struct PasteBuffer {
+    bytes: Vec<u8>,
+    overflow_tail: Vec<u8>,
+    overflowed: bool,
 }
 
 impl InputDecoder {
     fn push(&mut self, byte: u8) -> Option<DecodedInput> {
+        if let Some(paste) = self.paste.as_mut() {
+            if paste.overflowed {
+                paste.overflow_tail.push(byte);
+                if paste.overflow_tail.len() > BRACKETED_PASTE_END.len() {
+                    paste.overflow_tail.remove(0);
+                }
+                if paste.overflow_tail == BRACKETED_PASTE_END {
+                    self.paste = None;
+                    return Some(DecodedInput::PasteTooLarge);
+                }
+                return None;
+            }
+
+            paste.bytes.push(byte);
+            if paste.bytes.ends_with(BRACKETED_PASTE_END) {
+                paste
+                    .bytes
+                    .truncate(paste.bytes.len() - BRACKETED_PASTE_END.len());
+                let paste = self.paste.take().expect("paste buffer was present");
+                return Some(if paste.bytes.len() <= MAX_CLIPBOARD_BYTES {
+                    DecodedInput::Paste(paste.bytes)
+                } else {
+                    DecodedInput::PasteTooLarge
+                });
+            }
+            if paste.bytes.len() > MAX_CLIPBOARD_BYTES + BRACKETED_PASTE_END.len() {
+                paste.overflow_tail = paste.bytes
+                    [paste.bytes.len().saturating_sub(BRACKETED_PASTE_END.len())..]
+                    .to_vec();
+                paste.bytes.clear();
+                paste.overflowed = true;
+            }
+            return None;
+        }
+
         if self.pending.is_empty() {
             if byte == 0x1b {
                 self.pending.push(byte);
@@ -147,6 +197,14 @@ impl InputDecoder {
         }
 
         self.pending.push(byte);
+        if BRACKETED_PASTE_START.starts_with(&self.pending) {
+            if self.pending == BRACKETED_PASTE_START {
+                self.pending.clear();
+                self.pending_since = None;
+                self.paste = Some(PasteBuffer::default());
+            }
+            return None;
+        }
         let is_mouse_prefix = match self.pending.as_slice() {
             [0x1b] | [0x1b, b'['] => true,
             bytes if bytes.starts_with(b"\x1b[<") => true,
@@ -435,6 +493,11 @@ impl Default for AgentNavigator {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct AttentionCenter {
+    selected: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentJumpEntry {
     pane: PaneId,
@@ -509,6 +572,7 @@ struct HerdrActionEvent {
     result: Result<(), String>,
     description: String,
     follow_server_focus: bool,
+    clipboard_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -566,6 +630,9 @@ struct App {
     configuration_dirty: bool,
     target_manager: Option<TargetManager>,
     agent_navigator: Option<AgentNavigator>,
+    attention: AttentionIndex,
+    attention_store: Option<AttentionStore>,
+    attention_center: Option<AttentionCenter>,
     command_palette: Option<CommandPalette>,
     text_prompt: Option<TextPrompt>,
     close_confirmation: Option<CloseConfirmation>,
@@ -603,6 +670,9 @@ impl Default for App {
             configuration_dirty: false,
             target_manager: None,
             agent_navigator: None,
+            attention: AttentionIndex::default(),
+            attention_store: None,
+            attention_center: None,
             command_palette: None,
             text_prompt: None,
             close_confirmation: None,
@@ -644,12 +714,23 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let mut input_decoder = InputDecoder::default();
     let state_store = UiStateStore::discover()?;
     let restore_pending = state_store.load().unwrap_or_default().selected_pane;
+    let attention_store = AttentionStore::discover()?;
+    let (attention, attention_message) = match attention_store.load() {
+        Ok(attention) => (attention, None),
+        Err(_) => (
+            AttentionIndex::default(),
+            Some("persisted attention state was invalid; starting with an empty index".to_owned()),
+        ),
+    };
     let mut app = App {
         restore_pending,
         state_store: Some(state_store),
+        attention,
+        attention_store: Some(attention_store),
         config_path: Some(config_path.clone()),
         configured_targets,
         herdr_action_sender: Some(herdr_action_sender),
+        message: attention_message,
         ..App::default()
     };
     let mut should_draw = true;
@@ -662,6 +743,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 .is_none_or(|last_render| now.duration_since(last_render) >= MIN_RENDER_INTERVAL)
         {
             let state = updates.borrow().clone();
+            refresh_attention(&state, &mut app);
             reconcile_selection(&state, &mut app);
             ensure_routes(
                 &state,
@@ -768,7 +850,15 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                     app.herdr_action_inflight = false;
                     match action.result {
                         Ok(()) => {
-                            app.message = Some(format!("Herdr: {}", action.description));
+                            if let Some(feedback) = action.clipboard_feedback {
+                                app.clipboard_feedback = Some(ClipboardFeedback {
+                                    text: feedback,
+                                    expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
+                                });
+                                app.message = None;
+                            } else {
+                                app.message = Some(format!("Herdr: {}", action.description));
+                            }
                             if action.follow_server_focus {
                                 app.selection_explicit = false;
                                 app.selected_pane = None;
@@ -883,7 +973,7 @@ fn enter_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard
     enable_raw_mode().context("failed to enable raw terminal mode")?;
     let guard = TerminalGuard;
     let mut output = io::stdout();
-    if let Err(error) = execute!(output, EnterAlternateScreen, Hide) {
+    if let Err(error) = execute!(output, EnterAlternateScreen, EnableBracketedPaste, Hide) {
         drop(guard);
         return Err(error).context("failed to enter the alternate screen");
     }
@@ -908,6 +998,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(
             io::stdout(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             Show,
             LeaveAlternateScreen
@@ -970,6 +1061,43 @@ async fn handle_decoded_input(
             }
         }
         DecodedInput::Mouse(mouse) => handle_mouse(mouse, state, app).await?,
+        DecodedInput::Paste(bytes) => {
+            if app.mode != InputMode::Terminal
+                || app.target_manager.is_some()
+                || app.agent_navigator.is_some()
+                || app.attention_center.is_some()
+                || app.command_palette.is_some()
+                || app.text_prompt.is_some()
+                || app.close_confirmation.is_some()
+            {
+                app.message = Some("close the active Super-Herdr dialog before pasting".to_owned());
+            } else {
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        app.message =
+                            Some("terminal paste was not valid UTF-8; paste not sent".to_owned());
+                        return Ok(false);
+                    }
+                };
+                let characters = text.chars().count();
+                paste_text_into_selected(
+                    state,
+                    targets,
+                    transport_config,
+                    app,
+                    text,
+                    format!("pasted {characters} characters from terminal clipboard"),
+                )
+                .await?;
+            }
+        }
+        DecodedInput::PasteTooLarge => {
+            app.message = Some(format!(
+                "terminal paste exceeded the {} MiB limit; paste not sent",
+                MAX_CLIPBOARD_BYTES / (1024 * 1024)
+            ));
+        }
     }
     Ok(false)
 }
@@ -978,6 +1106,7 @@ async fn handle_mouse(mouse: MouseInput, state: &FederationState, app: &mut App)
     if app.mode != InputMode::Terminal
         || app.target_manager.is_some()
         || app.agent_navigator.is_some()
+        || app.attention_center.is_some()
         || app.command_palette.is_some()
         || app.text_prompt.is_some()
         || app.close_confirmation.is_some()
@@ -1314,6 +1443,25 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
+fn refresh_attention(state: &FederationState, app: &mut App) {
+    let previous_unread = app.attention.unread_count();
+    if app.attention.observe(state) {
+        if app.attention.unread_count() > previous_unread {
+            app.sidebar_offset = 0;
+            app.sidebar_follow_selected = false;
+        }
+        persist_attention(app);
+    }
+}
+
+fn persist_attention(app: &mut App) {
+    if let Some(store) = app.attention_store.as_ref()
+        && store.save(&app.attention).is_err()
+    {
+        app.message = Some("failed to persist attention metadata".to_owned());
+    }
+}
+
 fn select_pane(app: &mut App, pane: PaneId) {
     app.selection_explicit = true;
     app.restore_pending = None;
@@ -1325,6 +1473,9 @@ fn select_pane(app: &mut App, pane: PaneId) {
     app.route_retry_after.remove(&pane);
     app.control_retry_after.remove(&pane);
     app.message = None;
+    if app.attention.mark_seen_for_pane(&pane) {
+        persist_attention(app);
+    }
     if let Some(store) = app.state_store.as_ref()
         && store.save(&UiState::selected_pane(pane)).is_err()
     {
@@ -1579,6 +1730,9 @@ async fn handle_input(
     if app.agent_navigator.is_some() {
         return handle_agent_navigator_input(key, state, app);
     }
+    if app.attention_center.is_some() {
+        return handle_attention_center_input(key, state, app);
+    }
     match app.mode {
         InputMode::Terminal if key == PREFIX_KEY => {
             app.selection = None;
@@ -1633,12 +1787,13 @@ async fn handle_input(
                 b'k' => cycle_pane(state, app, -1),
                 b'n' => cycle_tab(state, app, 1),
                 b'p' => cycle_tab(state, app, -1),
-                b'v' => paste_system_clipboard(state, app).await?,
+                b'v' => paste_system_clipboard(state, targets, transport_config, app).await?,
                 b'i' => paste_clipboard_image(state, targets, transport_config, app).await?,
                 b'h' => {
                     app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
                 }
                 b'a' => app.agent_navigator = Some(AgentNavigator::default()),
+                b'e' => app.attention_center = Some(AttentionCenter::default()),
                 b'd' => request_workspace_close(state, app),
                 b' ' => app.command_palette = Some(CommandPalette::default()),
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
@@ -1658,7 +1813,7 @@ async fn handle_input(
                 0x1b => {}
                 _ => {
                     app.message = Some(
-                        "prefix: Space actions, 1-9 workspace, p/n tab, j/k pane, d close workspace, a agents, h hosts, v paste, i image, q quit, Ctrl+] literal"
+                        "prefix: Space actions, 1-9 workspace, p/n tab, j/k pane, d close workspace, a agents, e events, h hosts, v paste, i image, q quit, Ctrl+] literal"
                             .into(),
                     );
                 }
@@ -1883,6 +2038,7 @@ fn spawn_qualified_herdr_action(
             result,
             description: operation.description,
             follow_server_focus: operation.follow_server_focus,
+            clipboard_feedback: None,
         });
     });
 }
@@ -1921,6 +2077,7 @@ fn command_palette_actions(
     let mut actions = vec![
         ResourceAction::OpenTargetManager,
         ResourceAction::OpenAgentNavigator,
+        ResourceAction::OpenAttentionCenter,
     ];
 
     let selected_is_actionable = selected.is_some_and(|pane| {
@@ -2167,6 +2324,9 @@ fn execute_resource_action(
         }
         ResourceAction::OpenAgentNavigator => {
             app.agent_navigator = Some(AgentNavigator::default());
+        }
+        ResourceAction::OpenAttentionCenter => {
+            app.attention_center = Some(AttentionCenter::default());
         }
         ResourceAction::CreateWorkspace { target } => {
             app.text_prompt = Some(TextPrompt {
@@ -2584,6 +2744,79 @@ fn handle_agent_navigator_input(key: u8, state: &FederationState, app: &mut App)
     Ok(false)
 }
 
+fn handle_attention_center_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
+    let Some(mut center) = app.attention_center.take() else {
+        return Ok(false);
+    };
+    let event_count = app.attention.events().count();
+    match key {
+        b'q' | 0x1b => return Ok(false),
+        b'j' => {
+            if event_count > 0 {
+                center.selected = (center.selected + 1).min(event_count - 1);
+            }
+        }
+        b'k' => center.selected = center.selected.saturating_sub(1),
+        b'r' => {
+            if app.attention.mark_all_seen() {
+                persist_attention(app);
+            }
+        }
+        b'c' => {
+            if app.attention.clear_seen() {
+                persist_attention(app);
+            }
+            center.selected = center
+                .selected
+                .min(app.attention.events().count().saturating_sub(1));
+        }
+        b'\r' | b'\n' => {
+            let event = app.attention.events().rev().nth(center.selected).cloned();
+            if let Some(event) = event {
+                if pane_is_live(state, &event.pane) {
+                    select_pane(app, event.pane.clone());
+                    app.message = Some(format!(
+                        "jumped to {} on {}/{}",
+                        safe_text(&event.agent),
+                        event.pane.target,
+                        event.pane.session
+                    ));
+                    return Ok(false);
+                }
+                if app.attention.mark_seen_for_pane(&event.pane) {
+                    persist_attention(app);
+                }
+                app.message = Some(format!(
+                    "{} on {}/{} is no longer live",
+                    safe_text(&event.agent),
+                    event.pane.target,
+                    event.pane.session
+                ));
+                return Ok(false);
+            }
+        }
+        _ => {}
+    }
+    center.selected = center
+        .selected
+        .min(app.attention.events().count().saturating_sub(1));
+    app.attention_center = Some(center);
+    Ok(false)
+}
+
+fn pane_is_live(state: &FederationState, pane: &PaneId) -> bool {
+    state
+        .targets
+        .get(&pane.target_session())
+        .is_some_and(|target| {
+            target.connection == TargetConnectionState::Live
+                && target
+                    .snapshot
+                    .as_deref()
+                    .is_some_and(|snapshot| snapshot.panes.contains_key(pane))
+        })
+}
+
 fn agent_jump_entries(state: &FederationState, filter: AgentFilter) -> Vec<AgentJumpEntry> {
     let mut entries = state
         .targets
@@ -2672,29 +2905,12 @@ fn agent_priority(status: &str, interactive_ready: bool) -> u8 {
     }
 }
 
-async fn paste_system_clipboard(state: &FederationState, app: &mut App) -> Result<()> {
-    let Some(selected) = app.selected_pane.clone() else {
-        app.message = Some("no terminal pane is selected".to_owned());
-        return Ok(());
-    };
-    let Some(route) = app.routes.get(&selected) else {
-        app.message = Some("selected pane has no control route".to_owned());
-        return Ok(());
-    };
-    if route.input.is_none() {
-        app.message = Some("read-only: another Herdr client owns control; cannot paste".to_owned());
-        return Ok(());
-    }
-    let Some(target) = state.targets.get(&selected.target_session()) else {
-        app.message = Some("selected target is unavailable".to_owned());
-        return Ok(());
-    };
-    if !target.accepts_generation(route.generation) {
-        app.routes.remove(&selected);
-        app.message = Some("control route became stale".to_owned());
-        return Ok(());
-    }
-    let bracketed = route.parser.screen().bracketed_paste();
+async fn paste_system_clipboard(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+) -> Result<()> {
     let text = match clipboard::read_text(MAX_CLIPBOARD_BYTES).await {
         Ok(text) => text,
         Err(error) => {
@@ -2707,6 +2923,108 @@ async fn paste_system_clipboard(state: &FederationState, app: &mut App) -> Resul
         return Ok(());
     }
     let characters = text.chars().count();
+    paste_text_into_selected(
+        state,
+        targets,
+        transport_config,
+        app,
+        text,
+        format!("pasted {characters} characters from system clipboard"),
+    )
+    .await
+}
+
+async fn paste_text_into_selected(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+    text: String,
+    feedback: String,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if text.len() > MAX_CLIPBOARD_BYTES {
+        app.message = Some(format!(
+            "paste exceeded the {} MiB limit; paste not sent",
+            MAX_CLIPBOARD_BYTES / (1024 * 1024)
+        ));
+        return Ok(());
+    }
+    if text
+        .as_bytes()
+        .windows(BRACKETED_PASTE_END.len())
+        .any(|window| window == BRACKETED_PASTE_END)
+    {
+        app.message =
+            Some("paste contains a bracketed-paste terminator; paste not sent".to_owned());
+        return Ok(());
+    }
+
+    let Some(selected) = app.selected_pane.clone() else {
+        app.message = Some("no terminal pane is selected".to_owned());
+        return Ok(());
+    };
+    let key = selected.target_session();
+    let Some(route) = app.routes.get(&selected) else {
+        app.message = Some("selected pane has no control route".to_owned());
+        return Ok(());
+    };
+    if route.input.is_none() {
+        app.message = Some("read-only: another Herdr client owns control; cannot paste".to_owned());
+        return Ok(());
+    }
+    let Some(runtime) = state.targets.get(&key) else {
+        app.message = Some("selected target is unavailable".to_owned());
+        return Ok(());
+    };
+    if !runtime.accepts_generation(route.generation) {
+        app.routes.remove(&selected);
+        app.message = Some("control route became stale".to_owned());
+        return Ok(());
+    }
+    let Some(target) = targets.get(&key).cloned() else {
+        app.message = Some("selected target is unavailable".to_owned());
+        return Ok(());
+    };
+
+    if target.socket.is_some() {
+        if app.herdr_action_inflight {
+            app.message = Some("Herdr action already in progress; paste not sent".to_owned());
+            return Ok(());
+        }
+        let Some(sender) = app.herdr_action_sender.clone() else {
+            app.message = Some("Herdr action routing is unavailable; paste not sent".to_owned());
+            return Ok(());
+        };
+        let transport = transport_config.clone();
+        let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
+        let pane_id = selected.server_local_id().to_owned();
+        app.herdr_action_inflight = true;
+        app.message = Some("sending one atomic paste…".to_owned());
+        tokio::spawn(async move {
+            let result = send_pane_input(&target, &transport, &pane_id, &text, command_timeout)
+                .await
+                .map_err(|error| error.message);
+            let _ = sender.send(HerdrActionEvent {
+                result,
+                description: "pasted terminal text".to_owned(),
+                follow_server_focus: false,
+                clipboard_feedback: Some(feedback),
+            });
+        });
+        return Ok(());
+    }
+
+    let bracketed = route.parser.screen().bracketed_paste();
+    if !bracketed && text.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        app.message = Some(
+            "atomic multiline paste requires session discovery or a configured Herdr API socket; paste not sent"
+                .to_owned(),
+        );
+        return Ok(());
+    }
     let payload = terminal_paste_payload(text.as_bytes(), bracketed)?;
     let command = terminal_input_command(&payload)?;
     let Some(input) = app
@@ -2722,7 +3040,7 @@ async fn paste_system_clipboard(state: &FederationState, app: &mut App) -> Resul
         return Ok(());
     }
     app.clipboard_feedback = Some(ClipboardFeedback {
-        text: format!("pasted {characters} characters from system clipboard"),
+        text: feedback,
         expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
     });
     Ok(())
@@ -2812,8 +3130,6 @@ async fn paste_clipboard_image(
 }
 
 fn terminal_paste_payload(text: &[u8], bracketed: bool) -> Result<Vec<u8>> {
-    const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
-    const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
     if text
         .windows(BRACKETED_PASTE_END.len())
         .any(|window| window == BRACKETED_PASTE_END)
@@ -3475,6 +3791,8 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
         render_target_manager(frame, manager);
     } else if let Some(navigator) = app.agent_navigator.as_ref() {
         render_agent_navigator(frame, state, navigator);
+    } else if let Some(center) = app.attention_center.as_ref() {
+        render_attention_center(frame, &app.attention, center);
     } else if let Some(palette) = app.command_palette.as_ref() {
         render_command_palette(frame, state, app.selected_pane.as_ref(), palette);
     } else if let Some(prompt) = app.text_prompt.as_ref() {
@@ -3820,6 +4138,112 @@ fn render_agent_navigator(frame: &mut Frame, state: &FederationState, navigator:
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_attention_center(
+    frame: &mut Frame,
+    attention: &AttentionIndex,
+    center: &AttentionCenter,
+) {
+    let area = centered_popup(frame.area(), 88, 24);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" attention history ", Style::default().bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let events = attention.events().rev().collect::<Vec<_>>();
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "j/k select   Enter jump/read   r mark all read   c clear read   q close   {} unread",
+                attention.unread_count()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::default(),
+    ];
+    let available = usize::from(inner.height).saturating_sub(lines.len());
+    if events.is_empty() {
+        lines.push(Line::styled(
+            "No agent transitions have been recorded.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if available > 0 {
+        let selected = center.selected.min(events.len() - 1);
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(available)
+            .min(events.len().saturating_sub(available));
+        for (index, event) in events.iter().enumerate().skip(start).take(available) {
+            let marker = if event.unread { "●" } else { " " };
+            let event_color = match event.kind {
+                AttentionEventKind::NeedsAttention => Color::Red,
+                AttentionEventKind::Working => Color::Yellow,
+                AttentionEventKind::Completed => Color::Green,
+                AttentionEventKind::StatusChanged => Color::Cyan,
+                AttentionEventKind::Disappeared => Color::DarkGray,
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{marker} {:>4}  ", attention_event_age(event)),
+                    Style::default().fg(if event.unread {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    format!("{:<14}", event.kind.label()),
+                    Style::default().fg(event_color),
+                ),
+                Span::styled(
+                    format!(" {:<16}", safe_text(&event.agent)),
+                    Style::default().add_modifier(if event.unread {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(
+                    format!(
+                        " {}/{}  {}",
+                        safe_text(&event.pane.target),
+                        short_session(&event.pane.session),
+                        safe_text(&event.workspace)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            lines.push(if index == selected {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            });
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn attention_event_age(event: &AttentionEvent) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let seconds = now_ms.saturating_sub(event.occurred_at_ms) / 1000;
+    if seconds < 60 {
+        "now".to_owned()
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}d", seconds / (24 * 60 * 60))
+    }
+}
+
 fn ui_areas(area: Rect) -> (Rect, Rect, Rect) {
     let sidebar_width = if area.width >= 70 {
         SIDEBAR_WIDTH.min(area.width.saturating_sub(20))
@@ -3950,15 +4374,31 @@ fn sidebar_pane_at_row(
         .and_then(|row| row.pane.clone())
 }
 
+#[cfg(test)]
 fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<SidebarRow> {
+    sidebar_rows_with_attention(state, selected, None)
+}
+
+fn sidebar_rows_with_attention(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    attention: Option<&AttentionIndex>,
+) -> Vec<SidebarRow> {
     let selected_target = selected.map(PaneId::target_session);
     let selected_workspace = selected_workspace(state, selected);
     let mut rows = Vec::new();
     let waiting_agents = agent_jump_entries(state, AgentFilter::Attention);
-    if !waiting_agents.is_empty() {
+    let unread = attention.map_or(0, AttentionIndex::unread_count);
+    if !waiting_agents.is_empty() || unread > 0 {
         rows.push(SidebarRow {
             line: Line::styled(
-                format!(" waiting agents ({})  ^]a", waiting_agents.len()),
+                if unread > 0 && !waiting_agents.is_empty() {
+                    format!(" attention {unread} new · {} waiting", waiting_agents.len())
+                } else if unread > 0 {
+                    format!(" attention {unread} new  ^]e")
+                } else {
+                    format!(" waiting agents ({})  ^]a", waiting_agents.len())
+                },
                 Style::default().fg(Color::Red).bold(),
             ),
             pane: None,
@@ -3973,9 +4413,11 @@ fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<Sideb
                 } else {
                     Modifier::empty()
                 });
+            let unread =
+                attention.is_some_and(|attention| attention.has_unread_for_pane(&entry.pane));
             let mut line = Line::from(vec![
                 Span::styled(if is_selected { ">" } else { " " }, style),
-                Span::styled("! ", style),
+                Span::styled(if unread { "● " } else { "! " }, style),
                 Span::styled(entry.agent, style),
                 Span::styled(
                     format!(
@@ -4191,7 +4633,8 @@ fn scroll_sidebar(
     area: Rect,
     direction: TerminalScrollDirection,
 ) {
-    let row_count = sidebar_rows(state, app.selected_pane.as_ref()).len();
+    let row_count =
+        sidebar_rows_with_attention(state, app.selected_pane.as_ref(), Some(&app.attention)).len();
     let maximum = sidebar_max_offset(row_count, area);
     let amount = usize::from(MOUSE_SCROLL_LINES);
     let next_offset = match direction {
@@ -4234,7 +4677,7 @@ fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) 
         return;
     }
     let content = sidebar_block().inner(area);
-    let rows = sidebar_rows(state, app.selected_pane.as_ref());
+    let rows = sidebar_rows_with_attention(state, app.selected_pane.as_ref(), Some(&app.attention));
     reconcile_sidebar_viewport(&rows, app, area);
     for (offset, row) in rows
         .into_iter()
@@ -4258,10 +4701,11 @@ fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) 
 }
 
 fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
-    let lines = sidebar_rows(state, app.selected_pane.as_ref())
-        .into_iter()
-        .map(|row| row.line)
-        .collect::<Vec<_>>();
+    let lines =
+        sidebar_rows_with_attention(state, app.selected_pane.as_ref(), Some(&app.attention))
+            .into_iter()
+            .map(|row| row.line)
+            .collect::<Vec<_>>();
     let row_count = lines.len();
     let offset = u16::try_from(app.sidebar_offset).unwrap_or(u16::MAX);
     frame.render_widget(
@@ -4571,19 +5015,20 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentFilter, AgentNavigator, App, CellPosition, ClipboardFeedback, DecodedInput,
-        HERDR_PREFIX_KEY, InputDecoder, InputMode, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY,
-        PaneDirection, SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection,
-        SelectionFinish, TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
-        capture_selection_viewport, clamped_pane_position, cycle_tab, desired_access,
-        displayed_message, encode_mouse_event, fall_back_to_observe, filtered_palette_actions,
-        finish_ui_left_gesture, fuzzy_score, handle_decoded_input, handle_input, handle_mouse,
+        AgentFilter, AgentNavigator, App, AttentionCenter, CellPosition, ClipboardFeedback,
+        DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode, MAX_CLIPBOARD_BYTES,
+        MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection, SIDEBAR_WIDTH,
+        SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish, TargetManager,
+        TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
+        clamped_pane_position, cycle_tab, desired_access, displayed_message, encode_mouse_event,
+        fall_back_to_observe, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
+        handle_attention_center_input, handle_decoded_input, handle_input, handle_mouse,
         handle_target_manager_input, mouse_event_allowed, mouse_passthrough_enabled,
-        pane_direction_score, reconcile_selection, render_vt_screen, safe_text,
+        pane_direction_score, reconcile_selection, refresh_attention, render_vt_screen, safe_text,
         select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_block,
-        sidebar_content_height, sidebar_pane_at_row, sidebar_rows, tab_at_column,
-        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
-        viewport_shift_distance, visible_pane_areas,
+        sidebar_content_height, sidebar_pane_at_row, sidebar_rows, sidebar_rows_with_attention,
+        tab_at_column, terminal_paste_payload, ui_areas, update_selection_after_frame,
+        update_sidebar_hit_areas, viewport_shift_distance, visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession};
@@ -4900,6 +5345,58 @@ mod tests {
     }
 
     #[test]
+    fn attention_history_is_unread_once_and_jumps_to_the_qualified_pane() {
+        let key = TargetSession::new("host-a", "work");
+        let state_with_status = |status: &str| {
+            let snapshot = NormalizedSnapshot::from_value(
+                &key,
+                &json!({
+                    "workspaces": [{"workspace_id": "w1", "label": "compiler"}],
+                    "panes": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "agent": "builder",
+                        "agent_status": status
+                    }],
+                    "agents": [{
+                        "pane_id": "w1:p1",
+                        "name": "builder",
+                        "agent_status": status
+                    }]
+                }),
+            );
+            let mut state = FederationState::default();
+            state.targets.insert(
+                key.clone(),
+                runtime(key.clone(), TargetConnectionState::Live, Some(snapshot)),
+            );
+            state
+        };
+        let working = state_with_status("working");
+        let blocked = state_with_status("blocked");
+        let mut app = App::default();
+
+        refresh_attention(&working, &mut app);
+        refresh_attention(&blocked, &mut app);
+        refresh_attention(&blocked, &mut app);
+        assert_eq!(app.attention.events().count(), 1);
+        assert_eq!(app.attention.unread_count(), 1);
+
+        let rows = sidebar_rows_with_attention(&blocked, None, Some(&app.attention));
+        assert!(rows[0].line.to_string().contains("attention 1 new"));
+        assert!(rows[1].line.to_string().contains("● builder"));
+
+        app.attention_center = Some(AttentionCenter::default());
+        handle_attention_center_input(b'\r', &blocked, &mut app).unwrap();
+        assert_eq!(
+            app.selected_pane,
+            Some(PaneId::new("host-a", "work", "w1:p1"))
+        );
+        assert_eq!(app.attention.unread_count(), 0);
+        assert!(app.attention_center.is_none());
+    }
+
+    #[test]
     fn outer_mouse_capture_reports_drags_but_not_hover_motion() {
         assert!(MOUSE_CAPTURE_ENABLE.starts_with(b"\x1b[?1002h"));
         assert!(MOUSE_CAPTURE_ENABLE.ends_with(b"?1006h"));
@@ -4978,6 +5475,39 @@ mod tests {
                 release: false,
             }))
         );
+    }
+
+    #[test]
+    fn input_decoder_emits_multiline_bracketed_paste_once() {
+        let mut decoder = InputDecoder::default();
+        let mut decoded = Vec::new();
+        for byte in b"\x1b[200~first\nsecond\nthird\x1b[201~" {
+            if let Some(input) = decoder.push(*byte) {
+                decoded.push(input);
+            }
+        }
+
+        assert_eq!(
+            decoded,
+            vec![DecodedInput::Paste(b"first\nsecond\nthird".to_vec())]
+        );
+    }
+
+    #[test]
+    fn input_decoder_discards_an_oversized_paste_as_one_event() {
+        let mut decoder = InputDecoder::default();
+        for byte in b"\x1b[200~" {
+            assert_eq!(decoder.push(*byte), None);
+        }
+        for _ in 0..=MAX_CLIPBOARD_BYTES {
+            assert_eq!(decoder.push(b'x'), None);
+        }
+        let mut decoded = None;
+        for byte in b"\x1b[201~" {
+            decoded = decoder.push(*byte).or(decoded);
+        }
+
+        assert_eq!(decoded, Some(DecodedInput::PasteTooLarge));
     }
 
     #[test]

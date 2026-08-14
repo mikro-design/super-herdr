@@ -69,12 +69,24 @@ refresh path. CLI and TUI target management use one atomic file store. A refresh
 may reconnect Super-Herdr routes but cannot mutate server-owned workspaces,
 sessions, or processes.
 
-The desktop persists only versioned UI intent, currently the last explicitly
-selected qualified pane. Writes use a private state directory and atomic file
-replacement. Terminal contents, clipboard payloads, SSH material, connection
-leases, and server snapshots are never persisted. Restoration waits through
-target reconnects and succeeds only when the exact target/session/local-ID tuple
-is live; stale IDs are ignored without mutating the Herdr server.
+The desktop persists versioned UI intent and a separate bounded attention index.
+UI intent currently contains the last explicitly selected qualified pane. The
+attention index contains only qualified pane identity, agent/workspace labels,
+normalized status, transition kind, timestamp, unread state, and the last agent
+observation needed for deduplication. Writes use a private state directory and
+atomic file replacement. Terminal contents, clipboard payloads, SSH material,
+connection leases, and server snapshots are never persisted. Restoration waits
+through target reconnects and succeeds only when the exact
+target/session/local-ID tuple is live; stale IDs are ignored without mutating the
+Herdr server.
+
+Agent attention is derived only from authoritative normalized snapshots. A
+documented Herdr event causes an immediate snapshot, so status transitions appear
+without waiting for the polling deadline. The first observation establishes a
+baseline; later phase changes create one unread event. Repeated snapshots are
+deduplicated. An agent is recorded as disappeared only when its target remains
+live and an authoritative snapshot removes it; target disconnects never create
+false disappearance events. Selecting the qualified pane marks its events read.
 
 ## Terminal data plane
 
@@ -149,17 +161,25 @@ forces OSC 52 so a nested Super-Herdr uses the outer Herdr client's clipboard
 forwarding rather than a host-local graphical clipboard.
 Selection is rendered with the color-independent reverse-video modifier so a
 `NO_COLOR` environment cannot make the marked range invisible.
-Local-to-remote text paste is an explicit desktop-broker action. The broker reads
-from `pbpaste`, `wl-paste`, `xclip`, or `xsel`, applies a 1 MiB limit, honors the
-selected terminal's bracketed-paste mode, and routes only the resulting terminal
-input through Herdr's public control stream. It is deliberately unavailable when
-Super-Herdr itself runs through SSH because the remote process cannot directly
-read the client's clipboard; the local terminal remains the paste mediator in
-that topology. PNG image bridging reads explicitly from the desktop clipboard,
-uploads at most 32 MiB to a private per-target temporary directory, verifies the
-remote byte count and SHA-256 digest, and injects only the resulting path through
-the selected terminal route. File-list clipboard upload remains a later extension
-of the same broker. Remote agents never need desktop clipboard access.
+Local-to-remote text has two entry paths. Super-Herdr enables bracketed paste in
+the outer terminal and buffers a normal terminal paste as one bounded event; the
+explicit desktop-broker action reads from `pbpaste`, `wl-paste`, `xclip`, or
+`xsel`. Both paths apply a 1 MiB input limit and deliver one documented
+`pane.send_input` request through the target session's private Herdr API socket.
+Herdr owns the authoritative runtime input state, adds bracketed-paste markers
+when needed, and writes the complete input atomically. SSH targets use a bounded
+OpenSSH Unix-socket forward. Clipboard text is never placed in command arguments,
+logs, persistent state, or terminal frames. When no documented socket is known,
+Super-Herdr refuses multiline input rather than forwarding newline-delimited raw
+input that could become multiple messages. The explicit desktop broker remains
+unavailable when Super-Herdr itself runs through SSH because the remote process
+cannot directly read the client's clipboard; normal paste from the local terminal
+remains supported in that topology. PNG image bridging reads explicitly from the
+desktop clipboard, uploads at most 32 MiB to a private per-target temporary
+directory, verifies the remote byte count and SHA-256 digest, and injects only the
+resulting path through the selected terminal route. File-list clipboard upload
+remains a later extension of the same broker. Remote agents never need desktop
+clipboard access.
 
 Herdr 0.8's documented `terminal session` stream currently exposes terminal
 frames, closure, input, resize, scroll, and release, but not the server-to-client

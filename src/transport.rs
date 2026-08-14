@@ -324,7 +324,7 @@ async fn open_socket_event_stream(
     connect_timeout: Duration,
     pane_ids: &[String],
 ) -> Result<SocketChangeStream, SnapshotError> {
-    let mut connection = open_event_connection(target, config, connect_timeout).await?;
+    let mut connection = open_socket_connection(target, config, connect_timeout).await?;
     let request = event_subscription_request(pane_ids);
     let mut encoded = serde_json::to_vec(&request)
         .map_err(|_| SnapshotError::unavailable("failed to encode event subscription"))?;
@@ -336,7 +336,7 @@ async fn open_socket_event_stream(
         .map_err(|_| SnapshotError::unavailable("failed to write event subscription"))?;
 
     let mut reader = BufReader::new(connection.stream);
-    let acknowledgement = read_event_line(&mut reader, connect_timeout).await?;
+    let acknowledgement = read_socket_line(&mut reader, connect_timeout).await?;
     if acknowledgement.get("error").is_some()
         || acknowledgement.get("id").and_then(Value::as_str) != Some("super-herdr:events")
     {
@@ -362,7 +362,7 @@ impl ChangeStream for SocketChangeStream {
     fn next(&mut self) -> ChangeFuture<'_> {
         Box::pin(async move {
             loop {
-                let event = read_event_line(&mut self.reader, Duration::MAX).await?;
+                let event = read_socket_line(&mut self.reader, Duration::MAX).await?;
                 if event.get("event").and_then(Value::as_str).is_some() {
                     return Ok(());
                 }
@@ -393,17 +393,17 @@ fn event_subscription_request(pane_ids: &[String]) -> Value {
 }
 
 #[cfg(unix)]
-async fn read_event_line(
+async fn read_socket_line(
     reader: &mut BufReader<UnixStream>,
     read_timeout: Duration,
 ) -> Result<Value, SnapshotError> {
-    const MAX_EVENT_LINE: usize = 1024 * 1024;
+    const MAX_SOCKET_LINE: usize = 1024 * 1024;
     let mut line = Vec::new();
     let read = async {
         reader
             .read_until(b'\n', &mut line)
             .await
-            .map_err(|_| SnapshotError::unavailable("event stream read failed"))
+            .map_err(|_| SnapshotError::unavailable("Herdr socket read failed"))
     };
     let length = if read_timeout == Duration::MAX {
         read.await?
@@ -413,19 +413,19 @@ async fn read_event_line(
             .map_err(|_| SnapshotError::timed_out(read_timeout))??
     };
     if length == 0 {
-        return Err(SnapshotError::unavailable("event stream closed"));
+        return Err(SnapshotError::unavailable("Herdr socket closed"));
     }
-    if line.len() > MAX_EVENT_LINE {
+    if line.len() > MAX_SOCKET_LINE {
         return Err(SnapshotError::unavailable(
-            "event record exceeded size limit",
+            "Herdr socket record exceeded size limit",
         ));
     }
     serde_json::from_slice(&line)
-        .map_err(|_| SnapshotError::unavailable("event stream returned invalid JSON"))
+        .map_err(|_| SnapshotError::unavailable("Herdr socket returned invalid JSON"))
 }
 
 #[cfg(unix)]
-struct EventConnection {
+struct SocketConnection {
     stream: UnixStream,
     _forward: Option<SshSocketForward>,
 }
@@ -444,30 +444,30 @@ impl Drop for SshSocketForward {
 }
 
 #[cfg(unix)]
-async fn open_event_connection(
+async fn open_socket_connection(
     target: &Target,
     config: &TransportConfig,
     connect_timeout: Duration,
-) -> Result<EventConnection, SnapshotError> {
+) -> Result<SocketConnection, SnapshotError> {
     let socket = target
         .socket
         .as_deref()
-        .ok_or_else(|| SnapshotError::unavailable("event socket is not configured"))?;
+        .ok_or_else(|| SnapshotError::unavailable("Herdr API socket is not configured"))?;
     let Some(destination) = target.ssh.as_deref() else {
         let stream = timeout(connect_timeout, UnixStream::connect(socket))
             .await
             .map_err(|_| SnapshotError::timed_out(connect_timeout))?
-            .map_err(|_| SnapshotError::unavailable("failed to connect to local event socket"))?;
-        return Ok(EventConnection {
+            .map_err(|_| SnapshotError::unavailable("failed to connect to local Herdr socket"))?;
+        return Ok(SocketConnection {
             stream,
             _forward: None,
         });
     };
 
     let directory = tempfile::Builder::new()
-        .prefix("super-herdr-events-")
+        .prefix("super-herdr-socket-")
         .tempdir()
-        .map_err(|_| SnapshotError::unavailable("failed to create event forwarding directory"))?;
+        .map_err(|_| SnapshotError::unavailable("failed to create socket forwarding directory"))?;
     let local_socket = directory.path().join("herdr.sock");
     let forward = format!("{}:{socket}", local_socket.display());
     let mut command = Command::new(&config.ssh_bin);
@@ -490,7 +490,7 @@ async fn open_event_connection(
         .kill_on_drop(true);
     let child = command
         .spawn()
-        .map_err(|_| SnapshotError::unavailable("failed to start SSH event forwarding"))?;
+        .map_err(|_| SnapshotError::unavailable("failed to start SSH socket forwarding"))?;
     let mut guard = SshSocketForward {
         child,
         _directory: directory,
@@ -500,16 +500,16 @@ async fn open_event_connection(
         if guard
             .child
             .try_wait()
-            .map_err(|_| SnapshotError::unavailable("failed to inspect SSH event forwarding"))?
+            .map_err(|_| SnapshotError::unavailable("failed to inspect SSH socket forwarding"))?
             .is_some()
         {
             return Err(SnapshotError::unavailable(
-                "SSH event forwarding exited (diagnostics redacted)",
+                "SSH socket forwarding exited (diagnostics redacted)",
             ));
         }
         match UnixStream::connect(&local_socket).await {
             Ok(stream) => {
-                return Ok(EventConnection {
+                return Ok(SocketConnection {
                     stream,
                     _forward: Some(guard),
                 });
@@ -518,6 +518,90 @@ async fn open_event_connection(
             Err(_) => return Err(SnapshotError::timed_out(connect_timeout)),
         }
     }
+}
+
+/// Send text through Herdr's documented semantic pane-input API. Herdr applies
+/// its authoritative bracketed-paste state and writes the complete input as one
+/// runtime message. The payload travels only in the private socket stream, never
+/// in a process argument or diagnostic.
+pub async fn send_pane_input(
+    target: &Target,
+    config: &TransportConfig,
+    pane_id: &str,
+    text: &str,
+    command_timeout: Duration,
+) -> Result<(), SnapshotError> {
+    #[cfg(unix)]
+    {
+        timeout(
+            command_timeout,
+            send_pane_input_unix(target, config, pane_id, text, command_timeout),
+        )
+        .await
+        .map_err(|_| SnapshotError::timed_out(command_timeout))?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, config, pane_id, text, command_timeout);
+        Err(SnapshotError::unavailable(
+            "semantic pane input requires Unix-socket support",
+        ))
+    }
+}
+
+#[cfg(unix)]
+async fn send_pane_input_unix(
+    target: &Target,
+    config: &TransportConfig,
+    pane_id: &str,
+    text: &str,
+    connect_timeout: Duration,
+) -> Result<(), SnapshotError> {
+    const REQUEST_ID: &str = "super-herdr:pane-input";
+    const MAX_API_REQUEST_BYTES: usize = 1024 * 1024;
+
+    let request = serde_json::json!({
+        "id": REQUEST_ID,
+        "method": "pane.send_input",
+        "params": {
+            "pane_id": pane_id,
+            "text": text,
+            "keys": [],
+        },
+    });
+    let mut encoded = serde_json::to_vec(&request)
+        .map_err(|_| SnapshotError::unavailable("failed to encode semantic pane input"))?;
+    if encoded.len().saturating_add(1) > MAX_API_REQUEST_BYTES {
+        return Err(SnapshotError::unavailable(
+            "paste exceeds Herdr's API request size limit",
+        ));
+    }
+    encoded.push(b'\n');
+
+    let mut connection = open_socket_connection(target, config, connect_timeout).await?;
+    connection
+        .stream
+        .write_all(&encoded)
+        .await
+        .map_err(|_| SnapshotError::unavailable("failed to write semantic pane input"))?;
+    let mut reader = BufReader::new(connection.stream);
+    let response = read_socket_line(&mut reader, connect_timeout).await?;
+    if response.get("id").and_then(Value::as_str) != Some(REQUEST_ID) {
+        return Err(SnapshotError::unavailable(
+            "Herdr returned an unexpected pane-input response",
+        ));
+    }
+    if response.get("error").is_some() {
+        return Err(SnapshotError::unavailable(
+            "Herdr rejected semantic pane input (diagnostics redacted)",
+        ));
+    }
+    if response.get("result").is_none() {
+        return Err(SnapshotError::unavailable(
+            "Herdr pane-input response did not contain a result",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -906,6 +990,53 @@ mod tests {
             .unwrap();
         changes.next().await.unwrap();
         changes.next().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_pane_input_sends_one_private_socket_request() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        use super::send_pane_input;
+        use crate::config::Config;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["id"], "super-herdr:pane-input");
+            assert_eq!(request["method"], "pane.send_input");
+            assert_eq!(request["params"]["pane_id"], "w2:p3");
+            assert_eq!(request["params"]["text"], "first\nsecond\nthird");
+            assert_eq!(request["params"]["keys"], serde_json::json!([]));
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":\"super-herdr:pane-input\",\"result\":{\"type\":\"ok\"}}\n")
+                .await
+                .unwrap();
+        });
+        let config = Config::parse(&format!(
+            "[[targets]]\nname = \"local\"\nsocket = {:?}\n",
+            socket.display().to_string()
+        ))
+        .unwrap();
+
+        send_pane_input(
+            &config.targets[0],
+            &config.transport,
+            "w2:p3",
+            "first\nsecond\nthird",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
     }
 }

@@ -18,7 +18,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
   panes.
 - Keyboard and mouse routing through Herdr's public terminal-session interface.
 - Local text selection, multipage edge-drag selection, and desktop clipboard copy.
-- Explicit desktop-clipboard text paste into a selected remote pane.
+- Atomic multiline paste from the terminal or explicit desktop clipboard into a
+  selected remote pane.
 - Verified PNG clipboard upload to the selected host with path-only injection.
 - Event-driven updates when a documented Herdr socket is configured, with polling
   fallback.
@@ -30,6 +31,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - A global agent navigator with attention and active-work filters.
 - A persistent sidebar list of blocked, waiting, and input-ready agents across
   all live hosts, with click-to-jump routing.
+- A durable metadata-only attention history with unread counts, transition
+  deduplication, and qualified jump-and-mark-read behavior.
 - A fuzzy-searchable action palette for navigation and qualified workspace,
   tab, and pane lifecycle operations.
 
@@ -319,6 +322,7 @@ workspace actions:
 | `Ctrl+]`, then `Space` | Search navigation and resource actions |
 | `Ctrl+]`, then `d` | Close the selected Herdr workspace after qualified host/session confirmation |
 | `Ctrl+]`, then `a` | Open the global agent navigator |
+| `Ctrl+]`, then `e` | Open persistent agent-transition and unread history |
 | `Ctrl+]`, then `h` | Open the target manager |
 | `Ctrl+]`, then `v` | Paste desktop clipboard text into the selected pane |
 | `Ctrl+]`, then `i` | Upload a clipboard PNG and paste its verified target path |
@@ -379,6 +383,12 @@ to jump directly to its pane. `Ctrl+]`, then `a` opens the full navigator on the
 `attention` filter; use `j`/`k` to select, `f` to cycle between `attention`,
 `active`, and `all`, and `Enter` to jump to the agent's pane.
 
+Agent status changes are recorded as payload-free attention events. `Ctrl+]`,
+then `e` opens the newest-first history: use `j`/`k` to select, `Enter` to jump
+and mark that qualified pane's events read, `r` to mark everything read, and `c`
+to clear events already read. Repeated snapshots do not create duplicate events,
+and a disconnected target does not falsely mark its agents as disappeared.
+
 Mouse behavior inside the selected terminal:
 
 - A normal left-button drag selects terminal text locally, including in
@@ -398,25 +408,40 @@ never uses `--takeover`.
 
 ## Clipboard behavior
 
-| Frontend environment | Copy selection | Explicit text paste (`Ctrl+] v`) | PNG upload (`Ctrl+] i`) |
-| --- | --- | --- | --- |
-| macOS desktop | Native `pbcopy` | Native `pbpaste` | Native clipboard via `osascript` |
-| Linux Wayland desktop | Native `wl-copy` | Native `wl-paste` | `wl-paste` with `image/png` |
-| Linux X11 with `xclip` | Native | Native | `xclip` with `image/png` |
-| Linux X11 with only `xsel` | Native text | Native text | Unavailable |
-| Super-Herdr launched through SSH or inside Herdr | OSC 52 request | Unavailable; use the local terminal's paste | Unavailable |
+| Frontend environment | Copy selection | Normal terminal paste | Explicit text paste (`Ctrl+] v`) | PNG upload (`Ctrl+] i`) |
+| --- | --- | --- | --- | --- |
+| macOS desktop | Native `pbcopy` | Atomic | Native `pbpaste`, atomic | Native clipboard via `osascript` |
+| Linux Wayland desktop | Native `wl-copy` | Atomic | Native `wl-paste`, atomic | `wl-paste` with `image/png` |
+| Linux X11 with `xclip` | Native | Atomic | Native, atomic | `xclip` with `image/png` |
+| Linux X11 with only `xsel` | Native text | Atomic | Native text, atomic | Unavailable |
+| Super-Herdr launched through SSH or inside Herdr | OSC 52 request | Atomic, using the local terminal's paste | Unavailable | Unavailable |
 
 Selection copy excludes Super-Herdr borders, sidebar content, and right-side
 padding. Native delivery reports `copied N characters to system clipboard`. OSC
 52 reports only that a copy was requested because the remote process receives no
 clipboard acknowledgement.
 
-Explicit text paste:
+Super-Herdr enables bracketed paste in its outer terminal and buffers every
+normal terminal paste, including multiline content, as one bounded event. Both
+that path and explicit `Ctrl+] v` delivery use Herdr's documented
+`pane.send_input` socket API. Herdr therefore applies the pane runtime's actual
+bracketed-paste state and receives one semantic input request instead of one
+submission per newline. For SSH targets, the private Herdr Unix socket is
+forwarded through OpenSSH; clipboard text is never placed in SSH or Herdr process
+arguments.
+
+Text paste:
 
 - is limited to 1 MiB;
-- honors the selected terminal's bracketed-paste mode;
+- is sent as one semantic request and honors Herdr's authoritative
+  bracketed-paste mode;
 - rejects a payload containing a bracketed-paste terminator; and
 - requires a writable selected pane.
+
+Running-session discovery supplies the documented socket path automatically. If
+a target has neither discovery nor an explicit socket, Super-Herdr permits the
+existing raw fallback for a single line but refuses multiline input rather than
+silently splitting it into several messages.
 
 Explicit PNG upload:
 
@@ -457,6 +482,13 @@ or, when `XDG_STATE_HOME` is unset:
 ~/.local/state/super-herdr/ui-state.json
 ```
 
+The bounded attention index is persisted separately at
+`$XDG_STATE_HOME/super-herdr/attention-state.json`, or
+`~/.local/state/super-herdr/attention-state.json` when `XDG_STATE_HOME` is
+unset. It contains only qualified pane identity, agent/workspace labels, status,
+transition kind, timestamp, and unread state. It never contains terminal output,
+clipboard payloads, SSH material, or complete server snapshots.
+
 On startup, restoration waits for the corresponding target/session to reconnect
 and succeeds only if that exact qualified pane is live. Saved state never starts,
 focuses, stops, or restarts anything in Herdr. Terminal content, snapshots,
@@ -490,8 +522,8 @@ cargo clippy -j 4 -- -D warnings
 
 - The target-manager form covers the common name, SSH alias, session, and
   discovery fields. Advanced socket/client-path editing remains CLI-driven.
-- The agent navigator uses Herdr's current status fields; unread activity and a
-  durable notification history are not implemented.
+- Native desktop notification delivery is not implemented; attention events and
+  unread state currently remain inside the TUI.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG
   images only.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are

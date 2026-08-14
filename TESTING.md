@@ -16,10 +16,13 @@ cargo clippy -j 4 -- -D warnings
 
 Automated coverage must include qualified multi-host IDs, target failure
 isolation, atomic configuration writes, session discovery, terminal control and
-observe routing, mouse encoding, multipage selection, clipboard size/integrity
-checks, persisted UI selection, and sidebar overflow with offset-aware mouse
-targets. Linux release jobs must reject binaries whose highest required GLIBC
-symbol version exceeds 2.28.
+observe routing, mouse encoding, multipage selection, atomic bracketed-paste
+decoding, one-request semantic pane input, clipboard size/integrity checks,
+persisted UI selection, and sidebar overflow with offset-aware mouse targets.
+Attention coverage must include qualified transition deduplication,
+disconnect isolation, unread handling, and atomic metadata-only persistence.
+Linux release jobs must reject binaries whose highest required GLIBC symbol
+version exceeds 2.28.
 
 ## Manual desktop matrix
 
@@ -42,7 +45,9 @@ For every applicable row, verify:
 4. Normal clicks reach mouse-aware programs; dragging selects locally.
 5. Edge dragging continues multipage selection without further pointer movement.
 6. Selection excludes sidebar, borders, and terminal padding.
-7. Text paste honors bracketed paste; PNG upload verifies size and SHA-256.
+7. Paste a long multiline prompt with the terminal's normal paste command and
+   again with `Ctrl+] v`; each must appear as one editable paste and must not be
+   submitted as multiple messages. PNG upload must verify size and SHA-256.
 8. Adding, editing, or removing a target refreshes the TUI without restarting Herdr.
 9. Starting or stopping a Herdr session is reflected by registry refresh.
 10. The agent navigator filters and jumps across at least two hosts.
@@ -55,6 +60,10 @@ For every applicable row, verify:
 13. Blocked, waiting, and input-ready agents from every live host appear at the
     top of the sidebar; clicking a qualified row jumps to its pane, and
     `Ctrl+] a` opens the navigator on the attention filter.
+14. Change an agent from working to waiting and verify exactly one unread event;
+    restart Super-Herdr, open `Ctrl+] e`, jump to the qualified pane, and verify
+    that the event remains read after another restart. Disconnecting a target
+    must not create an agent-disappeared event.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put

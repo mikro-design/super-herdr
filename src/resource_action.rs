@@ -30,6 +30,7 @@ pub enum ResourceAction {
     },
     OpenTargetManager,
     OpenAgentNavigator,
+    OpenAttentionCenter,
     CreateWorkspace {
         target: TargetSession,
     },
@@ -69,7 +70,10 @@ impl ResourceAction {
     pub fn mutates_herdr(&self) -> bool {
         !matches!(
             self,
-            Self::JumpToPane { .. } | Self::OpenTargetManager | Self::OpenAgentNavigator
+            Self::JumpToPane { .. }
+                | Self::OpenTargetManager
+                | Self::OpenAgentNavigator
+                | Self::OpenAttentionCenter
         )
     }
 
@@ -84,7 +88,7 @@ impl ResourceAction {
             | Self::CloseWorkspace { workspace, .. }
             | Self::CreateTab { workspace } => Some(workspace.target_session()),
             Self::RenameTab { tab, .. } | Self::CloseTab { tab, .. } => Some(tab.target_session()),
-            Self::OpenTargetManager | Self::OpenAgentNavigator => None,
+            Self::OpenTargetManager | Self::OpenAgentNavigator | Self::OpenAttentionCenter => None,
         }
     }
 
@@ -93,6 +97,7 @@ impl ResourceAction {
             Self::JumpToPane { label, .. } => format!("Jump to {label}"),
             Self::OpenTargetManager => "Manage machines".to_owned(),
             Self::OpenAgentNavigator => "Open agent navigator".to_owned(),
+            Self::OpenAttentionCenter => "Open attention history".to_owned(),
             Self::CreateWorkspace { .. } => "Create workspace".to_owned(),
             Self::RenameWorkspace { current_label, .. } => {
                 format!("Rename workspace {current_label:?}")
