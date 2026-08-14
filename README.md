@@ -297,7 +297,8 @@ Running `super-herdr` without a subcommand opens the TUI.
 - `target remove` removes only Super-Herdr configuration and requires `--yes`.
 - `target list` shows configured hosts without contacting them.
 - `probe` queries configured sessions concurrently and reports failures per
-  target.
+  target. On an interactive terminal, `OK` is green and `FAIL` is red; redirected
+  output, JSON output, and terminals with `NO_COLOR` set remain uncolored.
 - `clipboard check` reports the active copy, text-paste, and image-paste paths.
   It does not read or print clipboard payloads.
 - `tui` opens the federated terminal UI.

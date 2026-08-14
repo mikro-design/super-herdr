@@ -34,7 +34,9 @@ symbol version exceeds 2.28.
 For every applicable row, verify:
 
 1. `super-herdr clipboard check` reports capabilities without reading payloads.
-2. `super-herdr probe` isolates an unreachable target while live targets remain usable.
+2. `super-herdr probe` isolates an unreachable target while live targets remain
+   usable; interactive `OK`/`FAIL` labels are green/red, while redirected,
+   `--json`, and `NO_COLOR=1` output contains no ANSI escapes.
 3. `Ctrl+B` opens Herdr-action mode, its supported chords affect only the
    selected qualified session, and `Ctrl+]` remains Super-Herdr's prefix.
 4. Normal clicks reach mouse-aware programs; dragging selects locally.

@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -10,6 +11,20 @@ use super_herdr::config::{Config, Target};
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
 use super_herdr::tui;
+
+const PROBE_OK_PLAIN: &str = "OK   ";
+const PROBE_OK_COLOR: &str = "\x1b[32mOK\x1b[0m   ";
+const PROBE_FAIL_PLAIN: &str = "FAIL ";
+const PROBE_FAIL_COLOR: &str = "\x1b[31mFAIL\x1b[0m ";
+
+fn probe_status_prefix(ok: bool, color: bool) -> &'static str {
+    match (ok, color) {
+        (true, true) => PROBE_OK_COLOR,
+        (true, false) => PROBE_OK_PLAIN,
+        (false, true) => PROBE_FAIL_COLOR,
+        (false, false) => PROBE_FAIL_PLAIN,
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -227,10 +242,12 @@ async fn run() -> Result<ExitCode> {
                     })?
                 );
             } else {
+                let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
                 for report in &reports {
                     if report.ok {
                         println!(
-                            "OK   {}/{} [{}] Herdr {} protocol {} via {}: {} workspace(s), {} pane(s), {} agent(s) ({} ms)",
+                            "{}{}/{} [{}] Herdr {} protocol {} via {}: {} workspace(s), {} pane(s), {} agent(s) ({} ms)",
+                            probe_status_prefix(true, color),
                             report.target,
                             report.session,
                             report.endpoint,
@@ -246,7 +263,8 @@ async fn run() -> Result<ExitCode> {
                         );
                     } else {
                         println!(
-                            "FAIL {}/{} [{}]: {} ({} ms)",
+                            "{}{}/{} [{}]: {} ({} ms)",
+                            probe_status_prefix(false, color),
                             report.target,
                             report.session,
                             report.endpoint,
@@ -269,6 +287,19 @@ async fn run() -> Result<ExitCode> {
         }
         Commands::Clipboard { .. } => unreachable!("clipboard commands return before config load"),
         Commands::Target { .. } => unreachable!("target commands return before config load"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_status_prefix;
+
+    #[test]
+    fn probe_status_prefixes_are_colored_only_when_requested() {
+        assert_eq!(probe_status_prefix(true, false), "OK   ");
+        assert_eq!(probe_status_prefix(false, false), "FAIL ");
+        assert_eq!(probe_status_prefix(true, true), "\x1b[32mOK\x1b[0m   ");
+        assert_eq!(probe_status_prefix(false, true), "\x1b[31mFAIL\x1b[0m ");
     }
 }
 
