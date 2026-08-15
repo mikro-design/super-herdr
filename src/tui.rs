@@ -29,7 +29,7 @@ use tokio::time::{interval, sleep_until, timeout};
 
 use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex, AttentionStore};
 use crate::clipboard;
-use crate::config::{Config, Target};
+use crate::config::{Config, Target, TransportConfig};
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
 use crate::resource_action::{ResourceAction, SplitDirection};
 use crate::state::{
@@ -41,7 +41,8 @@ use crate::terminal::{
     terminal_input_command, terminal_release_command, terminal_scroll_command,
 };
 use crate::transport::{
-    CliSnapshotTransport, expand_discovered_sessions, run_herdr_operation, send_pane_input,
+    CliSnapshotTransport, DiscoveredSession, SessionDiscovery, discover_running_sessions,
+    expand_discovered_sessions, run_herdr_operation, send_pane_input,
 };
 use crate::ui_state::{UiState, UiStateStore};
 
@@ -367,17 +368,27 @@ enum TargetFormField {
     Ssh,
     Session,
     DiscoverSessions,
+    DiscoveredSession,
 }
 
 impl TargetFormField {
-    fn next(self) -> Self {
+    fn next(self, has_discovered_sessions: bool) -> Self {
         match self {
             Self::Name => Self::Ssh,
             Self::Ssh => Self::Session,
             Self::Session => Self::DiscoverSessions,
-            Self::DiscoverSessions => Self::Name,
+            Self::DiscoverSessions if has_discovered_sessions => Self::DiscoveredSession,
+            Self::DiscoverSessions | Self::DiscoveredSession => Self::Name,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetTestState {
+    Untested,
+    Testing { request_id: u64 },
+    Passed { summary: String },
+    Failed { message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +402,10 @@ struct TargetForm {
     herdr_bins: Vec<String>,
     field: TargetFormField,
     error: Option<String>,
+    test_state: TargetTestState,
+    discovered_sessions: Vec<DiscoveredSession>,
+    discovered_selected: usize,
+    discovered_offset: usize,
 }
 
 impl TargetForm {
@@ -405,6 +420,10 @@ impl TargetForm {
             herdr_bins: vec!["herdr".to_owned()],
             field: TargetFormField::Name,
             error: None,
+            test_state: TargetTestState::Untested,
+            discovered_sessions: Vec::new(),
+            discovered_selected: 0,
+            discovered_offset: 0,
         }
     }
 
@@ -419,6 +438,10 @@ impl TargetForm {
             herdr_bins: target.herdr_bins.clone(),
             field: TargetFormField::Name,
             error: None,
+            test_state: TargetTestState::Untested,
+            discovered_sessions: Vec::new(),
+            discovered_selected: 0,
+            discovered_offset: 0,
         }
     }
 
@@ -438,15 +461,62 @@ impl TargetForm {
             TargetFormField::Name => Some(&mut self.name),
             TargetFormField::Ssh => Some(&mut self.ssh),
             TargetFormField::Session => Some(&mut self.session),
-            TargetFormField::DiscoverSessions => None,
+            TargetFormField::DiscoverSessions | TargetFormField::DiscoveredSession => None,
         }
+    }
+
+    fn validation_error(&self, configured: &[Target]) -> Option<String> {
+        let target = self.target();
+        let mut targets = configured.to_vec();
+        match self.original_name.as_deref() {
+            Some(original_name) => {
+                let Some(index) = targets
+                    .iter()
+                    .position(|candidate| candidate.name == original_name)
+                else {
+                    return Some(format!("target {original_name:?} is no longer configured"));
+                };
+                targets[index] = target;
+            }
+            None => targets.push(target),
+        }
+        Config {
+            transport: TransportConfig::default(),
+            targets,
+        }
+        .validate()
+        .err()
+        .map(|error| error.to_string())
+    }
+
+    fn invalidate_test(&mut self) {
+        self.error = None;
+        self.test_state = TargetTestState::Untested;
+        self.discovered_sessions.clear();
+        self.discovered_selected = 0;
+        self.discovered_offset = 0;
+        if self.field == TargetFormField::DiscoveredSession {
+            self.field = TargetFormField::Session;
+        }
+    }
+
+    fn select_discovered_session(&mut self, index: usize) {
+        let Some(session) = self.discovered_sessions.get(index) else {
+            return;
+        };
+        self.session.clone_from(&session.name);
+        self.socket = Some(session.socket_path.clone());
+        self.discover_sessions = false;
+        self.discovered_selected = index;
+        self.field = TargetFormField::DiscoveredSession;
+        self.error = None;
     }
 }
 
 #[derive(Debug, Clone)]
 enum TargetManagerMode {
     List,
-    Form(TargetForm),
+    Form(Box<TargetForm>),
     ConfirmRemove { name: String },
 }
 
@@ -455,6 +525,23 @@ struct TargetManager {
     targets: Vec<Target>,
     selected: usize,
     mode: TargetManagerMode,
+    mouse_press: Option<TargetManagerControl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetManagerControl {
+    Target(usize),
+    Add,
+    Edit,
+    Remove,
+    Close,
+    Field(TargetFormField),
+    TestConnection,
+    Save,
+    Cancel,
+    DiscoveredSession(usize),
+    ConfirmRemove,
+    CancelRemove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,6 +604,7 @@ impl TargetManager {
             targets,
             selected: 0,
             mode: TargetManagerMode::List,
+            mouse_press: None,
         }
     }
 
@@ -580,6 +668,12 @@ enum ConfigRefresh {
         expanded: Config,
     },
     Failed(String),
+}
+
+struct TargetTestEvent {
+    request_id: u64,
+    elapsed_ms: u128,
+    result: Result<SessionDiscovery, String>,
 }
 
 struct HerdrActionEvent {
@@ -653,6 +747,8 @@ struct App {
     configured_targets: Vec<Target>,
     configuration_dirty: bool,
     target_manager: Option<TargetManager>,
+    target_test_sender: Option<mpsc::UnboundedSender<TargetTestEvent>>,
+    next_target_test_request: u64,
     agent_navigator: Option<AgentNavigator>,
     attention: AttentionIndex,
     attention_store: Option<AttentionStore>,
@@ -695,6 +791,8 @@ impl Default for App {
             configured_targets: Vec::new(),
             configuration_dirty: false,
             target_manager: None,
+            target_test_sender: None,
+            next_target_test_request: 1,
             agent_navigator: None,
             attention: AttentionIndex::default(),
             attention_store: None,
@@ -732,6 +830,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let (route_sender, mut route_events) = mpsc::unbounded_channel();
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
     let (herdr_action_sender, mut herdr_action_events) = mpsc::unbounded_channel();
+    let (target_test_sender, mut target_test_events) = mpsc::unbounded_channel();
     spawn_input_reader(input_sender);
     let mut ticks = interval(Duration::from_millis(100));
     let mut selection_ticks = interval(SELECTION_AUTOSCROLL_INTERVAL);
@@ -757,6 +856,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         config_path: Some(config_path.clone()),
         configured_targets,
         herdr_action_sender: Some(herdr_action_sender),
+        target_test_sender: Some(target_test_sender),
         message: attention_message,
         ..App::default()
     };
@@ -895,6 +995,12 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                             app.message = Some(format!("Herdr action failed: {error}"));
                         }
                     }
+                    should_draw = true;
+                }
+            }
+            event = target_test_events.recv() => {
+                if let Some(event) = event {
+                    apply_target_test_event(event, &mut app);
                     should_draw = true;
                 }
             }
@@ -1071,7 +1177,10 @@ async fn handle_decoded_input(
 ) -> Result<bool> {
     match input {
         DecodedInput::Bytes(bytes) => {
-            if app.command_palette.is_some() || app.context_menu.is_some() {
+            if app.command_palette.is_some()
+                || app.context_menu.is_some()
+                || app.target_manager.is_some()
+            {
                 let navigation = match bytes.as_slice() {
                     b"\x1b[A" => Some(0x10),
                     b"\x1b[B" => Some(0x0e),
@@ -1143,8 +1252,13 @@ async fn handle_mouse(
         handle_context_menu_mouse(mouse, state, targets, transport_config, app);
         return Ok(());
     }
+    if app.target_manager.is_some() {
+        if let Some(frame_area) = app.last_frame_area {
+            handle_target_manager_mouse(mouse, frame_area, transport_config, app)?;
+        }
+        return Ok(());
+    }
     if app.mode != InputMode::Terminal
-        || app.target_manager.is_some()
         || app.agent_navigator.is_some()
         || app.attention_center.is_some()
         || app.command_palette.is_some()
@@ -1806,7 +1920,7 @@ async fn handle_input(
         return handle_command_palette_input(key, state, targets, transport_config, app);
     }
     if app.target_manager.is_some() {
-        return handle_target_manager_input(key, app);
+        return handle_target_manager_input(key, transport_config, app);
     }
     if app.agent_navigator.is_some() {
         return handle_agent_navigator_input(key, state, app);
@@ -2870,125 +2984,426 @@ fn handle_close_confirmation_input(
     Ok(false)
 }
 
-fn handle_target_manager_input(key: u8, app: &mut App) -> Result<bool> {
+fn handle_target_manager_mouse(
+    mouse: MouseInput,
+    frame_area: Rect,
+    transport_config: &TransportConfig,
+    app: &mut App,
+) -> Result<()> {
+    let outer = Position::new(mouse.column.saturating_sub(1), mouse.row.saturating_sub(1));
+    if let Some(direction) = mouse.scroll_direction() {
+        let Some(manager) = app.target_manager.as_mut() else {
+            return Ok(());
+        };
+        match &mut manager.mode {
+            TargetManagerMode::List => {
+                if manager.targets.is_empty() {
+                    return Ok(());
+                }
+                manager.selected = match direction {
+                    TerminalScrollDirection::Up => manager.selected.saturating_sub(1),
+                    TerminalScrollDirection::Down => {
+                        (manager.selected + 1).min(manager.targets.len() - 1)
+                    }
+                };
+            }
+            TargetManagerMode::Form(form) if !form.discovered_sessions.is_empty() => {
+                form.field = TargetFormField::DiscoveredSession;
+                form.discovered_selected = match direction {
+                    TerminalScrollDirection::Up => form.discovered_selected.saturating_sub(1),
+                    TerminalScrollDirection::Down => {
+                        (form.discovered_selected + 1).min(form.discovered_sessions.len() - 1)
+                    }
+                };
+            }
+            TargetManagerMode::Form(_) | TargetManagerMode::ConfirmRemove { .. } => {}
+        }
+        return Ok(());
+    }
+
+    let control = app.target_manager.as_ref().and_then(|manager| {
+        target_manager_controls(frame_area, manager)
+            .into_iter()
+            .find_map(|(area, control)| area.contains(outer).then_some(control))
+    });
+    if mouse.is_left_press() {
+        if let Some(manager) = app.target_manager.as_mut() {
+            manager.mouse_press = control;
+        }
+        return Ok(());
+    }
+    if !mouse.is_left_release() {
+        return Ok(());
+    }
+    let pressed = app
+        .target_manager
+        .as_mut()
+        .and_then(|manager| manager.mouse_press.take());
+    if pressed.is_none() || pressed != control {
+        return Ok(());
+    }
+    let Some(control) = control else {
+        return Ok(());
+    };
+    let Some(mut manager) = app.target_manager.take() else {
+        return Ok(());
+    };
+    let close_manager =
+        activate_target_manager_control(control, transport_config, &mut manager, app)?;
+    if !close_manager {
+        app.target_manager = Some(manager);
+    }
+    Ok(())
+}
+
+fn handle_target_manager_input(
+    key: u8,
+    transport_config: &TransportConfig,
+    app: &mut App,
+) -> Result<bool> {
     let Some(mut manager) = app.target_manager.take() else {
         return Ok(false);
     };
+    let mut close_manager = false;
     match &mut manager.mode {
         TargetManagerMode::List => match key {
-            b'q' | 0x1b => return Ok(false),
-            b'j' => {
+            b'q' | 0x1b => close_manager = true,
+            b'j' | 0x0e => {
                 if !manager.targets.is_empty() {
                     manager.selected = (manager.selected + 1).min(manager.targets.len() - 1);
                 }
             }
-            b'k' => manager.selected = manager.selected.saturating_sub(1),
-            b'a' => manager.mode = TargetManagerMode::Form(TargetForm::add()),
+            b'k' | 0x10 => manager.selected = manager.selected.saturating_sub(1),
+            b'a' => {
+                close_manager |= activate_target_manager_control(
+                    TargetManagerControl::Add,
+                    transport_config,
+                    &mut manager,
+                    app,
+                )?;
+            }
             b'e' | b'\r' | b'\n' => {
-                if let Some(target) = manager.selected_target() {
-                    manager.mode = TargetManagerMode::Form(TargetForm::edit(target));
-                }
+                close_manager |= activate_target_manager_control(
+                    TargetManagerControl::Edit,
+                    transport_config,
+                    &mut manager,
+                    app,
+                )?;
             }
             b'd' => {
-                if let Some(target) = manager.selected_target() {
-                    manager.mode = TargetManagerMode::ConfirmRemove {
-                        name: target.name.clone(),
-                    };
-                }
+                close_manager |= activate_target_manager_control(
+                    TargetManagerControl::Remove,
+                    transport_config,
+                    &mut manager,
+                    app,
+                )?;
             }
             _ => {}
         },
         TargetManagerMode::Form(form) => match key {
             0x1b => manager.mode = TargetManagerMode::List,
             b'\t' => {
-                form.field = form.field.next();
+                form.field = form.field.next(!form.discovered_sessions.is_empty());
                 form.error = None;
             }
+            0x10 if form.field == TargetFormField::DiscoveredSession => {
+                form.discovered_selected = form.discovered_selected.saturating_sub(1);
+            }
+            0x0e if form.field == TargetFormField::DiscoveredSession => {
+                form.discovered_selected = (form.discovered_selected + 1)
+                    .min(form.discovered_sessions.len().saturating_sub(1));
+            }
+            0x14 => start_target_connection_test(&mut manager, transport_config, app),
             b'\r' | b'\n' => {
-                let Some(path) = app.config_path.clone() else {
-                    form.error = Some("configuration path is unavailable".to_owned());
-                    app.target_manager = Some(manager);
-                    return Ok(false);
-                };
-                let target = form.target();
-                let original_name = form.original_name.clone();
-                let result = match original_name.as_deref() {
-                    Some(name) => Config::replace_target_file(Some(&path), name, target),
-                    None => Config::add_target_file(Some(&path), target),
-                };
-                match result {
-                    Ok(_) => {
-                        let (config, _) = Config::load(Some(&path))?;
-                        let updated_name = form.name.clone();
-                        manager.targets = config.targets.clone();
-                        manager.selected = manager
-                            .targets
-                            .iter()
-                            .position(|target| target.name == updated_name)
-                            .unwrap_or_default();
-                        manager.mode = TargetManagerMode::List;
-                        app.configured_targets = config.targets;
-                        app.configuration_dirty = true;
-                        app.message = Some(format!(
-                            "saved target {updated_name:?}; refreshing federation"
-                        ));
-                    }
-                    Err(error) => form.error = Some(error.to_string()),
+                if form.field == TargetFormField::DiscoveredSession {
+                    form.select_discovered_session(form.discovered_selected);
+                } else if form.field == TargetFormField::DiscoverSessions {
+                    form.invalidate_test();
+                    form.discover_sessions = !form.discover_sessions;
+                    form.field = TargetFormField::DiscoverSessions;
+                } else {
+                    save_target_form(&mut manager, app)?;
                 }
             }
             0x08 | 0x7f => {
-                if let Some(text) = form.active_text_mut() {
-                    text.pop();
+                if matches!(
+                    form.field,
+                    TargetFormField::Name | TargetFormField::Ssh | TargetFormField::Session
+                ) {
+                    if form.field == TargetFormField::Session {
+                        form.socket = None;
+                    }
+                    form.invalidate_test();
+                    if let Some(text) = form.active_text_mut() {
+                        text.pop();
+                    }
                 }
-                form.error = None;
             }
             b' ' if form.field == TargetFormField::DiscoverSessions => {
+                form.invalidate_test();
                 form.discover_sessions = !form.discover_sessions;
-                form.error = None;
+                form.field = TargetFormField::DiscoverSessions;
             }
             0x20..=0x7e => {
-                if let Some(text) = form.active_text_mut() {
-                    text.push(char::from(key));
+                if matches!(
+                    form.field,
+                    TargetFormField::Name | TargetFormField::Ssh | TargetFormField::Session
+                ) {
+                    if form.field == TargetFormField::Session {
+                        form.socket = None;
+                    }
+                    form.invalidate_test();
+                    if let Some(text) = form.active_text_mut() {
+                        text.push(char::from(key));
+                    }
                 }
-                form.error = None;
             }
             _ => {}
         },
-        TargetManagerMode::ConfirmRemove { name } => match key {
-            b'y' => {
-                let Some(path) = app.config_path.clone() else {
-                    app.message = Some("configuration path is unavailable".to_owned());
-                    manager.mode = TargetManagerMode::List;
-                    app.target_manager = Some(manager);
-                    return Ok(false);
-                };
-                let removed_name = name.clone();
-                match Config::remove_target_file(Some(&path), &removed_name) {
-                    Ok(_) => {
-                        let (config, _) = Config::load(Some(&path))?;
-                        manager.targets = config.targets.clone();
-                        manager.selected = manager
-                            .selected
-                            .min(manager.targets.len().saturating_sub(1));
-                        manager.mode = TargetManagerMode::List;
-                        app.configured_targets = config.targets;
-                        app.configuration_dirty = true;
-                        app.message = Some(format!(
-                            "removed target {removed_name:?}; no Herdr session was touched"
-                        ));
-                    }
-                    Err(error) => {
-                        app.message = Some(error.to_string());
-                        manager.mode = TargetManagerMode::List;
-                    }
-                }
-            }
+        TargetManagerMode::ConfirmRemove { name: _ } => match key {
+            b'y' => remove_target(&mut manager, app)?,
             b'n' | b'q' | 0x1b => manager.mode = TargetManagerMode::List,
             _ => {}
         },
     }
-    app.target_manager = Some(manager);
+    if !close_manager {
+        app.target_manager = Some(manager);
+    }
     Ok(false)
+}
+
+fn activate_target_manager_control(
+    control: TargetManagerControl,
+    transport_config: &TransportConfig,
+    manager: &mut TargetManager,
+    app: &mut App,
+) -> Result<bool> {
+    let mut close_manager = false;
+    match control {
+        TargetManagerControl::Target(index) => {
+            if index < manager.targets.len() {
+                manager.selected = index;
+            }
+        }
+        TargetManagerControl::Add => {
+            manager.mode = TargetManagerMode::Form(Box::new(TargetForm::add()))
+        }
+        TargetManagerControl::Edit => {
+            if let Some(target) = manager.selected_target() {
+                manager.mode = TargetManagerMode::Form(Box::new(TargetForm::edit(target)));
+            }
+        }
+        TargetManagerControl::Remove => {
+            if let Some(target) = manager.selected_target() {
+                manager.mode = TargetManagerMode::ConfirmRemove {
+                    name: target.name.clone(),
+                };
+            }
+        }
+        TargetManagerControl::Close => close_manager = true,
+        TargetManagerControl::Field(field) => {
+            if let TargetManagerMode::Form(form) = &mut manager.mode {
+                if field == TargetFormField::DiscoverSessions {
+                    form.invalidate_test();
+                    form.discover_sessions = !form.discover_sessions;
+                }
+                form.field = field;
+                form.error = None;
+            }
+        }
+        TargetManagerControl::TestConnection => {
+            start_target_connection_test(manager, transport_config, app)
+        }
+        TargetManagerControl::Save => save_target_form(manager, app)?,
+        TargetManagerControl::Cancel | TargetManagerControl::CancelRemove => {
+            manager.mode = TargetManagerMode::List
+        }
+        TargetManagerControl::DiscoveredSession(index) => {
+            if let TargetManagerMode::Form(form) = &mut manager.mode {
+                form.select_discovered_session(index);
+            }
+        }
+        TargetManagerControl::ConfirmRemove => remove_target(manager, app)?,
+    }
+    Ok(close_manager)
+}
+
+fn save_target_form(manager: &mut TargetManager, app: &mut App) -> Result<()> {
+    let TargetManagerMode::Form(form) = &manager.mode else {
+        return Ok(());
+    };
+    if let Some(error) = form.validation_error(&manager.targets) {
+        if let TargetManagerMode::Form(form) = &mut manager.mode {
+            form.error = Some(error);
+        }
+        return Ok(());
+    }
+    let Some(path) = app.config_path.clone() else {
+        if let TargetManagerMode::Form(form) = &mut manager.mode {
+            form.error = Some("configuration path is unavailable".to_owned());
+        }
+        return Ok(());
+    };
+    let (target, original_name, updated_name) = match &manager.mode {
+        TargetManagerMode::Form(form) => {
+            (form.target(), form.original_name.clone(), form.name.clone())
+        }
+        _ => return Ok(()),
+    };
+    let result = match original_name.as_deref() {
+        Some(name) => Config::replace_target_file(Some(&path), name, target),
+        None => Config::add_target_file(Some(&path), target),
+    };
+    match result {
+        Ok(_) => {
+            let (config, _) = Config::load(Some(&path))?;
+            manager.targets = config.targets.clone();
+            manager.selected = manager
+                .targets
+                .iter()
+                .position(|target| target.name == updated_name)
+                .unwrap_or_default();
+            manager.mode = TargetManagerMode::List;
+            app.configured_targets = config.targets;
+            app.configuration_dirty = true;
+            app.message = Some(format!(
+                "saved target {updated_name:?}; refreshing federation"
+            ));
+        }
+        Err(error) => {
+            if let TargetManagerMode::Form(form) = &mut manager.mode {
+                form.error = Some(error.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_target(manager: &mut TargetManager, app: &mut App) -> Result<()> {
+    let TargetManagerMode::ConfirmRemove { name } = &manager.mode else {
+        return Ok(());
+    };
+    let Some(path) = app.config_path.clone() else {
+        app.message = Some("configuration path is unavailable".to_owned());
+        manager.mode = TargetManagerMode::List;
+        return Ok(());
+    };
+    let removed_name = name.clone();
+    match Config::remove_target_file(Some(&path), &removed_name) {
+        Ok(_) => {
+            let (config, _) = Config::load(Some(&path))?;
+            manager.targets = config.targets.clone();
+            manager.selected = manager
+                .selected
+                .min(manager.targets.len().saturating_sub(1));
+            manager.mode = TargetManagerMode::List;
+            app.configured_targets = config.targets;
+            app.configuration_dirty = true;
+            app.message = Some(format!(
+                "removed target {removed_name:?}; no Herdr session was touched"
+            ));
+        }
+        Err(error) => {
+            app.message = Some(error.to_string());
+            manager.mode = TargetManagerMode::List;
+        }
+    }
+    Ok(())
+}
+
+fn start_target_connection_test(
+    manager: &mut TargetManager,
+    transport_config: &TransportConfig,
+    app: &mut App,
+) {
+    let TargetManagerMode::Form(form) = &manager.mode else {
+        return;
+    };
+    if let Some(error) = form.validation_error(&manager.targets) {
+        if let TargetManagerMode::Form(form) = &mut manager.mode {
+            form.error = Some(error);
+        }
+        return;
+    }
+    let Some(sender) = app.target_test_sender.clone() else {
+        if let TargetManagerMode::Form(form) = &mut manager.mode {
+            form.error = Some("connection testing is unavailable".to_owned());
+        }
+        return;
+    };
+    let target = form.target();
+    let transport = transport_config.clone();
+    let request_id = app.next_target_test_request;
+    app.next_target_test_request = app.next_target_test_request.saturating_add(1);
+    if let TargetManagerMode::Form(form) = &mut manager.mode {
+        form.error = None;
+        form.test_state = TargetTestState::Testing { request_id };
+        form.discovered_sessions.clear();
+        form.discovered_selected = 0;
+        form.discovered_offset = 0;
+    }
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let result = discover_running_sessions(&target, &transport)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(TargetTestEvent {
+            request_id,
+            elapsed_ms: started.elapsed().as_millis(),
+            result,
+        });
+    });
+}
+
+fn apply_target_test_event(event: TargetTestEvent, app: &mut App) {
+    let Some(manager) = app.target_manager.as_mut() else {
+        return;
+    };
+    let TargetManagerMode::Form(form) = &mut manager.mode else {
+        return;
+    };
+    if !matches!(
+        form.test_state,
+        TargetTestState::Testing { request_id } if request_id == event.request_id
+    ) {
+        return;
+    }
+    match event.result {
+        Ok(discovery) => {
+            let count = discovery.sessions.len();
+            form.discovered_selected = form
+                .session
+                .is_empty()
+                .then_some(0)
+                .or_else(|| {
+                    discovery
+                        .sessions
+                        .iter()
+                        .position(|session| session.name == form.session)
+                })
+                .unwrap_or_default();
+            form.discovered_sessions = discovery.sessions;
+            form.discovered_offset = 0;
+            form.test_state = TargetTestState::Passed {
+                summary: if count == 0 {
+                    format!(
+                        "Connected in {} ms; no running sessions found",
+                        event.elapsed_ms
+                    )
+                } else {
+                    format!(
+                        "Connected in {} ms; found {count} running session{}",
+                        event.elapsed_ms,
+                        if count == 1 { "" } else { "s" }
+                    )
+                },
+            };
+        }
+        Err(message) => {
+            form.discovered_sessions.clear();
+            form.test_state = TargetTestState::Failed { message };
+        }
+    }
 }
 
 fn handle_agent_navigator_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
@@ -4335,14 +4750,157 @@ fn render_close_confirmation(frame: &mut Frame, confirmation: &CloseConfirmation
     );
 }
 
-fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
-    let area = centered_popup(frame.area(), 68, 18);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
+fn target_manager_block() -> Block<'static> {
+    Block::default()
         .title(Span::styled(" target manager ", Style::default().bold()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue))
-        .padding(Padding::horizontal(1));
+        .padding(Padding::horizontal(1))
+}
+
+fn target_manager_area(frame_area: Rect) -> Rect {
+    centered_popup(frame_area, 78, 28)
+}
+
+fn target_manager_inner(frame_area: Rect) -> Rect {
+    target_manager_block().inner(target_manager_area(frame_area))
+}
+
+fn target_manager_list_offset(manager: &TargetManager, visible_rows: usize) -> usize {
+    if visible_rows == 0 || manager.selected < visible_rows {
+        0
+    } else {
+        manager
+            .selected
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
+    }
+}
+
+fn discovered_session_offset(form: &TargetForm, visible_rows: usize) -> usize {
+    let maximum = form.discovered_sessions.len().saturating_sub(visible_rows);
+    let mut offset = form.discovered_offset.min(maximum);
+    if visible_rows == 0 {
+        return offset;
+    }
+    if form.discovered_selected < offset {
+        offset = form.discovered_selected;
+    } else if form.discovered_selected >= offset.saturating_add(visible_rows) {
+        offset = form
+            .discovered_selected
+            .saturating_add(1)
+            .saturating_sub(visible_rows);
+    }
+    offset.min(maximum)
+}
+
+fn target_manager_controls(
+    frame_area: Rect,
+    manager: &TargetManager,
+) -> Vec<(Rect, TargetManagerControl)> {
+    let inner = target_manager_inner(frame_area);
+    let mut controls = Vec::new();
+    let mut add_control = |x: u16, y: u16, width: u16, control| {
+        if y < inner.height && x < inner.width {
+            controls.push((
+                Rect::new(
+                    inner.x.saturating_add(x),
+                    inner.y.saturating_add(y),
+                    width.min(inner.width.saturating_sub(x)),
+                    1,
+                ),
+                control,
+            ));
+        }
+    };
+    match &manager.mode {
+        TargetManagerMode::List => {
+            add_control(0, 2, 7, TargetManagerControl::Add);
+            add_control(9, 2, 8, TargetManagerControl::Edit);
+            add_control(19, 2, 10, TargetManagerControl::Remove);
+            add_control(31, 2, 9, TargetManagerControl::Close);
+            let visible_rows = usize::from(inner.height.saturating_sub(5));
+            let offset = target_manager_list_offset(manager, visible_rows);
+            for (visible, (index, _)) in manager
+                .targets
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(visible_rows)
+                .enumerate()
+            {
+                let Ok(visible) = u16::try_from(visible) else {
+                    break;
+                };
+                add_control(
+                    0,
+                    5 + visible,
+                    inner.width,
+                    TargetManagerControl::Target(index),
+                );
+            }
+        }
+        TargetManagerMode::Form(form) => {
+            add_control(
+                0,
+                2,
+                inner.width,
+                TargetManagerControl::Field(TargetFormField::Name),
+            );
+            add_control(
+                0,
+                3,
+                inner.width,
+                TargetManagerControl::Field(TargetFormField::Ssh),
+            );
+            add_control(
+                0,
+                4,
+                inner.width,
+                TargetManagerControl::Field(TargetFormField::Session),
+            );
+            add_control(
+                0,
+                5,
+                inner.width,
+                TargetManagerControl::Field(TargetFormField::DiscoverSessions),
+            );
+            add_control(0, 7, 19, TargetManagerControl::TestConnection);
+            add_control(21, 7, 8, TargetManagerControl::Save);
+            add_control(31, 7, 10, TargetManagerControl::Cancel);
+            let visible_rows = usize::from(inner.height.saturating_sub(13));
+            let offset = discovered_session_offset(form, visible_rows);
+            for (visible, (index, _)) in form
+                .discovered_sessions
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(visible_rows)
+                .enumerate()
+            {
+                let Ok(visible) = u16::try_from(visible) else {
+                    break;
+                };
+                add_control(
+                    0,
+                    13 + visible,
+                    inner.width,
+                    TargetManagerControl::DiscoveredSession(index),
+                );
+            }
+        }
+        TargetManagerMode::ConfirmRemove { .. } => {
+            add_control(0, 3, 10, TargetManagerControl::ConfirmRemove);
+            add_control(12, 3, 10, TargetManagerControl::CancelRemove);
+        }
+    }
+    controls
+}
+
+fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
+    let area = target_manager_area(frame.area());
+    frame.render_widget(Clear, area);
+    let block = target_manager_block();
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -4350,12 +4908,20 @@ fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
         TargetManagerMode::List => {
             let mut lines = vec![
                 Line::styled(
-                    "j/k select   a add   e/Enter edit   d remove   q close",
+                    "Click a machine or use j/k; actions are local to Super-Herdr",
                     Style::default().fg(Color::DarkGray),
                 ),
                 Line::default(),
+                Line::from("[ Add ]  [ Edit ]  [ Remove ]  [ Close ]"),
+                Line::default(),
+                Line::styled(
+                    format!("  {:<18} {:<22} {}", "NAME", "ENDPOINT", "SESSION SCOPE"),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ];
-            for (index, target) in manager.targets.iter().enumerate() {
+            let visible_rows = usize::from(inner.height.saturating_sub(5));
+            let offset = target_manager_list_offset(manager, visible_rows);
+            for (index, target) in manager.targets.iter().enumerate().skip(offset) {
                 let selected = index == manager.selected;
                 let scope = if target.discover_sessions {
                     "running sessions"
@@ -4392,9 +4958,9 @@ fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
             let mut lines = vec![
                 Line::styled(
                     if form.original_name.is_some() {
-                        "Edit host   Tab next field   Enter save   Esc cancel"
+                        "Edit machine · click fields/buttons · Ctrl+T test · Enter save"
                     } else {
-                        "Add host   Tab next field   Enter save   Esc cancel"
+                        "Add machine · click fields/buttons · Ctrl+T test · Enter save"
                     },
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -4416,16 +4982,72 @@ fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
                     if form.discover_sessions { "[x]" } else { "[ ]" }.to_owned(),
                 ),
                 Line::default(),
-                Line::styled(
-                    "Space toggles discovery. SSH authentication remains in OpenSSH.",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Line::from("[ Test & discover ]  [ Save ]  [ Cancel ]"),
+                Line::default(),
             ];
-            if let Some(error) = form.error.as_deref() {
-                lines.push(Line::styled(
-                    safe_text(error),
+            let validation_error = form.validation_error(&manager.targets);
+            let (status, style) = if let Some(error) = form.error.as_deref() {
+                (safe_text(error), Style::default().fg(Color::Red))
+            } else if let Some(error) = validation_error.as_deref() {
+                (
+                    format!("Fix before saving: {}", safe_text(error)),
                     Style::default().fg(Color::Red),
+                )
+            } else {
+                match &form.test_state {
+                    TargetTestState::Untested => (
+                        "Configuration is valid; connection not tested".to_owned(),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    TargetTestState::Testing { .. } => (
+                        "Testing through the documented Herdr session registry…".to_owned(),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    TargetTestState::Passed { summary } => {
+                        (safe_text(summary), Style::default().fg(Color::Green))
+                    }
+                    TargetTestState::Failed { message } => (
+                        format!("Connection failed: {}", safe_text(message)),
+                        Style::default().fg(Color::Red),
+                    ),
+                }
+            };
+            lines.push(Line::styled(status, style));
+            lines.push(Line::styled(
+                "SSH authentication stays in OpenSSH; this test never changes Herdr.",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::default());
+            if !form.discovered_sessions.is_empty() {
+                lines.push(Line::styled(
+                    "Running sessions · click one or focus with Tab and press Enter",
+                    Style::default().fg(Color::Cyan),
                 ));
+                let visible_rows = usize::from(inner.height.saturating_sub(13));
+                let offset = discovered_session_offset(form, visible_rows);
+                for (index, session) in form
+                    .discovered_sessions
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(visible_rows)
+                {
+                    let selected = index == form.discovered_selected;
+                    let line = Line::from(format!(
+                        "{} {:<24} use only this session",
+                        if selected { ">" } else { " " },
+                        safe_text(&session.name)
+                    ));
+                    lines.push(
+                        if selected && form.field == TargetFormField::DiscoveredSession {
+                            line.style(Style::default().add_modifier(Modifier::REVERSED))
+                        } else if selected {
+                            line.style(Style::default().fg(Color::Cyan))
+                        } else {
+                            line
+                        },
+                    );
+                }
             }
             lines
         }
@@ -4435,11 +5057,8 @@ fn render_target_manager(frame: &mut Frame, manager: &TargetManager) {
                 safe_text(name)
             )),
             Line::default(),
-            Line::styled(
-                "y remove   n/Esc cancel",
-                Style::default().fg(Color::Yellow),
-            ),
             Line::default(),
+            Line::from("[ Remove ]  [ Cancel ]"),
             Line::from("This does not stop, restart, or alter any Herdr session."),
         ],
     };
@@ -5588,18 +6207,19 @@ mod tests {
         ClipboardFeedback, ContextTarget, DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode,
         MAX_CLIPBOARD_BYTES, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection,
         SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish,
-        TargetManager, TerminalSelection, agent_jump_entries, capture_screen_rows,
+        TargetForm, TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent,
+        TargetTestState, TerminalSelection, agent_jump_entries, capture_screen_rows,
         capture_selection_viewport, clamped_pane_position, context_menu_for_target, cycle_tab,
         desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
         filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
         handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
-        handle_input, handle_mouse, handle_target_manager_input, mouse_event_allowed,
-        mouse_passthrough_enabled, pane_direction_score, reconcile_selection, refresh_attention,
-        render_vt_screen, safe_text, select_neighbor_pane, select_pane, select_workspace,
-        selected_terminal_text, sidebar_areas, sidebar_attention_rows, sidebar_block,
-        sidebar_content_height, sidebar_pane_at_row, tab_at_column, terminal_paste_payload,
-        ui_areas, update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
-        visible_pane_areas,
+        handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
+        mouse_event_allowed, mouse_passthrough_enabled, pane_direction_score, reconcile_selection,
+        refresh_attention, render_vt_screen, safe_text, select_neighbor_pane, select_pane,
+        select_workspace, selected_terminal_text, sidebar_areas, sidebar_attention_rows,
+        sidebar_block, sidebar_content_height, sidebar_pane_at_row, tab_at_column,
+        target_manager_controls, terminal_paste_payload, ui_areas, update_selection_after_frame,
+        update_sidebar_hit_areas, viewport_shift_distance, visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession, WorkspaceId};
@@ -5608,6 +6228,7 @@ mod tests {
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
     };
     use crate::terminal::{TerminalAccess, TerminalScrollDirection};
+    use crate::transport::{DiscoveredSession, SessionDiscovery};
 
     #[test]
     fn desktop_layout_reserves_most_space_for_the_terminal() {
@@ -5886,15 +6507,16 @@ mod tests {
             ..App::default()
         };
 
-        handle_target_manager_input(b'a', &mut app).unwrap();
+        let transport = crate::config::TransportConfig::default();
+        handle_target_manager_input(b'a', &transport, &mut app).unwrap();
         for byte in b"build" {
-            handle_target_manager_input(*byte, &mut app).unwrap();
+            handle_target_manager_input(*byte, &transport, &mut app).unwrap();
         }
-        handle_target_manager_input(b'\t', &mut app).unwrap();
+        handle_target_manager_input(b'\t', &transport, &mut app).unwrap();
         for byte in b"build-host" {
-            handle_target_manager_input(*byte, &mut app).unwrap();
+            handle_target_manager_input(*byte, &transport, &mut app).unwrap();
         }
-        handle_target_manager_input(b'\r', &mut app).unwrap();
+        handle_target_manager_input(b'\r', &transport, &mut app).unwrap();
 
         let config = Config::load(Some(&path)).unwrap().0;
         assert_eq!(config.targets.len(), 2);
@@ -5903,6 +6525,187 @@ mod tests {
         assert!(config.targets[1].discover_sessions);
         assert!(app.configuration_dirty);
         assert_eq!(fs::metadata(path).unwrap().permissions().readonly(), false);
+    }
+
+    #[test]
+    fn target_manager_validates_before_writing_and_applies_discovered_sessions() {
+        let existing = Target {
+            name: "existing".to_owned(),
+            ssh: Some("existing-host".to_owned()),
+            discover_sessions: true,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        let mut duplicate = TargetForm::add();
+        duplicate.name = "existing".to_owned();
+        assert!(
+            duplicate
+                .validation_error(std::slice::from_ref(&existing))
+                .unwrap()
+                .contains("duplicate target name")
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::add_target_file(Some(&path), existing.clone()).unwrap();
+        duplicate.ssh = "replacement-host".to_owned();
+        let mut invalid_app = App {
+            config_path: Some(path.clone()),
+            configured_targets: vec![existing.clone()],
+            target_manager: Some(TargetManager {
+                targets: vec![existing.clone()],
+                selected: 0,
+                mode: TargetManagerMode::Form(Box::new(duplicate)),
+                mouse_press: None,
+            }),
+            ..App::default()
+        };
+        handle_target_manager_input(
+            b'\r',
+            &crate::config::TransportConfig::default(),
+            &mut invalid_app,
+        )
+        .unwrap();
+        assert_eq!(Config::load(Some(&path)).unwrap().0.targets.len(), 1);
+        let TargetManagerMode::Form(form) = &invalid_app.target_manager.as_ref().unwrap().mode
+        else {
+            panic!("invalid form should remain open");
+        };
+        assert!(
+            form.error
+                .as_deref()
+                .unwrap()
+                .contains("duplicate target name")
+        );
+
+        let mut form = TargetForm::edit(&existing);
+        form.test_state = TargetTestState::Testing { request_id: 7 };
+        let mut app = App {
+            target_manager: Some(TargetManager {
+                targets: vec![existing],
+                selected: 0,
+                mode: TargetManagerMode::Form(Box::new(form)),
+                mouse_press: None,
+            }),
+            ..App::default()
+        };
+        super::apply_target_test_event(
+            TargetTestEvent {
+                request_id: 7,
+                elapsed_ms: 12,
+                result: Ok(SessionDiscovery {
+                    sessions: vec![DiscoveredSession {
+                        name: "build".to_owned(),
+                        running: true,
+                        session_dir: "/srv/herdr/build".to_owned(),
+                        socket_path: "/srv/herdr/build/herdr.sock".to_owned(),
+                    }],
+                    herdr_bin: "herdr".to_owned(),
+                }),
+            },
+            &mut app,
+        );
+        let manager = app.target_manager.as_mut().unwrap();
+        let TargetManagerMode::Form(form) = &mut manager.mode else {
+            panic!("expected target form");
+        };
+        assert!(matches!(form.test_state, TargetTestState::Passed { .. }));
+        assert_eq!(form.discovered_sessions.len(), 1);
+        form.select_discovered_session(0);
+        assert_eq!(form.session, "build");
+        assert_eq!(form.socket.as_deref(), Some("/srv/herdr/build/herdr.sock"));
+        assert!(!form.discover_sessions);
+
+        form.test_state = TargetTestState::Testing { request_id: 8 };
+        form.invalidate_test();
+        super::apply_target_test_event(
+            TargetTestEvent {
+                request_id: 8,
+                elapsed_ms: 20,
+                result: Ok(SessionDiscovery {
+                    sessions: vec![DiscoveredSession {
+                        name: "stale".to_owned(),
+                        running: true,
+                        session_dir: "/srv/herdr/stale".to_owned(),
+                        socket_path: "/srv/herdr/stale/herdr.sock".to_owned(),
+                    }],
+                    herdr_bin: "herdr".to_owned(),
+                }),
+            },
+            &mut app,
+        );
+        let TargetManagerMode::Form(form) = &app.target_manager.as_ref().unwrap().mode else {
+            panic!("expected target form");
+        };
+        assert!(form.discovered_sessions.is_empty());
+        assert_eq!(form.test_state, TargetTestState::Untested);
+    }
+
+    #[test]
+    fn target_manager_mouse_uses_the_same_rendered_controls() {
+        let target = Target {
+            name: "development".to_owned(),
+            ssh: Some("development-host".to_owned()),
+            discover_sessions: true,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let mut app = App {
+            target_manager: Some(TargetManager::new(vec![target])),
+            ..App::default()
+        };
+        let add_area = target_manager_controls(frame_area, app.target_manager.as_ref().unwrap())
+            .into_iter()
+            .find_map(|(area, control)| (control == TargetManagerControl::Add).then_some(area))
+            .unwrap();
+        let transport = crate::config::TransportConfig::default();
+        for release in [false, true] {
+            handle_target_manager_mouse(
+                MouseInput {
+                    code: 0,
+                    column: add_area.x + 1,
+                    row: add_area.y + 1,
+                    release,
+                },
+                frame_area,
+                &transport,
+                &mut app,
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            app.target_manager.as_ref().unwrap().mode,
+            TargetManagerMode::Form(_)
+        ));
+
+        let ssh_area = target_manager_controls(frame_area, app.target_manager.as_ref().unwrap())
+            .into_iter()
+            .find_map(|(area, control)| {
+                (control == TargetManagerControl::Field(super::TargetFormField::Ssh))
+                    .then_some(area)
+            })
+            .unwrap();
+        for release in [false, true] {
+            handle_target_manager_mouse(
+                MouseInput {
+                    code: 0,
+                    column: ssh_area.x + 1,
+                    row: ssh_area.y + 1,
+                    release,
+                },
+                frame_area,
+                &transport,
+                &mut app,
+            )
+            .unwrap();
+        }
+        let TargetManagerMode::Form(form) = &app.target_manager.as_ref().unwrap().mode else {
+            panic!("expected target form");
+        };
+        assert_eq!(form.field, super::TargetFormField::Ssh);
     }
 
     #[test]

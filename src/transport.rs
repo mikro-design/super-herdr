@@ -61,6 +61,12 @@ pub struct DiscoveredSession {
     pub socket_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDiscovery {
+    pub sessions: Vec<DiscoveredSession>,
+    pub herdr_bin: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionList {
     sessions: Vec<DiscoveredSession>,
@@ -101,14 +107,23 @@ async fn expand_discovered_target(target: Target, transport: &TransportConfig) -
     if !target.discover_sessions {
         return vec![target];
     }
-    match timeout(
-        Duration::from_secs(transport.command_timeout_seconds),
-        discover_sessions(&target, transport),
-    )
-    .await
-    {
-        Ok(Ok(sessions)) => targets_for_discovered_sessions(&target, sessions),
+    match discover_running_sessions(&target, transport).await {
+        Ok(discovery) => targets_for_discovered_sessions(&target, discovery.sessions),
         _ => vec![target],
+    }
+}
+
+/// Test access to a host and list its running Herdr sessions through the
+/// documented CLI. The command is bounded by the configured timeout and never
+/// starts, stops, or restarts a session.
+pub async fn discover_running_sessions(
+    target: &Target,
+    transport: &TransportConfig,
+) -> Result<SessionDiscovery, SnapshotError> {
+    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
+    match timeout(command_timeout, discover_sessions(target, transport)).await {
+        Ok(result) => result,
+        Err(_) => Err(SnapshotError::timed_out(command_timeout)),
     }
 }
 
@@ -132,11 +147,16 @@ fn targets_for_discovered_sessions(
 async fn discover_sessions(
     target: &Target,
     transport: &TransportConfig,
-) -> Result<Vec<DiscoveredSession>, SnapshotError> {
+) -> Result<SessionDiscovery, SnapshotError> {
     let mut failures = Vec::new();
     for executable in target.candidate_bins() {
         match discover_sessions_once(target, transport, executable).await {
-            Ok(sessions) => return Ok(sessions),
+            Ok(sessions) => {
+                return Ok(SessionDiscovery {
+                    sessions,
+                    herdr_bin: executable.to_owned(),
+                });
+            }
             Err(error) => failures.push(format!("{executable}: {error}")),
         }
     }

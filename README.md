@@ -373,12 +373,22 @@ keyboard or mouse selection automatically brings its workspace back into view.
 A click changes only Super-Herdr's local selection; it does not change another
 Herdr client's global focus.
 
-The target manager uses `j`/`k` to select a configured machine, `a` to add, `e`
-or `Enter` to edit, and `d` to remove with confirmation. In its form, `Tab`
-moves between fields, `Space` toggles running-session discovery, and `Enter`
-saves. A blank SSH field means the Herdr installation is local to the desktop.
-Advanced socket and client-path overrides remain available through `target add`
-and `target edit`.
+The target manager supports both keyboard and mouse operation. Click a machine
+and the displayed Add, Edit, Remove, or Close button, or use `j`/`k`, `a`, `e`,
+`d`, and `q`. In the form, click a field or use `Tab`; `Space` toggles
+running-session discovery, `Ctrl+T` or **Test & discover** checks the machine,
+and `Enter` or **Save** writes a valid form. Validation is shown before any file
+write, including duplicate names and unsafe SSH/session values. A blank SSH
+field means the Herdr installation is local to the desktop.
+
+The connection test runs asynchronously with the configured timeout and invokes
+only the documented `herdr session list --json` command. It never starts, stops,
+or restarts Herdr and never displays raw SSH diagnostics. Running sessions found
+by the test appear in the form. Clicking one—or focusing the list with `Tab`,
+selecting it with the arrow keys, and pressing `Enter`—switches the target to
+that exact session and its reported socket. Leave discovery enabled to follow
+all running sessions instead. Advanced socket and client-path overrides remain
+available through `target add` and `target edit`.
 
 The sidebar reserves its upper half for host/session/workspace navigation and its
 lower half for attention. The lower feed shows agents waiting now followed by
@@ -532,8 +542,9 @@ cargo clippy -j 4 -- -D warnings
 
 ## Current limitations and next slices
 
-- The target-manager form covers the common name, SSH alias, session, and
-  discovery fields. Advanced socket/client-path editing remains CLI-driven.
+- Advanced socket/client-path editing remains CLI-driven; the target manager
+  preserves existing overrides and fills the documented socket automatically
+  when a discovered session is selected.
 - Native desktop notification delivery is not implemented; attention events and
   unread state currently remain inside the TUI.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG

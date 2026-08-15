@@ -24,6 +24,9 @@ deduplication, disconnect isolation, unread handling, atomic metadata-only
 persistence, and click-to-jump rows in the lower sidebar. Context-menu coverage
 must prove that actions retain their exact qualified session/workspace/tab/pane
 identity and that destructive actions enter the shared confirmation path.
+Target-manager coverage must include rendered mouse hit targets, validation
+before file writes, stale asynchronous-result rejection, and exact
+session/socket selection from a sanitized discovery result.
 Linux release jobs must reject binaries whose highest required GLIBC symbol
 version exceeds 2.28.
 
@@ -51,7 +54,12 @@ For every applicable row, verify:
 7. Paste a long multiline prompt with the terminal's normal paste command and
    again with `Ctrl+] v`; each must appear as one editable paste and must not be
    submitted as multiple messages. PNG upload must verify size and SHA-256.
-8. Adding, editing, or removing a target refreshes the TUI without restarting Herdr.
+8. Add, edit, and remove a target using only the target manager's mouse controls.
+   Verify invalid and duplicate fields are rejected before save, **Test &
+   discover** remains responsive while bounded by the configured timeout, and a
+   discovered session can be selected exactly. Confirm the TUI refreshes without
+   starting, stopping, or restarting Herdr and that failures expose no raw SSH
+   diagnostics.
 9. Starting or stopping a Herdr session is reflected by registry refresh.
 10. The agent navigator filters and jumps across at least two hosts.
 11. With more workspace rows than fit onscreen, sidebar wheel scrolling reaches

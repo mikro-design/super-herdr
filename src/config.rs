@@ -139,7 +139,7 @@ impl Config {
         mutate_target_file(explicit_path, name, None)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.targets.is_empty() {
             bail!("configuration must contain at least one [[targets]] entry");
         }

@@ -69,6 +69,14 @@ refresh path. CLI and TUI target management use one atomic file store. A refresh
 may reconnect Super-Herdr routes but cannot mutate server-owned workspaces,
 sessions, or processes.
 
+The target-manager form validates a prospective full configuration before save.
+Its connection test is an asynchronous, timeout-bounded invocation of the same
+documented session registry used during refresh. Results are correlated to the
+form request and discarded after any intervening edit. A successful response can
+populate a selectable list of running sessions; choosing one records its name and
+reported socket in Super-Herdr configuration only. Raw command diagnostics and
+SSH material never enter UI state or logs.
+
 The desktop persists versioned UI intent and a separate bounded attention index.
 UI intent currently contains the last explicitly selected qualified pane. The
 attention index contains only qualified pane identity, agent/workspace labels,

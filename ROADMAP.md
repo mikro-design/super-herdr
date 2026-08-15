@@ -9,7 +9,8 @@ Work is ordered by dependency and product risk.
 - Atomic terminal/desktop multiline paste and verified PNG upload bridge.
 - Atomic UI selection persistence.
 - CLI target add/list/edit/remove backed by atomic TOML writes.
-- In-TUI target add/edit/remove manager.
+- Mouse- and keyboard-driven target manager with live validation, asynchronous
+  connection testing, and selectable discovered sessions.
 - Concurrent live configuration and running-session registry refresh.
 - Global agent navigator with all/attention/active filters.
 - Persistent lower-sidebar attention feed with current waiting agents, recent
@@ -23,11 +24,10 @@ Work is ordered by dependency and product risk.
 
 ## Next
 
-1. Add mouse activation and richer validation to target-manager forms.
-2. Execute and record the full desktop matrix in `TESTING.md`.
-3. Add opt-in native desktop delivery for metadata-only attention events.
-4. Add signed release artifacts and package-manager installation.
-5. Select an explicit project license before inviting external contributions.
+1. Execute and record the full desktop matrix in `TESTING.md`.
+2. Add opt-in native desktop delivery for metadata-only attention events.
+3. Add signed release artifacts and package-manager installation.
+4. Select an explicit project license before inviting external contributions.
 
 ## Later
 
