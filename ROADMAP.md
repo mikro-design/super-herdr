@@ -25,6 +25,8 @@ Work is ordered by dependency and product risk.
   by the shared resource-action and close-confirmation paths.
 - Live in-session workspace moves that replay an exported split tree with
   documented pane moves and restart no process.
+- Explicit cross-session workspace recreation with sanitized layouts, a bounded
+  pane count, and a read-only source.
 
 ## Next
 
@@ -34,13 +36,13 @@ Work is ordered by dependency and product risk.
 
 ## Blocked on Herdr
 
-- Moving a workspace between sessions on one host. Each session is its own
-  server process, and protocol 19 has no cross-session transfer. A true move
-  needs a Herdr-side transfer that hands live PTYs to the destination server,
-  the way `server.live_handoff` already does across an upgrade. Until then, the
-  only client-side option is recreating the workspace from its exported layout,
-  which restarts every process and drops scrollback; it must be presented as an
-  explicit recreate, never as a move.
+- Moving a workspace between sessions on one host with its processes intact.
+  Each session is its own server process, and protocol 19 has no cross-session
+  transfer. A true move needs a Herdr-side transfer that hands live PTYs to the
+  destination server, the way `server.live_handoff` already does across an
+  upgrade. Recreation ships as the client-side substitute and is presented as
+  such; it restarts every process and drops scrollback, so it does not close the
+  gap.
 
 ## Later
 

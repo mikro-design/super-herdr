@@ -60,6 +60,14 @@ pub enum ResourceAction {
         label: String,
         destination_label: String,
     },
+    /// Rebuild a workspace's tab and split structure on another session with
+    /// fresh shells. Herdr cannot move live panes across sessions, so this is
+    /// offered as a recreation and never as a move.
+    RecreateWorkspace {
+        workspace: WorkspaceId,
+        destination: TargetSession,
+        label: String,
+    },
     CreateTab {
         workspace: WorkspaceId,
     },
@@ -112,6 +120,7 @@ impl ResourceAction {
             Self::RenameWorkspace { workspace, .. }
             | Self::CloseWorkspace { workspace, .. }
             | Self::MoveWorkspace { workspace, .. }
+            | Self::RecreateWorkspace { workspace, .. }
             | Self::CreateTab { workspace } => Some(workspace.target_session()),
             Self::RenameTab { tab, .. } | Self::CloseTab { tab, .. } => Some(tab.target_session()),
             Self::OpenTargetManager | Self::OpenAgentNavigator | Self::OpenAttentionCenter => None,
@@ -134,6 +143,9 @@ impl ResourceAction {
                 destination_label,
                 ..
             } => format!("Move workspace {label:?} into {destination_label:?}"),
+            Self::RecreateWorkspace {
+                label, destination, ..
+            } => format!("Recreate workspace {label:?} on {destination} (new shells)"),
             Self::CreateTab { .. } => "Create tab".to_owned(),
             Self::RenameTab { current_label, .. } => format!("Rename tab {current_label:?}"),
             Self::CloseTab { label, .. } => format!("Close tab {label:?}"),

@@ -2403,6 +2403,87 @@ fn spawn_workspace_move(
     });
 }
 
+/// Recreate a workspace on another session. Two Herdr servers are involved, so
+/// both must be live; the source is only read, and nothing there is closed.
+fn spawn_workspace_recreate(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+    workspace: WorkspaceId,
+    destination: TargetSession,
+    label: String,
+) {
+    if app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    let source_key = workspace.target_session();
+    if source_key == destination {
+        app.message = Some("Herdr: use a move inside one session".to_owned());
+        return;
+    }
+    for key in [&source_key, &destination] {
+        if state
+            .targets
+            .get(key)
+            .is_none_or(|runtime| runtime.connection != TargetConnectionState::Live)
+        {
+            app.message = Some(format!("Herdr: {key} is not connected"));
+            return;
+        }
+    }
+    let (Some(source), Some(target)) = (
+        targets.get(&source_key).cloned(),
+        targets.get(&destination).cloned(),
+    ) else {
+        app.message = Some("Herdr: selected target is unavailable".to_owned());
+        return;
+    };
+    let Some(sender) = app.herdr_action_sender.clone() else {
+        app.message = Some("Herdr action routing is unavailable".to_owned());
+        return;
+    };
+    let transport = transport_config.clone();
+    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
+    app.herdr_action_inflight = true;
+    app.message = Some(format!(
+        "Herdr: recreating workspace {label:?} on {destination}…"
+    ));
+    tokio::spawn(async move {
+        let outcome = workspace_move::recreate_workspace(
+            &source,
+            &target,
+            &transport,
+            &workspace.resource,
+            Some(label.as_str()),
+            command_timeout,
+        )
+        .await;
+        let (result, description) = match outcome {
+            Ok(summary) => (
+                Ok(()),
+                format!(
+                    "recreated workspace {label:?} as {} on {destination} with {} tab(s) and {} new shell(s); the source workspace is unchanged",
+                    summary.workspace, summary.tabs, summary.panes
+                ),
+            ),
+            Err(error) => (
+                Err(format!(
+                    "recreating workspace {label:?} on {destination}: {error}"
+                )),
+                String::new(),
+            ),
+        };
+        let _ = sender.send(HerdrActionEvent {
+            result,
+            description,
+            follow_server_focus: false,
+            clipboard_feedback: None,
+        });
+    });
+}
+
 fn request_workspace_close(state: &FederationState, app: &mut App) {
     if app.herdr_action_inflight {
         app.message = Some("Herdr action already in progress".to_owned());
@@ -2468,6 +2549,7 @@ fn command_palette_actions(
                 workspace: workspace.id.clone(),
             });
             actions.extend(workspace_move_actions(snapshot, &workspace.id));
+            actions.extend(workspace_recreate_actions(state, snapshot, &workspace.id));
         }
         if let Some(tab_id) = pane.tab.as_ref()
             && let Some(tab) = snapshot.tabs.get(tab_id)
@@ -2606,6 +2688,36 @@ fn workspace_move_actions(
         .collect()
 }
 
+/// Offer a recreation on every other live session, including sessions on other
+/// hosts. Live panes cannot cross a session boundary, so the destination is a
+/// session rather than an existing workspace and the action says that it starts
+/// new shells.
+fn workspace_recreate_actions(
+    state: &FederationState,
+    snapshot: &NormalizedSnapshot,
+    source: &WorkspaceId,
+) -> Vec<ResourceAction> {
+    let Some(workspace) = snapshot.workspaces.get(source) else {
+        return Vec::new();
+    };
+    let label = display_label(&workspace.id.resource, workspace.label.as_deref());
+    let session = source.target_session();
+    state
+        .targets
+        .values()
+        .filter(|runtime| {
+            runtime.key != session
+                && runtime.connection == TargetConnectionState::Live
+                && runtime.snapshot.is_some()
+        })
+        .map(|runtime| ResourceAction::RecreateWorkspace {
+            workspace: source.clone(),
+            destination: runtime.key.clone(),
+            label: label.clone(),
+        })
+        .collect()
+}
+
 fn context_menu_for_target(
     state: &FederationState,
     target: ContextTarget,
@@ -2634,6 +2746,11 @@ fn context_menu_for_target(
             ];
             actions.extend(
                 workspace_move_actions(snapshot, &workspace)
+                    .into_iter()
+                    .take(MAX_CONTEXT_MENU_MOVE_DESTINATIONS),
+            );
+            actions.extend(
+                workspace_recreate_actions(state, snapshot, &workspace)
                     .into_iter()
                     .take(MAX_CONTEXT_MENU_MOVE_DESTINATIONS),
             );
@@ -2998,6 +3115,21 @@ fn execute_resource_action(
                     label,
                     destination_label,
                 },
+            );
+        }
+        ResourceAction::RecreateWorkspace {
+            workspace,
+            destination,
+            label,
+        } => {
+            spawn_workspace_recreate(
+                state,
+                targets,
+                transport_config,
+                app,
+                workspace,
+                destination,
+                label,
             );
         }
         ResourceAction::SplitPane { pane, direction } => {
@@ -6710,6 +6842,69 @@ mod tests {
             menu.actions.last(),
             Some(ResourceAction::CloseWorkspace { .. })
         ));
+    }
+
+    #[test]
+    fn recreation_targets_other_live_sessions_and_never_the_source() {
+        let key = TargetSession::new("host-b", "work");
+        let same_host = TargetSession::new("host-b", "scratch");
+        let other_host = TargetSession::new("host-c", "build");
+        let offline = TargetSession::new("host-d", "spare");
+        let workspace = WorkspaceId::new("host-b", "work", "w2");
+        let snapshot = |target: &TargetSession, resource: &str| {
+            NormalizedSnapshot::from_value(
+                target,
+                &json!({
+                    "workspaces": [{"workspace_id": resource, "label": "simulator"}],
+                    "tabs": [{"tab_id": format!("{resource}:t1"), "workspace_id": resource}],
+                    "panes": [{
+                        "pane_id": format!("{resource}:p1"),
+                        "workspace_id": resource,
+                        "tab_id": format!("{resource}:t1"),
+                    }]
+                }),
+            )
+        };
+        let mut state = FederationState::default();
+        for (target, connection, resource) in [
+            (&key, TargetConnectionState::Live, "w2"),
+            (&same_host, TargetConnectionState::Live, "w1"),
+            (&other_host, TargetConnectionState::Live, "w1"),
+        ] {
+            state.targets.insert(
+                target.clone(),
+                runtime(target.clone(), connection, Some(snapshot(target, resource))),
+            );
+        }
+        state.targets.insert(
+            offline.clone(),
+            runtime(offline, TargetConnectionState::Backoff { attempt: 2 }, None),
+        );
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Workspace(workspace.clone()),
+            ratatui::layout::Position::new(4, 5),
+        )
+        .unwrap();
+
+        let destinations = menu
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ResourceAction::RecreateWorkspace { destination, .. } => Some(destination.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(destinations, vec![same_host, other_host]);
+        assert!(menu.actions.iter().all(|action| {
+            action.target_session() == Some(TargetSession::new("host-b", "work"))
+        }));
+        assert!(
+            menu.actions
+                .iter()
+                .any(|action| action.palette_label().contains("new shells"))
+        );
     }
 
     #[test]

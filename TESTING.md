@@ -33,6 +33,11 @@ Workspace-move coverage must prove that a nested exported layout is rebuilt
 top-down, that each split targets the identifier Herdr returned for the
 previously moved pane, that an unsupported layout node is rejected instead of
 guessed, and that destinations outside the source session are never offered.
+Recreation coverage must prove that an applied layout keeps the structure,
+ratios, labels, and working directories while dropping pane identifiers,
+commands, and environment, that a workspace exceeding the pane bound is refused,
+that the source session is only read, and that recreation destinations are other
+live sessions rather than workspaces.
 Notification coverage must prove delivery is disabled by default, startup
 history is skipped, event filters are honored, repeated events are deduplicated,
 bursts are coalesced and rate-limited, and delivery objects exclude status,
@@ -109,6 +114,14 @@ For every applicable row, verify:
     re-qualified. Repeat over SSH and confirm one forwarding child serves the
     whole move. Verify no move destination is offered in another session or on
     another host.
+
+18. Recreate that workspace on a second session, once on the same host and once
+    on another host. Verify the destination reproduces every tab, split, and
+    ratio with new shells in the recorded working directories, that no command
+    from the source is re-run and no source environment appears there, that the
+    source workspace still holds its running processes and scrollback, and that
+    a working directory missing on the destination host reports a failure naming
+    the destination workspace instead of leaving a silent gap.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put

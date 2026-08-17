@@ -164,6 +164,18 @@ protocol 19 has no cross-session transfer, so destinations are restricted to the
 source session and cross-session recreation is not silently substituted for a
 move.
 
+Crossing a session boundary is a different operation with different guarantees,
+and the two are never conflated. Recreation reads the source workspace's tabs and
+layouts, reduces each exported tree to structure, ratios, labels, and working
+directories, and applies those on the destination session's own socket after
+creating a workspace there. Server-local identifiers, pane commands, and pane
+environment are dropped rather than forwarded: an identifier is meaningless on
+another server, and replaying a command or an environment would run a program or
+carry a secret onto another machine. The number of panes one recreation may
+start is bounded. The source is only read—never closed—so a failed recreation
+costs a partially built destination workspace that the report names, and never
+the running work.
+
 The private API socket answers one request per connection. A multi-request action
 therefore opens a connection per request while holding the SSH forwarding child
 for its whole sequence, so a remote move pays for one tunnel rather than one per

@@ -37,6 +37,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
   startup-history suppression, coalescing, and rate limiting.
 - Live workspace moves inside one Herdr session: every tab is rebuilt in the
   destination workspace with its splits and ratios, and no process restarts.
+- Explicit workspace recreation on another session or host, rebuilding the tab
+  and split structure with new shells while the source keeps running.
 - A fuzzy-searchable action palette for navigation and qualified workspace,
   tab, and pane lifecycle operations.
 - Right-click session, workspace, tab, and pane menus backed by those same
@@ -465,9 +467,26 @@ agents; only their identifiers are re-qualified by Herdr. The whole sequence
 runs as one action: if a step fails, the tabs already moved stay in the
 destination and the rest stay in the source, and nothing is closed. The context
 menu is not scrollable, so it lists at most eight destinations in workspace
-order; the action palette lists every one. Destinations in another session or on
-another host are never offered—Herdr's protocol 19 has no cross-session
+order; the action palette lists every one. A move destination in another session
+or on another host is never offered—Herdr's protocol 19 has no cross-session
 transfer.
+
+Crossing a session boundary is offered separately as `Recreate workspace "a" on
+build/toolchains (new shells)`, listing every other live session including those
+on other hosts. Recreation reads the source workspace, creates a workspace on
+the destination, and rebuilds each tab's split structure, ratios, pane labels,
+and recorded working directories there. It is not a move:
+
+- Every pane is a new shell. Processes, scrollback, and agent state stay in the
+  source workspace, which keeps running and is never closed. Close it yourself
+  with the usual confirmation once you are satisfied with the result.
+- Pane commands and environment variables are deliberately not replayed, so
+  recreation never runs a program or carries a secret onto another machine.
+- A working directory that does not exist on the destination host makes Herdr
+  reject that tab.
+- Recreation refuses a workspace that would start more than 64 panes. If a tab
+  fails part way through, the report names the destination workspace and how
+  many tabs it holds so you can close it there and retry.
 
 Right-clicking a session, workspace, tab, or pane opens a pointer-anchored menu.
 Use the mouse, `j`/`k`, or the arrow keys to choose an action and `Enter` to run
@@ -612,12 +631,11 @@ cargo clippy -j 4 -- -D warnings
   when a discovered session is selected.
 - Native notifications are delivery-only; clicking one does not yet jump to the
   qualified pane. Use the lower attention feed or `Ctrl+] e` to jump.
-- A workspace cannot be moved between Herdr sessions. Each session is a separate
-  server process owning its panes, and protocol 19 exposes no cross-session
-  transfer; `workspace.move` only reorders workspaces inside one session. A
-  future slice can recreate a workspace in another session from its exported
-  layout, but that restarts every process and drops scrollback, so it will be
-  offered as an explicit recreate rather than as a move.
+- A workspace still cannot be *moved* between Herdr sessions. Each session is a
+  separate server process owning its panes, and protocol 19 exposes no
+  cross-session transfer; `workspace.move` only reorders workspaces inside one
+  session. Recreation is the supported substitute and restarts every process.
+  A live cross-session move needs a Herdr-side transfer of the panes themselves.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG
   images only.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are
