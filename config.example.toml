@@ -8,6 +8,18 @@ batch_mode = true
 connect_timeout_seconds = 10
 command_timeout_seconds = 20
 
+# Native desktop notifications are opt-in and carry metadata only. Toggle them
+# with `super-herdr notifications enable` and verify with `notifications check`.
+[notifications]
+enabled = false
+needs_attention = true
+completed = true
+disappeared = true
+working = false
+status_changed = false
+minimum_interval_seconds = 5
+command_timeout_seconds = 5
+
 [[targets]]
 name = "development"
 ssh = "development-host"

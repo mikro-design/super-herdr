@@ -17,6 +17,8 @@ Work is ordered by dependency and product risk.
   transitions, independent scrolling, and qualified click-to-jump rows.
 - Durable payload-free attention history with unread transition tracking and
   deduplication across restarts.
+- Opt-in native desktop delivery for filtered metadata-only attention events,
+  with history suppression, coalescing, rate limiting, and failure isolation.
 - Fuzzy-searchable action palette with qualified workspace, tab, and pane
   lifecycle operations.
 - Qualified mouse context menus for sessions, workspaces, tabs, and panes, backed
@@ -25,9 +27,8 @@ Work is ordered by dependency and product risk.
 ## Next
 
 1. Execute and record the full desktop matrix in `TESTING.md`.
-2. Add opt-in native desktop delivery for metadata-only attention events.
-3. Add signed release artifacts and package-manager installation.
-4. Select an explicit project license before inviting external contributions.
+2. Add signed release artifacts and package-manager installation.
+3. Select an explicit project license before inviting external contributions.
 
 ## Later
 

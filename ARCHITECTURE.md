@@ -67,7 +67,8 @@ that host.
 The frontend watches the durable TOML configuration through the same bounded
 refresh path. CLI and TUI target management use one atomic file store. A refresh
 may reconnect Super-Herdr routes but cannot mutate server-owned workspaces,
-sessions, or processes.
+sessions, or processes. Notification-only configuration changes update the
+delivery queue in place and do not rebuild supervisors or terminal routes.
 
 The target-manager form validates a prospective full configuration before save.
 Its connection test is an asynchronous, timeout-bounded invocation of the same
@@ -100,6 +101,17 @@ feed: agents waiting now precede newest-first transition history. Each actionabl
 row retains its qualified pane identity for click-to-jump routing. The full
 attention center remains available for filtering, unread management, and history
 cleanup.
+
+Native desktop delivery is an opt-in consumer of new attention events. Its
+cursor starts at the newest persisted event, so startup never replays historical
+notifications. Event-kind filters run before a bounded metadata queue; matching
+events are deduplicated, briefly coalesced, and rate-limited before an isolated
+native command worker receives them. Notification text is constructed only from
+the transition kind, qualified target/session, and bounded agent/workspace
+labels. Status text, terminal contents, clipboard payloads, SSH material, and raw
+diagnostics never enter the delivery object. Native commands have a separate
+timeout, and delivery failure changes only a local TUI diagnostic—it cannot stop
+target supervision, reconnect a route, or mutate Herdr.
 
 ## Terminal data plane
 

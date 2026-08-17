@@ -33,6 +33,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
   transitions across all live hosts, with click-to-jump routing.
 - A durable metadata-only attention history with unread counts, transition
   deduplication, and qualified jump-and-mark-read behavior.
+- Opt-in native desktop notifications for selected attention transitions, with
+  startup-history suppression, coalescing, and rate limiting.
 - A fuzzy-searchable action palette for navigation and qualified workspace,
   tab, and pane lifecycle operations.
 - Right-click session, workspace, tab, and pane menus backed by those same
@@ -68,6 +70,11 @@ client machine's clipboard.
   - macOS: `pbcopy`, `pbpaste`, and `osascript` from the operating system.
   - Linux Wayland: `wl-copy` and `wl-paste` from `wl-clipboard`.
   - Linux X11: `xclip`, or `xsel` for text-only copy and paste.
+
+- Native notification delivery when enabled:
+
+  - macOS: `osascript` from the operating system.
+  - Linux desktop: `notify-send` from the desktop notification tools.
 
 - `sha256sum` on an SSH target when using verified PNG upload.
 
@@ -248,6 +255,16 @@ batch_mode = true
 connect_timeout_seconds = 10
 command_timeout_seconds = 20
 
+[notifications]
+enabled = false
+needs_attention = true
+completed = true
+disappeared = true
+working = false
+status_changed = false
+minimum_interval_seconds = 5
+command_timeout_seconds = 5
+
 [[targets]]
 name = "development"
 ssh = "development-host"
@@ -281,6 +298,13 @@ Target fields:
 Each discovered session is supervised independently. A failed target does not
 freeze or tear down other targets.
 
+Notifications are disabled by default. When enabled, the event switches select
+which transitions may reach the desktop. `minimum_interval_seconds` bounds the
+delivery rate after a short coalescing window, and `command_timeout_seconds`
+bounds the native notification process. Notifications contain only an agent
+label, workspace label, qualified target/session, and transition kind. Terminal
+and clipboard contents are never included.
+
 ## Commands
 
 ```sh
@@ -293,6 +317,10 @@ super-herdr probe
 super-herdr probe --json
 super-herdr probe --json --snapshots
 super-herdr clipboard check
+super-herdr notifications check
+super-herdr notifications enable
+super-herdr notifications test
+super-herdr notifications disable
 super-herdr tui
 ```
 
@@ -308,6 +336,13 @@ Running `super-herdr` without a subcommand opens the TUI.
   output, JSON output, and terminals with `NO_COLOR` set remain uncolored.
 - `clipboard check` reports the active copy, text-paste, and image-paste paths.
   It does not read or print clipboard payloads.
+- `notifications check` reports the configured filters and whether native
+  delivery is available without sending anything.
+- `notifications enable` and `notifications disable` atomically update only the
+  notification setting. A running TUI reloads it without reconnecting terminal
+  routes or restarting Herdr.
+- `notifications test` sends one synthetic metadata-only notification and
+  requires notifications to be enabled.
 - `tui` opens the federated terminal UI.
 
 ## TUI controls
@@ -403,6 +438,22 @@ then `e` opens the newest-first history: use `j`/`k` to select, `Enter` to jump
 and mark that qualified pane's events read, `r` to mark everything read, and `c`
 to clear events already read. Repeated snapshots do not create duplicate events,
 and a disconnected target does not falsely mark its agents as disappeared.
+
+Native attention notifications are opt-in. Enable and verify them on the desktop
+where Super-Herdr runs:
+
+```sh
+super-herdr notifications check
+super-herdr notifications enable
+super-herdr notifications test
+```
+
+The TUI never replays persisted attention history as notifications at startup.
+New matching transitions are deduplicated, briefly coalesced, and rate-limited.
+Delivery failures are isolated from target supervision and terminal routing. A
+Super-Herdr process running through SSH or nested inside Herdr reports native
+delivery as unavailable; keep it on the desktop for this feature. Disable it at
+any time with `super-herdr notifications disable`.
 
 Right-clicking a session, workspace, tab, or pane opens a pointer-anchored menu.
 Use the mouse, `j`/`k`, or the arrow keys to choose an action and `Enter` to run
@@ -545,8 +596,8 @@ cargo clippy -j 4 -- -D warnings
 - Advanced socket/client-path editing remains CLI-driven; the target manager
   preserves existing overrides and fills the documented socket automatically
   when a discovered session is selected.
-- Native desktop notification delivery is not implemented; attention events and
-  unread state currently remain inside the TUI.
+- Native notifications are delivery-only; clicking one does not yet jump to the
+  qualified pane. Use the lower attention feed or `Ctrl+] e` to jump.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG
   images only.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are

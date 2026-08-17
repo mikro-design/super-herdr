@@ -26,7 +26,15 @@ must prove that actions retain their exact qualified session/workspace/tab/pane
 identity and that destructive actions enter the shared confirmation path.
 Target-manager coverage must include rendered mouse hit targets, validation
 before file writes, stale asynchronous-result rejection, and exact
-session/socket selection from a sanitized discovery result.
+session/socket selection from a sanitized discovery result. CLI output coverage
+must verify that redirected output has no ANSI escapes and that a downstream
+consumer closing its pipe early exits cleanly without a panic.
+Notification coverage must prove delivery is disabled by default, startup
+history is skipped, event filters are honored, repeated events are deduplicated,
+bursts are coalesced and rate-limited, and delivery objects exclude status,
+terminal, and clipboard payloads. Configuration toggles must preserve comments
+and existing filters, and notification-only refresh must not rebuild terminal
+routes.
 Linux release jobs must reject binaries whose highest required GLIBC symbol
 version exceeds 2.28.
 
@@ -81,6 +89,12 @@ For every applicable row, verify:
     non-destructive actions affect only that qualified resource, and every close
     action displays the exact qualified resource in its confirmation before
     execution.
+16. On a desktop, run `super-herdr notifications check`, enable notifications,
+    send the synthetic test, and produce matching agent transitions. Verify old
+    persisted history is not replayed, bursts are coalesced and rate-limited,
+    notification text contains metadata only, and disabling takes effect without
+    reconnecting terminal routes. A nested SSH or Herdr run must report native
+    delivery as unavailable without affecting the TUI.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put

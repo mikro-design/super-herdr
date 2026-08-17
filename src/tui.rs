@@ -31,6 +31,7 @@ use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex, Atten
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
+use crate::notifications::{self, NotificationDelivery, NotificationQueue};
 use crate::resource_action::{ResourceAction, SplitDirection};
 use crate::state::{
     FederationState, FederationStore, NormalizedSnapshot, SupervisorOptions, TargetConnectionState,
@@ -482,6 +483,7 @@ impl TargetForm {
         }
         Config {
             transport: TransportConfig::default(),
+            notifications: crate::config::NotificationsConfig::default(),
             targets,
         }
         .validate()
@@ -676,6 +678,10 @@ struct TargetTestEvent {
     result: Result<SessionDiscovery, String>,
 }
 
+struct NotificationDeliveryEvent {
+    result: Result<(), String>,
+}
+
 struct HerdrActionEvent {
     result: Result<(), String>,
     description: String,
@@ -753,6 +759,10 @@ struct App {
     attention: AttentionIndex,
     attention_store: Option<AttentionStore>,
     attention_center: Option<AttentionCenter>,
+    notification_queue: NotificationQueue,
+    notification_sender: Option<mpsc::UnboundedSender<NotificationDeliveryEvent>>,
+    notification_inflight: bool,
+    notification_error_reported: bool,
     command_palette: Option<CommandPalette>,
     context_menu: Option<ContextMenu>,
     text_prompt: Option<TextPrompt>,
@@ -797,6 +807,10 @@ impl Default for App {
             attention: AttentionIndex::default(),
             attention_store: None,
             attention_center: None,
+            notification_queue: NotificationQueue::default(),
+            notification_sender: None,
+            notification_inflight: false,
+            notification_error_reported: false,
             command_palette: None,
             context_menu: None,
             text_prompt: None,
@@ -809,6 +823,7 @@ impl Default for App {
 
 pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let configured_targets = config.targets.clone();
+    let configured_notifications = config.notifications.clone();
     let mut active_config = expand_discovered_sessions(config).await;
     let (mut terminal, _guard) = enter_terminal()?;
     let mut targets = active_config
@@ -831,6 +846,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
     let (herdr_action_sender, mut herdr_action_events) = mpsc::unbounded_channel();
     let (target_test_sender, mut target_test_events) = mpsc::unbounded_channel();
+    let (notification_sender, mut notification_events) = mpsc::unbounded_channel();
     spawn_input_reader(input_sender);
     let mut ticks = interval(Duration::from_millis(100));
     let mut selection_ticks = interval(SELECTION_AUTOSCROLL_INTERVAL);
@@ -848,11 +864,17 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
             Some("persisted attention state was invalid; starting with an empty index".to_owned()),
         ),
     };
+    let last_attention_event_id = attention.events().next_back().map(|event| event.id);
     let mut app = App {
         restore_pending,
         state_store: Some(state_store),
         attention,
         attention_store: Some(attention_store),
+        notification_queue: NotificationQueue::new(
+            configured_notifications,
+            last_attention_event_id,
+        ),
+        notification_sender: Some(notification_sender),
         config_path: Some(config_path.clone()),
         configured_targets,
         herdr_action_sender: Some(herdr_action_sender),
@@ -932,8 +954,14 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 config_refresh_inflight = false;
                 match refresh {
                     Some(ConfigRefresh::Ready { configured, expanded }) => {
+                        if app
+                            .notification_queue
+                            .reconfigure(configured.notifications.clone())
+                        {
+                            app.notification_error_reported = false;
+                        }
                         app.configured_targets = configured.targets.clone();
-                        if expanded != active_config {
+                        if federation_routes_changed(&active_config, &expanded) {
                             release_routes(&mut app).await;
                             if let Some(old_store) = store.take() {
                                 old_store.shutdown().await;
@@ -955,6 +983,8 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                             store = Some(new_store);
                             active_config = expanded;
                             app.message = Some("refreshed configured hosts and running sessions".to_owned());
+                        } else {
+                            active_config.notifications = expanded.notifications;
                         }
                         if let Some(manager) = app.target_manager.as_mut()
                             && matches!(&manager.mode, TargetManagerMode::List)
@@ -1001,6 +1031,20 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
             event = target_test_events.recv() => {
                 if let Some(event) = event {
                     apply_target_test_event(event, &mut app);
+                    should_draw = true;
+                }
+            }
+            event = notification_events.recv() => {
+                if let Some(event) = event {
+                    app.notification_inflight = false;
+                    match event.result {
+                        Ok(()) => app.notification_error_reported = false,
+                        Err(error) if !app.notification_error_reported => {
+                            app.notification_error_reported = true;
+                            app.message = Some(format!("desktop notification unavailable: {error}"));
+                        }
+                        Err(_) => {}
+                    }
                     should_draw = true;
                 }
             }
@@ -1064,6 +1108,11 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 {
                     app.clipboard_feedback = None;
                     should_draw = true;
+                }
+                if !app.notification_inflight
+                    && let Some(delivery) = app.notification_queue.take_ready(Instant::now())
+                {
+                    spawn_notification_delivery(delivery, &mut app);
                 }
             }
             _ = config_refresh_ticks.tick() => {
@@ -1165,6 +1214,23 @@ fn spawn_config_refresh(path: PathBuf, sender: mpsc::UnboundedSender<ConfigRefre
             Err(error) => ConfigRefresh::Failed(error.to_string()),
         };
         let _ = sender.send(refresh);
+    });
+}
+
+fn spawn_notification_delivery(delivery: NotificationDelivery, app: &mut App) {
+    let Some(sender) = app.notification_sender.clone() else {
+        if !app.notification_error_reported {
+            app.notification_error_reported = true;
+            app.message = Some("desktop notification delivery is unavailable".to_owned());
+        }
+        return;
+    };
+    app.notification_inflight = true;
+    tokio::spawn(async move {
+        let result = notifications::deliver(delivery)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(NotificationDeliveryEvent { result });
     });
 }
 
@@ -1643,6 +1709,11 @@ fn refresh_attention(state: &FederationState, app: &mut App) {
             app.attention_sidebar_offset = 0;
         }
         persist_attention(app);
+    }
+    let events = app.attention.events().cloned().collect::<Vec<_>>();
+    let now = Instant::now();
+    for event in &events {
+        app.notification_queue.enqueue(event, now);
     }
 }
 
@@ -6192,6 +6263,10 @@ fn target_key(target: &Target) -> TargetSession {
     TargetSession::new(&target.name, target.session_name())
 }
 
+fn federation_routes_changed(current: &Config, next: &Config) -> bool {
+    current.transport != next.transport || current.targets != next.targets
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -6211,7 +6286,7 @@ mod tests {
         TargetTestState, TerminalSelection, agent_jump_entries, capture_screen_rows,
         capture_selection_viewport, clamped_pane_position, context_menu_for_target, cycle_tab,
         desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
-        filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
+        federation_routes_changed, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
         handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
         handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
         mouse_event_allowed, mouse_passthrough_enabled, pane_direction_score, reconcile_selection,
@@ -6268,6 +6343,24 @@ mod tests {
         assert_eq!(PREFIX_KEY, 0x1d);
         assert_eq!(HERDR_PREFIX_KEY, 0x02);
         assert_ne!(PREFIX_KEY, HERDR_PREFIX_KEY);
+    }
+
+    #[test]
+    fn notification_refresh_does_not_rebuild_terminal_routes() {
+        let current = Config::parse(
+            r#"
+                [[targets]]
+                name = "host-a"
+            "#,
+        )
+        .unwrap();
+        let mut notifications_changed = current.clone();
+        notifications_changed.notifications.enabled = true;
+        assert!(!federation_routes_changed(&current, &notifications_changed));
+
+        let mut targets_changed = current.clone();
+        targets_changed.targets[0].session = Some("work".to_owned());
+        assert!(federation_routes_changed(&current, &targets_changed));
     }
 
     #[tokio::test]

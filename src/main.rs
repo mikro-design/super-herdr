@@ -1,4 +1,5 @@
-use std::io::{self, IsTerminal};
+use std::fmt;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use clap::{Parser, Subcommand};
 
 use super_herdr::clipboard;
 use super_herdr::config::{Config, Target};
+use super_herdr::notifications;
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
 use super_herdr::tui;
@@ -64,6 +66,11 @@ enum Commands {
         #[command(subcommand)]
         command: ClipboardCommands,
     },
+    /// Inspect or test native metadata-only attention notifications.
+    Notifications {
+        #[command(subcommand)]
+        command: NotificationCommands,
+    },
     /// Add or inspect configured Herdr hosts.
     Target {
         #[command(subcommand)]
@@ -75,6 +82,18 @@ enum Commands {
 enum ClipboardCommands {
     /// Report the active native or terminal-mediated clipboard paths.
     Check,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum NotificationCommands {
+    /// Report configured notification filters and desktop delivery capability.
+    Check,
+    /// Enable native notifications in the configuration.
+    Enable,
+    /// Disable native notifications in the configuration.
+    Disable,
+    /// Deliver one synthetic metadata-only desktop notification.
+    Test,
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,11 +184,30 @@ enum TargetCommands {
 async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
+        Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn stdout_line(arguments: fmt::Arguments<'_>) -> Result<()> {
+    let mut output = io::stdout().lock();
+    output
+        .write_fmt(arguments)
+        .context("failed to write standard output")?;
+    output
+        .write_all(b"\n")
+        .context("failed to write standard output")
 }
 
 async fn run() -> Result<ExitCode> {
@@ -182,7 +220,7 @@ async fn run() -> Result<ExitCode> {
         }
     ) {
         for line in clipboard::diagnostic_lines() {
-            println!("{line}");
+            stdout_line(format_args!("{line}"))?;
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -196,24 +234,24 @@ async fn run() -> Result<ExitCode> {
 
     match command {
         Commands::Check => {
-            println!(
+            stdout_line(format_args!(
                 "{}: {} valid target(s)",
                 path.display(),
                 config.targets.len()
-            );
+            ))?;
             for target in &config.targets {
                 let session_scope = if target.discover_sessions {
                     format!("discover sessions (fallback {})", target.session_name())
                 } else {
                     format!("session {}", target.session_name())
                 };
-                println!(
+                stdout_line(format_args!(
                     "  {}: {} / {} / {}",
                     target.name,
                     target.endpoint(),
                     session_scope,
                     target.candidate_bins().collect::<Vec<_>>().join(", ")
-                );
+                ))?;
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -234,18 +272,18 @@ async fn run() -> Result<ExitCode> {
                         .iter_mut()
                         .for_each(|report| report.discard_snapshot());
                 }
-                println!(
+                stdout_line(format_args!(
                     "{}",
                     serde_json::to_string_pretty(&FederationReport {
                         config: path.display().to_string(),
                         targets: reports,
                     })?
-                );
+                ))?;
             } else {
                 let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
                 for report in &reports {
                     if report.ok {
-                        println!(
+                        stdout_line(format_args!(
                             "{}{}/{} [{}] Herdr {} protocol {} via {}: {} workspace(s), {} pane(s), {} agent(s) ({} ms)",
                             probe_status_prefix(true, color),
                             report.target,
@@ -260,9 +298,9 @@ async fn run() -> Result<ExitCode> {
                             report.panes,
                             report.agents,
                             report.elapsed_ms
-                        );
+                        ))?;
                     } else {
-                        println!(
+                        stdout_line(format_args!(
                             "{}{}/{} [{}]: {} ({} ms)",
                             probe_status_prefix(false, color),
                             report.target,
@@ -270,7 +308,7 @@ async fn run() -> Result<ExitCode> {
                             report.endpoint,
                             report.error.as_deref().unwrap_or("unknown error"),
                             report.elapsed_ms
-                        );
+                        ))?;
                     }
                 }
             }
@@ -286,13 +324,51 @@ async fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Clipboard { .. } => unreachable!("clipboard commands return before config load"),
+        Commands::Notifications { command } => {
+            match command {
+                NotificationCommands::Check => {
+                    for line in notifications::diagnostic_lines(&config.notifications) {
+                        stdout_line(format_args!("{line}"))?;
+                    }
+                }
+                NotificationCommands::Enable | NotificationCommands::Disable => {
+                    let enabled = matches!(command, NotificationCommands::Enable);
+                    Config::set_notifications_enabled_file(Some(&path), enabled)?;
+                    stdout_line(format_args!(
+                        "native notifications {} in {}",
+                        if enabled { "enabled" } else { "disabled" },
+                        path.display()
+                    ))?;
+                    stdout_line(format_args!(
+                        "the TUI will reload this setting without restarting Herdr"
+                    ))?;
+                }
+                NotificationCommands::Test => {
+                    let delivery = notifications::test_delivery(&config.notifications)?;
+                    notifications::deliver(delivery).await?;
+                    stdout_line(format_args!("native test notification delivered"))?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Target { .. } => unreachable!("target commands return before config load"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::probe_status_prefix;
+    use super::{is_broken_pipe, probe_status_prefix};
+
+    #[test]
+    fn recognizes_a_contextualized_broken_pipe() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed pipe",
+        ))
+        .context("output failed");
+        assert!(is_broken_pipe(&error));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("ordinary failure")));
+    }
 
     #[test]
     fn probe_status_prefixes_are_colored_only_when_requested() {
@@ -330,8 +406,8 @@ fn run_target_command(
                 },
             };
             let path = Config::add_target_file(config_path, target)?;
-            println!("added target {name:?} to {}", path.display());
-            println!("run `super-herdr probe` to verify it");
+            stdout_line(format_args!("added target {name:?} to {}", path.display()))?;
+            stdout_line(format_args!("run `super-herdr probe` to verify it"))?;
             Ok(ExitCode::SUCCESS)
         }
         TargetCommands::Edit {
@@ -399,11 +475,11 @@ fn run_target_command(
             }
             let updated_name = target.name.clone();
             let path = Config::replace_target_file(config_path, &name, target)?;
-            println!(
+            stdout_line(format_args!(
                 "updated target {name:?} as {updated_name:?} in {}",
                 path.display()
-            );
-            println!("run `super-herdr probe` to verify it");
+            ))?;
+            stdout_line(format_args!("run `super-herdr probe` to verify it"))?;
             Ok(ExitCode::SUCCESS)
         }
         TargetCommands::Remove { name, yes } => {
@@ -413,24 +489,31 @@ fn run_target_command(
                 );
             }
             let path = Config::remove_target_file(config_path, &name)?;
-            println!("removed target {name:?} from {}", path.display());
-            println!("no Herdr session was stopped or restarted");
+            stdout_line(format_args!(
+                "removed target {name:?} from {}",
+                path.display()
+            ))?;
+            stdout_line(format_args!("no Herdr session was stopped or restarted"))?;
             Ok(ExitCode::SUCCESS)
         }
         TargetCommands::List => {
             let (config, path) = Config::load(config_path)?;
-            println!(
+            stdout_line(format_args!(
                 "{}: {} configured target(s)",
                 path.display(),
                 config.targets.len()
-            );
+            ))?;
             for target in &config.targets {
                 let scope = if target.discover_sessions {
                     "all running sessions"
                 } else {
                     target.session_name()
                 };
-                println!("  {}: {} / {scope}", target.name, target.endpoint());
+                stdout_line(format_args!(
+                    "  {}: {} / {scope}",
+                    target.name,
+                    target.endpoint()
+                ))?;
             }
             Ok(ExitCode::SUCCESS)
         }

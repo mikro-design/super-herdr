@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub transport: TransportConfig,
+    #[serde(default, skip_serializing_if = "NotificationsConfig::is_default")]
+    pub notifications: NotificationsConfig,
     pub targets: Vec<Target>,
 }
 
@@ -37,6 +39,48 @@ impl Default for TransportConfig {
             connect_timeout_seconds: default_connect_timeout(),
             command_timeout_seconds: default_command_timeout(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub needs_attention: bool,
+    #[serde(default = "default_true")]
+    pub completed: bool,
+    #[serde(default = "default_true")]
+    pub disappeared: bool,
+    #[serde(default)]
+    pub working: bool,
+    #[serde(default)]
+    pub status_changed: bool,
+    #[serde(default = "default_notification_interval")]
+    pub minimum_interval_seconds: u64,
+    #[serde(default = "default_notification_timeout")]
+    pub command_timeout_seconds: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            needs_attention: true,
+            completed: true,
+            disappeared: true,
+            working: false,
+            status_changed: false,
+            minimum_interval_seconds: default_notification_interval(),
+            command_timeout_seconds: default_notification_timeout(),
+        }
+    }
+}
+
+impl NotificationsConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -116,6 +160,7 @@ impl Config {
         } else {
             let config = Self {
                 transport: TransportConfig::default(),
+                notifications: NotificationsConfig::default(),
                 targets: vec![target],
             };
             config.validate()?;
@@ -139,6 +184,20 @@ impl Config {
         mutate_target_file(explicit_path, name, None)
     }
 
+    pub fn set_notifications_enabled_file(
+        explicit_path: Option<&Path>,
+        enabled: bool,
+    ) -> Result<PathBuf> {
+        let path = resolve_path(explicit_path)?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        let updated = set_notifications_enabled(&text, enabled);
+        Self::parse(&updated).context("generated configuration is invalid")?;
+        write_private_atomic(&path, updated.as_bytes())?;
+        Ok(path)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.targets.is_empty() {
             bail!("configuration must contain at least one [[targets]] entry");
@@ -151,6 +210,16 @@ impl Config {
         }
         if self.transport.command_timeout_seconds == 0 {
             bail!("transport.command_timeout_seconds must be greater than zero");
+        }
+        if self.notifications.minimum_interval_seconds == 0
+            || self.notifications.minimum_interval_seconds > 3600
+        {
+            bail!("notifications.minimum_interval_seconds must be between 1 and 3600");
+        }
+        if self.notifications.command_timeout_seconds == 0
+            || self.notifications.command_timeout_seconds > 30
+        {
+            bail!("notifications.command_timeout_seconds must be between 1 and 30");
         }
 
         let mut names = HashSet::new();
@@ -300,6 +369,91 @@ fn target_sections(text: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
+fn set_notifications_enabled(text: &str, enabled: bool) -> String {
+    let value = if enabled { "true" } else { "false" };
+    let headers = table_headers(text);
+    if let Some((header_index, (start, _))) = headers
+        .iter()
+        .enumerate()
+        .find(|(_, (_, header))| *header == "[notifications]")
+    {
+        let end = headers
+            .get(header_index + 1)
+            .map(|(offset, _)| *offset)
+            .unwrap_or(text.len());
+        let section = &text[*start..end];
+        let mut offset = 0_usize;
+        for line in section.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "enabled")
+            {
+                let line_start = start + offset;
+                let line_end = line_start + line.len();
+                let (content, newline) = line
+                    .strip_suffix('\n')
+                    .map_or((line, ""), |content| (content, "\n"));
+                let equals = content
+                    .find('=')
+                    .expect("an enabled assignment always contains '='");
+                let right = &content[equals + 1..];
+                let value_start = right
+                    .find(|character: char| !character.is_whitespace())
+                    .unwrap_or(right.len());
+                let before_comment = right.find('#').unwrap_or(right.len());
+                let value_end = right[..before_comment].trim_end().len();
+                let mut updated = String::with_capacity(text.len());
+                updated.push_str(&text[..line_start]);
+                updated.push_str(&content[..equals + 1]);
+                updated.push_str(&right[..value_start]);
+                updated.push_str(value);
+                updated.push_str(&right[value_end..]);
+                updated.push_str(newline);
+                updated.push_str(&text[line_end..]);
+                return updated;
+            }
+            offset += line.len();
+        }
+        let header_end = text[*start..]
+            .find('\n')
+            .map(|offset| start + offset + 1)
+            .unwrap_or(text.len());
+        let mut updated = String::with_capacity(text.len() + 16);
+        updated.push_str(&text[..header_end]);
+        updated.push_str(&format!("enabled = {value}\n"));
+        updated.push_str(&text[header_end..]);
+        return updated;
+    }
+
+    let insert_at = headers
+        .iter()
+        .find(|(_, header)| *header == "[[targets]]")
+        .map(|(offset, _)| *offset)
+        .unwrap_or(text.len());
+    let mut updated = String::with_capacity(text.len() + 42);
+    updated.push_str(&text[..insert_at]);
+    if insert_at > 0 && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&format!("[notifications]\nenabled = {value}\n\n"));
+    updated.push_str(&text[insert_at..]);
+    updated
+}
+
+fn table_headers(text: &str) -> Vec<(usize, &str)> {
+    let mut headers = Vec::new();
+    let mut offset = 0_usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            headers.push((offset, trimmed));
+        }
+        offset += line.len();
+    }
+    headers
+}
+
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let directory = path
         .parent()
@@ -386,6 +540,14 @@ const fn default_command_timeout() -> u64 {
     20
 }
 
+const fn default_notification_interval() -> u64 {
+    5
+}
+
+const fn default_notification_timeout() -> u64 {
+    5
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -434,6 +596,103 @@ mod tests {
         .unwrap();
 
         assert!(config.targets[0].discover_sessions);
+    }
+
+    #[test]
+    fn notifications_are_opt_in_and_validate_delivery_bounds() {
+        let disabled = Config::parse(
+            r#"
+                [[targets]]
+                name = "local"
+            "#,
+        )
+        .unwrap();
+        assert!(!disabled.notifications.enabled);
+        assert!(disabled.notifications.needs_attention);
+
+        let enabled = Config::parse(
+            r#"
+                [notifications]
+                enabled = true
+                minimum_interval_seconds = 7
+                completed = false
+
+                [[targets]]
+                name = "local"
+            "#,
+        )
+        .unwrap();
+        assert!(enabled.notifications.enabled);
+        assert_eq!(enabled.notifications.minimum_interval_seconds, 7);
+        assert!(!enabled.notifications.completed);
+        assert!(enabled.notifications.disappeared);
+
+        let error = Config::parse(
+            r#"
+                [notifications]
+                enabled = true
+                minimum_interval_seconds = 0
+
+                [[targets]]
+                name = "local"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("minimum_interval_seconds"));
+    }
+
+    #[test]
+    fn notification_toggle_preserves_comments_and_filter_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"# retained operator note
+[notifications]
+completed = false
+
+[[targets]]
+name = "local"
+"#,
+        )
+        .unwrap();
+
+        Config::set_notifications_enabled_file(Some(&path), true).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# retained operator note\n"));
+        assert!(text.contains("enabled = true"));
+        assert!(text.contains("completed = false"));
+        let config = Config::parse(&text).unwrap();
+        assert!(config.notifications.enabled);
+        assert!(!config.notifications.completed);
+
+        fs::write(
+            &path,
+            text.replace("enabled = true", "enabled = true # retained switch note"),
+        )
+        .unwrap();
+        Config::set_notifications_enabled_file(Some(&path), false).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enabled = false # retained switch note"));
+        assert!(!Config::parse(&text).unwrap().notifications.enabled);
+
+        let inserted_path = directory.path().join("without-notifications.toml");
+        Config::add_target_file(
+            Some(&inserted_path),
+            Target {
+                name: "inserted".to_owned(),
+                ssh: None,
+                discover_sessions: false,
+                session: None,
+                socket: None,
+                herdr_bins: vec!["herdr".to_owned()],
+            },
+        )
+        .unwrap();
+        Config::set_notifications_enabled_file(Some(&inserted_path), true).unwrap();
+        let inserted = fs::read_to_string(inserted_path).unwrap();
+        assert!(inserted.contains("[notifications]\nenabled = true"));
+        assert!(Config::parse(&inserted).unwrap().notifications.enabled);
     }
 
     #[test]
