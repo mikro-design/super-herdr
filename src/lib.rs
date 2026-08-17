@@ -10,3 +10,4 @@ pub mod terminal;
 pub mod transport;
 pub mod tui;
 pub mod ui_state;
+pub mod workspace_move;

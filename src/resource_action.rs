@@ -20,6 +20,16 @@ impl SplitDirection {
             Self::Down => "down",
         }
     }
+
+    /// Herdr reports and accepts the same split names in its documented layout
+    /// export and `pane.move` destination.
+    pub fn from_api_value(value: &str) -> Option<Self> {
+        match value {
+            "right" => Some(Self::Right),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +51,14 @@ pub enum ResourceAction {
     CloseWorkspace {
         workspace: WorkspaceId,
         label: String,
+    },
+    /// Move every tab of one workspace into another workspace of the same
+    /// session. Herdr relocates live panes, so no process is restarted.
+    MoveWorkspace {
+        workspace: WorkspaceId,
+        destination: WorkspaceId,
+        label: String,
+        destination_label: String,
     },
     CreateTab {
         workspace: WorkspaceId,
@@ -93,6 +111,7 @@ impl ResourceAction {
             Self::CreateWorkspace { target } => Some(target.clone()),
             Self::RenameWorkspace { workspace, .. }
             | Self::CloseWorkspace { workspace, .. }
+            | Self::MoveWorkspace { workspace, .. }
             | Self::CreateTab { workspace } => Some(workspace.target_session()),
             Self::RenameTab { tab, .. } | Self::CloseTab { tab, .. } => Some(tab.target_session()),
             Self::OpenTargetManager | Self::OpenAgentNavigator | Self::OpenAttentionCenter => None,
@@ -110,6 +129,11 @@ impl ResourceAction {
                 format!("Rename workspace {current_label:?}")
             }
             Self::CloseWorkspace { label, .. } => format!("Close workspace {label:?}"),
+            Self::MoveWorkspace {
+                label,
+                destination_label,
+                ..
+            } => format!("Move workspace {label:?} into {destination_label:?}"),
             Self::CreateTab { .. } => "Create tab".to_owned(),
             Self::RenameTab { current_label, .. } => format!("Rename tab {current_label:?}"),
             Self::CloseTab { label, .. } => format!("Close tab {label:?}"),
@@ -149,6 +173,27 @@ mod tests {
         assert_eq!(action.palette_scope(), "build/toolchains");
         assert!(action.mutates_herdr());
         assert!(action.is_destructive());
+    }
+
+    #[test]
+    fn a_workspace_move_stays_qualified_and_is_not_a_close() {
+        let action = ResourceAction::MoveWorkspace {
+            workspace: WorkspaceId::new("build", "toolchains", "w2"),
+            destination: WorkspaceId::new("build", "toolchains", "w5"),
+            label: "compiler".to_owned(),
+            destination_label: "archive".to_owned(),
+        };
+
+        assert_eq!(
+            action.target_session(),
+            Some(TargetSession::new("build", "toolchains"))
+        );
+        assert!(action.mutates_herdr());
+        assert!(!action.is_destructive());
+        assert_eq!(
+            action.palette_label(),
+            "Move workspace \"compiler\" into \"archive\""
+        );
     }
 
     #[test]

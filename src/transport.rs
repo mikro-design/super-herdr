@@ -1,4 +1,6 @@
 use std::future::Future;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -465,24 +467,52 @@ impl Drop for SshSocketForward {
     }
 }
 
+/// A reachable Herdr API socket. For an SSH target the forwarding child stays
+/// alive with the endpoint, so several one-shot requests share one tunnel.
+#[cfg(unix)]
+struct SocketEndpoint {
+    path: PathBuf,
+    forward: Option<SshSocketForward>,
+}
+
+#[cfg(unix)]
+impl SocketEndpoint {
+    async fn connect(&self, connect_timeout: Duration) -> Result<UnixStream, SnapshotError> {
+        timeout(connect_timeout, UnixStream::connect(&self.path))
+            .await
+            .map_err(|_| SnapshotError::timed_out(connect_timeout))?
+            .map_err(|_| SnapshotError::unavailable("failed to connect to the Herdr socket"))
+    }
+}
+
 #[cfg(unix)]
 async fn open_socket_connection(
     target: &Target,
     config: &TransportConfig,
     connect_timeout: Duration,
 ) -> Result<SocketConnection, SnapshotError> {
+    let endpoint = open_socket_endpoint(target, config, connect_timeout).await?;
+    let stream = endpoint.connect(connect_timeout).await?;
+    Ok(SocketConnection {
+        stream,
+        _forward: endpoint.forward,
+    })
+}
+
+#[cfg(unix)]
+async fn open_socket_endpoint(
+    target: &Target,
+    config: &TransportConfig,
+    connect_timeout: Duration,
+) -> Result<SocketEndpoint, SnapshotError> {
     let socket = target
         .socket
         .as_deref()
         .ok_or_else(|| SnapshotError::unavailable("Herdr API socket is not configured"))?;
     let Some(destination) = target.ssh.as_deref() else {
-        let stream = timeout(connect_timeout, UnixStream::connect(socket))
-            .await
-            .map_err(|_| SnapshotError::timed_out(connect_timeout))?
-            .map_err(|_| SnapshotError::unavailable("failed to connect to local Herdr socket"))?;
-        return Ok(SocketConnection {
-            stream,
-            _forward: None,
+        return Ok(SocketEndpoint {
+            path: PathBuf::from(socket),
+            forward: None,
         });
     };
 
@@ -530,15 +560,91 @@ async fn open_socket_connection(
             ));
         }
         match UnixStream::connect(&local_socket).await {
-            Ok(stream) => {
-                return Ok(SocketConnection {
-                    stream,
-                    _forward: Some(guard),
+            // The probe only proves the tunnel is listening. Herdr serves one
+            // request per connection, so callers open their own.
+            Ok(_) => {
+                return Ok(SocketEndpoint {
+                    path: local_socket,
+                    forward: Some(guard),
                 });
             }
             Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
             Err(_) => return Err(SnapshotError::timed_out(connect_timeout)),
         }
+    }
+}
+
+const MAX_API_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// A private Herdr API endpoint that carries several documented requests.
+///
+/// Herdr answers one request per connection and then closes it, so every
+/// request opens its own socket. For an SSH target the forwarding child is
+/// created once and outlives the individual requests, so a multi-step operation
+/// pays for one tunnel instead of one per request.
+#[cfg(unix)]
+pub struct ApiSession {
+    endpoint: SocketEndpoint,
+    request_timeout: Duration,
+    next_id: u64,
+}
+
+#[cfg(unix)]
+impl ApiSession {
+    pub async fn open(
+        target: &Target,
+        config: &TransportConfig,
+        request_timeout: Duration,
+    ) -> Result<Self, SnapshotError> {
+        Ok(Self {
+            endpoint: open_socket_endpoint(target, config, request_timeout).await?,
+            request_timeout,
+            next_id: 0,
+        })
+    }
+
+    /// Issue one documented API request and return its `result` value. Server
+    /// diagnostics are never surfaced; a rejected request reports only its
+    /// method so terminal or agent content cannot leak into the UI.
+    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, SnapshotError> {
+        self.next_id = self.next_id.saturating_add(1);
+        let id = format!("super-herdr:{method}:{}", self.next_id);
+        let request = serde_json::json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut encoded = serde_json::to_vec(&request)
+            .map_err(|_| SnapshotError::unavailable(format!("failed to encode {method}")))?;
+        if encoded.len().saturating_add(1) > MAX_API_REQUEST_BYTES {
+            return Err(SnapshotError::unavailable(format!(
+                "{method} exceeds Herdr's API request size limit"
+            )));
+        }
+        encoded.push(b'\n');
+
+        let stream = self.endpoint.connect(self.request_timeout).await?;
+        let mut reader = BufReader::new(stream);
+        timeout(self.request_timeout, reader.get_mut().write_all(&encoded))
+            .await
+            .map_err(|_| SnapshotError::timed_out(self.request_timeout))?
+            .map_err(|_| SnapshotError::unavailable(format!("failed to write {method}")))?;
+
+        let response = read_socket_line(&mut reader, self.request_timeout).await?;
+        if response.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+            return Err(SnapshotError::unavailable(format!(
+                "Herdr returned an unexpected {method} response"
+            )));
+        }
+        if response.get("error").is_some() {
+            return Err(SnapshotError::unavailable(format!(
+                "Herdr rejected {method} (diagnostics redacted)"
+            )));
+        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| SnapshotError::unavailable(format!("{method} returned no result")))
     }
 }
 
@@ -579,50 +685,20 @@ async fn send_pane_input_unix(
     text: &str,
     connect_timeout: Duration,
 ) -> Result<(), SnapshotError> {
-    const REQUEST_ID: &str = "super-herdr:pane-input";
-    const MAX_API_REQUEST_BYTES: usize = 1024 * 1024;
-
-    let request = serde_json::json!({
-        "id": REQUEST_ID,
-        "method": "pane.send_input",
-        "params": {
-            "pane_id": pane_id,
-            "text": text,
-            "keys": [],
-        },
+    let params = serde_json::json!({
+        "pane_id": pane_id,
+        "text": text,
+        "keys": [],
     });
-    let mut encoded = serde_json::to_vec(&request)
-        .map_err(|_| SnapshotError::unavailable("failed to encode semantic pane input"))?;
-    if encoded.len().saturating_add(1) > MAX_API_REQUEST_BYTES {
+    if serde_json::to_vec(&params).map_or(usize::MAX, |encoded| encoded.len())
+        >= MAX_API_REQUEST_BYTES
+    {
         return Err(SnapshotError::unavailable(
             "paste exceeds Herdr's API request size limit",
         ));
     }
-    encoded.push(b'\n');
-
-    let mut connection = open_socket_connection(target, config, connect_timeout).await?;
-    connection
-        .stream
-        .write_all(&encoded)
-        .await
-        .map_err(|_| SnapshotError::unavailable("failed to write semantic pane input"))?;
-    let mut reader = BufReader::new(connection.stream);
-    let response = read_socket_line(&mut reader, connect_timeout).await?;
-    if response.get("id").and_then(Value::as_str) != Some(REQUEST_ID) {
-        return Err(SnapshotError::unavailable(
-            "Herdr returned an unexpected pane-input response",
-        ));
-    }
-    if response.get("error").is_some() {
-        return Err(SnapshotError::unavailable(
-            "Herdr rejected semantic pane input (diagnostics redacted)",
-        ));
-    }
-    if response.get("result").is_none() {
-        return Err(SnapshotError::unavailable(
-            "Herdr pane-input response did not contain a result",
-        ));
-    }
+    let mut session = ApiSession::open(target, config, connect_timeout).await?;
+    session.request("pane.send_input", params).await?;
     Ok(())
 }
 
@@ -1033,14 +1109,15 @@ mod tests {
             let mut request = String::new();
             reader.read_line(&mut request).await.unwrap();
             let request: serde_json::Value = serde_json::from_str(&request).unwrap();
-            assert_eq!(request["id"], "super-herdr:pane-input");
+            let id = request["id"].as_str().unwrap().to_owned();
+            assert!(id.starts_with("super-herdr:pane.send_input:"));
             assert_eq!(request["method"], "pane.send_input");
             assert_eq!(request["params"]["pane_id"], "w2:p3");
             assert_eq!(request["params"]["text"], "first\nsecond\nthird");
             assert_eq!(request["params"]["keys"], serde_json::json!([]));
             reader
                 .get_mut()
-                .write_all(b"{\"id\":\"super-herdr:pane-input\",\"result\":{\"type\":\"ok\"}}\n")
+                .write_all(format!("{{\"id\":{id:?},\"result\":{{\"type\":\"ok\"}}}}\n").as_bytes())
                 .await
                 .unwrap();
         });

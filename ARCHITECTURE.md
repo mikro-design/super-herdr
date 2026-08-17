@@ -150,6 +150,25 @@ workspace, tab, or pane under the pointer; it never reconstructs identity from a
 display label. Destructive workspace, tab, and pane actions must pass through
 the same qualified confirmation path.
 
+Moving a workspace is a multi-request action inside one session. Super-Herdr
+reads each source tab's split tree through the documented layout export, reduces
+it to one anchor pane plus the ordered splits that rebuild it, and replays that
+plan as documented pane moves into the destination workspace. Herdr moves live
+panes, so processes, scrollback, and agent authority survive; because a pane
+identifier encodes its workspace, each later split targets the identifier the
+previous move returned. The whole sequence runs in one task behind the same
+single-action guard and reports one result, and a partial failure leaves already
+moved tabs in the destination and the remainder in the source without closing
+anything. A session is a separate server process that owns its panes, and
+protocol 19 has no cross-session transfer, so destinations are restricted to the
+source session and cross-session recreation is not silently substituted for a
+move.
+
+The private API socket answers one request per connection. A multi-request action
+therefore opens a connection per request while holding the SSH forwarding child
+for its whole sequence, so a remote move pays for one tunnel rather than one per
+pane.
+
 The outer TUI captures SGR mouse input and translates terminal coordinates back
 to the selected pane. A left press is held until the gesture is resolved: release
 without movement becomes an application click, while movement becomes local text

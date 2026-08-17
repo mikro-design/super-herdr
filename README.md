@@ -35,6 +35,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
   deduplication, and qualified jump-and-mark-read behavior.
 - Opt-in native desktop notifications for selected attention transitions, with
   startup-history suppression, coalescing, and rate limiting.
+- Live workspace moves inside one Herdr session: every tab is rebuilt in the
+  destination workspace with its splits and ratios, and no process restarts.
 - A fuzzy-searchable action palette for navigation and qualified workspace,
   tab, and pane lifecycle operations.
 - Right-click session, workspace, tab, and pane menus backed by those same
@@ -455,6 +457,18 @@ Super-Herdr process running through SSH or nested inside Herdr reports native
 delivery as unavailable; keep it on the desktop for this feature. Disable it at
 any time with `super-herdr notifications disable`.
 
+A workspace can be moved into another workspace of the same Herdr session, from
+the action palette or the workspace context menu (`Move workspace "a" into
+"b"`). Super-Herdr reads each source tab's split tree from Herdr and replays it
+with documented pane moves, so panes keep their processes, scrollback, and
+agents; only their identifiers are re-qualified by Herdr. The whole sequence
+runs as one action: if a step fails, the tabs already moved stay in the
+destination and the rest stay in the source, and nothing is closed. The context
+menu is not scrollable, so it lists at most eight destinations in workspace
+order; the action palette lists every one. Destinations in another session or on
+another host are never offered—Herdr's protocol 19 has no cross-session
+transfer.
+
 Right-clicking a session, workspace, tab, or pane opens a pointer-anchored menu.
 Use the mouse, `j`/`k`, or the arrow keys to choose an action and `Enter` to run
 it. Workspace, tab, and pane closure still goes through the same qualified
@@ -598,6 +612,12 @@ cargo clippy -j 4 -- -D warnings
   when a discovered session is selected.
 - Native notifications are delivery-only; clicking one does not yet jump to the
   qualified pane. Use the lower attention feed or `Ctrl+] e` to jump.
+- A workspace cannot be moved between Herdr sessions. Each session is a separate
+  server process owning its panes, and protocol 19 exposes no cross-session
+  transfer; `workspace.move` only reorders workspaces inside one session. A
+  future slice can recreate a workspace in another session from its exported
+  layout, but that restarts every process and drops scrollback, so it will be
+  offered as an explicit recreate rather than as a move.
 - File-list clipboard upload is not implemented; the bridge currently accepts PNG
   images only.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are

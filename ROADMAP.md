@@ -23,12 +23,24 @@ Work is ordered by dependency and product risk.
   lifecycle operations.
 - Qualified mouse context menus for sessions, workspaces, tabs, and panes, backed
   by the shared resource-action and close-confirmation paths.
+- Live in-session workspace moves that replay an exported split tree with
+  documented pane moves and restart no process.
 
 ## Next
 
 1. Execute and record the full desktop matrix in `TESTING.md`.
 2. Add signed release artifacts and package-manager installation.
 3. Select an explicit project license before inviting external contributions.
+
+## Blocked on Herdr
+
+- Moving a workspace between sessions on one host. Each session is its own
+  server process, and protocol 19 has no cross-session transfer. A true move
+  needs a Herdr-side transfer that hands live PTYs to the destination server,
+  the way `server.live_handoff` already does across an upgrade. Until then, the
+  only client-side option is recreating the workspace from its exported layout,
+  which restarts every process and drops scrollback; it must be presented as an
+  explicit recreate, never as a move.
 
 ## Later
 

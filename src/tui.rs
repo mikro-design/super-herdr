@@ -46,6 +46,7 @@ use crate::transport::{
     expand_discovered_sessions, run_herdr_operation, send_pane_input,
 };
 use crate::ui_state::{UiState, UiStateStore};
+use crate::workspace_move;
 
 const PREFIX_KEY: u8 = 0x1d;
 const HERDR_PREFIX_KEY: u8 = 0x02;
@@ -2309,6 +2310,99 @@ fn spawn_qualified_herdr_action(
     });
 }
 
+struct WorkspaceMove {
+    workspace: WorkspaceId,
+    destination: WorkspaceId,
+    label: String,
+    destination_label: String,
+}
+
+/// Move one workspace into another on the same Herdr session. The whole
+/// multi-request sequence runs in one task and reports one result, so the
+/// single-action guard and per-target failure isolation still hold. Herdr
+/// re-qualifies moved pane identifiers, so the selection follows server focus
+/// once the move lands.
+fn spawn_workspace_move(
+    state: &FederationState,
+    targets: &BTreeMap<TargetSession, Target>,
+    transport_config: &crate::config::TransportConfig,
+    app: &mut App,
+    move_request: WorkspaceMove,
+) {
+    if app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    let key = move_request.workspace.target_session();
+    if key != move_request.destination.target_session() {
+        app.message = Some("Herdr: a workspace can only move inside one session".to_owned());
+        return;
+    }
+    if move_request.workspace == move_request.destination {
+        app.message = Some("Herdr: a workspace cannot move into itself".to_owned());
+        return;
+    }
+    if state
+        .targets
+        .get(&key)
+        .is_none_or(|runtime| runtime.connection != TargetConnectionState::Live)
+    {
+        app.message = Some(format!("Herdr: {key} is not connected"));
+        return;
+    }
+    let Some(target) = targets.get(&key).cloned() else {
+        app.message = Some("Herdr: selected target is unavailable".to_owned());
+        return;
+    };
+    let Some(sender) = app.herdr_action_sender.clone() else {
+        app.message = Some("Herdr action routing is unavailable".to_owned());
+        return;
+    };
+    let WorkspaceMove {
+        workspace,
+        destination,
+        label,
+        destination_label,
+    } = move_request;
+    let transport = transport_config.clone();
+    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
+    app.herdr_action_inflight = true;
+    app.message = Some(format!(
+        "Herdr: moving workspace {label:?} into {destination_label:?} on {key}…"
+    ));
+    tokio::spawn(async move {
+        let outcome = workspace_move::move_workspace(
+            &target,
+            &transport,
+            &workspace.resource,
+            &destination.resource,
+            command_timeout,
+        )
+        .await;
+        let (result, description) = match outcome {
+            Ok(summary) => (
+                Ok(()),
+                format!(
+                    "moved {} tab(s) and {} pane(s) from workspace {label:?} into {destination_label:?} on {key}",
+                    summary.tabs, summary.panes
+                ),
+            ),
+            Err(error) => (
+                Err(format!(
+                    "moving workspace {label:?} into {destination_label:?} on {key}: {error}"
+                )),
+                String::new(),
+            ),
+        };
+        let _ = sender.send(HerdrActionEvent {
+            result,
+            description,
+            follow_server_focus: true,
+            clipboard_feedback: None,
+        });
+    });
+}
+
 fn request_workspace_close(state: &FederationState, app: &mut App) {
     if app.herdr_action_inflight {
         app.message = Some("Herdr action already in progress".to_owned());
@@ -2373,6 +2467,7 @@ fn command_palette_actions(
             actions.push(ResourceAction::CreateTab {
                 workspace: workspace.id.clone(),
             });
+            actions.extend(workspace_move_actions(snapshot, &workspace.id));
         }
         if let Some(tab_id) = pane.tab.as_ref()
             && let Some(tab) = snapshot.tabs.get(tab_id)
@@ -2479,6 +2574,38 @@ fn command_palette_actions(
     actions
 }
 
+/// A context menu is not scrollable, so it lists at most this many move
+/// destinations in workspace-identifier order. The action palette lists every
+/// destination and is searchable.
+const MAX_CONTEXT_MENU_MOVE_DESTINATIONS: usize = 8;
+
+/// Offer a move into every other workspace of the same session. Herdr relocates
+/// live panes inside one server process, so a destination in another session is
+/// never listed as a move.
+fn workspace_move_actions(
+    snapshot: &NormalizedSnapshot,
+    source: &WorkspaceId,
+) -> Vec<ResourceAction> {
+    let Some(workspace) = snapshot.workspaces.get(source) else {
+        return Vec::new();
+    };
+    let label = display_label(&workspace.id.resource, workspace.label.as_deref());
+    snapshot
+        .workspaces
+        .values()
+        .filter(|destination| &destination.id != source)
+        .map(|destination| ResourceAction::MoveWorkspace {
+            workspace: source.clone(),
+            destination: destination.id.clone(),
+            label: label.clone(),
+            destination_label: display_label(
+                &destination.id.resource,
+                destination.label.as_deref(),
+            ),
+        })
+        .collect()
+}
+
 fn context_menu_for_target(
     state: &FederationState,
     target: ContextTarget,
@@ -2496,19 +2623,23 @@ fn context_menu_for_target(
             let snapshot = actionable_snapshot(state, &workspace.target_session())?;
             let resource = snapshot.workspaces.get(&workspace)?;
             let label = display_label(&resource.id.resource, resource.label.as_deref());
-            (
-                format!("workspace {label} · {}", workspace.target_session()),
-                vec![
-                    ResourceAction::CreateTab {
-                        workspace: workspace.clone(),
-                    },
-                    ResourceAction::RenameWorkspace {
-                        workspace: workspace.clone(),
-                        current_label: label.clone(),
-                    },
-                    ResourceAction::CloseWorkspace { workspace, label },
-                ],
-            )
+            let mut actions = vec![
+                ResourceAction::CreateTab {
+                    workspace: workspace.clone(),
+                },
+                ResourceAction::RenameWorkspace {
+                    workspace: workspace.clone(),
+                    current_label: label.clone(),
+                },
+            ];
+            actions.extend(
+                workspace_move_actions(snapshot, &workspace)
+                    .into_iter()
+                    .take(MAX_CONTEXT_MENU_MOVE_DESTINATIONS),
+            );
+            let title = format!("workspace {label} · {}", workspace.target_session());
+            actions.push(ResourceAction::CloseWorkspace { workspace, label });
+            (title, actions)
         }
         ContextTarget::Tab(tab) => {
             let snapshot = actionable_snapshot(state, &tab.target_session())?;
@@ -2847,6 +2978,25 @@ fn execute_resource_action(
                     ],
                     description: format!("created tab on {target_session}"),
                     follow_server_focus: true,
+                },
+            );
+        }
+        ResourceAction::MoveWorkspace {
+            workspace,
+            destination,
+            label,
+            destination_label,
+        } => {
+            spawn_workspace_move(
+                state,
+                targets,
+                transport_config,
+                app,
+                WorkspaceMove {
+                    workspace,
+                    destination,
+                    label,
+                    destination_label,
                 },
             );
         }
@@ -6280,11 +6430,12 @@ mod tests {
     use super::{
         AgentFilter, AgentNavigator, App, AttentionCenter, AttentionIndex, CellPosition,
         ClipboardFeedback, ContextTarget, DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode,
-        MAX_CLIPBOARD_BYTES, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection,
-        SIDEBAR_WIDTH, SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish,
-        TargetForm, TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent,
-        TargetTestState, TerminalSelection, agent_jump_entries, capture_screen_rows,
-        capture_selection_viewport, clamped_pane_position, context_menu_for_target, cycle_tab,
+        MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS, MOUSE_CAPTURE_ENABLE, MouseInput,
+        PREFIX_KEY, PaneDirection, SIDEBAR_WIDTH, SelectionAutoscroll,
+        SelectionAutoscrollDirection, SelectionFinish, TargetForm, TargetManager,
+        TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
+        TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
+        clamped_pane_position, command_palette_actions, context_menu_for_target, cycle_tab,
         desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
         federation_routes_changed, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
         handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
@@ -6498,6 +6649,109 @@ mod tests {
             workspace,
             label: "simulator".to_owned(),
         }));
+    }
+
+    #[test]
+    fn workspace_moves_are_offered_only_inside_one_session() {
+        let key = TargetSession::new("host-b", "work");
+        let other = TargetSession::new("host-c", "build");
+        let workspace = WorkspaceId::new("host-b", "work", "w2");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [
+                    {"workspace_id": "w2", "label": "simulator"},
+                    {"workspace_id": "w3", "label": "toolchain"}
+                ],
+                "tabs": [{"tab_id": "w2:t1", "workspace_id": "w2"}],
+                "panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"}]
+            }),
+        );
+        let other_snapshot = NormalizedSnapshot::from_value(
+            &other,
+            &json!({
+                "workspaces": [{"workspace_id": "w1", "label": "remote"}],
+                "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key.clone(), TargetConnectionState::Live, Some(snapshot)),
+        );
+        state.targets.insert(
+            other.clone(),
+            runtime(other, TargetConnectionState::Live, Some(other_snapshot)),
+        );
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Workspace(workspace.clone()),
+            ratatui::layout::Position::new(4, 5),
+        )
+        .unwrap();
+
+        let moves = menu
+            .actions
+            .iter()
+            .filter(|action| matches!(action, ResourceAction::MoveWorkspace { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            moves,
+            vec![&ResourceAction::MoveWorkspace {
+                workspace,
+                destination: WorkspaceId::new("host-b", "work", "w3"),
+                label: "simulator".to_owned(),
+                destination_label: "toolchain".to_owned(),
+            }]
+        );
+        assert!(matches!(
+            menu.actions.last(),
+            Some(ResourceAction::CloseWorkspace { .. })
+        ));
+    }
+
+    #[test]
+    fn a_crowded_session_caps_menu_destinations_but_not_the_palette() {
+        let key = TargetSession::new("host-b", "work");
+        let workspaces = (1..=12)
+            .map(|index| json!({"workspace_id": format!("w{index}")}))
+            .collect::<Vec<_>>();
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": workspaces,
+                "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key.clone(), TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Workspace(WorkspaceId::new("host-b", "work", "w1")),
+            ratatui::layout::Position::new(0, 0),
+        )
+        .unwrap();
+        let menu_moves = menu
+            .actions
+            .iter()
+            .filter(|action| matches!(action, ResourceAction::MoveWorkspace { .. }))
+            .count();
+        assert_eq!(menu_moves, MAX_CONTEXT_MENU_MOVE_DESTINATIONS);
+
+        let palette =
+            command_palette_actions(&state, Some(&PaneId::new("host-b", "work", "w1:p1")));
+        let palette_moves = palette
+            .iter()
+            .filter(|action| matches!(action, ResourceAction::MoveWorkspace { .. }))
+            .count();
+        assert_eq!(palette_moves, 11);
     }
 
     #[tokio::test]

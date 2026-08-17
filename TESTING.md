@@ -29,6 +29,10 @@ before file writes, stale asynchronous-result rejection, and exact
 session/socket selection from a sanitized discovery result. CLI output coverage
 must verify that redirected output has no ANSI escapes and that a downstream
 consumer closing its pipe early exits cleanly without a panic.
+Workspace-move coverage must prove that a nested exported layout is rebuilt
+top-down, that each split targets the identifier Herdr returned for the
+previously moved pane, that an unsupported layout node is rejected instead of
+guessed, and that destinations outside the source session are never offered.
 Notification coverage must prove delivery is disabled by default, startup
 history is skipped, event filters are honored, repeated events are deduplicated,
 bursts are coalesced and rate-limited, and delivery objects exclude status,
@@ -95,6 +99,16 @@ For every applicable row, verify:
     notification text contains metadata only, and disabling takes effect without
     reconnecting terminal routes. A nested SSH or Herdr run must report native
     delivery as unavailable without affecting the TUI.
+
+17. Build a workspace with several tabs and nested splits, run at least one
+    long-running process and one agent in it, and move it into another workspace
+    of the same session. Verify the destination reproduces every tab, split
+    direction, and ratio, that no process restarted and scrollback survived, that
+    the emptied source workspace disappears without a close confirmation, and
+    that the selection follows Herdr's focus after the identifiers are
+    re-qualified. Repeat over SSH and confirm one forwarding child serves the
+    whole move. Verify no move destination is offered in another session or on
+    another host.
 
 Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put
