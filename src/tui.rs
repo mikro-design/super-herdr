@@ -679,8 +679,11 @@ struct TargetTestEvent {
     result: Result<SessionDiscovery, String>,
 }
 
-struct NotificationDeliveryEvent {
-    result: Result<(), String>,
+/// What a native notification reported back: whether the desktop accepted it,
+/// and later whether the person clicked it.
+enum NotificationEvent {
+    Delivered(Result<(), String>),
+    Activated(PaneId),
 }
 
 struct HerdrActionEvent {
@@ -761,7 +764,7 @@ struct App {
     attention_store: Option<AttentionStore>,
     attention_center: Option<AttentionCenter>,
     notification_queue: NotificationQueue,
-    notification_sender: Option<mpsc::UnboundedSender<NotificationDeliveryEvent>>,
+    notification_sender: Option<mpsc::UnboundedSender<NotificationEvent>>,
     notification_inflight: bool,
     notification_error_reported: bool,
     command_palette: Option<CommandPalette>,
@@ -1037,14 +1040,21 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
             }
             event = notification_events.recv() => {
                 if let Some(event) = event {
-                    app.notification_inflight = false;
-                    match event.result {
-                        Ok(()) => app.notification_error_reported = false,
-                        Err(error) if !app.notification_error_reported => {
-                            app.notification_error_reported = true;
-                            app.message = Some(format!("desktop notification unavailable: {error}"));
+                    match event {
+                        NotificationEvent::Delivered(result) => {
+                            app.notification_inflight = false;
+                            match result {
+                                Ok(()) => app.notification_error_reported = false,
+                                Err(error) if !app.notification_error_reported => {
+                                    app.notification_error_reported = true;
+                                    app.message = Some(format!("desktop notification unavailable: {error}"));
+                                }
+                                Err(_) => {}
+                            }
                         }
-                        Err(_) => {}
+                        NotificationEvent::Activated(pane) => {
+                            jump_from_notification(&updates.borrow(), &mut app, pane);
+                        }
                     }
                     should_draw = true;
                 }
@@ -1228,11 +1238,39 @@ fn spawn_notification_delivery(delivery: NotificationDelivery, app: &mut App) {
     };
     app.notification_inflight = true;
     tokio::spawn(async move {
-        let result = notifications::deliver(delivery)
-            .await
-            .map_err(|error| error.to_string());
-        let _ = sender.send(NotificationDeliveryEvent { result });
+        let pending = match notifications::dispatch(&delivery).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let _ = sender.send(NotificationEvent::Delivered(Err(error.to_string())));
+                return;
+            }
+        };
+        // Delivery is complete once the desktop accepts the notification, so
+        // the next one is never gated on someone reading this one.
+        let _ = sender.send(NotificationEvent::Delivered(Ok(())));
+        if let Ok(Some(pane)) = notifications::wait_for_activation(pending).await {
+            let _ = sender.send(NotificationEvent::Activated(pane));
+        }
     });
+}
+
+/// Route a clicked notification to its qualified pane. The identifier is only
+/// as fresh as the notification, so a pane that has since gone marks its events
+/// read instead of moving the selection, exactly as the attention feed does.
+fn jump_from_notification(state: &FederationState, app: &mut App, pane: PaneId) {
+    if pane_is_live(state, &pane) {
+        let target = pane.target_session();
+        select_pane(app, pane);
+        app.message = Some(format!("jumped to the notified pane on {target}"));
+        return;
+    }
+    if app.attention.mark_seen_for_pane(&pane) {
+        persist_attention(app);
+    }
+    app.message = Some(format!(
+        "the notified pane on {} is no longer live",
+        pane.target_session()
+    ));
 }
 
 async fn handle_decoded_input(
@@ -6572,12 +6610,13 @@ mod tests {
         federation_routes_changed, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
         handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
         handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
-        mouse_event_allowed, mouse_passthrough_enabled, pane_direction_score, reconcile_selection,
-        refresh_attention, render_vt_screen, safe_text, select_neighbor_pane, select_pane,
-        select_workspace, selected_terminal_text, sidebar_areas, sidebar_attention_rows,
-        sidebar_block, sidebar_content_height, sidebar_pane_at_row, tab_at_column,
-        target_manager_controls, terminal_paste_payload, ui_areas, update_selection_after_frame,
-        update_sidebar_hit_areas, viewport_shift_distance, visible_pane_areas,
+        jump_from_notification, mouse_event_allowed, mouse_passthrough_enabled,
+        pane_direction_score, reconcile_selection, refresh_attention, render_vt_screen, safe_text,
+        select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_areas,
+        sidebar_attention_rows, sidebar_block, sidebar_content_height, sidebar_pane_at_row,
+        tab_at_column, target_manager_controls, terminal_paste_payload, ui_areas,
+        update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
+        visible_pane_areas,
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession, WorkspaceId};
@@ -6842,6 +6881,59 @@ mod tests {
             menu.actions.last(),
             Some(ResourceAction::CloseWorkspace { .. })
         ));
+    }
+
+    #[test]
+    fn a_clicked_notification_jumps_only_while_its_pane_is_live() {
+        let key = TargetSession::new("host-a", "work");
+        let pane = PaneId::new("host-a", "work", "w1:p1");
+        let state_with_status = |status: &str| {
+            let snapshot = NormalizedSnapshot::from_value(
+                &key,
+                &json!({
+                    "workspaces": [{"workspace_id": "w1", "label": "compiler"}],
+                    "panes": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "agent": "builder",
+                        "agent_status": status
+                    }],
+                    "agents": [{
+                        "pane_id": "w1:p1",
+                        "name": "builder",
+                        "agent_status": status
+                    }]
+                }),
+            );
+            let mut state = FederationState::default();
+            state.targets.insert(
+                key.clone(),
+                runtime(key.clone(), TargetConnectionState::Live, Some(snapshot)),
+            );
+            state
+        };
+        let working = state_with_status("working");
+        let live = state_with_status("blocked");
+        let notify = |app: &mut App| {
+            refresh_attention(&working, app);
+            refresh_attention(&live, app);
+        };
+        let mut app = App::default();
+        notify(&mut app);
+        assert_eq!(app.attention.unread_count(), 1);
+
+        jump_from_notification(&live, &mut app, pane.clone());
+        assert_eq!(app.selected_pane, Some(pane.clone()));
+        assert!(displayed_message(&app).unwrap().contains("host-a/work"));
+
+        // The identifier is only as fresh as the notification that carried it.
+        let mut app = App::default();
+        notify(&mut app);
+        let gone = FederationState::default();
+        jump_from_notification(&gone, &mut app, pane);
+        assert_eq!(app.selected_pane, None);
+        assert_eq!(app.attention.unread_count(), 0);
+        assert!(displayed_message(&app).unwrap().contains("no longer live"));
     }
 
     #[test]

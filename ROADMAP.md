@@ -18,7 +18,8 @@ Work is ordered by dependency and product risk.
 - Durable payload-free attention history with unread transition tracking and
   deduplication across restarts.
 - Opt-in native desktop delivery for filtered metadata-only attention events,
-  with history suppression, coalescing, rate limiting, and failure isolation.
+  with history suppression, coalescing, rate limiting, and failure isolation,
+  and click-to-jump routing where the desktop reports actions.
 - Fuzzy-searchable action palette with qualified workspace, tab, and pane
   lifecycle operations.
 - Qualified mouse context menus for sessions, workspaces, tabs, and panes, backed

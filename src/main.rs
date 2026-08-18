@@ -327,7 +327,7 @@ async fn run() -> Result<ExitCode> {
         Commands::Notifications { command } => {
             match command {
                 NotificationCommands::Check => {
-                    for line in notifications::diagnostic_lines(&config.notifications) {
+                    for line in notifications::diagnostic_lines(&config.notifications).await {
                         stdout_line(format_args!("{line}"))?;
                     }
                 }

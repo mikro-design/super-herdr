@@ -38,7 +38,12 @@ ratios, labels, and working directories while dropping pane identifiers,
 commands, and environment, that a workspace exceeding the pane bound is refused,
 that the source session is only read, and that recreation destinations are other
 live sessions rather than workspaces.
-Notification coverage must prove delivery is disabled by default, startup
+Notification coverage must prove that click reporting is used only when the
+desktop advertises both an action and a wait option, that only the one offered
+action identifier counts as an activation, that a notification naming no pane can
+never move the selection, and that the pane identifier stays out of the
+notification text. Notification coverage must also prove delivery is disabled by
+default, startup
 history is skipped, event filters are honored, repeated events are deduplicated,
 bursts are coalesced and rate-limited, and delivery objects exclude status,
 terminal, and clipboard payloads. Configuration toggles must preserve comments
@@ -102,7 +107,11 @@ For every applicable row, verify:
     send the synthetic test, and produce matching agent transitions. Verify old
     persisted history is not replayed, bursts are coalesced and rate-limited,
     notification text contains metadata only, and disabling takes effect without
-    reconnecting terminal routes. A nested SSH or Herdr run must report native
+    reconnecting terminal routes. Where `notifications check` reports click to
+    jump as available, click a delivered notification and verify it selects the
+    qualified pane, that a notification for a pane closed in the meantime
+    reports it is no longer live, and that a burst is not delayed by leaving an
+    earlier notification unclicked. A nested SSH or Herdr run must report native
     delivery as unavailable without affecting the TUI.
 
 17. Build a workspace with several tabs and nested splits, run at least one

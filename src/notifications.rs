@@ -3,17 +3,25 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 use crate::attention::{AttentionEvent, AttentionEventKind};
 use crate::config::NotificationsConfig;
+use crate::model::PaneId;
 
 const COALESCE_WINDOW: Duration = Duration::from_millis(500);
 const MAX_PENDING_METADATA: usize = 16;
+/// How long a delivered notification stays on screen. A notification that can
+/// report a click is waited on for this long plus the command timeout.
+const EXPIRE: Duration = Duration::from_secs(10);
+/// Identifier of the one offered action. The desktop reports it on stdout when
+/// the notification is clicked.
+const JUMP_ACTION: &str = "jump";
 
 #[derive(Debug)]
 pub struct NotificationQueue {
@@ -88,6 +96,7 @@ impl NotificationQueue {
         let delivery = NotificationDelivery {
             title: notification_title(pending_count, &latest),
             body: notification_body(pending_count, &latest),
+            pane: Some(latest.pane.clone()),
             timeout: Duration::from_secs(self.config.command_timeout_seconds),
         };
         self.clear_pending();
@@ -116,6 +125,9 @@ fn should_notify(config: &NotificationsConfig, kind: AttentionEventKind) -> bool
 pub struct NotificationDelivery {
     title: String,
     body: String,
+    /// The qualified pane a click should jump to. A synthetic test
+    /// notification names no pane and therefore offers no action.
+    pane: Option<PaneId>,
     timeout: Duration,
 }
 
@@ -181,10 +193,19 @@ impl NativeBackend {
     }
 }
 
-pub fn diagnostic_lines(config: &NotificationsConfig) -> Vec<String> {
-    let delivery = native_backend()
+pub async fn diagnostic_lines(config: &NotificationsConfig) -> Vec<String> {
+    let backend = native_backend();
+    let delivery = backend
+        .as_ref()
         .map(|backend| backend.label().to_owned())
         .unwrap_or_else(|error| format!("unavailable ({error})"));
+    let click = match backend {
+        Ok(backend) if native_capabilities(backend).await.actions => {
+            "available; clicking a notification jumps to its qualified pane".to_owned()
+        }
+        Ok(_) => "unavailable (this desktop's notification tool cannot report a click)".to_owned(),
+        Err(_) => "unavailable".to_owned(),
+    };
     let mut enabled_kinds = Vec::new();
     if config.needs_attention {
         enabled_kinds.push("needs_attention");
@@ -211,6 +232,7 @@ pub fn diagnostic_lines(config: &NotificationsConfig) -> Vec<String> {
             }
         ),
         format!("delivery: {delivery}"),
+        format!("click to jump: {click}"),
         format!("events: {}", enabled_kinds.join(", ")),
         format!(
             "minimum interval: {} second(s)",
@@ -228,6 +250,7 @@ pub fn test_delivery(config: &NotificationsConfig) -> Result<NotificationDeliver
     Ok(NotificationDelivery {
         title: "Super-Herdr notification test".to_owned(),
         body: "Native metadata-only notification delivery is working".to_owned(),
+        pane: None,
         timeout: Duration::from_secs(config.command_timeout_seconds),
     })
 }
@@ -260,21 +283,140 @@ fn native_backend() -> Result<NativeBackend> {
     bail!("native notifications are unsupported on this platform");
 }
 
-pub async fn deliver(delivery: NotificationDelivery) -> Result<()> {
-    let mut command = match native_backend()? {
+/// What a desktop can report back about a notification it displayed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeCapabilities {
+    /// The notification tool can offer a clickable action and report it.
+    pub actions: bool,
+}
+
+/// A notification the desktop is showing. Delivery already succeeded; the
+/// child is retained only to learn whether the notification is clicked.
+#[derive(Debug)]
+pub struct PendingNotification {
+    child: Child,
+    pane: Option<PaneId>,
+    activation: bool,
+    timeout: Duration,
+}
+
+/// Show a notification and return once the desktop has accepted it. The click
+/// itself is awaited separately so a burst is never gated on a person.
+pub async fn dispatch(delivery: &NotificationDelivery) -> Result<PendingNotification> {
+    let backend = native_backend()?;
+    let capabilities = native_capabilities(backend).await;
+    let activation = capabilities.actions && delivery.pane.is_some();
+    let mut command = match backend {
         #[cfg(target_os = "macos")]
-        NativeBackend::MacOs => macos_command(&delivery),
+        NativeBackend::MacOs => macos_command(delivery),
         #[cfg(target_os = "linux")]
-        NativeBackend::Freedesktop => freedesktop_command(&delivery),
+        NativeBackend::Freedesktop => freedesktop_command(delivery, activation),
     };
-    let status = timeout(delivery.timeout, command.status())
-        .await
-        .context("native notification command timed out")?
+    if activation {
+        command.stdout(Stdio::piped());
+    }
+    let child = command
+        .spawn()
         .context("failed to start the native notification command")?;
-    if !status.success() {
+    Ok(PendingNotification {
+        child,
+        pane: delivery.pane.clone(),
+        activation,
+        timeout: delivery.timeout,
+    })
+}
+
+/// Wait for the notification to close and report the qualified pane when the
+/// person clicked its action. The wait is bounded by how long the notification
+/// can stay on screen, so an ignored notification always releases its child.
+pub async fn wait_for_activation(pending: PendingNotification) -> Result<Option<PaneId>> {
+    let PendingNotification {
+        mut child,
+        pane,
+        activation,
+        timeout: command_timeout,
+    } = pending;
+    if !activation {
+        let status = timeout(command_timeout, child.wait())
+            .await
+            .context("native notification command timed out")?
+            .context("failed to run the native notification command")?;
+        if !status.success() {
+            bail!("native notification command exited unsuccessfully");
+        }
+        return Ok(None);
+    }
+
+    let output = timeout(EXPIRE + command_timeout, child.wait_with_output())
+        .await
+        .context("native notification stayed open longer than its expiry")?
+        .context("failed to read the native notification result")?;
+    if !output.status.success() {
         bail!("native notification command exited unsuccessfully");
     }
-    Ok(())
+    Ok(activated_pane(
+        &String::from_utf8_lossy(&output.stdout),
+        pane,
+    ))
+}
+
+/// Show a notification and wait only for the desktop to accept it, ignoring any
+/// click. This is the one-shot path used by `notifications test`.
+pub async fn deliver(delivery: NotificationDelivery) -> Result<()> {
+    let mut pending = dispatch(&delivery).await?;
+    pending.activation = false;
+    wait_for_activation(pending).await.map(|_| ())
+}
+
+/// The desktop prints the identifier of the invoked action. Anything else—an
+/// expiry, a dismissal, an unrelated line—is not a jump.
+fn activated_pane(stdout: &str, pane: Option<PaneId>) -> Option<PaneId> {
+    stdout
+        .lines()
+        .any(|line| line.trim() == JUMP_ACTION)
+        .then_some(pane)
+        .flatten()
+}
+
+static NATIVE_CAPABILITIES: OnceLock<NativeCapabilities> = OnceLock::new();
+
+/// Probe the notification tool once per process. An older `notify-send` rejects
+/// unknown options outright, so the flags are used only when it advertises
+/// them.
+async fn native_capabilities(backend: NativeBackend) -> NativeCapabilities {
+    if let Some(cached) = NATIVE_CAPABILITIES.get() {
+        return *cached;
+    }
+    let probed = match backend {
+        // `osascript` displays a notification but cannot report a click, so
+        // macOS delivery stays one-way.
+        #[cfg(target_os = "macos")]
+        NativeBackend::MacOs => NativeCapabilities::default(),
+        #[cfg(target_os = "linux")]
+        NativeBackend::Freedesktop => {
+            let mut command = Command::new("notify-send");
+            command.arg("--help");
+            isolate_command(&mut command);
+            let help = timeout(Duration::from_secs(2), command.output()).await;
+            match help {
+                Ok(Ok(output)) => parse_notify_send_capabilities(&format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )),
+                _ => NativeCapabilities::default(),
+            }
+        }
+    };
+    *NATIVE_CAPABILITIES.get_or_init(|| probed)
+}
+
+/// Click reporting needs both an action to offer and the option to wait for it;
+/// libnotify gained them in 0.8.
+fn parse_notify_send_capabilities(help: &str) -> NativeCapabilities {
+    NativeCapabilities {
+        actions: help.contains("--action") && help.contains("--wait"),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -291,13 +433,17 @@ fn macos_command(delivery: &NotificationDelivery) -> Command {
 }
 
 #[cfg(target_os = "linux")]
-fn freedesktop_command(delivery: &NotificationDelivery) -> Command {
+fn freedesktop_command(delivery: &NotificationDelivery, activation: bool) -> Command {
     let mut command = Command::new("notify-send");
     command
         .arg("--app-name=Super-Herdr")
-        .arg("--expire-time=10000")
-        .arg(&delivery.title)
-        .arg(&delivery.body);
+        .arg(format!("--expire-time={}", EXPIRE.as_millis()));
+    if activation {
+        command
+            .arg("--wait")
+            .arg(format!("--action={JUMP_ACTION}=Jump to pane"));
+    }
+    command.arg(&delivery.title).arg(&delivery.body);
     isolate_command(&mut command);
     command
 }
@@ -339,7 +485,10 @@ fn executable(path: &Path) -> bool {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{NotificationQueue, diagnostic_lines, notification_body, test_delivery};
+    use super::{
+        NotificationDelivery, NotificationQueue, activated_pane, diagnostic_lines,
+        notification_body, parse_notify_send_capabilities, test_delivery,
+    };
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::config::NotificationsConfig;
     use crate::model::PaneId;
@@ -418,11 +567,76 @@ mod tests {
     }
 
     #[test]
-    fn notification_diagnostics_and_tests_never_include_payloads() {
+    fn click_reporting_needs_both_an_action_and_a_wait() {
+        // libnotify 0.7.9, still shipped by current LTS distributions.
+        let old_help = "  -u, --urgency=LEVEL\n  -t, --expire-time=TIME\n  -h, --hint=TYPE\n";
+        assert!(!parse_notify_send_capabilities(old_help).actions);
+
+        let new_help = "  -A, --action=[NAME=]Text\n  -w, --wait\n  -t, --expire-time=TIME\n";
+        assert!(parse_notify_send_capabilities(new_help).actions);
+
+        // A tool that can offer an action but never reports it is not enough.
+        assert!(!parse_notify_send_capabilities("  -A, --action=NAME\n").actions);
+    }
+
+    #[test]
+    fn an_activation_is_only_the_offered_action() {
+        let pane = PaneId::new("build", "toolchains", "w2:p1");
+        assert_eq!(
+            activated_pane("jump\n", Some(pane.clone())),
+            Some(pane.clone())
+        );
+        assert_eq!(activated_pane("", Some(pane.clone())), None);
+        assert_eq!(activated_pane("closed\n", Some(pane.clone())), None);
+        // A notification that names no pane can never move the selection.
+        assert_eq!(activated_pane("jump\n", None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clickable_notification_offers_one_action_and_no_payload() {
+        use super::freedesktop_command;
+
+        let delivery = NotificationDelivery {
+            title: "Agent needs attention".to_owned(),
+            body: "codex · simulator\nbuild/toolchains · needs input".to_owned(),
+            pane: Some(PaneId::new("build", "toolchains", "w2:p1")),
+            timeout: Duration::from_secs(5),
+        };
+
+        let arguments = |activation| {
+            freedesktop_command(&delivery, activation)
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let clickable = arguments(true);
+        assert!(clickable.contains(&"--wait".to_owned()));
+        assert!(clickable.contains(&"--action=jump=Jump to pane".to_owned()));
+        assert!(clickable.contains(&"--expire-time=10000".to_owned()));
+        // The pane identifier routes the click; it is never written into the
+        // notification text.
+        assert!(!clickable.iter().any(|argument| argument.contains("w2:p1")));
+
+        let plain = arguments(false);
+        assert!(
+            !plain
+                .iter()
+                .any(|argument| argument.starts_with("--action"))
+        );
+        assert!(!plain.contains(&"--wait".to_owned()));
+        assert_eq!(plain.last(), clickable.last());
+    }
+
+    #[tokio::test]
+    async fn notification_diagnostics_and_tests_never_include_payloads() {
         let disabled = NotificationsConfig::default();
         assert!(test_delivery(&disabled).is_err());
-        let lines = diagnostic_lines(&disabled).join("\n");
+        let lines = diagnostic_lines(&disabled).await.join("\n");
         assert!(lines.contains("notifications: disabled"));
+        assert!(lines.contains("click to jump:"));
         assert!(lines.contains("terminal and clipboard contents are excluded"));
 
         let enabled = NotificationsConfig {

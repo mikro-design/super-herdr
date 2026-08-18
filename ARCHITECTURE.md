@@ -113,6 +113,19 @@ diagnostics never enter the delivery object. Native commands have a separate
 timeout, and delivery failure changes only a local TUI diagnostic—it cannot stop
 target supervision, reconnect a route, or mutate Herdr.
 
+A notification may carry one action back. Delivery and activation are separate
+phases: delivery completes when the desktop accepts the notification, so a burst
+is never gated on a person reading one, while a bounded wait watches for the
+click. The queued delivery object carries the qualified pane only as routing
+data—it is never rendered into the notification text—and an activation is
+accepted only when the desktop reports the one offered action identifier. A
+clicked pane is re-checked against live state before the selection moves,
+because the identifier is only as fresh as the notification that carried it; a
+pane that has since closed marks its events read instead. Whether the desktop
+can report a click at all is probed once from the notification tool's own
+advertised options, since an older tool rejects unknown options outright and
+would otherwise lose notifications entirely.
+
 ## Terminal data plane
 
 One selected pane owns keyboard input. Observe streams may remain open for visible

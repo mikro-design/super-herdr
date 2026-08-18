@@ -34,7 +34,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - A durable metadata-only attention history with unread counts, transition
   deduplication, and qualified jump-and-mark-read behavior.
 - Opt-in native desktop notifications for selected attention transitions, with
-  startup-history suppression, coalescing, and rate limiting.
+  startup-history suppression, coalescing, and rate limiting. Where the desktop
+  can report a click, the notification jumps straight to its qualified pane.
 - Live workspace moves inside one Herdr session: every tab is rebuilt in the
   destination workspace with its splits and ratios, and no process restarts.
 - Explicit workspace recreation on another session or host, rebuilding the tab
@@ -459,6 +460,27 @@ Super-Herdr process running through SSH or nested inside Herdr reports native
 delivery as unavailable; keep it on the desktop for this feature. Disable it at
 any time with `super-herdr notifications disable`.
 
+A delivered notification offers one `Jump to pane` action. Clicking it selects
+the qualified pane the notification described, exactly as clicking that row in
+the attention feed would; a pane that has closed since delivery marks its events
+read and says so instead of moving the selection. The pane identifier only
+routes the click and never appears in the notification text.
+
+Click reporting depends on the desktop, and `notifications check` reports which
+you have:
+
+- Linux with libnotify 0.8 or newer, whose `notify-send` offers `--action` and
+  `--wait`, and a notification daemon that supports actions: supported.
+- Linux with libnotify 0.7.x: notifications work, clicking does nothing. The
+  older `notify-send` rejects unknown options, so the flags are used only when
+  it advertises them.
+- macOS: notifications work, clicking does nothing. `osascript` can display a
+  notification but cannot report that it was clicked.
+
+Waiting for a click never delays the next notification: delivery completes when
+the desktop accepts the notification, and the wait is bounded by how long the
+notification can stay on screen.
+
 A workspace can be moved into another workspace of the same Herdr session, from
 the action palette or the workspace context menu (`Move workspace "a" into
 "b"`). Super-Herdr reads each source tab's split tree from Herdr and replays it
@@ -629,8 +651,9 @@ cargo clippy -j 4 -- -D warnings
 - Advanced socket/client-path editing remains CLI-driven; the target manager
   preserves existing overrides and fills the documented socket automatically
   when a discovered session is selected.
-- Native notifications are delivery-only; clicking one does not yet jump to the
-  qualified pane. Use the lower attention feed or `Ctrl+] e` to jump.
+- Notification click-to-jump needs a desktop that reports actions: libnotify 0.8
+  or newer on Linux. On macOS, and on Linux with libnotify 0.7.x, notifications
+  remain one-way; use the lower attention feed or `Ctrl+] e` to jump.
 - A workspace still cannot be *moved* between Herdr sessions. Each session is a
   separate server process owning its panes, and protocol 19 exposes no
   cross-session transfer; `workspace.move` only reorders workspaces inside one
