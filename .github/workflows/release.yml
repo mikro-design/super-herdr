@@ -236,8 +236,7 @@ jobs:
         working-directory: release-files
         run: |
           cosign sign-blob --yes \
-            --output-signature SHA256SUMS.sig \
-            --output-certificate SHA256SUMS.pem \
+            --bundle SHA256SUMS.sigstore.json \
             SHA256SUMS
 
       - name: Render package definitions

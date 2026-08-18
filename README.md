@@ -104,8 +104,8 @@ sudo dpkg -i super-herdr_0.3.0-1_amd64.deb
 
 ### Prebuilt binaries
 
-Each tagged release publishes stripped binaries, Debian packages, a signed
-`SHA256SUMS` manifest, and build provenance attestations on the
+Each tagged release publishes stripped binaries, Debian packages, a `SHA256SUMS`
+manifest with its Sigstore bundle, and build provenance attestations on the
 [releases page](https://github.com/mikro-design/super-herdr/releases). Pick the
 archive matching your platform:
 
@@ -153,11 +153,9 @@ gh attestation verify "${archive}" --repo mikro-design/super-herdr
 
 # Or verify the signed manifest, then check any file against it.
 curl -fLO "${release_url}/SHA256SUMS"
-curl -fLO "${release_url}/SHA256SUMS.sig"
-curl -fLO "${release_url}/SHA256SUMS.pem"
+curl -fLO "${release_url}/SHA256SUMS.sigstore.json"
 cosign verify-blob \
-  --certificate SHA256SUMS.pem \
-  --signature SHA256SUMS.sig \
+  --bundle SHA256SUMS.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp \
     '^https://github\.com/mikro-design/super-herdr/\.github/workflows/release\.yml@refs/tags/v' \
