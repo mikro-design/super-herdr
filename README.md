@@ -98,8 +98,8 @@ brew install mikro-design/tap/super-herdr
 paru -S super-herdr-bin
 
 # Debian and Ubuntu, amd64 or arm64
-curl -LO https://github.com/mikro-design/super-herdr/releases/latest/download/super-herdr_0.3.0-1_amd64.deb
-sudo dpkg -i super-herdr_0.3.0-1_amd64.deb
+curl -LO https://github.com/mikro-design/super-herdr/releases/latest/download/super-herdr_0.3.1-1_amd64.deb
+sudo dpkg -i super-herdr_0.3.1-1_amd64.deb
 ```
 
 ### Prebuilt binaries
@@ -119,7 +119,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.3.0
+tag=v0.3.1
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -168,8 +168,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.3.0`
-must be tagged `v0.3.0`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.3.1`
+must be tagged `v0.3.1`.
 
 ### macOS
 

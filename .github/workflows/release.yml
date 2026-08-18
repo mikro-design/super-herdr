@@ -168,6 +168,14 @@ jobs:
           esac
           package="super-herdr_${{ steps.package.outputs.version }}-1_${architecture}.deb"
           cargo deb --no-build --no-strip --target "${{ matrix.target }}" --output "${package}"
+          # Dependency resolution is architecture-sensitive on the build host,
+          # so assert the declared floor instead of trusting whatever it found.
+          expected="libc6 (>= 2.28)"
+          declared="$(dpkg-deb --field "${package}" Depends)"
+          if [[ "${declared}" != "${expected}" ]]; then
+            echo "${package} declares Depends '${declared}', expected '${expected}'" >&2
+            exit 1
+          fi
           echo "package=${package}" >> "${GITHUB_OUTPUT}"
 
       # Provenance ties each published file to this workflow, commit, and

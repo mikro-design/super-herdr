@@ -1,6 +1,6 @@
 [package]
 name = "super-herdr"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 publish = false
 description = "A multi-host federation client for Herdr sessions"
@@ -13,6 +13,11 @@ copyright = "2026 Mikro Design"
 license-file = "LICENSE-MIT"
 section = "utils"
 priority = "optional"
+# Automatic resolution reads the build host's symbol files, which overstates the
+# floor on amd64 and yields nothing at all for a cross-built arm64 binary. CI
+# enforces a GLIBC 2.28 baseline, so state that same floor for every
+# architecture.
+depends = "libc6 (>= 2.28)"
 extended-description = """
 Super-Herdr is a desktop frontend that federates running Herdr sessions across several hosts into one terminal UI, with qualified identities, per-target failure isolation, agent attention tracking, and a local clipboard bridge."""
 assets = [
