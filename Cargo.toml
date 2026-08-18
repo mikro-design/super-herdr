@@ -4,6 +4,8 @@ version = "0.2.1"
 edition = "2024"
 publish = false
 description = "A multi-host federation client for Herdr sessions"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mikro-design/super-herdr"
 
 [dependencies]
 anyhow = "1"

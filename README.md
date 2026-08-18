@@ -673,6 +673,20 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the domain model and invariants,
 
 ## Licensing
 
-No project license has been selected. Super-Herdr interoperates through Herdr's
-public interfaces. Copying or modifying Herdr source requires a separate licensing
-and maintenance decision.
+Copyright (c) 2026 Mikro Design.
+
+Super-Herdr is dual licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This is the customary Rust dual license: the MIT terms are the
+simplest to comply with, and Apache-2.0 adds an explicit patent grant.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in Super-Herdr by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+
+This license covers Super-Herdr only. Super-Herdr interoperates through Herdr's
+public interfaces and contains no Herdr source; copying or modifying Herdr source
+remains a separate licensing and maintenance decision.

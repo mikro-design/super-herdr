@@ -24,6 +24,7 @@ Work is ordered by dependency and product risk.
   lifecycle operations.
 - Qualified mouse context menus for sessions, workspaces, tabs, and panes, backed
   by the shared resource-action and close-confirmation paths.
+- Dual MIT/Apache-2.0 licensing, so the project can accept outside contributions.
 - Live in-session workspace moves that replay an exported split tree with
   documented pane moves and restart no process.
 - Explicit cross-session workspace recreation with sanitized layouts, a bounded
@@ -33,7 +34,6 @@ Work is ordered by dependency and product risk.
 
 1. Execute and record the full desktop matrix in `TESTING.md`.
 2. Add signed release artifacts and package-manager installation.
-3. Select an explicit project license before inviting external contributions.
 
 ## Blocked on Herdr
 
