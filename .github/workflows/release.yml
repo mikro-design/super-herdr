@@ -50,7 +50,15 @@ jobs:
         run: cargo test --locked --jobs 4
 
       - name: Run Clippy
-        run: cargo clippy --locked --jobs 4 -- -D warnings
+        run: cargo clippy --locked --jobs 4 --all-targets -- -D warnings
+
+      # Platform-gated code only compiles on its own target. Checking the macOS
+      # target from here catches a path that no Linux build would ever reach.
+      - name: Lint macOS-only code paths
+        shell: bash
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo clippy --locked --jobs 4 --target x86_64-apple-darwin --all-targets -- -D warnings
 
   build:
     name: Build ${{ matrix.target }}

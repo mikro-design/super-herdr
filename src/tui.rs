@@ -7158,7 +7158,7 @@ mod tests {
         assert_eq!(config.targets[1].endpoint(), "build-host");
         assert!(config.targets[1].discover_sessions);
         assert!(app.configuration_dirty);
-        assert_eq!(fs::metadata(path).unwrap().permissions().readonly(), false);
+        assert!(!fs::metadata(path).unwrap().permissions().readonly());
     }
 
     #[test]

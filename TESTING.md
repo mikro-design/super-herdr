@@ -50,7 +50,8 @@ terminal, and clipboard payloads. Configuration toggles must preserve comments
 and existing filters, and notification-only refresh must not rebuild terminal
 routes.
 Linux release jobs must reject binaries whose highest required GLIBC symbol
-version exceeds 2.28. Release coverage must prove that every published file
+version exceeds 2.28. Lint coverage must include test code and the macOS target,
+because platform-gated code is invisible to a Linux-only lint. Release coverage must prove that every published file
 appears in the signed `SHA256SUMS`, that `cosign verify-blob` accepts the
 manifest for the tagged workflow identity, that `gh attestation verify` accepts
 each archive and Debian package, and that the generated formula and PKGBUILD

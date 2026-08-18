@@ -355,30 +355,6 @@ async fn run() -> Result<ExitCode> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_broken_pipe, probe_status_prefix};
-
-    #[test]
-    fn recognizes_a_contextualized_broken_pipe() {
-        let error = anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "closed pipe",
-        ))
-        .context("output failed");
-        assert!(is_broken_pipe(&error));
-        assert!(!is_broken_pipe(&anyhow::anyhow!("ordinary failure")));
-    }
-
-    #[test]
-    fn probe_status_prefixes_are_colored_only_when_requested() {
-        assert_eq!(probe_status_prefix(true, false), "OK   ");
-        assert_eq!(probe_status_prefix(false, false), "FAIL ");
-        assert_eq!(probe_status_prefix(true, true), "\x1b[32mOK\x1b[0m   ");
-        assert_eq!(probe_status_prefix(false, true), "\x1b[31mFAIL\x1b[0m ");
-    }
-}
-
 fn run_target_command(
     config_path: Option<&std::path::Path>,
     command: TargetCommands,
@@ -517,5 +493,29 @@ fn run_target_command(
             }
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_broken_pipe, probe_status_prefix};
+
+    #[test]
+    fn recognizes_a_contextualized_broken_pipe() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed pipe",
+        ))
+        .context("output failed");
+        assert!(is_broken_pipe(&error));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("ordinary failure")));
+    }
+
+    #[test]
+    fn probe_status_prefixes_are_colored_only_when_requested() {
+        assert_eq!(probe_status_prefix(true, false), "OK   ");
+        assert_eq!(probe_status_prefix(false, false), "FAIL ");
+        assert_eq!(probe_status_prefix(true, true), "\x1b[32mOK\x1b[0m   ");
+        assert_eq!(probe_status_prefix(false, true), "\x1b[31mFAIL\x1b[0m ");
     }
 }

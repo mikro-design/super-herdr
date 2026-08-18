@@ -413,6 +413,7 @@ async fn native_capabilities(backend: NativeBackend) -> NativeCapabilities {
 
 /// Click reporting needs both an action to offer and the option to wait for it;
 /// libnotify gained them in 0.8.
+#[cfg(target_os = "linux")]
 fn parse_notify_send_capabilities(help: &str) -> NativeCapabilities {
     NativeCapabilities {
         actions: help.contains("--action") && help.contains("--wait"),
@@ -486,8 +487,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        NotificationDelivery, NotificationQueue, activated_pane, diagnostic_lines,
-        notification_body, parse_notify_send_capabilities, test_delivery,
+        NotificationQueue, activated_pane, diagnostic_lines, notification_body, test_delivery,
     };
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::config::NotificationsConfig;
@@ -566,8 +566,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn click_reporting_needs_both_an_action_and_a_wait() {
+        use super::parse_notify_send_capabilities;
+
         // libnotify 0.7.9, still shipped by current LTS distributions.
         let old_help = "  -u, --urgency=LEVEL\n  -t, --expire-time=TIME\n  -h, --hint=TYPE\n";
         assert!(!parse_notify_send_capabilities(old_help).actions);
@@ -595,7 +598,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_clickable_notification_offers_one_action_and_no_payload() {
-        use super::freedesktop_command;
+        use super::{NotificationDelivery, freedesktop_command};
 
         let delivery = NotificationDelivery {
             title: "Agent needs attention".to_owned(),

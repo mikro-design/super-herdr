@@ -684,7 +684,11 @@ Before handing off changes, run:
 ```sh
 cargo fmt --check
 cargo test -j 4
-cargo clippy -j 4 -- -D warnings
+cargo clippy -j 4 --all-targets -- -D warnings
+
+# Platform-gated code needs its own target to be seen at all.
+rustup target add x86_64-apple-darwin
+cargo clippy -j 4 --target x86_64-apple-darwin --all-targets -- -D warnings
 ```
 
 ## Current limitations and next slices
