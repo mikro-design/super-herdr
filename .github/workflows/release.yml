@@ -3,6 +3,8 @@ name: CI and Release
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - "v[0-9]*"
   workflow_dispatch:
