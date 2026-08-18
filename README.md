@@ -88,9 +88,24 @@ provided Makefile targets.
 
 ## Install
 
+### Package managers
+
+```sh
+# macOS and Linux, Homebrew tap
+brew install mikro-design/tap/super-herdr
+
+# Arch Linux, from the AUR
+paru -S super-herdr-bin
+
+# Debian and Ubuntu, amd64 or arm64
+curl -LO https://github.com/mikro-design/super-herdr/releases/latest/download/super-herdr_0.2.1-1_amd64.deb
+sudo dpkg -i super-herdr_0.2.1-1_amd64.deb
+```
+
 ### Prebuilt binaries
 
-Each tagged release publishes stripped binaries with SHA-256 checksums on the
+Each tagged release publishes stripped binaries, Debian packages, a signed
+`SHA256SUMS` manifest, and build provenance attestations on the
 [releases page](https://github.com/mikro-design/super-herdr/releases). Pick the
 archive matching your platform:
 
@@ -110,7 +125,8 @@ archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
 
 curl -fLO "${release_url}/${archive}"
-curl -fLO "${release_url}/${archive}.sha256"
+curl -fLO "${release_url}/SHA256SUMS"
+grep " ${archive}$" SHA256SUMS > "${archive}.sha256"
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum -c "${archive}.sha256"
 else
@@ -124,6 +140,33 @@ super-herdr --version
 
 Install into any directory on your `PATH`; `~/.cargo/bin` matches what
 `make macos`/`make linux` use below.
+
+### Verifying a release
+
+Every published file is covered twice: by a signed checksum manifest and by a
+build provenance attestation. Both are keyless—the signature is bound to the
+release workflow's own identity, so there is no key to trust or rotate.
+
+```sh
+# Provenance: this file was produced by this repository's release workflow.
+gh attestation verify "${archive}" --repo mikro-design/super-herdr
+
+# Or verify the signed manifest, then check any file against it.
+curl -fLO "${release_url}/SHA256SUMS"
+curl -fLO "${release_url}/SHA256SUMS.sig"
+curl -fLO "${release_url}/SHA256SUMS.pem"
+cosign verify-blob \
+  --certificate SHA256SUMS.pem \
+  --signature SHA256SUMS.sig \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp \
+    '^https://github\.com/mikro-design/super-herdr/\.github/workflows/release\.yml@refs/tags/v' \
+  SHA256SUMS
+```
+
+A checksum alone only proves a file is intact; the signature and the attestation
+are what tie it to this repository's workflow rather than to whoever served the
+download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag

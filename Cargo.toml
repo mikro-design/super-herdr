@@ -7,6 +7,21 @@ description = "A multi-host federation client for Herdr sessions"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mikro-design/super-herdr"
 
+[package.metadata.deb]
+maintainer = "Mikro Design <vemund.bakken@onio.com>"
+copyright = "2026 Mikro Design"
+license-file = "LICENSE-MIT"
+section = "utils"
+priority = "optional"
+extended-description = """
+Super-Herdr is a desktop frontend that federates running Herdr sessions across several hosts into one terminal UI, with qualified identities, per-target failure isolation, agent attention tracking, and a local clipboard bridge."""
+assets = [
+    ["target/release/super-herdr", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/super-herdr/README.md", "644"],
+    ["LICENSE-MIT", "usr/share/doc/super-herdr/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/super-herdr/LICENSE-APACHE", "644"],
+]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
