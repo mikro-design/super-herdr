@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod daemon;

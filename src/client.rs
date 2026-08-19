@@ -1,0 +1,404 @@
+//! The client side of the daemon protocol.
+//!
+//! A frontend talks to the federation only through this module, whether the
+//! daemon runs in its own process or inside this one. Both cases speak the same
+//! protocol over the same framing; the only difference is whether the bytes
+//! cross a socket or an in-memory pipe.
+//!
+//! Federation state is republished as a `watch::Receiver<FederationState>` —
+//! the shape a frontend already consumes — so a renderer does not have to know
+//! that state now arrives as a snapshot followed by per-target deltas. Anything
+//! that is not state is forwarded verbatim, because frames, leases, and results
+//! are events a frontend must see in order rather than a value it can sample.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::{Context, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+
+use crate::daemon::server::DaemonHandle;
+use crate::model::PaneId;
+use crate::operation::Operation;
+use crate::protocol::{
+    ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ServerMessage, decode, encode,
+};
+use crate::state::FederationState;
+use crate::terminal::{TerminalAccess, TerminalScrollDirection};
+
+/// A connection to a daemon.
+///
+/// Dropping this ends the connection: the daemon releases every lease and route
+/// this client held.
+pub struct Client {
+    commands: ClientCommands,
+    state: watch::Receiver<FederationState>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+/// A cheap handle for sending commands, cloneable so a frontend can keep one
+/// beside the rest of its state instead of threading a connection through every
+/// function that might type into a pane.
+#[derive(Clone)]
+pub struct ClientCommands {
+    commands: mpsc::UnboundedSender<ClientMessage>,
+    next_request: Arc<AtomicU64>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Everything the daemon says that is not federation state.
+pub type Events = mpsc::UnboundedReceiver<ServerMessage>;
+
+impl Client {
+    /// Attach to a daemon running inside this process.
+    pub async fn attach(daemon: &DaemonHandle, name: &str) -> Result<(Self, Events)> {
+        Self::connect(daemon.attach()?, name).await
+    }
+
+    /// Connect to a daemon over its Unix socket.
+    pub async fn connect_socket(path: &Path, name: &str) -> Result<(Self, Events)> {
+        let stream = UnixStream::connect(path).await.with_context(|| {
+            format!("failed to reach a Super-Herdr daemon at {}", path.display())
+        })?;
+        Self::connect(stream, name).await
+    }
+
+    async fn connect<S>(stream: S, name: &str) -> Result<(Self, Events)>
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let (reader, mut writer) = tokio::io::split(stream);
+        let hello = encode(&ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            client: name.to_owned(),
+        })?;
+        writer
+            .write_all(&hello)
+            .await
+            .context("failed to greet the daemon")?;
+
+        let mut buffered = BufReader::new(reader);
+        let mut line = Vec::new();
+        // The daemon answers a handshake before anything else, so a mismatch is
+        // an error here rather than a surprise several messages later.
+        let read = (&mut buffered)
+            .take(MAX_MESSAGE_BYTES as u64)
+            .read_until(b'\n', &mut line)
+            .await
+            .context("failed to read the daemon's greeting")?;
+        if read == 0 || line.last() != Some(&b'\n') {
+            anyhow::bail!("the daemon closed the connection during the handshake");
+        }
+        line.pop();
+        match decode::<ServerMessage>(&line)? {
+            ServerMessage::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => {}
+            ServerMessage::Hello { protocol, .. } => anyhow::bail!(
+                "the daemon speaks protocol {protocol}; this client speaks {PROTOCOL_VERSION}"
+            ),
+            ServerMessage::Error { message, .. } => {
+                anyhow::bail!("the daemon refused this connection: {message}")
+            }
+            _ => anyhow::bail!("the daemon answered the handshake with something else"),
+        }
+
+        let (commands, mut outgoing) = mpsc::unbounded_channel::<ClientMessage>();
+        let sending = tokio::spawn(async move {
+            while let Some(message) = outgoing.recv().await {
+                let Ok(line) = encode(&message) else {
+                    continue;
+                };
+                if writer.write_all(&line).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (state, state_receiver) = watch::channel(FederationState::default());
+        let (events, event_receiver) = mpsc::unbounded_channel();
+        let receiving = tokio::spawn(async move {
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let read = (&mut buffered)
+                    .take(MAX_MESSAGE_BYTES as u64)
+                    .read_until(b'\n', &mut line)
+                    .await;
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line.last() != Some(&b'\n') => break,
+                    Ok(_) => {}
+                }
+                line.pop();
+                let Ok(message) = decode::<ServerMessage>(&line) else {
+                    break;
+                };
+                match message {
+                    ServerMessage::FederationState { state: whole } => {
+                        state.send_replace(whole);
+                    }
+                    ServerMessage::TargetState { target, state: one } => {
+                        state.send_modify(|federation| {
+                            match one {
+                                Some(one) => federation.targets.insert(target, one),
+                                None => federation.targets.remove(&target),
+                            };
+                            // The revision is this client's own count of
+                            // applied changes; it is never the daemon's, and
+                            // nothing may treat the two as comparable.
+                            federation.revision = federation.revision.saturating_add(1);
+                        });
+                    }
+                    other => {
+                        if events.send(other).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok((
+            Self {
+                commands: ClientCommands {
+                    commands,
+                    next_request: Arc::new(AtomicU64::new(0)),
+                },
+                state: state_receiver,
+                tasks: vec![sending, receiving],
+            },
+            event_receiver,
+        ))
+    }
+
+    /// Federation state, in the shape a frontend already consumes.
+    pub fn state(&self) -> watch::Receiver<FederationState> {
+        self.state.clone()
+    }
+
+    pub fn commands(&self) -> ClientCommands {
+        self.commands.clone()
+    }
+
+    pub fn subscribe_state(&self) {
+        self.commands.subscribe_state();
+    }
+}
+
+impl ClientCommands {
+    pub fn subscribe_state(&self) {
+        self.send(ClientMessage::SubscribeState);
+    }
+
+    pub fn subscribe_pane(&self, pane: PaneId, access: TerminalAccess, cols: u16, rows: u16) {
+        self.send(ClientMessage::SubscribePane {
+            pane,
+            access,
+            cols,
+            rows,
+        });
+    }
+
+    pub fn unsubscribe_pane(&self, pane: PaneId) {
+        self.send(ClientMessage::UnsubscribePane { pane });
+    }
+
+    pub fn take_pane_control(&self, pane: PaneId) {
+        self.send(ClientMessage::TakePaneControl { pane });
+    }
+
+    pub fn send_input(&self, pane: PaneId, bytes: Vec<u8>) {
+        self.send(ClientMessage::PaneInput { pane, bytes });
+    }
+
+    pub fn resize_pane(&self, pane: PaneId, cols: u16, rows: u16) {
+        self.send(ClientMessage::PaneResize { pane, cols, rows });
+    }
+
+    pub fn scroll_pane(
+        &self,
+        pane: PaneId,
+        direction: TerminalScrollDirection,
+        lines: u16,
+        column: u16,
+        row: u16,
+        modifiers: u8,
+    ) {
+        self.send(ClientMessage::PaneScroll {
+            pane,
+            direction,
+            lines,
+            column,
+            row,
+            modifiers,
+        });
+    }
+
+    /// Ask the daemon to run one operation, returning the request identifier
+    /// its result will carry.
+    pub fn run_operation(&self, operation: Operation) -> u64 {
+        let request = self.next_request.fetch_add(1, Ordering::Relaxed);
+        self.send(ClientMessage::RunOperation { request, operation });
+        request
+    }
+
+    pub fn mark_attention_seen(&self, pane: PaneId) {
+        self.send(ClientMessage::MarkAttentionSeen { pane });
+    }
+
+    pub fn mark_all_attention_seen(&self) {
+        self.send(ClientMessage::MarkAllAttentionSeen);
+    }
+
+    /// Commands are fire-and-forget. A dead connection is reported by the event
+    /// stream ending, so every call site does not have to handle it.
+    fn send(&self, message: ClientMessage) {
+        let _ = self.commands.send(message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Client;
+    use crate::config::{Config, Target};
+    use crate::daemon::server::{DaemonHandle, DaemonOptions, spawn_in_process};
+    use crate::model::TargetSession;
+
+    fn target_named(name: &str) -> Target {
+        Target {
+            name: name.to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+        }
+    }
+
+    fn daemon_with(targets: Vec<Target>) -> (DaemonHandle, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config = Config {
+            transport: Default::default(),
+            notifications: Default::default(),
+            targets,
+        };
+        let options = DaemonOptions {
+            // No socket is bound in this mode; the path is never used.
+            socket: directory.path().join("unused.sock"),
+            attention_state: Some(directory.path().join("attention.json")),
+            refresh_interval: Duration::from_secs(3600),
+            attention: true,
+        };
+        (spawn_in_process(config, None, options), directory)
+    }
+
+    /// Wait for the mirror to satisfy a condition, so a test never depends on
+    /// how many deltas the daemon needed to get there.
+    async fn wait_for(
+        state: &mut tokio::sync::watch::Receiver<crate::state::FederationState>,
+        mut ready: impl FnMut(&crate::state::FederationState) -> bool,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if ready(&state.borrow_and_update()) {
+                    return true;
+                }
+                if state.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn a_frontend_hosting_its_own_daemon_needs_no_socket() {
+        let (daemon, directory) = daemon_with(vec![target_named("first")]);
+
+        let (client, _events) = Client::attach(&daemon, "test").await.expect("attaches");
+        client.subscribe_state();
+        let mut state = client.state();
+
+        assert!(
+            wait_for(&mut state, |state| {
+                state
+                    .targets
+                    .contains_key(&TargetSession::new("first", "default"))
+            })
+            .await
+        );
+        assert!(
+            !directory.path().join("unused.sock").exists(),
+            "an in-process daemon binds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_and_its_deltas_rebuild_the_same_federation() {
+        let (daemon, _directory) = daemon_with(vec![target_named("first"), target_named("second")]);
+
+        let (client, _events) = Client::attach(&daemon, "test").await.expect("attaches");
+        client.subscribe_state();
+        let mut state = client.state();
+
+        // Both targets arrive, and every mirrored entry is filed under its own
+        // qualified key rather than whatever the message happened to say.
+        assert!(
+            wait_for(&mut state, |state| state.targets.len() == 2).await,
+            "the mirror holds both targets"
+        );
+        let mirrored = state.borrow().clone();
+        for (key, target) in &mirrored.targets {
+            assert_eq!(&target.key, key);
+        }
+        assert!(
+            mirrored
+                .targets
+                .contains_key(&TargetSession::new("second", "default"))
+        );
+    }
+
+    #[tokio::test]
+    async fn two_frontends_share_one_daemon() {
+        let (daemon, _directory) = daemon_with(vec![target_named("first")]);
+
+        let (first, _first_events) = Client::attach(&daemon, "first").await.expect("attaches");
+        let (second, _second_events) = Client::attach(&daemon, "second").await.expect("attaches");
+        first.subscribe_state();
+        second.subscribe_state();
+
+        let (mut one, mut two) = (first.state(), second.state());
+        assert!(wait_for(&mut one, |state| !state.targets.is_empty()).await);
+        assert!(wait_for(&mut two, |state| !state.targets.is_empty()).await);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_goes_away_does_not_stop_the_daemon() {
+        let (daemon, _directory) = daemon_with(vec![target_named("first")]);
+
+        {
+            let (client, _events) = Client::attach(&daemon, "leaving").await.expect("attaches");
+            client.subscribe_state();
+        }
+
+        let (client, _events) = Client::attach(&daemon, "arriving").await.expect("attaches");
+        client.subscribe_state();
+        let mut state = client.state();
+        assert!(wait_for(&mut state, |state| !state.targets.is_empty()).await);
+    }
+}
