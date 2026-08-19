@@ -385,8 +385,9 @@ impl AttentionStore {
         })
     }
 
-    #[cfg(test)]
-    fn at(path: PathBuf) -> Self {
+    /// Use an explicit path instead of the discovered one. The daemon needs
+    /// this so a test never writes into the running user's real history.
+    pub fn at(path: PathBuf) -> Self {
         Self { path }
     }
 

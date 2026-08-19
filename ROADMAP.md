@@ -34,6 +34,13 @@ Work is ordered by dependency and product risk.
   documented pane moves and restart no process.
 - Explicit cross-session workspace recreation with sanitized layouts, a bounded
   pane count, and a read-only source.
+- A versioned client protocol and a headless `super-herdr daemon` that serves
+  federation state, shared per-pane terminal routes, resolved Herdr operations,
+  and the durable attention index over an owner-only Unix socket, with an
+  exclusive per-pane control lease and an explicit takeover.
+- Live configuration and session-discovery refresh inside the daemon, which
+  rebuilds supervisors without restarting Herdr and retires only the routes
+  whose target actually changed.
 
 ## Next
 
@@ -41,9 +48,35 @@ Work is ordered by dependency and product risk.
    machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
    recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
    needing a pointer or a notification click, are still unrecorded.
+2. Make the TUI a client of the daemon, keeping an in-process mode so a
+   single-machine install needs no service, and move native notification
+   delivery behind the daemon's attention stream.
+3. Remove the daemon's socket on a signalled shutdown. A stale socket is
+   already replaced on the next start, so this costs a leftover file rather
+   than a failed restart, but the daemon should not rely on that.
+4. Add device pairing: a pairing code presented by the TUI, a revocable
+   per-device token in the existing atomic TOML store, and a network transport.
+   Until then a remote client reaches the daemon's Unix socket over OpenSSH
+   forwarding, which is why this can be decided deliberately rather than in a
+   hurry.
+5. Generalize the clipboard broker's verified upload into a file bridge —
+   arbitrary content, caller-supplied name, chunked and resumable, streamed at
+   every hop — covering client-to-target, target-to-client, and target-to-target
+   transfers.
+6. Ship the first remote client as a web client the daemon serves, covering
+   tablet and phone from one codebase. Navigation, the attention feed, and
+   read-only pane observation come before input.
+7. Extend attention delivery with push notifications to paired devices, as a
+   further sink under the existing filters, coalescing, and rate limits.
 
 ## Blocked on Herdr
 
+- Pane-initiated file delivery, where a person inside a pane sends the file they
+  are looking at to whichever client they have attached. The documented
+  `terminal session` stream carries frames, closure, input, resize, scroll, and
+  release, with no client-bound envelope a host-side helper could write into.
+  Transfers are initiated from the client until such an envelope exists;
+  scraping pane output for markers is not an acceptable substitute.
 - Moving a workspace between sessions on one host with its processes intact.
   Each session is its own server process, and protocol 19 has no cross-session
   transfer. A true move needs a Herdr-side transfer that hands live PTYs to the
@@ -54,6 +87,9 @@ Work is ordered by dependency and product risk.
 
 ## Later
 
+- Native tablet and phone clients on the same daemon protocol, for hardware
+  keyboard handling and filesystem integration through an iOS File Provider or
+  an Android DocumentsProvider.
 - Provider boundaries for optional non-Herdr backends, without depending on
   Herdr internals.
 - Read-only shared observation and collaboration controls.
@@ -62,4 +98,6 @@ Work is ordered by dependency and product risk.
 
 Team sharing, authorization, and auditing remain deferred until the
 single-operator terminal and clipboard experience is qualified on every
-supported desktop path.
+supported desktop path. Device pairing above is not that work: it grants one
+operator's own devices access to that operator's own daemon and adds no shared
+or delegated authority.

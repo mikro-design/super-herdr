@@ -4,7 +4,10 @@
 
 Present multiple persistent Herdr servers as one desktop application without
 moving remote shells or agents to the desktop and without losing local clipboard
-and image-paste integration.
+and image-paste integration. The same federation should also be reachable from a
+tablet or phone without moving that authority onto the device, and files should
+cross between device, daemon host, and target through one verified path rather
+than an ad hoc copy; see "Daemon and remote clients" and "File bridge".
 
 ## Process boundary
 
@@ -263,6 +266,174 @@ forwarding therefore needs an added public terminal-session envelope (preferred)
 or a separately reviewed documented transport. Super-Herdr must not scrape or
 depend on Herdr's private client protocol to bypass that boundary.
 
+## Daemon and remote clients
+
+This boundary is designed, not implemented. It is recorded here so the split is
+planned rather than discovered.
+
+The federation authority has to run where SSH configuration, host keys, and an
+always-on network already live. A tablet or phone is none of those things: it
+suspends background work, it should not carry credentials for every target, and
+it cannot hold one supervisor per qualified session across a day of sleep. So
+the reach-it-from-anywhere problem is not solved by porting the frontend. The
+binary splits instead: a headless daemon keeps every responsibility described
+above, and clients render. The existing TUI becomes one client. That boundary
+already exists inside the process—`FederationStore` publishes state through a
+watch channel, terminal routes publish encoded frames, and `ResourceAction`
+values carry qualified intent—so a remote client replaces a function call with a
+socket at exactly those three points and is granted nothing else.
+
+```text
+always-on host
+  super-herdr daemon: federation authority
+       |-- SSH --> development host: Herdr session work
+       |-- SSH --> build host: Herdr session toolchains
+       `-- one authenticated protocol over a private network
+              |-- super-herdr TUI, local or remote
+              `-- tablet and phone clients
+```
+
+The protocol carries four streams. Federation state is a snapshot followed by
+deltas and drives all navigation. Attention events are already bounded and
+payload-free. Terminal frames flow only for panes a client has explicitly
+subscribed to; a phone subscribes to one. Upstream, a client sends typed actions
+and pane input. Frames stay encoded ANSI until that client's renderer, matching
+the rule the local frontend already follows, so no lossy intermediate screen
+model is introduced by the hop. Per-client queues are bounded and coalesced, and
+a client that stops reading—a backgrounded phone—loses frames rather than
+growing a queue, because the next frame is authoritative anyway.
+
+Identity and authority do not change. A client never resolves a target; it sends
+qualified IDs and the daemon routes them exactly as the local frontend does. A
+client holds no SSH material, no Herdr socket path, and no configuration
+authority. A lost or compromised device therefore reaches a host only through
+the daemon's own policy, and revoking it is a daemon-side operation rather than
+a key rotation on every target.
+
+Several attached clients make control arbitration a real concept for the first
+time. "The selected pane owns keyboard input" is a frontend-local rule; with a
+phone and a desktop attached at once, the per-pane control lease becomes
+daemon-owned and exclusive. A second client observes that pane and may request a
+takeover that the current holder is told about. Two keyboards are never silently
+multiplexed into one PTY.
+
+The daemon holds one route per pane rather than one per client, so two people
+watching the same pane cost the target one observe stream. That sharing is what
+makes arbitration necessary, and it fixes the rules: a client asking for control
+that another holds is given observation rather than a refusal, an explicit
+takeover downgrades the previous holder and tells it so, and a holder that
+disconnects frees the lease without handing it to an observer that never asked
+for one. Input, scroll, and resize are refused for a client without the lease
+and reported back, because silently dropping a keystroke leaves a person typing
+into a pane that never answers. A route opened only to observe cannot be
+promoted in place, so a takeover reopens it with an input channel.
+
+Pane size follows the control lease. Only the lease holder may resize, so an
+observer on a phone cannot reshape a pane someone is working in, and a lease
+that moves to a client of a different size resizes the pane with it. A route is
+retired when an authoritative snapshot from a live target no longer contains its
+pane; a target in backoff proves nothing about its panes and never retires one,
+matching the rule attention tracking already uses to avoid inventing
+disappearances during a reconnect.
+
+A client asks for operations, not intents. The frontend's `ResourceAction`
+values are requests to open a prompt or a confirmation: renaming means *ask for
+a label*, closing means *ask whether they meant it*. Asking is the client's job,
+so the wire carries a resolved `Operation` instead — a rename that already holds
+its new label, a close that names only something the person has agreed to lose.
+A daemon receiving intents would have to grow a UI or guess. Every operation
+names exactly one session, and the server-local identifier is extracted at the
+final transport step, so a multi-request move and a single documented command
+travel the same qualified path.
+
+The daemon refreshes the durable configuration on the same bounded schedule the
+frontend uses, and one refresh runs at a time so a slow discovery on an
+unreachable host cannot queue up behind itself. A refresh rebuilds supervisors
+but never starts, stops, or restarts Herdr, and it retires only the routes whose
+target actually changed: a route is an SSH child already talking to a Herdr
+server, so re-reading a file must not cost somebody the terminal they are
+working in. A changed transport invalidates every route because the command that
+opened them would now be built differently. A configuration that fails to parse
+leaves the running federation exactly as it was.
+
+The daemon listens on a Unix socket with owner-only permissions and is not
+published to a network. A client on another machine reaches it the way
+Super-Herdr already reaches a Herdr socket: forwarded over OpenSSH. That keeps
+the security posture unchanged for now — OpenSSH remains the authority, and
+there is no second credential store — and leaves device pairing and a network
+transport as one deliberate decision rather than something that arrives by
+accident with the first remote client. A socket that refuses a connection is a
+leftover from a process that did not clean up and is replaced; one that accepts
+a connection belongs to a running daemon and is never evicted.
+
+Exposure is deliberately delegated. The daemon binds to loopback or a private
+interface and is not published to the public internet; reachability from
+elsewhere is a WireGuard or Tailscale concern rather than a transport
+Super-Herdr reimplements. Each device is paired out of band—the TUI presents a
+pairing code—and receives a revocable per-device token recorded in the same
+atomic TOML store that already holds targets, bound to a TLS connection. This is
+device pairing for one operator's own clients. It is deliberately not the shared
+identity, authorization, or audit system the roadmap defers, and it must not
+grow into one by accident.
+
+The first remote client is a web client the daemon itself serves, which covers
+tablet and phone from one codebase and can be saved to a home screen. Native
+clients can follow on the same protocol without changing it. Push delivery for
+attention events is a further sink alongside the existing native desktop command
+worker and inherits its filters, deduplication, coalescing, and rate limits; the
+qualified pane travels as routing data and is never rendered into notification
+text, exactly as the desktop path already guarantees. Because a single-machine
+install should not require operating a service, the TUI retains an in-process
+mode that runs the daemon's responsibilities inside the frontend process.
+
+## File bridge
+
+Moving a file between the machine a person is holding, the daemon host, and the
+target host is currently unsupported, and once the daemon is not the machine in
+front of the person, an ad hoc multi-hop copy becomes the default. That copy is
+unverified and it bypasses every boundary the rest of this document establishes.
+The bridge instead generalizes the verified upload the clipboard broker already
+performs: stream bytes into a private per-target staging directory, read back a
+byte count and SHA-256 receipt, verify it against the sender's own digest, and
+use the resulting path only after it verifies.
+
+The generalization is narrow. Content is arbitrary rather than PNG, the name is
+supplied by the caller, the ceiling is configurable and separate from the image
+ceiling, and a transfer is chunked and resumable so a large file survives a
+reconnect. Bytes stream through every hop rather than being buffered whole, so
+peak memory does not track file size at either end.
+
+Three directions share that one path. A client uploads through the daemon to a
+target. A target's file is pulled by the daemon and handed to the client. A file
+also moves target to target without touching the device at all, because only the
+daemon holds live connections to both—the direction the current desktop-bound
+design cannot express, and the one that removes the laptop from the middle of a
+build-host-to-development-host copy.
+
+Where the bytes land is a mutation question, so the default is conservative. A
+transfer completes into a private staging directory and the verified path is
+injected into the pane; the bridge does not write into a working directory the
+person did not name. Delivering into a pane's working directory is a separate,
+explicitly chosen action. A transferred file is data: it is never executed, its
+mode is not carried across hosts, and no command is inferred from its name or
+content—the same reasoning that drops pane commands and environment during
+cross-session recreation.
+
+A caller-supplied name is sanitized to a single path component before it reaches
+a remote shell, and no path is interpolated unquoted. Payload bytes never enter
+logs, command arguments, terminal frames, or persistent state; only sizes,
+digests, and outcomes appear in diagnostics. Staging is per target and bounded,
+and an abandoned transfer is cleaned up rather than retained until the process
+exits.
+
+Delivery initiated from inside a pane—a person typing a command to send the file
+they are looking at to whichever client they have attached—has no documented
+channel. Herdr's `terminal session` stream carries frames, closure, input,
+resize, scroll, and release, with nothing client-bound a host-side helper could
+write into. Until such an envelope exists, transfers are initiated from the
+client, and Super-Herdr does not invent a side channel by scraping the pane's
+own output for markers.
+
 ## Security
 
 - OpenSSH configuration and host-key verification remain authoritative.
@@ -272,6 +443,13 @@ depend on Herdr's private client protocol to bypass that boundary.
   an option or containing whitespace/control characters are rejected.
 - Credentials, clipboard payloads, and terminal contents are not written to logs.
 - A target failure is isolated and bounded by connect and command timeouts.
+- The daemon is never published to a public network; remote reachability is
+  delegated to an existing private network, and each paired device holds a
+  revocable per-device token rather than any credential for a target.
+- A remote client receives rendered state and sends qualified IDs. It never
+  receives SSH material, Herdr socket paths, or configuration authority.
+- Transferred file bytes are size-bounded, verified by byte count and SHA-256,
+  never executed, and never written to logs or command arguments.
 
 ## Source boundary
 

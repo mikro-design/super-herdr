@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 
 use super_herdr::clipboard;
 use super_herdr::config::{Config, Target};
+use super_herdr::daemon::{DaemonOptions, serve};
 use super_herdr::notifications;
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
@@ -61,6 +62,12 @@ enum Commands {
     },
     /// Open the federated terminal UI.
     Tui,
+    /// Serve the federation on a local socket for Super-Herdr clients.
+    Daemon {
+        /// Socket path. Defaults to the XDG runtime directory.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
     /// Inspect clipboard copy and paste capabilities without reading clipboard contents.
     Clipboard {
         #[command(subcommand)]
@@ -321,6 +328,18 @@ async fn run() -> Result<ExitCode> {
         }
         Commands::Tui => {
             tui::run(config, path).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Daemon { socket } => {
+            let mut options = DaemonOptions::discover()?;
+            if let Some(socket) = socket {
+                options.socket = socket;
+            }
+            stdout_line(format_args!(
+                "super-herdr daemon listening on {}",
+                options.socket.display()
+            ))?;
+            serve(config, Some(path), options).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Clipboard { .. } => unreachable!("clipboard commands return before config load"),
