@@ -22,8 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
+};
+use tokio::net::UnixListener;
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -54,6 +56,13 @@ pub struct DaemonOptions {
     /// state path.
     pub attention_state: Option<PathBuf>,
     pub refresh_interval: Duration,
+    /// Whether this daemon derives and persists attention itself.
+    ///
+    /// Exactly one process may own the durable index, because two would write
+    /// the same file with independently numbered events. A standalone daemon
+    /// owns it; a daemon hosted inside a frontend that still tracks attention
+    /// locally does not.
+    pub attention: bool,
 }
 
 impl DaemonOptions {
@@ -74,6 +83,7 @@ impl DaemonOptions {
             socket: root.join("super-herdr/daemon.sock"),
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
+            attention: true,
         })
     }
 }
@@ -149,6 +159,10 @@ struct Daemon {
     attention_cursor: Option<u64>,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
+    owns_attention: bool,
+    /// Panes whose route opened with less access than was asked for, drained
+    /// into the broker on the next pass.
+    downgraded: Vec<PaneId>,
     /// The expanded configuration currently driving supervisors, kept so a
     /// refresh can tell a real change from a re-read of the same file.
     active: Config,
@@ -156,6 +170,46 @@ struct Daemon {
     refresh_inflight: bool,
     store: Option<FederationStore>,
     watcher: Option<JoinHandle<()>>,
+}
+
+/// One in-memory client attachment, for a frontend hosting its own daemon.
+pub const IN_PROCESS_BUFFER: usize = 64 * 1024;
+
+/// A running daemon that in-process clients can attach to.
+pub struct DaemonHandle {
+    attach: mpsc::UnboundedSender<DuplexStream>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl DaemonHandle {
+    /// Attach an in-process client and return its end of the pipe. The daemon
+    /// sees it as an ordinary connection.
+    pub fn attach(&self) -> Result<DuplexStream> {
+        let (theirs, ours) = tokio::io::duplex(IN_PROCESS_BUFFER);
+        self.attach
+            .send(theirs)
+            .map_err(|_| anyhow::anyhow!("the daemon is no longer running"))?;
+        Ok(ours)
+    }
+
+    pub async fn shutdown(self) {
+        drop(self.attach);
+        self.task.abort();
+    }
+}
+
+/// Run a daemon inside this process, with no socket at all.
+///
+/// A single-machine install should not have to operate a service, and should
+/// not leave a socket behind for anything else to find.
+pub fn spawn_in_process(
+    config: Config,
+    config_path: Option<PathBuf>,
+    options: DaemonOptions,
+) -> DaemonHandle {
+    let (attach, attachments) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run(config, config_path, options, None, attachments));
+    DaemonHandle { attach, task }
 }
 
 /// Run the daemon until the listener fails or the process is stopped.
@@ -169,12 +223,27 @@ pub async fn serve(
     options: DaemonOptions,
 ) -> Result<()> {
     let listener = bind(&options.socket)?;
+    let socket = options.socket.clone();
+    let (_attach, attachments) = mpsc::unbounded_channel();
+    let result = run(config, config_path, options, Some(listener), attachments).await;
+    let _ = fs::remove_file(&socket);
+    result
+}
+
+async fn run(
+    config: Config,
+    config_path: Option<PathBuf>,
+    options: DaemonOptions,
+    listener: Option<UnixListener>,
+    mut attachments: mpsc::UnboundedReceiver<DuplexStream>,
+) -> Result<()> {
     let active = expand_discovered_sessions(config).await;
     let (inputs, mut received) = mpsc::unbounded_channel();
 
-    let attention_store = match options.attention_state.clone() {
-        Some(path) => Some(AttentionStore::at(path)),
-        None => AttentionStore::discover().ok(),
+    let attention_store = match (options.attention, options.attention_state.clone()) {
+        (false, _) => None,
+        (true, Some(path)) => Some(AttentionStore::at(path)),
+        (true, None) => AttentionStore::discover().ok(),
     };
     let attention = attention_store
         .as_ref()
@@ -191,8 +260,10 @@ pub async fn serve(
         attention,
         attention_store,
         attention_cursor,
+        owns_attention: options.attention,
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
+        downgraded: Vec::new(),
         active,
         config_path: config_path.clone(),
         refresh_inflight: false,
@@ -218,17 +289,33 @@ pub async fn serve(
         })
     });
 
-    let accepting = tokio::spawn(accept(listener, inputs));
-    while let Some(input) = received.recv().await {
-        daemon.handle(input);
+    let accepting = listener.map(|listener| tokio::spawn(accept(listener, inputs.clone())));
+    loop {
+        tokio::select! {
+            input = received.recv() => {
+                let Some(input) = input else { break };
+                daemon.handle(input);
+            }
+            attachment = attachments.recv() => {
+                match attachment {
+                    Some(stream) => {
+                        tokio::spawn(connection(stream, inputs.clone()));
+                    }
+                    // Every attach handle is gone, so no in-process client can
+                    // arrive again. A socket-served daemon keeps running.
+                    None => attachments.close(),
+                }
+            }
+        }
     }
 
-    accepting.abort();
+    if let Some(accepting) = accepting {
+        accepting.abort();
+    }
     if let Some(refreshing) = refreshing {
         refreshing.abort();
     }
     daemon.stop_federation().await;
-    let _ = fs::remove_file(&options.socket);
     Ok(())
 }
 
@@ -304,8 +391,17 @@ async fn accept(listener: UnixListener, inputs: mpsc::UnboundedSender<Input>) {
     }
 }
 
-async fn connection(stream: UnixStream, inputs: mpsc::UnboundedSender<Input>) {
-    let (reader, mut writer) = stream.into_split();
+/// Serve one client connection over any byte stream.
+///
+/// An in-process frontend attaches through an in-memory pipe rather than the
+/// socket, and takes this same path deliberately: local and remote clients then
+/// share one implementation of framing, handshake, and every rule behind them,
+/// so a bug cannot hide in the mode nobody runs on their own machine.
+async fn connection<S>(stream: S, inputs: mpsc::UnboundedSender<Input>)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let (outbox, mut outgoing) = mpsc::unbounded_channel();
     let (reply, assigned) = oneshot::channel();
     if inputs.send(Input::Connected { outbox, reply }).is_err() {
@@ -416,6 +512,12 @@ impl Daemon {
     fn apply(&mut self, effects: Vec<Effect>) {
         let mut pending = effects;
         while let Some(effect) = pending.pop_front_compat() {
+            // A route that opened with less access than asked for reports the
+            // downgrade through the broker, so every subscriber is told by the
+            // same path that grants a lease in the first place.
+            for pane in std::mem::take(&mut self.downgraded) {
+                pending.extend(self.broker.route_downgraded(&pane));
+            }
             match effect {
                 Effect::Send { client, message } => {
                     if let Some(outbox) = self.outboxes.get(&client) {
@@ -595,6 +697,9 @@ impl Daemon {
             let _ = self.inputs.send(Input::RouteClosed { pane });
             return;
         };
+        // A refused control stream falls back to observation rather than
+        // costing the client its view of the pane. Herdr is not asked twice for
+        // the same thing: the second attempt asks for less.
         let mut process = match spawn_terminal(
             &target,
             &self.transport,
@@ -605,6 +710,26 @@ impl Daemon {
             cols,
         ) {
             Ok(process) => process,
+            Err(_) if access == TerminalAccess::Control => {
+                match spawn_terminal(
+                    &target,
+                    &self.transport,
+                    &executable,
+                    &pane,
+                    TerminalAccess::Observe,
+                    rows,
+                    cols,
+                ) {
+                    Ok(process) => {
+                        self.downgraded.push(pane.clone());
+                        process
+                    }
+                    Err(_) => {
+                        let _ = self.inputs.send(Input::RouteClosed { pane });
+                        return;
+                    }
+                }
+            }
             Err(_) => {
                 let _ = self.inputs.send(Input::RouteClosed { pane });
                 return;
@@ -754,7 +879,7 @@ impl Daemon {
     /// is what lets a phone learn an agent is waiting without the desktop being
     /// awake.
     fn observe_attention(&mut self) -> Vec<Effect> {
-        if !self.attention.observe(&self.state) {
+        if !self.owns_attention || !self.attention.observe(&self.state) {
             return Vec::new();
         }
         self.persist_attention();
@@ -892,6 +1017,7 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
+                attention: true,
             };
             let server = tokio::spawn(serve(empty_config(), None, options));
             Self { directory, server }
@@ -1049,6 +1175,7 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
+                attention: true,
             },
         ));
 
@@ -1150,6 +1277,7 @@ mod tests {
             socket: harness.socket(),
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
+            attention: true,
         };
         let error = serve(empty_config(), None, options)
             .await
@@ -1173,6 +1301,7 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
+                attention: true,
             },
         ));
 

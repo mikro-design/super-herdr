@@ -390,6 +390,36 @@ impl Broker {
         effects
     }
 
+    /// Herdr refused a control stream, so the route runs as an observer.
+    ///
+    /// This is a downgrade rather than a failure: the frontend's rule has
+    /// always been that a refused control lease falls back to watching instead
+    /// of tearing the pane down, and moving that rule here keeps it true for
+    /// every client at once. Whoever held the lease is told, because the
+    /// alternative is a person typing into a pane that silently stopped
+    /// accepting input.
+    pub fn route_downgraded(&mut self, pane: &PaneId) -> Vec<Effect> {
+        let Some(route) = self.routes.get_mut(pane) else {
+            return Vec::new();
+        };
+        if route.access == TerminalAccess::Observe && route.control.is_none() {
+            return Vec::new();
+        }
+        route.access = TerminalAccess::Observe;
+        route.control = None;
+        route
+            .subscribers
+            .iter()
+            .map(|client| Effect::Send {
+                client: *client,
+                message: ServerMessage::PaneLease {
+                    pane: pane.clone(),
+                    access: TerminalAccess::Observe,
+                },
+            })
+            .collect()
+    }
+
     pub fn attention_observed(&mut self, event: AttentionEvent) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.broadcast_state(ServerMessage::Attention { event }, &mut effects);
@@ -1292,6 +1322,64 @@ mod tests {
                 access: TerminalAccess::Control,
             })
         );
+    }
+
+    #[test]
+    fn a_refused_control_stream_downgrades_instead_of_closing_the_pane() {
+        let mut broker = broker();
+        let holder = greet(&mut broker);
+        let observer = greet(&mut broker);
+        subscribe(
+            &mut broker,
+            holder,
+            "w1:p1",
+            TerminalAccess::Control,
+            80,
+            24,
+        );
+        subscribe(
+            &mut broker,
+            observer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+        );
+
+        let effects = broker.route_downgraded(&pane("w1:p1"));
+
+        // Everyone watching learns what the route now is, and the pane is not
+        // closed.
+        for client in [holder, observer] {
+            assert_eq!(
+                messages_for(&effects, client),
+                vec![ServerMessage::PaneLease {
+                    pane: pane("w1:p1"),
+                    access: TerminalAccess::Observe,
+                }]
+            );
+        }
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseRoute { .. }))
+        );
+
+        // The lease is genuinely gone: the old holder can no longer type, and
+        // repeating the downgrade says nothing further.
+        let refused = broker.handle(
+            holder,
+            ClientMessage::PaneInput {
+                pane: pane("w1:p1"),
+                bytes: b"x".to_vec(),
+            },
+        );
+        assert!(
+            !refused
+                .iter()
+                .any(|effect| matches!(effect, Effect::RouteInput { .. }))
+        );
+        assert!(broker.route_downgraded(&pane("w1:p1")).is_empty());
     }
 
     #[test]
