@@ -17,7 +17,10 @@ cargo clippy -j 4 -- -D warnings
 Automated coverage must include qualified multi-host IDs, target failure
 isolation, atomic configuration writes, session discovery, terminal control and
 observe routing, mouse encoding, multipage selection, atomic bracketed-paste
-decoding, one-request semantic pane input, clipboard size/integrity checks,
+decoding, one-request semantic pane input, clipboard size/integrity checks, refusal
+of a clipboard media extension that is not plain ASCII alphanumerics before it
+can reach the remote upload command, carriage of a media flavor that declares no
+signature,
 persisted UI selection, and independently scrolling split-sidebar viewports with
 offset-aware mouse targets. Attention coverage must include qualified transition
 deduplication, disconnect isolation, unread handling, atomic metadata-only

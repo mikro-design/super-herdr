@@ -55,7 +55,7 @@ const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(10);
 const INPUT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(30);
 const CLIPBOARD_FEEDBACK_DURATION: Duration = Duration::from_secs(3);
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
-const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CLIPBOARD_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const MOUSE_SCROLL_LINES: u16 = 3;
 const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -4166,20 +4166,21 @@ async fn paste_clipboard_image(
         app.message = Some("control route became stale".to_owned());
         return Ok(());
     }
-    let image = match clipboard::read_png(MAX_CLIPBOARD_IMAGE_BYTES).await {
+    let image = match clipboard::read_media(clipboard::PNG, MAX_CLIPBOARD_MEDIA_BYTES).await {
         Ok(image) => image,
         Err(error) => {
             app.message = Some(format!("clipboard image unavailable: {error}"));
             return Ok(());
         }
     };
-    let upload = match clipboard::upload_png(target, transport_config, &image).await {
-        Ok(upload) => upload,
-        Err(error) => {
-            app.message = Some(format!("clipboard image upload failed: {error}"));
-            return Ok(());
-        }
-    };
+    let upload =
+        match clipboard::upload_media(target, transport_config, clipboard::PNG, &image).await {
+            Ok(upload) => upload,
+            Err(error) => {
+                app.message = Some(format!("clipboard image upload failed: {error}"));
+                return Ok(());
+            }
+        };
     let Some(route) = app.routes.get(&selected) else {
         app.message = Some("terminal control route closed during image upload".to_owned());
         return Ok(());
