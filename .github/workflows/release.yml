@@ -23,6 +23,9 @@ jobs:
   quality:
     name: Quality gates
     runs-on: ubuntu-latest
+    # The gates run in minutes, and every other job waits on them. A hung runner
+    # here blocks the whole workflow, so it fails fast like the rest.
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
