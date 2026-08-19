@@ -66,6 +66,10 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: quality
     runs-on: ${{ matrix.os }}
+    # A build takes minutes. Without a ceiling, a runner that hangs installing a
+    # package sits there until the six-hour default, so a release waits on a
+    # transient failure instead of retrying it.
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
