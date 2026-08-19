@@ -636,7 +636,9 @@ Explicit file upload:
   preferring PNG so a screenshot behaves exactly as it always has;
 - is limited to 32 MiB;
 - writes to a private temporary directory on the selected host;
-- verifies remote byte count and SHA-256 digest; and
+- verifies remote byte count and SHA-256 digest;
+- removes the uploaded file again if either check fails, so a refused
+  transfer leaves nothing on the host; and
 - sends only the verified target path to the pane.
 
 The transfer itself is format-agnostic: it moves bytes, verifies them, and

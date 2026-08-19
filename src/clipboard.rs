@@ -455,6 +455,9 @@ pub async fn upload_media(
         .await
         .context("clipboard media upload timed out")??;
         if upload.bytes != bytes.len() || upload.digest != expected_digest {
+            // A refusal that leaves the payload behind is not a refusal: the
+            // host keeps a file nothing verified, and nothing will collect it.
+            remove_remote_upload(destination, transport, &upload.path).await;
             bail!("remote clipboard media verification failed");
         }
         return Ok(UploadedFile {
@@ -808,6 +811,62 @@ printf '%s\t%s\t%s\n' "$path" "$size" "$digest"
     parse_remote_upload_receipt(&receipt)
 }
 
+/// The directory a receipt's payload lives in, if it is one this bridge made.
+///
+/// The path comes back from the remote host, so it is treated as untrusted:
+/// only a directory this bridge created is ever named for removal.
+fn removable_upload_directory(path: &str) -> Option<&str> {
+    let directory = path.rsplit_once('/').map(|(head, _)| head)?;
+    let name = directory
+        .rsplit_once('/')
+        .map_or(directory, |(_, tail)| tail);
+    if !directory.starts_with('/')
+        || !name.starts_with("super-herdr-clipboard.")
+        || directory.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(directory)
+}
+
+/// Best-effort removal of an upload that failed verification.
+///
+/// The directory is sent on stdin rather than interpolated into the command, so
+/// the removal carries no remote-supplied text in its arguments, and the remote
+/// side re-checks the shape before deleting anything.
+async fn remove_remote_upload(destination: &str, transport: &TransportConfig, path: &str) {
+    let Some(directory) = removable_upload_directory(path) else {
+        return;
+    };
+    const SCRIPT: &str = r#"set -eu
+IFS= read -r dir
+case "$dir" in
+  /*/super-herdr-clipboard.*) ;;
+  *) exit 1 ;;
+esac
+rm -rf -- "$dir"
+"#;
+    let mut command = build_ssh_command(destination, transport, SCRIPT.to_owned());
+    let Ok(mut child) = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut input) = child.stdin.take() {
+        let _ = input.write_all(format!("{directory}\n").as_bytes()).await;
+        let _ = input.shutdown().await;
+    }
+    let _ = timeout(
+        Duration::from_secs(transport.command_timeout_seconds),
+        child.wait(),
+    )
+    .await;
+}
+
 fn parse_remote_upload_receipt(bytes: &[u8]) -> Result<RemoteUploadReceipt> {
     let text = std::str::from_utf8(bytes).context("remote upload receipt is not UTF-8")?;
     let mut fields = text.trim_end_matches(['\r', '\n']).split('\t');
@@ -850,6 +909,7 @@ fn upload_local_media(
         .context("failed to retain the local clipboard media")?;
     let verified = fs::read(&path).context("failed to verify the local clipboard media")?;
     if verified.len() != bytes.len() || sha256_hex(&verified) != expected_digest {
+        let _ = fs::remove_file(&path);
         bail!("local clipboard media verification failed");
     }
     Ok(UploadedFile {
@@ -929,7 +989,7 @@ mod tests {
 
     use super::{
         ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, PDF, PNG, SVG, TIFF, WEBP,
-        parse_remote_upload_receipt, sha256_hex,
+        parse_remote_upload_receipt, removable_upload_directory, sha256_hex,
     };
 
     fn context(
@@ -1040,6 +1100,27 @@ mod tests {
         assert!(TIFF.validate(b"II*\x00body").is_ok());
         assert!(TIFF.validate(b"MM\x00*body").is_ok());
         assert!(TIFF.validate(b"MM*\x00body").is_err());
+    }
+
+    #[test]
+    fn only_a_directory_this_bridge_made_is_ever_removed() {
+        assert_eq!(
+            removable_upload_directory("/tmp/super-herdr-clipboard.ab12cd34/payload.png"),
+            Some("/tmp/super-herdr-clipboard.ab12cd34")
+        );
+        // A remote host that reports something else gets nothing removed.
+        for path in [
+            "/etc/payload.png",
+            "/tmp/payload.png",
+            "relative/super-herdr-clipboard.x/payload.png",
+            "/super-herdr-clipboard.x-elsewhere/../etc/payload.png",
+            "payload.png",
+        ] {
+            assert!(
+                removable_upload_directory(path).is_none(),
+                "would have removed {path:?}"
+            );
+        }
     }
 
     #[test]
