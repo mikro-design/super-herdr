@@ -20,7 +20,8 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Local text selection, multipage edge-drag selection, and desktop clipboard copy.
 - Atomic multiline paste from the terminal or explicit desktop clipboard into a
   selected remote pane.
-- Verified PNG clipboard upload to the selected host with path-only injection.
+- Verified clipboard file upload to the selected host with path-only injection,
+  for PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG.
 - Event-driven updates when a documented Herdr socket is configured, with polling
   fallback.
 - Atomic persistence and restoration of the last explicitly selected qualified
@@ -424,7 +425,7 @@ workspace actions:
 | `Ctrl+]`, then `e` | Open persistent agent-transition and unread history |
 | `Ctrl+]`, then `h` | Open the target manager |
 | `Ctrl+]`, then `v` | Paste desktop clipboard text into the selected pane |
-| `Ctrl+]`, then `i` | Upload a clipboard PNG and paste its verified target path |
+| `Ctrl+]`, then `i` | Upload the clipboard's file and paste its verified target path |
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |
@@ -593,7 +594,7 @@ never uses `--takeover`.
 
 ## Clipboard behavior
 
-| Frontend environment | Copy selection | Normal terminal paste | Explicit text paste (`Ctrl+] v`) | PNG upload (`Ctrl+] i`) |
+| Frontend environment | Copy selection | Normal terminal paste | Explicit text paste (`Ctrl+] v`) | File upload (`Ctrl+] i`) |
 | --- | --- | --- | --- | --- |
 | macOS desktop | Native `pbcopy` | Atomic | Native `pbpaste`, atomic | Native clipboard via `osascript` |
 | Linux Wayland desktop | Native `wl-copy` | Atomic | Native `wl-paste`, atomic | `wl-paste` with `image/png` |
@@ -628,12 +629,24 @@ a target has neither discovery nor an explicit socket, Super-Herdr permits the
 existing raw fallback for a single line but refuses multiline input rather than
 silently splitting it into several messages.
 
-Explicit PNG upload:
+Explicit file upload:
 
+- covers PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG. Super-Herdr asks the desktop
+  which flavors the clipboard is offering and takes the first it supports,
+  preferring PNG so a screenshot behaves exactly as it always has;
 - is limited to 32 MiB;
 - writes to a private temporary directory on the selected host;
 - verifies remote byte count and SHA-256 digest; and
 - sends only the verified target path to the pane.
+
+The transfer itself is format-agnostic: it moves bytes, verifies them, and
+injects a path. A format is recognized by byte patterns at fixed offsets, so
+WebP is identified by its container tag rather than by the `RIFF` prefix it
+shares with AVI and WAV, and formats with more than one valid header, such as
+GIF and TIFF, carry every form. A flavor with no dependable signature, such as
+SVG, is carried on the digest alone rather than refused. The uploaded file's
+extension always comes from Super-Herdr's own table and never from the
+clipboard, so no untrusted text reaches the remote command.
 
 Clipboard payloads and terminal contents are never logged.
 
@@ -720,8 +733,11 @@ cargo clippy -j 4 --target x86_64-apple-darwin --all-targets -- -D warnings
   cross-session transfer; `workspace.move` only reorders workspaces inside one
   session. Recreation is the supported substitute and restarts every process.
   A live cross-session move needs a Herdr-side transfer of the panes themselves.
-- File-list clipboard upload is not implemented; the bridge currently accepts PNG
-  images only.
+- File-list clipboard upload is not implemented: the bridge accepts one file at
+  a time from the clipboard's own data, not a list of file references copied in
+  a file manager.
+- WebP and SVG have no classic macOS pasteboard class, so on macOS they report as
+  unsupported rather than being requested under a code that cannot exist.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are
   not available through Herdr 0.8's documented terminal-session stream. Local
   Super-Herdr text selection remains the supported remote-to-local copy path.

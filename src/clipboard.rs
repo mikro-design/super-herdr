@@ -75,6 +75,21 @@ impl CommandSpec {
     }
 }
 
+/// A byte pattern a format guarantees at a fixed offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Marker {
+    offset: usize,
+    bytes: &'static [u8],
+}
+
+impl Marker {
+    fn matches(self, payload: &[u8]) -> bool {
+        payload
+            .get(self.offset..self.offset.saturating_add(self.bytes.len()))
+            .is_some_and(|window| window == self.bytes)
+    }
+}
+
 /// A clipboard flavor Super-Herdr knows how to move.
 ///
 /// The transfer path is deliberately type-agnostic: it moves bytes, verifies a
@@ -89,25 +104,97 @@ pub struct ClipboardMedia {
     /// and never from the clipboard, so no untrusted text reaches the remote
     /// command.
     pub extension: &'static str,
-    /// Leading bytes the format guarantees, for formats that guarantee any.
-    signature: Option<&'static [u8]>,
+    /// Alternatives that identify the format, any one of which is enough. Each
+    /// alternative is a set of markers that must all match, because a format
+    /// like WebP is only identified by two patterns at different offsets, and
+    /// one like GIF has more than one valid form. Empty means the format has no
+    /// signature worth checking.
+    signatures: &'static [&'static [Marker]],
 }
 
 pub const PNG: ClipboardMedia = ClipboardMedia {
     mime: "image/png",
     extension: "png",
-    signature: Some(b"\x89PNG\r\n\x1a\n"),
+    signatures: &[&[Marker {
+        offset: 0,
+        bytes: b"\x89PNG\r\n\x1a\n",
+    }]],
 };
 
-/// Flavors the bridge can move, in the order they are preferred when a
-/// clipboard offers several at once.
-pub const KNOWN_MEDIA: &[ClipboardMedia] = &[PNG];
+pub const JPEG: ClipboardMedia = ClipboardMedia {
+    mime: "image/jpeg",
+    extension: "jpg",
+    signatures: &[&[Marker {
+        offset: 0,
+        bytes: b"\xff\xd8\xff",
+    }]],
+};
 
-/// A clipboard type list is metadata, not payload, but it is still written by
-/// whichever program owns the clipboard, so it is bounded before it is read.
-const MAXIMUM_TYPE_LIST_BYTES: usize = 64 * 1024;
-const MAXIMUM_REPORTED_TYPES: usize = 12;
-const MAXIMUM_TYPE_NAME_CHARS: usize = 80;
+/// RIFF alone also begins AVI and WAV, so the container tag at offset 8 is what
+/// actually identifies WebP.
+pub const WEBP: ClipboardMedia = ClipboardMedia {
+    mime: "image/webp",
+    extension: "webp",
+    signatures: &[&[
+        Marker {
+            offset: 0,
+            bytes: b"RIFF",
+        },
+        Marker {
+            offset: 8,
+            bytes: b"WEBP",
+        },
+    ]],
+};
+
+pub const GIF: ClipboardMedia = ClipboardMedia {
+    mime: "image/gif",
+    extension: "gif",
+    signatures: &[
+        &[Marker {
+            offset: 0,
+            bytes: b"GIF87a",
+        }],
+        &[Marker {
+            offset: 0,
+            bytes: b"GIF89a",
+        }],
+    ],
+};
+
+/// Little-endian and big-endian TIFF differ in their header.
+pub const TIFF: ClipboardMedia = ClipboardMedia {
+    mime: "image/tiff",
+    extension: "tif",
+    signatures: &[
+        &[Marker {
+            offset: 0,
+            bytes: b"II*\x00",
+        }],
+        &[Marker {
+            offset: 0,
+            bytes: b"MM\x00*",
+        }],
+    ],
+};
+
+pub const PDF: ClipboardMedia = ClipboardMedia {
+    mime: "application/pdf",
+    extension: "pdf",
+    signatures: &[&[Marker {
+        offset: 0,
+        bytes: b"%PDF-",
+    }]],
+};
+
+/// SVG is XML text, which may open with a declaration, a comment, a byte order
+/// mark, or the root element. There is no prefix worth trusting, so it carries
+/// on the digest alone like any unrecognized flavor.
+pub const SVG: ClipboardMedia = ClipboardMedia {
+    mime: "image/svg+xml",
+    extension: "svg",
+    signatures: &[],
+};
 
 impl ClipboardMedia {
     /// Reject bytes that cannot be what the clipboard claimed.
@@ -116,10 +203,14 @@ impl ClipboardMedia {
     /// are what prove the transfer, and refusing an unrecognized payload would
     /// only block flavors this table has not learned yet.
     fn validate(self, bytes: &[u8]) -> Result<()> {
-        let Some(signature) = self.signature else {
+        if self.signatures.is_empty() {
             return Ok(());
-        };
-        if !bytes.starts_with(signature) {
+        }
+        let recognized = self
+            .signatures
+            .iter()
+            .any(|alternative| alternative.iter().all(|marker| marker.matches(bytes)));
+        if !recognized {
             bail!("clipboard does not contain {} data", self.mime);
         }
         Ok(())
@@ -133,6 +224,17 @@ impl ClipboardMedia {
         Ok(self.extension)
     }
 }
+
+/// Flavors the bridge can move, in the order they are preferred when a
+/// clipboard offers several at once. PNG stays first so that the common case,
+/// a screenshot, keeps behaving exactly as it always has.
+pub const KNOWN_MEDIA: &[ClipboardMedia] = &[PNG, JPEG, WEBP, GIF, TIFF, PDF, SVG];
+
+/// A clipboard type list is metadata, not payload, but it is still written by
+/// whichever program owns the clipboard, so it is bounded before it is read.
+const MAXIMUM_TYPE_LIST_BYTES: usize = 64 * 1024;
+const MAXIMUM_REPORTED_TYPES: usize = 12;
+const MAXIMUM_TYPE_NAME_CHARS: usize = 80;
 
 pub async fn diagnostic_lines() -> Vec<String> {
     let context = clipboard_context();
@@ -539,10 +641,15 @@ fn media_reader_label(media: ClipboardMedia) -> String {
 #[cfg(target_os = "macos")]
 const MACOS_CLASSES: &[(&str, &str)] = &[
     ("image/png", "PNGf"),
+    ("image/jpeg", "JPEG"),
+    ("image/gif", "GIFf"),
     ("image/tiff", "TIFF"),
     ("application/pdf", "PDF "),
     ("text/rtf", "RTF "),
 ];
+
+// WebP and SVG have no classic pasteboard class, so they report as unsupported
+// on macOS rather than being requested under a code that cannot exist.
 
 #[cfg(target_os = "macos")]
 fn macos_pasteboard_class(media: ClipboardMedia) -> Option<&'static str> {
@@ -820,7 +927,10 @@ fn write_osc52(text: &str) -> Result<()> {
 mod tests {
     use std::ffi::OsStr;
 
-    use super::{ClipboardContext, ClipboardMedia, PNG, parse_remote_upload_receipt, sha256_hex};
+    use super::{
+        ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, PDF, PNG, SVG, TIFF, WEBP,
+        parse_remote_upload_receipt, sha256_hex,
+    };
 
     fn context(
         ssh_connection: Option<&OsStr>,
@@ -874,10 +984,73 @@ mod tests {
         const OPAQUE: ClipboardMedia = ClipboardMedia {
             mime: "application/octet-stream",
             extension: "bin",
-            signature: None,
+            signatures: &[],
         };
         assert!(OPAQUE.validate(b"anything at all").is_ok());
         assert_eq!(OPAQUE.safe_extension().unwrap(), "bin");
+        // SVG is XML text and is carried the same way.
+        assert!(SVG.validate(b"<?xml version=\"1.0\"?><svg/>").is_ok());
+        assert!(SVG.validate(b"not xml at all").is_ok());
+    }
+
+    #[test]
+    fn each_flavor_recognizes_only_its_own_bytes() {
+        let samples: &[(ClipboardMedia, &[u8])] = &[
+            (PNG, b"\x89PNG\r\n\x1a\nbody"),
+            (JPEG, b"\xff\xd8\xff\xe0body"),
+            (GIF, b"GIF89abody"),
+            (TIFF, b"II*\x00body"),
+            (PDF, b"%PDF-1.7body"),
+            (WEBP, b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+        ];
+        for (media, bytes) in samples {
+            assert!(
+                media.validate(bytes).is_ok(),
+                "{} rejected its own bytes",
+                media.mime
+            );
+            for (other, _) in samples {
+                if other.mime != media.mime {
+                    assert!(
+                        other.validate(bytes).is_err(),
+                        "{} accepted {} bytes",
+                        other.mime,
+                        media.mime
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_signature_is_checked_at_its_own_offset() {
+        // RIFF alone is also AVI and WAV; the tag at offset 8 is what makes it
+        // WebP, so a prefix-only check would accept the wrong container.
+        assert!(WEBP.validate(b"RIFF\x24\x00\x00\x00AVI LIST").is_err());
+        assert!(WEBP.validate(b"RIFF").is_err());
+        assert!(WEBP.validate(b"RIFF\x24\x00\x00\x00WEBP").is_ok());
+    }
+
+    #[test]
+    fn a_format_with_several_valid_forms_accepts_each() {
+        assert!(GIF.validate(b"GIF87abody").is_ok());
+        assert!(GIF.validate(b"GIF89abody").is_ok());
+        assert!(GIF.validate(b"GIF88abody").is_err());
+        // Little-endian and big-endian TIFF.
+        assert!(TIFF.validate(b"II*\x00body").is_ok());
+        assert!(TIFF.validate(b"MM\x00*body").is_ok());
+        assert!(TIFF.validate(b"MM*\x00body").is_err());
+    }
+
+    #[test]
+    fn every_table_entry_carries_an_inert_extension() {
+        for media in KNOWN_MEDIA {
+            assert!(
+                media.safe_extension().is_ok(),
+                "{} has an extension that could reach a shell",
+                media.mime
+            );
+        }
     }
 
     #[test]
@@ -888,7 +1061,7 @@ mod tests {
             let media = ClipboardMedia {
                 mime: "test/hostile",
                 extension: Box::leak(extension.to_owned().into_boxed_str()),
-                signature: None,
+                signatures: &[],
             };
             assert!(
                 media.safe_extension().is_err(),

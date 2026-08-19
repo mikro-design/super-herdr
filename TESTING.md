@@ -20,7 +20,10 @@ observe routing, mouse encoding, multipage selection, atomic bracketed-paste
 decoding, one-request semantic pane input, clipboard size/integrity checks, refusal
 of a clipboard media extension that is not plain ASCII alphanumerics before it
 can reach the remote upload command, carriage of a media flavor that declares no
-signature,
+signature, recognition of each supported flavor by its own bytes and by no other
+flavor's, signature matching at the offset a format actually uses rather than by
+prefix alone, acceptance of every valid header form for a format that has more
+than one,
 persisted UI selection, and independently scrolling split-sidebar viewports with
 offset-aware mouse targets. Attention coverage must include qualified transition
 deduplication, disconnect isolation, unread handling, atomic metadata-only
