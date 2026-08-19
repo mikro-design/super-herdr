@@ -94,9 +94,13 @@ provided Makefile targets.
 # macOS and Linux, Homebrew tap
 brew install mikro-design/tap/super-herdr
 
-# Debian and Ubuntu, amd64 or arm64
-curl -LO https://github.com/mikro-design/super-herdr/releases/latest/download/super-herdr_0.3.1-1_amd64.deb
-sudo dpkg -i super-herdr_0.3.1-1_amd64.deb
+# Debian and Ubuntu. The version is part of the asset name, so there is no
+# stable "latest" URL; set these to a published release and your architecture.
+version=0.3.1
+arch=amd64 # or arm64
+package="super-herdr_${version}-1_${arch}.deb"
+curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
+sudo dpkg -i "${package}"
 ```
 
 ### Prebuilt binaries
@@ -158,6 +162,11 @@ cosign verify-blob \
     '^https://github\.com/mikro-design/super-herdr/\.github/workflows/release\.yml@refs/tags/v' \
   SHA256SUMS
 ```
+
+`gh attestation verify` needs GitHub CLI 2.49 or newer; an older `gh` does not
+recognize the subcommand and prints its own help instead of an error. The second
+path needs [cosign](https://github.com/sigstore/cosign) installed and no `gh` at
+all.
 
 A checksum alone only proves a file is intact; the signature and the attestation
 are what tie it to this repository's workflow rather than to whoever served the
@@ -274,6 +283,10 @@ super-herdr target edit build --single-session --session toolchains
 super-herdr target edit desktop --local --discover-sessions
 ```
 
+`--rename` changes the federation name, which changes every qualified ID that
+uses it. `--clear-session`, `--clear-socket`, and `--default-herdr-bin` drop an
+override and restore the default rather than replacing it with another value.
+
 Remove a target from Super-Herdr only:
 
 ```sh
@@ -359,6 +372,7 @@ super-herdr check
 super-herdr probe
 super-herdr probe --json
 super-herdr probe --json --snapshots
+super-herdr probe --timeout SECONDS
 super-herdr clipboard check
 super-herdr notifications check
 super-herdr notifications enable
@@ -377,6 +391,8 @@ Running `super-herdr` without a subcommand opens the TUI.
 - `probe` queries configured sessions concurrently and reports failures per
   target. On an interactive terminal, `OK` is green and `FAIL` is red; redirected
   output, JSON output, and terminals with `NO_COLOR` set remain uncolored.
+  `--timeout` overrides the configured command timeout for one run, and
+  `--snapshots` adds full server snapshots to `--json` output.
 - `clipboard check` reports the active copy, text-paste, and image-paste paths.
   It does not read or print clipboard payloads.
 - `notifications check` reports the configured filters and whether native
