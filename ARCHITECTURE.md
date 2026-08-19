@@ -443,6 +443,18 @@ mode is not carried across hosts, and no command is inferred from its name or
 content—the same reasoning that drops pane commands and environment during
 cross-session recreation.
 
+The clipboard divides along the same line rather than moving as a unit. Reading
+one is a desktop-session capability: it shells out to the compositor or window
+system the person is sitting in front of, and already refuses to run over SSH or
+nested inside Herdr rather than pretending there is a clipboard there. That half
+stays with the client permanently. Uploading needs a route to the host, which is
+what a daemon has and a device does not, so that half moves. The client
+therefore enumerates the flavors it can see, names one, and states the size and
+digest of what it holds; the daemon resolves the extension, moves the bytes, and
+verifies what landed against what was promised. A flavor the table does not know
+is the same case as a file from a device with no flavor at all, so one path
+serves both.
+
 A caller-supplied name is sanitized to a single path component before it reaches
 a remote shell, and no path is interpolated unquoted. Payload bytes never enter
 logs, command arguments, terminal frames, or persistent state; only sizes,

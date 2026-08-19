@@ -58,6 +58,13 @@ Work is ordered by dependency and product risk.
 3. Give a remote client a path for atomic multiline paste and clipboard media
    upload. Both still run from the frontend against the target's own Herdr API
    socket, which works only while the frontend and the daemon share a machine.
+   The clipboard does not move as a unit: reading one is a desktop-session
+   capability that stays with the client permanently, because a daemon on
+   another machine has no clipboard to read, while the upload needs a route to
+   the host and so belongs to the daemon. The client enumerates flavors and
+   names one; the daemon resolves the extension and injects the verified path.
+   Atomic paste is the easier half — one documented request with no local
+   capability behind it.
 4. Remove the daemon's socket on a signalled shutdown. A stale socket is
    already replaced on the next start, so this costs a leftover file rather
    than a failed restart, but the daemon should not rely on that.
