@@ -54,18 +54,19 @@ version exceeds 2.28. Lint coverage must include test code and the macOS target,
 because platform-gated code is invisible to a Linux-only lint. Release coverage must prove that every published file
 appears in the signed `SHA256SUMS`, that `cosign verify-blob` accepts the
 manifest for the tagged workflow identity, that `gh attestation verify` accepts
-each archive and Debian package, and that the generated formula and PKGBUILD
-carry the checksums of the archives that release actually published.
+each archive and Debian package, and that the generated formula, PKGBUILD, and
+`.SRCINFO` carry the checksums of the archives that release actually published,
+with the PKGBUILD and `.SRCINFO` agreeing on version and checksums.
 
 ## Manual desktop matrix
 
-| Frontend | Remote path | Text copy/paste | PNG paste | Mouse/select/scroll | Host/session refresh |
-| --- | --- | --- | --- | --- | --- |
-| macOS terminal | OpenSSH alias | Required | Required | Required | Required |
-| Linux Wayland | OpenSSH alias | Required | Required | Required | Required |
-| Linux X11 with `xclip` | OpenSSH alias | Required | Required | Required | Required |
-| Linux X11 with `xsel` only | OpenSSH alias | Required | Not supported | Required | Required |
-| Nested SSH or Herdr | terminal-mediated copy | Copy request only; local paste | Not supported | Required | Required |
+| Frontend | Remote path | Text copy/paste | PNG paste | Mouse/select/scroll | Host/session refresh | Recorded |
+| --- | --- | --- | --- | --- | --- | --- |
+| macOS terminal | OpenSSH alias | Required | Required | Required | Required | No |
+| Linux Wayland | OpenSSH alias | Required | Required | Required | Required | No |
+| Linux X11 with `xclip` | OpenSSH alias | Required | Required | Required | Required | No |
+| Linux X11 with `xsel` only | OpenSSH alias | Required | Not supported | Required | Required | No |
+| Nested SSH or Herdr | terminal-mediated copy | Copy request only; local paste | Not supported | Required | Required | Command line only, 2026-08-19 |
 
 For every applicable row, verify:
 
@@ -141,3 +142,42 @@ Record the operating-system version, terminal emulator, display protocol, Herdr
 version/protocol, and Super-Herdr commit for each qualification run. Never put
 real hostnames, addresses, usernames, credentials, terminal contents, or
 clipboard payloads in committed test records.
+
+## Qualification records
+
+`scripts/qualify-desktop.sh [config]` decides the part of the list above that a
+machine can decide — items 1 and 2 in full, the delivery report in item 16, and
+a bounded TUI start and quit — and prints a record block with the environment
+already redacted. It sends only `Ctrl+] q`, which Super-Herdr intercepts, so no
+keystroke reaches a pane and no running process is disturbed. Run it first on
+each frontend; what it does not cover needs a person at that desktop, and a row
+stays unrecorded until someone does it.
+
+### 2026-08-19 — nested inside Herdr
+
+- Host: Linux 6.8.0 x86_64
+- Terminal: unknown (TERM=xterm-256color), display protocol: none
+- Clipboard context: process nested inside Herdr; copy path: OSC 52 terminal
+  request (not acknowledged)
+- Clipboard tools present: xclip, notify-send
+- Notifications: delivery unavailable (native notifications require Super-Herdr
+  to run on the desktop); click to jump unavailable
+- Herdr 0.8.0 protocol 19; 2 target(s), 1 reachable
+- Super-Herdr 0.3.1 at commit 9a00be9
+- Automated checks: 11 passed, 0 failed
+
+Covered: item 1; item 2 in full, including failure isolation against a target
+that was genuinely unreachable, colored `OK`/`FAIL` on a pty, no ANSI escapes
+when redirected or under `--json` or `NO_COLOR=1`, and a clean exit when a
+consumer closes the pipe early; and the item 16 claim that a nested run reports
+native delivery as unavailable without affecting the TUI, which rendered its
+targets, agents, and attention pane and quit on `Ctrl+] q` with exit code 0. A
+probe before and after showed the observed session unchanged.
+
+Outstanding for this row: items 3 through 15, 17, and 18. Each needs a person
+at a desktop — dragging a selection, pasting with the terminal's own command,
+right-clicking a resource, clicking a delivered notification — and none of them
+is claimed here.
+
+The macOS, Wayland, and X11 rows have no recorded run at all; this host has no
+desktop session, so it cannot stand in for them.

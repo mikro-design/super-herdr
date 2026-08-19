@@ -109,4 +109,29 @@ package() {
 }
 PKGBUILD
 
-echo "rendered ${output}/super-herdr.rb and ${output}/PKGBUILD for v${version}"
+# The AUR validates a push against .SRCINFO, not against PKGBUILD, so the two
+# must agree. makepkg is not installable on the release runner, so this renders
+# the same projection makepkg --printsrcinfo would emit, from the same values.
+# The leading dot is dropped because a release asset glob skips hidden files;
+# the AUR repository wants it back as .SRCINFO.
+cat > "${output}/super-herdr-bin.SRCINFO" <<SRCINFO
+pkgbase = super-herdr-bin
+	pkgdesc = Multi-host federation client for Herdr sessions
+	pkgver = ${version}
+	pkgrel = 1
+	url = https://github.com/${repository}
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = super-herdr
+	conflicts = super-herdr
+	source_x86_64 = ${base}/super-herdr-v${version}-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = ${linux_intel}
+	source_aarch64 = ${base}/super-herdr-v${version}-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = ${linux_arm}
+
+pkgname = super-herdr-bin
+SRCINFO
+
+echo "rendered ${output}/super-herdr.rb, ${output}/PKGBUILD, and ${output}/super-herdr-bin.SRCINFO for v${version}"

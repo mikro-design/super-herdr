@@ -94,13 +94,13 @@ provided Makefile targets.
 # macOS and Linux, Homebrew tap
 brew install mikro-design/tap/super-herdr
 
-# Arch Linux, from the AUR
-paru -S super-herdr-bin
-
 # Debian and Ubuntu, amd64 or arm64
 curl -LO https://github.com/mikro-design/super-herdr/releases/latest/download/super-herdr_0.3.1-1_amd64.deb
 sudo dpkg -i super-herdr_0.3.1-1_amd64.deb
 ```
+
+An AUR package (`super-herdr-bin`) is generated for every release but is not
+submitted yet, so Arch users should take a prebuilt binary below until it is.
 
 ### Prebuilt binaries
 
@@ -713,8 +713,10 @@ cargo clippy -j 4 --target x86_64-apple-darwin --all-targets -- -D warnings
   remain planned.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the domain model and invariants,
-[TESTING.md](TESTING.md) for the release test matrix, and
-[ROADMAP.md](ROADMAP.md) for dependency-ordered follow-up work.
+[TESTING.md](TESTING.md) for the release test matrix and its qualification
+records, and [ROADMAP.md](ROADMAP.md) for dependency-ordered follow-up work.
+`scripts/qualify-desktop.sh` runs the machine-decidable part of that matrix on
+whichever desktop you invoke it from.
 
 ## Licensing
 

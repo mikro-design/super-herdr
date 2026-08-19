@@ -27,6 +27,9 @@ Work is ordered by dependency and product risk.
 - Dual MIT/Apache-2.0 licensing, so the project can accept outside contributions.
 - Signed releases: a keyless-signed checksum manifest, build provenance
   attestations, Debian packages, and generated Homebrew and AUR definitions.
+- First signed release published as v0.3.1, with the formula live in
+  `mikro-design/homebrew-tap` so `brew install mikro-design/tap/super-herdr`
+  works on macOS and Linux.
 - Live in-session workspace moves that replay an exported split tree with
   documented pane moves and restart no process.
 - Explicit cross-session workspace recreation with sanitized layouts, a bounded
@@ -34,9 +37,13 @@ Work is ordered by dependency and product risk.
 
 ## Next
 
-1. Execute and record the full desktop matrix in `TESTING.md`.
-2. Publish the first signed release and submit the generated formula and
-   PKGBUILD to a Homebrew tap and the AUR.
+1. Execute and record the full desktop matrix in `TESTING.md`. The
+   machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
+   recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
+   needing a pointer or a notification click, are still unrecorded.
+2. Submit the generated PKGBUILD and `.SRCINFO` to the AUR as `super-herdr-bin`.
+   Blocked on an AUR account whose SSH key is registered there; the name is
+   still unclaimed.
 
 ## Blocked on Herdr
 
