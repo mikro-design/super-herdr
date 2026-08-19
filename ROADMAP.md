@@ -41,6 +41,9 @@ Work is ordered by dependency and product risk.
 - Live configuration and session-discovery refresh inside the daemon, which
   rebuilds supervisors without restarting Herdr and retires only the routes
   whose target actually changed.
+- The TUI as a client of that daemon, hosting one in-process so a
+  single-machine install still runs as one command and binds nothing, and
+  reaching Herdr only through resolved operations and shared pane routes.
 
 ## Next
 
@@ -48,25 +51,29 @@ Work is ordered by dependency and product risk.
    machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
    recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
    needing a pointer or a notification click, are still unrecorded.
-2. Make the TUI a client of the daemon, keeping an in-process mode so a
-   single-machine install needs no service, and move native notification
-   delivery behind the daemon's attention stream.
-3. Remove the daemon's socket on a signalled shutdown. A stale socket is
+2. Move the durable attention index and native notification delivery into the
+   daemon. The frontend still owns both, so a hosted daemon is told not to
+   derive attention; until this lands, an attached phone cannot learn that an
+   agent is waiting unless the desktop frontend is running.
+3. Give a remote client a path for atomic multiline paste and clipboard media
+   upload. Both still run from the frontend against the target's own Herdr API
+   socket, which works only while the frontend and the daemon share a machine.
+4. Remove the daemon's socket on a signalled shutdown. A stale socket is
    already replaced on the next start, so this costs a leftover file rather
    than a failed restart, but the daemon should not rely on that.
-4. Add device pairing: a pairing code presented by the TUI, a revocable
+5. Add device pairing: a pairing code presented by the TUI, a revocable
    per-device token in the existing atomic TOML store, and a network transport.
    Until then a remote client reaches the daemon's Unix socket over OpenSSH
    forwarding, which is why this can be decided deliberately rather than in a
    hurry.
-5. Generalize the clipboard broker's verified upload into a file bridge —
+6. Generalize the clipboard broker's verified upload into a file bridge —
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target
    transfers.
-6. Ship the first remote client as a web client the daemon serves, covering
+7. Ship the first remote client as a web client the daemon serves, covering
    tablet and phone from one codebase. Navigation, the attention feed, and
    read-only pane observation come before input.
-7. Extend attention delivery with push notifications to paired devices, as a
+8. Extend attention delivery with push notifications to paired devices, as a
    further sink under the existing filters, coalescing, and rate limits.
 
 ## Blocked on Herdr

@@ -376,6 +376,30 @@ device pairing for one operator's own clients. It is deliberately not the shared
 identity, authorization, or audit system the roadmap defers, and it must not
 grow into one by accident.
 
+The frontend is a client of that daemon and hosts one inside itself, so a
+single-machine install remains one command with no socket and no service to
+operate. It attaches over an in-memory pipe rather than a socket, but takes the
+same code path: one implementation of framing, handshake, leases, and every rule
+behind them, so nothing can hide in the mode nobody runs on their own machine.
+What stays in the frontend is what a renderer owns — the VT parser, the screen
+model, selection, and the desktop clipboard — and what leaves is everything that
+talks to a Herdr server. A frontend no longer builds a Herdr command line; it
+names a resolved operation and the daemon chooses the client, resolves the
+target, and extracts the server-local identifier at the last step.
+
+Two rules moved with that split. A refused control stream falls back to
+observation rather than closing the pane, which was a frontend rule and is now
+the daemon's, so it holds for every attached client at once. And the frontend
+distinguishes what it asked for from what it was granted: comparing the two
+would otherwise make a downgraded lease look like a stale subscription and
+resubscribe it forever.
+
+The durable attention index stays with the frontend for now, because exactly one
+process may own it — two would write the same file with independently numbered
+events — and moving it is one step with native notification delivery rather than
+two half-steps. A daemon hosted inside a frontend therefore does not derive
+attention; a standalone one does.
+
 The first remote client is a web client the daemon itself serves, which covers
 tablet and phone from one codebase and can be saved to a home screen. Native
 clients can follow on the same protocol without changing it. Push delivery for

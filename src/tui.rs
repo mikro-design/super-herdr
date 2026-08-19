@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Stdout, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,37 +20,33 @@ use ratatui::widgets::{
     Tabs,
 };
 use ratatui::{Frame, Terminal};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep_until, timeout};
+use tokio::time::{interval, sleep_until};
 
 use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex, AttentionStore};
+use crate::client::{Client, ClientCommands};
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
+use crate::daemon::server::{DaemonOptions, spawn_in_process};
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
 use crate::notifications::{self, NotificationDelivery, NotificationQueue};
+use crate::operation::Operation;
+use crate::protocol::ServerMessage;
 use crate::resource_action::{ResourceAction, SplitDirection};
 use crate::state::{
-    FederationState, FederationStore, NormalizedSnapshot, SupervisorOptions, TargetConnectionState,
-    TargetRuntimeState, TargetUpdateMode,
+    FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
+    TargetUpdateMode,
 };
-use crate::terminal::{
-    TerminalAccess, TerminalEvent, TerminalScrollDirection, parse_terminal_event, spawn_terminal,
-    terminal_input_command, terminal_release_command, terminal_scroll_command,
-};
+use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 use crate::transport::{
-    CliSnapshotTransport, DiscoveredSession, SessionDiscovery, discover_running_sessions,
-    expand_discovered_sessions, run_herdr_operation, send_pane_input,
+    DiscoveredSession, SessionDiscovery, discover_running_sessions, expand_discovered_sessions,
+    send_pane_input,
 };
 use crate::ui_state::{UiState, UiStateStore};
-use crate::workspace_move;
 
 const PREFIX_KEY: u8 = 0x1d;
 const HERDR_PREFIX_KEY: u8 = 0x02;
 const SIDEBAR_WIDTH: u16 = 28;
-const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(10);
 const INPUT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(30);
 const CLIPBOARD_FEEDBACK_DURATION: Duration = Duration::from_secs(3);
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
@@ -638,31 +633,30 @@ enum ContextTarget {
     Pane(PaneId),
 }
 
+/// A pane this frontend is watching.
+///
+/// The terminal itself lives with the daemon; what is local is the screen model
+/// and the two facts that describe the subscription. `requested` is what was
+/// asked for and is compared against what the layout now wants, while `access`
+/// is what the daemon actually granted. Keeping them apart is what stops a
+/// downgraded lease from looking like a stale subscription and being resubscribed
+/// forever.
 struct ActiveRoute {
-    serial: u64,
     pane: PaneId,
+    requested: TerminalAccess,
     access: TerminalAccess,
     generation: u64,
     rows: u16,
     columns: u16,
-    child: Child,
-    input: Option<ChildStdin>,
-    reader: JoinHandle<()>,
     parser: vt100::Parser,
     last_sequence: Option<u64>,
 }
 
-impl Drop for ActiveRoute {
-    fn drop(&mut self) {
-        self.reader.abort();
-        let _ = self.child.start_kill();
-    }
-}
-
-enum RouteEvent {
-    Output { serial: u64, event: TerminalEvent },
-    Failed { serial: u64 },
-    Closed { serial: u64 },
+/// What a frontend needs to remember about an operation while the daemon runs
+/// it, since the result comes back carrying only a request identifier.
+struct PendingOperation {
+    description: String,
+    follow_server_focus: bool,
 }
 
 enum ConfigRefresh {
@@ -736,9 +730,12 @@ struct App {
     state_store: Option<UiStateStore>,
     mode: InputMode,
     routes: BTreeMap<PaneId, ActiveRoute>,
-    next_route_serial: u64,
     route_retry_after: BTreeMap<PaneId, Instant>,
-    control_retry_after: BTreeMap<PaneId, Instant>,
+    /// Commands to the daemon. Held here rather than threaded through every
+    /// function that might type into a pane, matching how the frontend already
+    /// carries its other senders.
+    client: Option<ClientCommands>,
+    pending_operations: BTreeMap<u64, PendingOperation>,
     last_frame_area: Option<Rect>,
     last_terminal_area: Option<Rect>,
     selection: Option<TerminalSelection>,
@@ -784,9 +781,9 @@ impl Default for App {
             state_store: None,
             mode: InputMode::Terminal,
             routes: BTreeMap::new(),
-            next_route_serial: 1,
             route_retry_after: BTreeMap::new(),
-            control_retry_after: BTreeMap::new(),
+            client: None,
+            pending_operations: BTreeMap::new(),
             last_frame_area: None,
             last_terminal_area: None,
             selection: None,
@@ -836,17 +833,28 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         .cloned()
         .map(|target| (target_key(&target), target))
         .collect::<BTreeMap<_, _>>();
-    let options = SupervisorOptions::from_config(&active_config);
     let mut transport_config = active_config.transport.clone();
-    let initial_store = FederationStore::start(
+    // The frontend hosts its own daemon, so a single-machine install still runs
+    // as one command with no socket and no service to operate. It is the same
+    // daemon a phone would reach, spoken over an in-memory pipe rather than a
+    // socket, so both paths exercise one implementation.
+    //
+    // Attention stays with the frontend for now: exactly one process may own
+    // the durable index, and moving it is a separate step that carries native
+    // notification delivery with it.
+    let daemon_options = DaemonOptions {
+        attention: false,
+        ..DaemonOptions::discover()?
+    };
+    let daemon = spawn_in_process(
         active_config.clone(),
-        Arc::new(CliSnapshotTransport),
-        options,
+        Some(config_path.clone()),
+        daemon_options,
     );
-    let mut updates = initial_store.subscribe();
-    let mut store = Some(initial_store);
+    let (client, mut daemon_events) = Client::attach(&daemon, "super-herdr-tui").await?;
+    client.subscribe_state();
+    let mut updates = client.state();
     let (input_sender, mut input) = mpsc::unbounded_channel();
-    let (route_sender, mut route_events) = mpsc::unbounded_channel();
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
     let (herdr_action_sender, mut herdr_action_events) = mpsc::unbounded_channel();
     let (target_test_sender, mut target_test_events) = mpsc::unbounded_channel();
@@ -883,6 +891,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         configured_targets,
         herdr_action_sender: Some(herdr_action_sender),
         target_test_sender: Some(target_test_sender),
+        client: Some(client.commands()),
         message: attention_message,
         ..App::default()
     };
@@ -898,14 +907,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
             let state = updates.borrow().clone();
             refresh_attention(&state, &mut app);
             reconcile_selection(&state, &mut app);
-            ensure_routes(
-                &state,
-                &targets,
-                &transport_config,
-                &mut terminal,
-                &route_sender,
-                &mut app,
-            )?;
+            ensure_routes(&state, &mut terminal, &mut app)?;
             let frame_area: Rect = terminal
                 .size()
                 .context("failed to read terminal size")?
@@ -965,11 +967,12 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                             app.notification_error_reported = false;
                         }
                         app.configured_targets = configured.targets.clone();
+                        // Supervisors belong to the daemon, which refreshes them
+                        // from the same file on its own schedule. What the
+                        // frontend still needs from a reload is the local
+                        // clipboard transport and the list the target manager
+                        // shows.
                         if federation_routes_changed(&active_config, &expanded) {
-                            release_routes(&mut app).await;
-                            if let Some(old_store) = store.take() {
-                                old_store.shutdown().await;
-                            }
                             targets = expanded
                                 .targets
                                 .iter()
@@ -977,19 +980,9 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                                 .map(|target| (target_key(&target), target))
                                 .collect();
                             transport_config = expanded.transport.clone();
-                            let options = SupervisorOptions::from_config(&expanded);
-                            let new_store = FederationStore::start(
-                                expanded.clone(),
-                                Arc::new(CliSnapshotTransport),
-                                options,
-                            );
-                            updates = new_store.subscribe();
-                            store = Some(new_store);
-                            active_config = expanded;
                             app.message = Some("refreshed configured hosts and running sessions".to_owned());
-                        } else {
-                            active_config.notifications = expanded.notifications;
                         }
+                        active_config = expanded;
                         if let Some(manager) = app.target_manager.as_mut()
                             && matches!(&manager.mode, TargetManagerMode::List)
                         {
@@ -1059,17 +1052,20 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                     should_draw = true;
                 }
             }
-            event = route_events.recv() => {
-                if let Some(event) = event {
-                    handle_route_event(event, &mut app);
-                    for _ in 1..ROUTE_EVENT_DRAIN_LIMIT {
-                        let Ok(event) = route_events.try_recv() else {
-                            break;
-                        };
-                        handle_route_event(event, &mut app);
-                    }
-                    should_draw = true;
+            event = daemon_events.recv() => {
+                let Some(event) = event else {
+                    break Err(anyhow::anyhow!("the daemon stopped serving this frontend"));
+                };
+                handle_daemon_event(event, &mut app);
+                // Frames are drained in bounded batches so a busy pane cannot
+                // starve input.
+                for _ in 1..ROUTE_EVENT_DRAIN_LIMIT {
+                    let Ok(event) = daemon_events.try_recv() else {
+                        break;
+                    };
+                    handle_daemon_event(event, &mut app);
                 }
+                should_draw = true;
             }
             _ = selection_ticks.tick() => {
                 if tick_selection_autoscroll(&mut app).await? {
@@ -1107,11 +1103,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 if app.route_retry_after.len() != before {
                     should_draw = true;
                 }
-                let before = app.control_retry_after.len();
-                app.control_retry_after.retain(|_, retry| *retry > Instant::now());
-                if app.control_retry_after.len() != before {
-                    should_draw = true;
-                }
                 if app
                     .clipboard_feedback
                     .as_ref()
@@ -1132,31 +1123,11 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         }
     };
 
-    release_routes(&mut app).await;
-    if let Some(store) = store {
-        store.shutdown().await;
-    }
+    // Dropping the client releases every lease and route it held; the daemon
+    // then stops with it. No Herdr session is touched either way.
+    drop(client);
+    daemon.shutdown().await;
     result
-}
-
-async fn release_routes(app: &mut App) {
-    let routes = std::mem::take(&mut app.routes);
-    for mut route in routes.into_values() {
-        if route.access == TerminalAccess::Control {
-            if let Some(input) = route.input.as_mut() {
-                if let Ok(command) = terminal_release_command() {
-                    let _ = input.write_all(&command).await;
-                }
-                let _ = input.shutdown().await;
-            }
-            if timeout(Duration::from_millis(250), route.child.wait())
-                .await
-                .is_err()
-            {
-                let _ = route.child.start_kill();
-            }
-        }
-    }
 }
 
 fn enter_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard)> {
@@ -1301,9 +1272,7 @@ async fn handle_decoded_input(
                 }
             }
         }
-        DecodedInput::Mouse(mouse) => {
-            handle_mouse(mouse, state, targets, transport_config, app).await?
-        }
+        DecodedInput::Mouse(mouse) => handle_mouse(mouse, state, transport_config, app).await?,
         DecodedInput::Paste(bytes) => {
             if app.mode != InputMode::Terminal
                 || app.target_manager.is_some()
@@ -1349,12 +1318,11 @@ async fn handle_decoded_input(
 async fn handle_mouse(
     mouse: MouseInput,
     state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
     transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<()> {
     if app.context_menu.is_some() {
-        handle_context_menu_mouse(mouse, state, targets, transport_config, app);
+        handle_context_menu_mouse(mouse, state, app);
         return Ok(());
     }
     if app.target_manager.is_some() {
@@ -1578,7 +1546,7 @@ fn pane_reports_mouse(app: &App, pane: &PaneId) -> bool {
     app.routes.get(pane).is_some_and(|route| {
         mouse_passthrough_enabled(
             route.parser.screen().mouse_protocol_mode(),
-            route.input.is_some(),
+            route.access == TerminalAccess::Control,
         )
     })
 }
@@ -1718,20 +1686,22 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
         SelectionAutoscrollDirection::Up => 0,
         SelectionAutoscrollDirection::Down => route.rows.saturating_sub(1),
     };
-    let command = terminal_scroll_command(direction, 1, autoscroll.column, row, 0)?;
-    let Some(input) = app
-        .routes
-        .get_mut(&autoscroll.pane)
-        .and_then(|route| route.input.as_mut())
-    else {
+    let Some(client) = app.client.clone().filter(|_| {
+        app.routes
+            .get(&autoscroll.pane)
+            .is_some_and(|route| route.access == TerminalAccess::Control)
+    }) else {
         app.selection_autoscroll = None;
         return Ok(false);
     };
-    if input.write_all(&command).await.is_err() {
-        fall_back_to_observe(app, &autoscroll.pane);
-        app.selection_autoscroll = None;
-        return Ok(false);
-    }
+    client.scroll_pane(
+        autoscroll.pane.clone(),
+        direction,
+        1,
+        autoscroll.column,
+        row,
+        0,
+    );
     if let Some(current) = app.selection_autoscroll.as_mut()
         && current.pane == autoscroll.pane
         && current.direction == autoscroll.direction
@@ -1773,7 +1743,6 @@ fn select_pane(app: &mut App, pane: PaneId) {
     app.sidebar_follow_selected = true;
     app.selected_pane = Some(pane.clone());
     app.route_retry_after.remove(&pane);
-    app.control_retry_after.remove(&pane);
     app.message = None;
     if app.attention.mark_seen_for_pane(&pane) {
         persist_attention(app);
@@ -1806,22 +1775,23 @@ async fn send_terminal_scroll(
         return Ok(());
     }
 
-    let command = terminal_scroll_command(
+    let Some(client) = app
+        .client
+        .clone()
+        .filter(|_| route.access == TerminalAccess::Control)
+    else {
+        app.message =
+            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
+        return Ok(());
+    };
+    client.scroll_pane(
+        pane.clone(),
         direction,
         MOUSE_SCROLL_LINES,
         mouse.column.saturating_sub(1),
         mouse.row.saturating_sub(1),
         mouse.key_modifiers(),
-    )?;
-    let route = app.routes.get_mut(pane).expect("route was checked above");
-    let Some(input) = route.input.as_mut() else {
-        app.message =
-            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
-        return Ok(());
-    };
-    if input.write_all(&command).await.is_err() {
-        fall_back_to_observe(app, pane);
-    }
+    );
     Ok(())
 }
 
@@ -1855,19 +1825,16 @@ async fn send_mouse_inputs(
         return Ok(());
     }
 
-    let route = app.routes.get_mut(pane).expect("route was checked above");
-    let Some(input) = route.input.as_mut() else {
+    let Some(client) = app
+        .client
+        .clone()
+        .filter(|_| route.access == TerminalAccess::Control)
+    else {
         app.message =
             Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
         return Ok(());
     };
-    if input
-        .write_all(&terminal_input_command(&bytes)?)
-        .await
-        .is_err()
-    {
-        fall_back_to_observe(app, pane);
-    }
+    client.send_input(pane.clone(), bytes);
     Ok(())
 }
 
@@ -2018,16 +1985,16 @@ async fn handle_input(
     app: &mut App,
 ) -> Result<bool> {
     if app.context_menu.is_some() {
-        return handle_context_menu_input(key, state, targets, transport_config, app);
+        return handle_context_menu_input(key, state, app);
     }
     if app.close_confirmation.is_some() {
-        return handle_close_confirmation_input(key, state, targets, transport_config, app);
+        return handle_close_confirmation_input(key, app);
     }
     if app.text_prompt.is_some() {
-        return handle_text_prompt_input(key, state, targets, transport_config, app);
+        return handle_text_prompt_input(key, app);
     }
     if app.command_palette.is_some() {
-        return handle_command_palette_input(key, state, targets, transport_config, app);
+        return handle_command_palette_input(key, state, app);
     }
     if app.target_manager.is_some() {
         return handle_target_manager_input(key, transport_config, app);
@@ -2069,21 +2036,18 @@ async fn handle_input(
                 app.message = Some("control route became stale".to_owned());
                 return Ok(false);
             }
-            let route = app
+            let controlling = app
                 .routes
-                .get_mut(&selected)
-                .expect("route was checked above");
-            let Some(input) = route.input.as_mut() else {
+                .get(&selected)
+                .is_some_and(|route| route.access == TerminalAccess::Control);
+            let Some(client) = app.client.clone().filter(|_| controlling) else {
                 app.message = Some(
                     "read-only: another Herdr client owns control; retrying automatically"
                         .to_owned(),
                 );
                 return Ok(false);
             };
-            let command = terminal_input_command(&[key])?;
-            if input.write_all(&command).await.is_err() {
-                fall_back_to_observe(app, &selected);
-            }
+            client.send_input(selected.clone(), vec![key]);
         }
         InputMode::Prefix => {
             match key {
@@ -2103,16 +2067,14 @@ async fn handle_input(
                 b' ' => app.command_palette = Some(CommandPalette::default()),
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
                 PREFIX_KEY => {
-                    if let Some(route) = app
-                        .selected_pane
-                        .as_ref()
-                        .and_then(|pane| app.routes.get_mut(pane))
-                        && let Some(input) = route.input.as_mut()
+                    if let Some(pane) = app.selected_pane.clone()
+                        && app
+                            .routes
+                            .get(&pane)
+                            .is_some_and(|route| route.access == TerminalAccess::Control)
+                        && let Some(client) = app.client.clone()
                     {
-                        input
-                            .write_all(&terminal_input_command(&[PREFIX_KEY])?)
-                            .await
-                            .context("failed to send the literal prefix key")?;
+                        client.send_input(pane, vec![PREFIX_KEY]);
                     }
                 }
                 0x1b => {}
@@ -2126,20 +2088,14 @@ async fn handle_input(
             app.mode = InputMode::Terminal;
         }
         InputMode::HerdrPrefix => {
-            handle_herdr_prefix(key, state, targets, transport_config, app)?;
+            handle_herdr_prefix(key, state, app)?;
             app.mode = InputMode::Terminal;
         }
     }
     Ok(false)
 }
 
-fn handle_herdr_prefix(
-    key: u8,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<()> {
+fn handle_herdr_prefix(key: u8, state: &FederationState, app: &mut App) -> Result<()> {
     match key {
         b'h' => select_neighbor_pane(state, app, PaneDirection::Left),
         b'j' => select_neighbor_pane(state, app, PaneDirection::Down),
@@ -2158,57 +2114,38 @@ fn handle_herdr_prefix(
                 app.message = Some("Herdr: selected pane has no workspace".to_owned());
                 return Ok(());
             };
-            spawn_selected_herdr_action(
-                state,
-                targets,
-                transport_config,
+            run_operation(
                 app,
-                vec![
-                    "tab".to_owned(),
-                    "create".to_owned(),
-                    "--workspace".to_owned(),
-                    workspace.resource.clone(),
-                    "--focus".to_owned(),
-                ],
+                Operation::CreateTab {
+                    workspace: workspace.clone(),
+                },
                 "created tab".to_owned(),
                 true,
             );
         }
-        b'v' => spawn_pane_action(
-            state,
-            targets,
-            transport_config,
+        b'v' => run_selected_pane_operation(
             app,
-            HerdrPaneAction {
-                prefix: &["pane", "split"],
-                suffix: &["--direction", "right", "--focus"],
-                description: "split pane vertically",
-                follow_server_focus: true,
+            |pane| Operation::SplitPane {
+                pane,
+                direction: SplitDirection::Right,
             },
+            "split pane vertically",
+            true,
         ),
-        b'-' => spawn_pane_action(
-            state,
-            targets,
-            transport_config,
+        b'-' => run_selected_pane_operation(
             app,
-            HerdrPaneAction {
-                prefix: &["pane", "split"],
-                suffix: &["--direction", "down", "--focus"],
-                description: "split pane horizontally",
-                follow_server_focus: true,
+            |pane| Operation::SplitPane {
+                pane,
+                direction: SplitDirection::Down,
             },
+            "split pane horizontally",
+            true,
         ),
-        b'z' => spawn_pane_action(
-            state,
-            targets,
-            transport_config,
+        b'z' => run_selected_pane_operation(
             app,
-            HerdrPaneAction {
-                prefix: &["pane", "zoom"],
-                suffix: &["--toggle"],
-                description: "toggled pane zoom",
-                follow_server_focus: false,
-            },
+            |pane| Operation::TogglePaneZoom { pane },
+            "toggled pane zoom",
+            false,
         ),
         b'?' => {
             app.message = Some(
@@ -2227,125 +2164,56 @@ fn handle_herdr_prefix(
     Ok(())
 }
 
-struct HerdrPaneAction<'a> {
-    prefix: &'a [&'a str],
-    suffix: &'a [&'a str],
-    description: &'a str,
-    follow_server_focus: bool,
-}
-
-struct HerdrOperation {
-    args: Vec<String>,
-    description: String,
-    follow_server_focus: bool,
-}
-
-fn spawn_pane_action(
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
+/// Submit one resolved operation to the daemon.
+///
+/// The frontend no longer builds a Herdr command line: it names what it wants
+/// and the daemon resolves the target, chooses the client, and extracts the
+/// server-local identifier. What stays here is the single-action guard and the
+/// description to show when the result comes back, since a result carries only
+/// a request identifier.
+fn run_operation(
     app: &mut App,
-    action: HerdrPaneAction<'_>,
-) {
-    let Some(pane) = app.selected_pane.as_ref() else {
-        app.message = Some("Herdr: no pane is selected".to_owned());
-        return;
-    };
-    let mut args = action
-        .prefix
-        .iter()
-        .map(|argument| (*argument).to_owned())
-        .collect::<Vec<_>>();
-    args.push(pane.resource.clone());
-    args.extend(action.suffix.iter().map(|argument| (*argument).to_owned()));
-    spawn_selected_herdr_action(
-        state,
-        targets,
-        transport_config,
-        app,
-        args,
-        action.description.to_owned(),
-        action.follow_server_focus,
-    );
-}
-
-fn spawn_selected_herdr_action(
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-    args: Vec<String>,
+    operation: Operation,
     description: String,
     follow_server_focus: bool,
 ) {
-    let Some(selected) = app.selected_pane.as_ref() else {
-        app.message = Some("Herdr: no pane is selected".to_owned());
+    if app.herdr_action_inflight {
+        app.message = Some("Herdr action already in progress".to_owned());
+        return;
+    }
+    let Some(client) = app.client.as_ref() else {
+        app.message = Some("Herdr action routing is unavailable".to_owned());
         return;
     };
-    let key = selected.target_session();
-    spawn_qualified_herdr_action(
-        state,
-        targets,
-        transport_config,
-        app,
-        &key,
-        HerdrOperation {
-            args,
+    let request = client.run_operation(operation);
+    app.herdr_action_inflight = true;
+    app.message = Some(format!("Herdr: {description}…"));
+    app.pending_operations.insert(
+        request,
+        PendingOperation {
             description,
             follow_server_focus,
         },
     );
 }
 
-fn spawn_qualified_herdr_action(
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
+/// Run an operation against the selected pane's own pane identifier.
+fn run_selected_pane_operation(
     app: &mut App,
-    key: &TargetSession,
-    operation: HerdrOperation,
+    build: impl FnOnce(PaneId) -> Operation,
+    description: &str,
+    follow_server_focus: bool,
 ) {
-    if app.herdr_action_inflight {
-        app.message = Some("Herdr action already in progress".to_owned());
-        return;
-    }
-    let Some(target) = targets.get(key).cloned() else {
-        app.message = Some("Herdr: selected target is unavailable".to_owned());
+    let Some(pane) = app.selected_pane.clone() else {
+        app.message = Some("Herdr: no pane is selected".to_owned());
         return;
     };
-    let Some(executable) = state
-        .targets
-        .get(key)
-        .and_then(|target| target.selected_herdr_bin.clone())
-    else {
-        app.message = Some("Herdr: no compatible client is selected".to_owned());
-        return;
-    };
-    let Some(sender) = app.herdr_action_sender.clone() else {
-        app.message = Some("Herdr action routing is unavailable".to_owned());
-        return;
-    };
-    let transport = transport_config.clone();
-    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
-    app.herdr_action_inflight = true;
-    app.message = Some(format!("Herdr: {}…", operation.description));
-    tokio::spawn(async move {
-        let result = run_herdr_operation(
-            &target,
-            &transport,
-            &executable,
-            &operation.args,
-            command_timeout,
-        )
-        .await
-        .map_err(|error| error.message);
-        let _ = sender.send(HerdrActionEvent {
-            result,
-            description: operation.description,
-            follow_server_focus: operation.follow_server_focus,
-            clipboard_feedback: None,
-        });
-    });
+    run_operation(
+        app,
+        build(pane),
+        description.to_owned(),
+        follow_server_focus,
+    );
 }
 
 struct WorkspaceMove {
@@ -2360,17 +2228,7 @@ struct WorkspaceMove {
 /// single-action guard and per-target failure isolation still hold. Herdr
 /// re-qualifies moved pane identifiers, so the selection follows server focus
 /// once the move lands.
-fn spawn_workspace_move(
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-    move_request: WorkspaceMove,
-) {
-    if app.herdr_action_inflight {
-        app.message = Some("Herdr action already in progress".to_owned());
-        return;
-    }
+fn spawn_workspace_move(state: &FederationState, app: &mut App, move_request: WorkspaceMove) {
     let key = move_request.workspace.target_session();
     if key != move_request.destination.target_session() {
         app.message = Some("Herdr: a workspace can only move inside one session".to_owned());
@@ -2388,79 +2246,39 @@ fn spawn_workspace_move(
         app.message = Some(format!("Herdr: {key} is not connected"));
         return;
     }
-    let Some(target) = targets.get(&key).cloned() else {
-        app.message = Some("Herdr: selected target is unavailable".to_owned());
-        return;
-    };
-    let Some(sender) = app.herdr_action_sender.clone() else {
-        app.message = Some("Herdr action routing is unavailable".to_owned());
-        return;
-    };
     let WorkspaceMove {
         workspace,
         destination,
         label,
         destination_label,
     } = move_request;
-    let transport = transport_config.clone();
-    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
-    app.herdr_action_inflight = true;
-    app.message = Some(format!(
-        "Herdr: moving workspace {label:?} into {destination_label:?} on {key}…"
-    ));
-    tokio::spawn(async move {
-        let outcome = workspace_move::move_workspace(
-            &target,
-            &transport,
-            &workspace.resource,
-            &destination.resource,
-            command_timeout,
-        )
-        .await;
-        let (result, description) = match outcome {
-            Ok(summary) => (
-                Ok(()),
-                format!(
-                    "moved {} tab(s) and {} pane(s) from workspace {label:?} into {destination_label:?} on {key}",
-                    summary.tabs, summary.panes
-                ),
-            ),
-            Err(error) => (
-                Err(format!(
-                    "moving workspace {label:?} into {destination_label:?} on {key}: {error}"
-                )),
-                String::new(),
-            ),
-        };
-        let _ = sender.send(HerdrActionEvent {
-            result,
-            description,
-            follow_server_focus: true,
-            clipboard_feedback: None,
-        });
-    });
+    run_operation(
+        app,
+        Operation::MoveWorkspace {
+            workspace,
+            destination,
+        },
+        format!("moved workspace {label:?} into {destination_label:?} on {key}"),
+        true,
+    );
 }
 
 /// Recreate a workspace on another session. Two Herdr servers are involved, so
 /// both must be live; the source is only read, and nothing there is closed.
 fn spawn_workspace_recreate(
     state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
     app: &mut App,
     workspace: WorkspaceId,
     destination: TargetSession,
     label: String,
 ) {
-    if app.herdr_action_inflight {
-        app.message = Some("Herdr action already in progress".to_owned());
-        return;
-    }
     let source_key = workspace.target_session();
     if source_key == destination {
         app.message = Some("Herdr: use a move inside one session".to_owned());
         return;
     }
+    // Two Herdr servers are involved, so both must be live before anything is
+    // built on the destination.
     for key in [&source_key, &destination] {
         if state
             .targets
@@ -2471,55 +2289,18 @@ fn spawn_workspace_recreate(
             return;
         }
     }
-    let (Some(source), Some(target)) = (
-        targets.get(&source_key).cloned(),
-        targets.get(&destination).cloned(),
-    ) else {
-        app.message = Some("Herdr: selected target is unavailable".to_owned());
-        return;
-    };
-    let Some(sender) = app.herdr_action_sender.clone() else {
-        app.message = Some("Herdr action routing is unavailable".to_owned());
-        return;
-    };
-    let transport = transport_config.clone();
-    let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
-    app.herdr_action_inflight = true;
-    app.message = Some(format!(
-        "Herdr: recreating workspace {label:?} on {destination}…"
-    ));
-    tokio::spawn(async move {
-        let outcome = workspace_move::recreate_workspace(
-            &source,
-            &target,
-            &transport,
-            &workspace.resource,
-            Some(label.as_str()),
-            command_timeout,
-        )
-        .await;
-        let (result, description) = match outcome {
-            Ok(summary) => (
-                Ok(()),
-                format!(
-                    "recreated workspace {label:?} as {} on {destination} with {} tab(s) and {} new shell(s); the source workspace is unchanged",
-                    summary.workspace, summary.tabs, summary.panes
-                ),
-            ),
-            Err(error) => (
-                Err(format!(
-                    "recreating workspace {label:?} on {destination}: {error}"
-                )),
-                String::new(),
-            ),
-        };
-        let _ = sender.send(HerdrActionEvent {
-            result,
-            description,
-            follow_server_focus: false,
-            clipboard_feedback: None,
-        });
-    });
+    let description =
+        format!("recreated workspace {label:?} from {source_key} on {destination} (new shells)");
+    run_operation(
+        app,
+        Operation::RecreateWorkspace {
+            workspace,
+            destination,
+            label: (!label.is_empty()).then_some(label),
+        },
+        description,
+        false,
+    );
 }
 
 fn request_workspace_close(state: &FederationState, app: &mut App) {
@@ -2911,13 +2692,7 @@ fn filtered_palette_actions(
     actions.into_iter().map(|(_, action)| action).collect()
 }
 
-fn handle_command_palette_input(
-    key: u8,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<bool> {
+fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
     let Some(mut palette) = app.command_palette.take() else {
         return Ok(false);
     };
@@ -2926,7 +2701,7 @@ fn handle_command_palette_input(
         0x1b => return Ok(false),
         b'\r' | b'\n' => {
             if let Some(action) = actions.get(palette.selected).cloned() {
-                execute_resource_action(action, state, targets, transport_config, app);
+                execute_resource_action(action, state, app);
                 return Ok(false);
             }
         }
@@ -2960,13 +2735,7 @@ fn handle_command_palette_input(
     Ok(false)
 }
 
-fn handle_context_menu_input(
-    key: u8,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<bool> {
+fn handle_context_menu_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
     let Some(mut menu) = app.context_menu.take() else {
         return Ok(false);
     };
@@ -2987,7 +2756,7 @@ fn handle_context_menu_input(
         }
         b'\r' | b'\n' => {
             if let Some(action) = menu.actions.get(menu.selected).cloned() {
-                execute_resource_action(action, state, targets, transport_config, app);
+                execute_resource_action(action, state, app);
             }
             return Ok(false);
         }
@@ -2997,13 +2766,7 @@ fn handle_context_menu_input(
     Ok(false)
 }
 
-fn handle_context_menu_mouse(
-    mouse: MouseInput,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) {
+fn handle_context_menu_mouse(mouse: MouseInput, state: &FederationState, app: &mut App) {
     let Some(frame_area) = app.last_frame_area else {
         app.context_menu = None;
         return;
@@ -3049,7 +2812,7 @@ fn handle_context_menu_mouse(
         });
         if let Some(action) = action {
             app.context_menu = None;
-            execute_resource_action(action, state, targets, transport_config, app);
+            execute_resource_action(action, state, app);
         } else if let Some(menu) = app.context_menu.as_mut() {
             menu.pressed = None;
         }
@@ -3058,13 +2821,7 @@ fn handle_context_menu_mouse(
     }
 }
 
-fn execute_resource_action(
-    action: ResourceAction,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) {
+fn execute_resource_action(action: ResourceAction, state: &FederationState, app: &mut App) {
     if action.mutates_herdr() && app.herdr_action_inflight {
         app.message = Some("Herdr action already in progress".to_owned());
         return;
@@ -3117,23 +2874,11 @@ fn execute_resource_action(
         }
         ResourceAction::CreateTab { workspace } => {
             let target_session = workspace.target_session();
-            spawn_qualified_herdr_action(
-                state,
-                targets,
-                transport_config,
+            run_operation(
                 app,
-                &target_session,
-                HerdrOperation {
-                    args: vec![
-                        "tab".to_owned(),
-                        "create".to_owned(),
-                        "--workspace".to_owned(),
-                        workspace.resource,
-                        "--focus".to_owned(),
-                    ],
-                    description: format!("created tab on {target_session}"),
-                    follow_server_focus: true,
-                },
+                Operation::CreateTab { workspace },
+                format!("created tab on {target_session}"),
+                true,
             );
         }
         ResourceAction::MoveWorkspace {
@@ -3144,8 +2889,6 @@ fn execute_resource_action(
         } => {
             spawn_workspace_move(
                 state,
-                targets,
-                transport_config,
                 app,
                 WorkspaceMove {
                     workspace,
@@ -3160,68 +2903,30 @@ fn execute_resource_action(
             destination,
             label,
         } => {
-            spawn_workspace_recreate(
-                state,
-                targets,
-                transport_config,
-                app,
-                workspace,
-                destination,
-                label,
-            );
+            spawn_workspace_recreate(state, app, workspace, destination, label);
         }
         ResourceAction::SplitPane { pane, direction } => {
             let target_session = pane.target_session();
-            spawn_qualified_herdr_action(
-                state,
-                targets,
-                transport_config,
+            run_operation(
                 app,
-                &target_session,
-                HerdrOperation {
-                    args: vec![
-                        "pane".to_owned(),
-                        "split".to_owned(),
-                        pane.resource,
-                        "--direction".to_owned(),
-                        direction.cli_value().to_owned(),
-                        "--focus".to_owned(),
-                    ],
-                    description: format!("split pane {} on {target_session}", direction.label()),
-                    follow_server_focus: true,
-                },
+                Operation::SplitPane { pane, direction },
+                format!("split pane {} on {target_session}", direction.label()),
+                true,
             );
         }
         ResourceAction::TogglePaneZoom { pane } => {
             let target_session = pane.target_session();
-            spawn_qualified_herdr_action(
-                state,
-                targets,
-                transport_config,
+            run_operation(
                 app,
-                &target_session,
-                HerdrOperation {
-                    args: vec![
-                        "pane".to_owned(),
-                        "zoom".to_owned(),
-                        pane.resource,
-                        "--toggle".to_owned(),
-                    ],
-                    description: format!("toggled pane zoom on {target_session}"),
-                    follow_server_focus: false,
-                },
+                Operation::TogglePaneZoom { pane },
+                format!("toggled pane zoom on {target_session}"),
+                false,
             );
         }
     }
 }
 
-fn handle_text_prompt_input(
-    key: u8,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<bool> {
+fn handle_text_prompt_input(key: u8, app: &mut App) -> Result<bool> {
     let Some(mut prompt) = app.text_prompt.take() else {
         return Ok(false);
     };
@@ -3232,29 +2937,24 @@ fn handle_text_prompt_input(
             if value.is_empty() {
                 prompt.error = Some("A non-empty label is required".to_owned());
             } else {
-                let (target_session, args, description, follow_server_focus) = match prompt.action {
+                // The prompt is where an intent becomes an operation: the label
+                // the person typed is now part of what the daemon is asked to do.
+                let (operation, description, follow_server_focus) = match prompt.action {
                     TextPromptAction::CreateWorkspace { target } => (
-                        target.clone(),
-                        vec![
-                            "workspace".to_owned(),
-                            "create".to_owned(),
-                            "--label".to_owned(),
-                            value.clone(),
-                            "--focus".to_owned(),
-                        ],
+                        Operation::CreateWorkspace {
+                            target: target.clone(),
+                            label: value.clone(),
+                        },
                         format!("created workspace {value:?} on {target}"),
                         true,
                     ),
                     TextPromptAction::RenameWorkspace { workspace } => {
                         let target = workspace.target_session();
                         (
-                            target.clone(),
-                            vec![
-                                "workspace".to_owned(),
-                                "rename".to_owned(),
-                                workspace.resource,
-                                value.clone(),
-                            ],
+                            Operation::RenameWorkspace {
+                                workspace,
+                                label: value.clone(),
+                            },
                             format!("renamed workspace to {value:?} on {target}"),
                             false,
                         )
@@ -3262,30 +2962,16 @@ fn handle_text_prompt_input(
                     TextPromptAction::RenameTab { tab } => {
                         let target = tab.target_session();
                         (
-                            target.clone(),
-                            vec![
-                                "tab".to_owned(),
-                                "rename".to_owned(),
-                                tab.resource,
-                                value.clone(),
-                            ],
+                            Operation::RenameTab {
+                                tab,
+                                label: value.clone(),
+                            },
                             format!("renamed tab to {value:?} on {target}"),
                             false,
                         )
                     }
                 };
-                spawn_qualified_herdr_action(
-                    state,
-                    targets,
-                    transport_config,
-                    app,
-                    &target_session,
-                    HerdrOperation {
-                        args,
-                        description,
-                        follow_server_focus,
-                    },
-                );
+                run_operation(app, operation, description, follow_server_focus);
                 return Ok(false);
             }
         }
@@ -3307,44 +2993,33 @@ fn handle_text_prompt_input(
     Ok(false)
 }
 
-fn handle_close_confirmation_input(
-    key: u8,
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<bool> {
+fn handle_close_confirmation_input(key: u8, app: &mut App) -> Result<bool> {
     let Some(confirmation) = app.close_confirmation.take() else {
         return Ok(false);
     };
     match key {
         b'y' => {
-            let (target_session, args, description) = match confirmation.action {
+            // Confirmation is what turns a destructive intent into an
+            // operation. Nothing that has not been agreed to reaches the daemon.
+            let (operation, description) = match confirmation.action {
                 ResourceAction::CloseWorkspace { workspace, label } => {
                     let target = workspace.target_session();
                     (
-                        target.clone(),
-                        vec![
-                            "workspace".to_owned(),
-                            "close".to_owned(),
-                            workspace.resource,
-                        ],
+                        Operation::CloseWorkspace { workspace },
                         format!("closed workspace {label:?} on {target}"),
                     )
                 }
                 ResourceAction::CloseTab { tab, label } => {
                     let target = tab.target_session();
                     (
-                        target.clone(),
-                        vec!["tab".to_owned(), "close".to_owned(), tab.resource],
+                        Operation::CloseTab { tab },
                         format!("closed tab {label:?} on {target}"),
                     )
                 }
                 ResourceAction::ClosePane { pane, label } => {
                     let target = pane.target_session();
                     (
-                        target.clone(),
-                        vec!["pane".to_owned(), "close".to_owned(), pane.resource],
+                        Operation::ClosePane { pane },
                         format!("closed pane {label:?} on {target}"),
                     )
                 }
@@ -3356,18 +3031,7 @@ fn handle_close_confirmation_input(
                     return Ok(false);
                 }
             };
-            spawn_qualified_herdr_action(
-                state,
-                targets,
-                transport_config,
-                app,
-                &target_session,
-                HerdrOperation {
-                    args,
-                    description,
-                    follow_server_focus: true,
-                },
-            );
+            run_operation(app, operation, description, true);
         }
         b'n' | b'q' | 0x1b => {}
         _ => app.close_confirmation = Some(confirmation),
@@ -4058,7 +3722,7 @@ async fn paste_text_into_selected(
         app.message = Some("selected pane has no control route".to_owned());
         return Ok(());
     };
-    if route.input.is_none() {
+    if route.access != TerminalAccess::Control {
         app.message = Some("read-only: another Herdr client owns control; cannot paste".to_owned());
         return Ok(());
     }
@@ -4113,19 +3777,15 @@ async fn paste_text_into_selected(
         return Ok(());
     }
     let payload = terminal_paste_payload(text.as_bytes(), bracketed)?;
-    let command = terminal_input_command(&payload)?;
-    let Some(input) = app
+    let controlling = app
         .routes
-        .get_mut(&selected)
-        .and_then(|route| route.input.as_mut())
-    else {
+        .get(&selected)
+        .is_some_and(|route| route.access == TerminalAccess::Control);
+    let Some(client) = app.client.clone().filter(|_| controlling) else {
         app.message = Some("terminal control route closed before paste".to_owned());
         return Ok(());
     };
-    if input.write_all(&command).await.is_err() {
-        fall_back_to_observe(app, &selected);
-        return Ok(());
-    }
+    client.send_input(selected.clone(), payload);
     app.clipboard_feedback = Some(ClipboardFeedback {
         text: feedback,
         expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
@@ -4156,7 +3816,7 @@ async fn paste_clipboard_media(
         app.message = Some("selected pane has no control route".to_owned());
         return Ok(());
     };
-    if route.input.is_none() {
+    if route.access != TerminalAccess::Control {
         app.message =
             Some("read-only: another Herdr client owns control; cannot paste media".to_owned());
         return Ok(());
@@ -4193,19 +3853,15 @@ async fn paste_clipboard_media(
         upload.path.as_bytes(),
         route.parser.screen().bracketed_paste(),
     )?;
-    let command = terminal_input_command(&payload)?;
-    let Some(input) = app
+    let controlling = app
         .routes
-        .get_mut(&selected)
-        .and_then(|route| route.input.as_mut())
-    else {
+        .get(&selected)
+        .is_some_and(|route| route.access == TerminalAccess::Control);
+    let Some(client) = app.client.clone().filter(|_| controlling) else {
         app.message = Some("terminal control route closed before media path paste".to_owned());
         return Ok(());
     };
-    if input.write_all(&command).await.is_err() {
-        fall_back_to_observe(app, &selected);
-        return Ok(());
-    }
+    client.send_input(selected.clone(), payload);
     app.clipboard_feedback = Some(ClipboardFeedback {
         text: format!(
             "uploaded and verified {} {} bytes; pasted remote path",
@@ -4242,7 +3898,6 @@ fn cycle_pane(state: &FederationState, app: &mut App, direction: isize) {
         app.selection_autoscroll = None;
         app.routes.clear();
         app.route_retry_after.clear();
-        app.control_retry_after.clear();
         return;
     }
     app.selection_explicit = true;
@@ -4507,7 +4162,6 @@ fn reconcile_selection(state: &FederationState, app: &mut App) {
         app.selection = None;
         app.selection_autoscroll = None;
         app.route_retry_after.clear();
-        app.control_retry_after.clear();
         app.message = None;
     }
 }
@@ -4522,16 +4176,25 @@ fn selectable_panes(state: &FederationState) -> Vec<PaneId> {
         .collect()
 }
 
+/// Reconcile the daemon subscriptions with what the layout wants on screen.
+///
+/// The terminals themselves live with the daemon; what this keeps is one screen
+/// model per visible pane. A subscription is replaced rather than adjusted when
+/// its size, its requested access, or its target's connection generation
+/// changes, which is the same rule the frontend applied when it spawned these
+/// routes itself.
 fn ensure_routes(
     state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    route_sender: &mpsc::UnboundedSender<RouteEvent>,
     app: &mut App,
 ) -> Result<()> {
-    let Some(selected) = app.selected_pane.as_ref() else {
-        app.routes.clear();
+    let Some(client) = app.client.clone() else {
+        return Ok(());
+    };
+    let Some(selected) = app.selected_pane.clone() else {
+        for pane in std::mem::take(&mut app.routes).into_keys() {
+            client.unsubscribe_pane(pane);
+        }
         return Ok(());
     };
     let area = terminal.size().context("failed to read terminal size")?;
@@ -4539,28 +4202,35 @@ fn ensure_routes(
     let (_, _, terminal_area) = ui_areas(frame_area);
     app.last_frame_area = Some(frame_area);
     app.last_terminal_area = Some(terminal_area);
-    let desired = visible_pane_areas(state, Some(selected), terminal_area)
+    let desired = visible_pane_areas(state, Some(&selected), terminal_area)
         .into_iter()
         .filter_map(|(pane, area)| {
-            let inner = pane_block(&pane, &pane == selected, None).inner(area);
+            let inner = pane_block(&pane, pane == selected, None).inner(area);
             (inner.width > 0 && inner.height > 0).then_some((pane, inner))
         })
         .collect::<BTreeMap<_, _>>();
 
-    let control_retry_after = &app.control_retry_after;
+    let mut released = Vec::new();
     app.routes.retain(|pane, route| {
-        let Some(inner) = desired.get(pane) else {
-            return false;
-        };
-        let Some(runtime) = state.targets.get(&pane.target_session()) else {
-            return false;
-        };
-        let access = desired_access(pane, selected, control_retry_after);
-        route.access == access
-            && route.generation == runtime.connection_generation
-            && route.rows == inner.height
-            && route.columns == inner.width
+        let keep = desired.get(pane).is_some_and(|inner| {
+            state
+                .targets
+                .get(&pane.target_session())
+                .is_some_and(|runtime| {
+                    route.requested == desired_access(pane, &selected)
+                        && route.generation == runtime.connection_generation
+                        && route.rows == inner.height
+                        && route.columns == inner.width
+                })
+        });
+        if !keep {
+            released.push(pane.clone());
+        }
+        keep
     });
+    for pane in released {
+        client.unsubscribe_pane(pane);
+    }
 
     for (pane, inner) in desired {
         if app.routes.contains_key(&pane)
@@ -4571,151 +4241,54 @@ fn ensure_routes(
         {
             continue;
         }
-        let key = pane.target_session();
-        let Some(runtime) = state.targets.get(&key) else {
+        let Some(runtime) = state.targets.get(&pane.target_session()) else {
             continue;
         };
-        if runtime.connection != TargetConnectionState::Live {
-            continue;
-        }
-        let Some(target) = targets.get(&key) else {
-            if pane == *selected {
-                app.message = Some("selected target is missing from configuration".to_owned());
-            }
-            continue;
-        };
-        let Some(executable) = runtime.selected_herdr_bin.as_deref() else {
-            if pane == *selected {
-                app.message = Some("selected target has no compatible Herdr client".to_owned());
-            }
-            continue;
-        };
-        let access = desired_access(&pane, selected, &app.control_retry_after);
-        let process = match spawn_terminal(
-            target,
-            transport_config,
-            executable,
-            &pane,
-            access,
-            inner.height,
-            inner.width,
-        ) {
-            Ok(process) => process,
-            Err(error) => {
-                app.route_retry_after
-                    .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
-                if pane == *selected {
-                    app.message = Some(format!("terminal route failed: {error}"));
-                    if access == TerminalAccess::Control {
-                        app.control_retry_after
-                            .insert(pane.clone(), Instant::now() + CONTROL_RETRY_DELAY);
-                    }
-                }
-                continue;
-            }
-        };
-        if access == TerminalAccess::Control && process.input.is_none() {
-            app.message = Some("terminal control route has no input stream".to_owned());
-            continue;
-        }
-        let serial = app.next_route_serial;
-        app.next_route_serial = app.next_route_serial.saturating_add(1);
-        let reader = spawn_route_reader(serial, process.output, route_sender.clone());
+        let requested = desired_access(&pane, &selected);
+        client.subscribe_pane(pane.clone(), requested, inner.width, inner.height);
         app.routes.insert(
             pane.clone(),
             ActiveRoute {
-                serial,
                 pane,
-                access,
+                requested,
+                // Until the daemon answers with a lease, assume the lesser of what
+                // was asked for, so nothing types into a pane it may not own.
+                access: TerminalAccess::Observe,
                 generation: runtime.connection_generation,
                 rows: inner.height,
                 columns: inner.width,
-                child: process.child,
-                input: process.input,
-                reader,
                 parser: vt100::Parser::new(inner.height, inner.width, 2_000),
                 last_sequence: None,
             },
         );
     }
-    if let Some(route) = app.routes.get(selected) {
-        app.message = match route.access {
-            TerminalAccess::Control => None,
-            TerminalAccess::Observe => Some(
-                "read-only: another Herdr client owns control; retrying automatically".to_owned(),
-            ),
-        };
-    }
     Ok(())
 }
 
-fn desired_access(
-    pane: &PaneId,
-    selected: &PaneId,
-    control_retry_after: &BTreeMap<PaneId, Instant>,
-) -> TerminalAccess {
-    if pane != selected
-        || control_retry_after
-            .get(pane)
-            .is_some_and(|retry| *retry > Instant::now())
-    {
-        TerminalAccess::Observe
-    } else {
+/// Only the selected pane asks for control. Whether it gets it is the daemon's
+/// answer, not this frontend's assumption.
+fn desired_access(pane: &PaneId, selected: &PaneId) -> TerminalAccess {
+    if pane == selected {
         TerminalAccess::Control
+    } else {
+        TerminalAccess::Observe
     }
 }
 
-fn spawn_route_reader(
-    serial: u64,
-    output: tokio::process::ChildStdout,
-    sender: mpsc::UnboundedSender<RouteEvent>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut output = BufReader::new(output);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match output.read_until(b'\n', &mut line).await {
-                Ok(0) | Err(_) => {
-                    let _ = sender.send(RouteEvent::Closed { serial });
-                    return;
-                }
-                Ok(_) => match parse_terminal_event(&line) {
-                    Ok(TerminalEvent::Closed) => {
-                        let _ = sender.send(RouteEvent::Closed { serial });
-                        return;
-                    }
-                    Ok(event) => {
-                        if sender.send(RouteEvent::Output { serial, event }).is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = sender.send(RouteEvent::Failed { serial });
-                        return;
-                    }
-                },
+/// Apply one message from the daemon that is not federation state.
+fn handle_daemon_event(message: ServerMessage, app: &mut App) {
+    match message {
+        ServerMessage::PaneFrame {
+            pane,
+            sequence,
+            width,
+            height,
+            full,
+            bytes,
+        } => {
+            if !app.routes.contains_key(&pane) {
+                return;
             }
-        }
-    })
-}
-
-fn handle_route_event(event: RouteEvent, app: &mut App) {
-    match event {
-        RouteEvent::Output { serial, event } => {
-            let Some(pane) = route_pane_for_serial(app, serial) else {
-                return;
-            };
-            let TerminalEvent::Frame {
-                sequence,
-                width,
-                height,
-                full,
-                bytes,
-            } = event
-            else {
-                return;
-            };
             let pending_direction = app
                 .selection_autoscroll
                 .as_ref()
@@ -4727,10 +4300,7 @@ fn handle_route_event(event: RouteEvent, app: &mut App) {
                     .map(|route| capture_screen_rows(route.parser.screen()))
             });
             let after = {
-                let route = app
-                    .routes
-                    .get_mut(&pane)
-                    .expect("route was resolved by serial");
+                let route = app.routes.get_mut(&pane).expect("route was checked above");
                 if full || route.rows != height || route.columns != width {
                     route.parser = vt100::Parser::new(height, width, 2_000);
                     route.rows = height;
@@ -4742,44 +4312,61 @@ fn handle_route_event(event: RouteEvent, app: &mut App) {
             };
             update_selection_after_frame(app, &pane, pending_direction, before.as_deref(), after);
         }
-        RouteEvent::Failed { serial } => {
-            if let Some(pane) = route_pane_for_serial(app, serial) {
-                let access = app.routes.get(&pane).map(|route| route.access);
-                app.routes.remove(&pane);
-                match access {
-                    Some(TerminalAccess::Control) => fall_back_to_observe(app, &pane),
-                    _ => {
-                        app.route_retry_after
-                            .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
-                    }
-                }
-                if app.selected_pane.as_ref() == Some(&pane) {
-                    app.message = Some("terminal route returned an invalid frame".to_owned());
-                }
+        ServerMessage::PaneLease { pane, access } => {
+            if let Some(route) = app.routes.get_mut(&pane) {
+                route.access = access;
+            }
+            if app.selected_pane.as_ref() == Some(&pane) {
+                app.message = match access {
+                    TerminalAccess::Control => None,
+                    TerminalAccess::Observe => Some(
+                        "read-only: another Herdr client owns control; retrying automatically"
+                            .to_owned(),
+                    ),
+                };
             }
         }
-        RouteEvent::Closed { serial } => {
-            if let Some(pane) = route_pane_for_serial(app, serial) {
-                let access = app.routes.get(&pane).map(|route| route.access);
-                app.routes.remove(&pane);
-                match access {
-                    Some(TerminalAccess::Control) => fall_back_to_observe(app, &pane),
-                    _ => {
-                        app.route_retry_after
-                            .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
-                    }
-                }
-                if app.selected_pane.as_ref() == Some(&pane) {
-                    app.message = Some(match access {
-                        Some(TerminalAccess::Control) => {
-                            "read-only: another Herdr client owns control; retrying automatically"
-                                .to_owned()
-                        }
-                        _ => "terminal observer route closed".to_owned(),
-                    });
-                }
+        ServerMessage::PaneClosed { pane } => {
+            app.routes.remove(&pane);
+            // Wait before asking again, so a pane that cannot be opened does not
+            // become a resubscribe loop.
+            app.route_retry_after
+                .insert(pane.clone(), Instant::now() + Duration::from_secs(2));
+            if app.selected_pane.as_ref() == Some(&pane) {
+                app.message = Some("terminal route closed".to_owned());
             }
         }
+        ServerMessage::OperationResult {
+            request,
+            applied,
+            message,
+        } => {
+            app.herdr_action_inflight = false;
+            let pending = app.pending_operations.remove(&request);
+            if applied {
+                app.message = Some(format!(
+                    "Herdr: {}",
+                    pending
+                        .as_ref()
+                        .map_or(message.as_str(), |pending| pending.description.as_str())
+                ));
+                if pending.is_some_and(|pending| pending.follow_server_focus) {
+                    app.selection_explicit = false;
+                    app.selected_pane = None;
+                }
+            } else {
+                app.message = Some(format!("Herdr action failed: {message}"));
+            }
+        }
+        ServerMessage::Error { message, .. } => {
+            app.message = Some(message);
+        }
+        // Attention is still derived by this frontend from the same
+        // authoritative state; see the note where the daemon is started.
+        ServerMessage::Attention { .. }
+        | ServerMessage::Hello { .. }
+        | ServerMessage::FederationState { .. }
+        | ServerMessage::TargetState { .. } => {}
     }
 }
 
@@ -4847,24 +4434,6 @@ fn viewport_shift_distance(
         SelectionAutoscrollDirection::Up => before[..before.len() - lines] == after[*lines..],
         SelectionAutoscrollDirection::Down => before[*lines..] == after[..after.len() - lines],
     })
-}
-
-fn fall_back_to_observe(app: &mut App, pane: &PaneId) {
-    app.routes.remove(pane);
-    app.route_retry_after.remove(pane);
-    app.control_retry_after
-        .insert(pane.clone(), Instant::now() + CONTROL_RETRY_DELAY);
-    if app.selected_pane.as_ref() == Some(pane) {
-        app.message =
-            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
-    }
-}
-
-fn route_pane_for_serial(app: &App, serial: u64) -> Option<PaneId> {
-    app.routes
-        .iter()
-        .find(|(_, route)| route.serial == serial)
-        .map(|(pane, _)| pane.clone())
 }
 
 fn render(frame: &mut Frame, state: &FederationState, app: &App) {
@@ -6606,8 +6175,8 @@ mod tests {
         TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
         TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
         clamped_pane_position, command_palette_actions, context_menu_for_target, cycle_tab,
-        desired_access, displayed_message, encode_mouse_event, fall_back_to_observe,
-        federation_routes_changed, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
+        desired_access, displayed_message, encode_mouse_event, federation_routes_changed,
+        filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
         handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
         handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
         jump_from_notification, mouse_event_allowed, mouse_passthrough_enabled,
@@ -7644,7 +7213,6 @@ mod tests {
             last_frame_area: Some(frame_area),
             ..App::default()
         };
-        let targets = BTreeMap::new();
         let transport = crate::config::TransportConfig::default();
 
         handle_mouse(
@@ -7655,7 +7223,6 @@ mod tests {
                 release: false,
             },
             &state,
-            &targets,
             &transport,
             &mut app,
         )
@@ -7669,7 +7236,7 @@ mod tests {
             .iter()
             .position(ResourceAction::is_destructive)
             .unwrap();
-        handle_context_menu_input(b'\r', &state, &targets, &transport, &mut app).unwrap();
+        handle_context_menu_input(b'\r', &state, &mut app).unwrap();
         assert_eq!(
             app.close_confirmation,
             Some(super::CloseConfirmation {
@@ -7816,26 +7383,18 @@ mod tests {
         );
     }
 
+    /// Which pane asks for control is still a frontend decision; whether it
+    /// gets control is the daemon's, and is tested against the broker.
     #[test]
-    fn occupied_control_lease_falls_back_then_retries() {
-        let pane = PaneId::new("host-a", "dev", "w1:p1");
-        let mut app = App {
-            selected_pane: Some(pane.clone()),
-            ..App::default()
-        };
+    fn only_the_selected_pane_asks_for_control() {
+        let selected = PaneId::new("host-a", "dev", "w1:p1");
+        let other = PaneId::new("host-a", "dev", "w1:p2");
 
-        fall_back_to_observe(&mut app, &pane);
         assert_eq!(
-            desired_access(&pane, &pane, &app.control_retry_after),
-            TerminalAccess::Observe
-        );
-
-        app.control_retry_after =
-            BTreeMap::from([(pane.clone(), Instant::now() - Duration::from_millis(1))]);
-        assert_eq!(
-            desired_access(&pane, &pane, &app.control_retry_after),
+            desired_access(&selected, &selected),
             TerminalAccess::Control
         );
+        assert_eq!(desired_access(&other, &selected), TerminalAccess::Observe);
     }
 
     #[test]
@@ -8216,7 +7775,6 @@ mod tests {
                 .and_then(|hit| hit.pane.as_ref()),
             Some(&PaneId::new("host-a", "dev", &last_initial_pane))
         );
-        let targets = BTreeMap::new();
         let transport = crate::config::TransportConfig::default();
 
         handle_mouse(
@@ -8227,7 +7785,6 @@ mod tests {
                 release: false,
             },
             &state,
-            &targets,
             &transport,
             &mut app,
         )
