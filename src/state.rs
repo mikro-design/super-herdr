@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -11,7 +12,46 @@ use crate::config::{Config, Target, TransportConfig};
 use crate::model::{PaneId, TabId, TargetSession, TerminalId, WorkspaceId};
 use crate::transport::{SnapshotError, SnapshotErrorKind, SnapshotTransport, TransportSnapshot};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Several federation maps are keyed by a `QualifiedId`, which is a structure
+/// rather than a string and therefore cannot be a JSON object key. Every such
+/// value already carries its own key, so the wire form is the sequence of
+/// values and the map is rebuilt on arrival. The key is never transmitted
+/// separately, so a message cannot describe a map whose key disagrees with the
+/// value it points at.
+mod keyed_map {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub trait Keyed {
+        type Key: Ord;
+
+        fn wire_key(&self) -> Self::Key;
+    }
+
+    pub fn serialize<S, V>(map: &BTreeMap<V::Key, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Keyed + Serialize,
+    {
+        serializer.collect_seq(map.values())
+    }
+
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<BTreeMap<V::Key, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Keyed + Deserialize<'de>,
+    {
+        Ok(Vec::<V>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| (value.wire_key(), value))
+            .collect())
+    }
+}
+
+use keyed_map::Keyed;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceCounts {
     pub workspaces: usize,
     pub tabs: usize,
@@ -19,7 +59,7 @@ pub struct ResourceCounts {
     pub agents: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedSnapshot {
     pub server_version: Option<String>,
     pub protocol: Option<u64>,
@@ -29,15 +69,20 @@ pub struct NormalizedSnapshot {
     pub focused_workspace: Option<WorkspaceId>,
     pub focused_tab: Option<TabId>,
     pub focused_pane: Option<PaneId>,
+    #[serde(with = "keyed_map")]
     pub workspaces: BTreeMap<WorkspaceId, WorkspaceState>,
+    #[serde(with = "keyed_map")]
     pub tabs: BTreeMap<TabId, TabState>,
+    #[serde(with = "keyed_map")]
     pub panes: BTreeMap<PaneId, PaneState>,
+    #[serde(with = "keyed_map")]
     pub layouts: BTreeMap<TabId, LayoutState>,
+    #[serde(with = "keyed_map")]
     pub agents: BTreeMap<PaneId, AgentState>,
     pub terminals: BTreeSet<TerminalId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub id: WorkspaceId,
     pub active_tab: Option<TabId>,
@@ -47,7 +92,7 @@ pub struct WorkspaceState {
     pub agent_status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
     pub id: TabId,
     pub workspace: Option<WorkspaceId>,
@@ -57,7 +102,7 @@ pub struct TabState {
     pub agent_status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneState {
     pub id: PaneId,
     pub workspace: Option<WorkspaceId>,
@@ -70,7 +115,7 @@ pub struct PaneState {
     pub revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutRect {
     pub x: u16,
     pub y: u16,
@@ -78,14 +123,14 @@ pub struct LayoutRect {
     pub height: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutPane {
     pub pane: PaneId,
     pub focused: bool,
     pub rect: LayoutRect,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutState {
     pub workspace: WorkspaceId,
     pub tab: TabId,
@@ -95,7 +140,7 @@ pub struct LayoutState {
     pub panes: Vec<LayoutPane>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentState {
     pub pane: PaneId,
     pub name: Option<String>,
@@ -103,6 +148,54 @@ pub struct AgentState {
     pub status: Option<String>,
     pub interactive_ready: Option<bool>,
     pub revision: Option<u64>,
+}
+
+impl Keyed for WorkspaceState {
+    type Key = WorkspaceId;
+
+    fn wire_key(&self) -> Self::Key {
+        self.id.clone()
+    }
+}
+
+impl Keyed for TabState {
+    type Key = TabId;
+
+    fn wire_key(&self) -> Self::Key {
+        self.id.clone()
+    }
+}
+
+impl Keyed for PaneState {
+    type Key = PaneId;
+
+    fn wire_key(&self) -> Self::Key {
+        self.id.clone()
+    }
+}
+
+impl Keyed for LayoutState {
+    type Key = TabId;
+
+    fn wire_key(&self) -> Self::Key {
+        self.tab.clone()
+    }
+}
+
+impl Keyed for AgentState {
+    type Key = PaneId;
+
+    fn wire_key(&self) -> Self::Key {
+        self.pane.clone()
+    }
+}
+
+impl Keyed for TargetRuntimeState {
+    type Key = TargetSession;
+
+    fn wire_key(&self) -> Self::Key {
+        self.key.clone()
+    }
 }
 
 impl NormalizedSnapshot {
@@ -134,7 +227,8 @@ impl NormalizedSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetConnectionState {
     Connecting,
     Live,
@@ -142,13 +236,14 @@ pub enum TargetConnectionState {
     Incompatible,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetUpdateMode {
     Polling,
     Events,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetRuntimeState {
     pub key: TargetSession,
     pub endpoint: String,
@@ -189,9 +284,10 @@ impl TargetRuntimeState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationState {
     pub revision: u64,
+    #[serde(with = "keyed_map")]
     pub targets: BTreeMap<TargetSession, TargetRuntimeState>,
 }
 
@@ -520,7 +616,7 @@ fn retry_delay(options: &SupervisorOptions, failed_attempts: u32) -> Duration {
         .min(options.maximum_backoff)
 }
 
-fn target_key(target: &Target) -> TargetSession {
+pub fn target_key(target: &Target) -> TargetSession {
     TargetSession::new(&target.name, target.session_name())
 }
 
