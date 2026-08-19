@@ -393,8 +393,11 @@ Running `super-herdr` without a subcommand opens the TUI.
   output, JSON output, and terminals with `NO_COLOR` set remain uncolored.
   `--timeout` overrides the configured command timeout for one run, and
   `--snapshots` adds full server snapshots to `--json` output.
-- `clipboard check` reports the active copy, text-paste, and image-paste paths.
-  It does not read or print clipboard payloads.
+- `clipboard check` reports the active copy, text-paste, and media-paste paths,
+  which flavors the clipboard is currently offering, and which of those this
+  build can upload. It does not read or print clipboard payloads; flavor names
+  are metadata, and are stripped of control characters and bounded before they
+  are shown.
 - `notifications check` reports the configured filters and whether native
   delivery is available without sending anything.
 - `notifications enable` and `notifications disable` atomically update only the

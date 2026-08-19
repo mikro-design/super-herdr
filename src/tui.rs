@@ -2093,7 +2093,7 @@ async fn handle_input(
                 b'n' => cycle_tab(state, app, 1),
                 b'p' => cycle_tab(state, app, -1),
                 b'v' => paste_system_clipboard(state, targets, transport_config, app).await?,
-                b'i' => paste_clipboard_image(state, targets, transport_config, app).await?,
+                b'i' => paste_clipboard_media(state, targets, transport_config, app).await?,
                 b'h' => {
                     app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
                 }
@@ -4133,7 +4133,7 @@ async fn paste_text_into_selected(
     Ok(())
 }
 
-async fn paste_clipboard_image(
+async fn paste_clipboard_media(
     state: &FederationState,
     targets: &BTreeMap<TargetSession, Target>,
     transport_config: &crate::config::TransportConfig,
@@ -4158,7 +4158,7 @@ async fn paste_clipboard_image(
     };
     if route.input.is_none() {
         app.message =
-            Some("read-only: another Herdr client owns control; cannot paste image".to_owned());
+            Some("read-only: another Herdr client owns control; cannot paste media".to_owned());
         return Ok(());
     }
     if !runtime.accepts_generation(route.generation) {
@@ -4166,28 +4166,27 @@ async fn paste_clipboard_image(
         app.message = Some("control route became stale".to_owned());
         return Ok(());
     }
-    let image = match clipboard::read_media(clipboard::PNG, MAX_CLIPBOARD_MEDIA_BYTES).await {
-        Ok(image) => image,
+    let (media, payload) = match clipboard::read_offered_media(MAX_CLIPBOARD_MEDIA_BYTES).await {
+        Ok(offered) => offered,
         Err(error) => {
-            app.message = Some(format!("clipboard image unavailable: {error}"));
+            app.message = Some(format!("clipboard media unavailable: {error}"));
             return Ok(());
         }
     };
-    let upload =
-        match clipboard::upload_media(target, transport_config, clipboard::PNG, &image).await {
-            Ok(upload) => upload,
-            Err(error) => {
-                app.message = Some(format!("clipboard image upload failed: {error}"));
-                return Ok(());
-            }
-        };
+    let upload = match clipboard::upload_media(target, transport_config, media, &payload).await {
+        Ok(upload) => upload,
+        Err(error) => {
+            app.message = Some(format!("clipboard media upload failed: {error}"));
+            return Ok(());
+        }
+    };
     let Some(route) = app.routes.get(&selected) else {
-        app.message = Some("terminal control route closed during image upload".to_owned());
+        app.message = Some("terminal control route closed during media upload".to_owned());
         return Ok(());
     };
     if !runtime.accepts_generation(route.generation) {
         app.routes.remove(&selected);
-        app.message = Some("control route became stale during image upload".to_owned());
+        app.message = Some("control route became stale during media upload".to_owned());
         return Ok(());
     }
     let payload = terminal_paste_payload(
@@ -4200,7 +4199,7 @@ async fn paste_clipboard_image(
         .get_mut(&selected)
         .and_then(|route| route.input.as_mut())
     else {
-        app.message = Some("terminal control route closed before image path paste".to_owned());
+        app.message = Some("terminal control route closed before media path paste".to_owned());
         return Ok(());
     };
     if input.write_all(&command).await.is_err() {
@@ -4209,8 +4208,8 @@ async fn paste_clipboard_image(
     }
     app.clipboard_feedback = Some(ClipboardFeedback {
         text: format!(
-            "uploaded and verified {} clipboard image bytes; pasted remote path",
-            upload.bytes
+            "uploaded and verified {} {} bytes; pasted remote path",
+            upload.bytes, upload.mime
         ),
         expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
     });

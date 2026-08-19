@@ -219,7 +219,7 @@ async fn run() -> Result<ExitCode> {
             command: ClipboardCommands::Check
         }
     ) {
-        for line in clipboard::diagnostic_lines() {
+        for line in clipboard::diagnostic_lines().await {
             stdout_line(format_args!("{line}"))?;
         }
         return Ok(ExitCode::SUCCESS);

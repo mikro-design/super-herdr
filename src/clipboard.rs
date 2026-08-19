@@ -99,6 +99,16 @@ pub const PNG: ClipboardMedia = ClipboardMedia {
     signature: Some(b"\x89PNG\r\n\x1a\n"),
 };
 
+/// Flavors the bridge can move, in the order they are preferred when a
+/// clipboard offers several at once.
+pub const KNOWN_MEDIA: &[ClipboardMedia] = &[PNG];
+
+/// A clipboard type list is metadata, not payload, but it is still written by
+/// whichever program owns the clipboard, so it is bounded before it is read.
+const MAXIMUM_TYPE_LIST_BYTES: usize = 64 * 1024;
+const MAXIMUM_REPORTED_TYPES: usize = 12;
+const MAXIMUM_TYPE_NAME_CHARS: usize = 80;
+
 impl ClipboardMedia {
     /// Reject bytes that cannot be what the clipboard claimed.
     ///
@@ -124,7 +134,7 @@ impl ClipboardMedia {
     }
 }
 
-pub fn diagnostic_lines() -> Vec<String> {
+pub async fn diagnostic_lines() -> Vec<String> {
     let context = clipboard_context();
     let writer = native_writer();
     let reader = native_reader();
@@ -146,8 +156,18 @@ pub fn diagnostic_lines() -> Vec<String> {
     } else {
         "unavailable to an SSH/nested process; paste through the local terminal or run Super-Herdr on the desktop".to_owned()
     };
-    let image_method = if context == ClipboardContext::Desktop {
+    let media_method = if context == ClipboardContext::Desktop {
         media_reader_label(PNG)
+    } else {
+        "unavailable to an SSH/nested process".to_owned()
+    };
+    let offered = if context == ClipboardContext::Desktop {
+        let names = offered_type_names().await;
+        if names.is_empty() {
+            "not reported by this desktop".to_owned()
+        } else {
+            names.join(", ")
+        }
     } else {
         "unavailable to an SSH/nested process".to_owned()
     };
@@ -156,7 +176,16 @@ pub fn diagnostic_lines() -> Vec<String> {
         format!("context: {}", context.label()),
         format!("copy: {copy_method} ({copy_acknowledgement})"),
         format!("paste action: {paste_method}"),
-        format!("image paste action: {image_method}"),
+        format!("media paste action: {media_method}"),
+        format!("clipboard offers: {offered}"),
+        format!(
+            "uploadable flavors: {}",
+            KNOWN_MEDIA
+                .iter()
+                .map(|media| media.mime)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         "clipboard payloads are neither inspected by this check nor written to logs".to_owned(),
     ]
 }
@@ -182,6 +211,103 @@ pub async fn read_text(maximum_bytes: usize) -> Result<String> {
     };
     let bytes = read_command_bytes(spec, maximum_bytes, "system clipboard").await?;
     String::from_utf8(bytes).context("system clipboard does not contain UTF-8 text")
+}
+
+/// Ask the clipboard which flavors it currently holds.
+///
+/// Assuming a flavor is how the bridge used to fail: a JPEG on the clipboard
+/// produced "does not contain image/png data", which is true and useless. An
+/// empty result means enumeration is unavailable, not that the clipboard is
+/// empty, so callers must fall back rather than conclude anything from it.
+pub async fn offered_type_names() -> Vec<String> {
+    if clipboard_context() != ClipboardContext::Desktop {
+        return Vec::new();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(spec) = native_type_lister() else {
+            return Vec::new();
+        };
+        let Ok(bytes) = read_command_bytes(spec, MAXIMUM_TYPE_LIST_BYTES, "clipboard types").await
+        else {
+            return Vec::new();
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Vec::new();
+        };
+        collect_type_names(text.lines())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let spec = CommandSpec::new("osascript", &["-e", "clipboard info"]);
+        let Ok(bytes) = read_command_bytes(spec, MAXIMUM_TYPE_LIST_BYTES, "clipboard types").await
+        else {
+            return Vec::new();
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Vec::new();
+        };
+        collect_type_names(macos_type_fields(&text).iter().map(String::as_str))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Flavor names are untrusted text from whichever program owns the clipboard.
+/// They may be shown, but only stripped of control characters and bounded.
+fn collect_type_names<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut names = Vec::new();
+    for candidate in raw {
+        let cleaned: String = candidate
+            .chars()
+            .filter(|character| character.is_ascii_graphic() || *character == ' ')
+            .take(MAXIMUM_TYPE_NAME_CHARS)
+            .collect();
+        let cleaned = cleaned.trim().to_owned();
+        if cleaned.is_empty() || names.contains(&cleaned) {
+            continue;
+        }
+        names.push(cleaned);
+        if names.len() >= MAXIMUM_REPORTED_TYPES {
+            break;
+        }
+    }
+    names
+}
+
+/// The flavors the bridge can actually move, in table preference order.
+pub async fn offered_media() -> Vec<ClipboardMedia> {
+    let names = offered_type_names().await;
+    KNOWN_MEDIA
+        .iter()
+        .copied()
+        .filter(|media| names.iter().any(|name| name == media.mime))
+        .collect()
+}
+
+/// Read whichever supported flavor the clipboard is offering.
+pub async fn read_offered_media(maximum_bytes: usize) -> Result<(ClipboardMedia, Vec<u8>)> {
+    let names = offered_type_names().await;
+    if let Some(media) = KNOWN_MEDIA
+        .iter()
+        .copied()
+        .find(|media| names.iter().any(|name| name == media.mime))
+    {
+        let bytes = read_media(media, maximum_bytes).await?;
+        return Ok((media, bytes));
+    }
+    if names.is_empty() {
+        // Enumeration is unavailable here, so ask for the historical flavor
+        // rather than refusing a clipboard that may well hold one.
+        let bytes = read_media(PNG, maximum_bytes).await?;
+        return Ok((PNG, bytes));
+    }
+    bail!(
+        "clipboard offers {}, none of which can be uploaded yet",
+        names.join(", ")
+    );
 }
 
 pub async fn read_media(media: ClipboardMedia, maximum_bytes: usize) -> Result<Vec<u8>> {
@@ -353,6 +479,20 @@ fn native_reader() -> Option<CommandSpec> {
 }
 
 #[cfg(target_os = "linux")]
+fn native_type_lister() -> Option<CommandSpec> {
+    if env::var_os("WAYLAND_DISPLAY").is_some() && command_available("wl-paste") {
+        return Some(CommandSpec::new("wl-paste", &["--list-types"]));
+    }
+    if env::var_os("DISPLAY").is_some() && command_available("xclip") {
+        return Some(CommandSpec::new(
+            "xclip",
+            &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+        ));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn native_media_reader(media: ClipboardMedia) -> Option<CommandSpec> {
     if env::var_os("WAYLAND_DISPLAY").is_some() && command_available("wl-paste") {
         return Some(CommandSpec::new("wl-paste", &["--type", media.mime]));
@@ -391,19 +531,49 @@ fn media_reader_label(media: ClipboardMedia) -> String {
     }
 }
 
-/// macOS names pasteboard flavors by four-character code rather than by MIME.
+/// macOS names pasteboard flavors by four-character code rather than by MIME,
+/// so the two are mapped in both directions from one table.
 ///
 /// An unmapped flavor reports as unsupported instead of guessing a code, which
 /// would ask the pasteboard for something that cannot exist.
 #[cfg(target_os = "macos")]
+const MACOS_CLASSES: &[(&str, &str)] = &[
+    ("image/png", "PNGf"),
+    ("image/tiff", "TIFF"),
+    ("application/pdf", "PDF "),
+    ("text/rtf", "RTF "),
+];
+
+#[cfg(target_os = "macos")]
 fn macos_pasteboard_class(media: ClipboardMedia) -> Option<&'static str> {
-    match media.mime {
-        "image/png" => Some("PNGf"),
-        "image/tiff" => Some("TIFF"),
-        "application/pdf" => Some("PDF "),
-        "text/rtf" => Some("RTF "),
-        _ => None,
-    }
+    MACOS_CLASSES
+        .iter()
+        .find(|(mime, _)| *mime == media.mime)
+        .map(|(_, class)| *class)
+}
+
+/// Turn one `clipboard info` report into flavor names.
+///
+/// The report is a comma-separated list of alternating flavor and size, where a
+/// flavor is either `«class XXXX»` or a human name. A class this build does not
+/// map is still reported, as `class:XXXX`, so the operator can see what is
+/// actually on the clipboard.
+#[cfg(target_os = "macos")]
+fn macos_type_fields(report: &str) -> Vec<String> {
+    report
+        .split(',')
+        .map(str::trim)
+        .filter_map(|field| {
+            let class = field.strip_prefix("\u{ab}class ")?.strip_suffix('\u{bb}')?;
+            let class = class.trim_end();
+            Some(
+                MACOS_CLASSES
+                    .iter()
+                    .find(|(_, code)| code.trim_end() == class)
+                    .map_or_else(|| format!("class:{class}"), |(mime, _)| (*mime).to_owned()),
+            )
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
