@@ -1,49 +1,32 @@
 # Packaging
 
-Package definitions are generated, not maintained by hand: a formula or PKGBUILD
-must name the exact archives a release published and their checksums, and a
-hand-edited copy drifts silently. `scripts/render-packaging.sh` renders the formula,
-the PKGBUILD, and the matching `.SRCINFO` from a release's own `SHA256SUMS`, and
-the release workflow runs it and attaches the results to the GitHub release.
+Package definitions are generated, not maintained by hand: a formula must name
+the exact archives a release published and their checksums, and a hand-edited
+copy drifts silently. `scripts/render-packaging.sh` renders the Homebrew formula
+from a release's own `SHA256SUMS`, the release workflow runs it and attaches the
+result to the GitHub release, and `scripts/verify-packaging.sh` proves the
+rendered checksums match before the release exists.
 
-## Publishing a release to the package managers
+## Publishing a release to Homebrew
 
 1. Tag a release (`git tag vX.Y.Z && git push origin vX.Y.Z`) and wait for the
    `CI and Release` workflow.
-2. Download `super-herdr.rb`, `PKGBUILD`, and `super-herdr-bin.SRCINFO` from the
-   finished release.
-3. Homebrew: commit `super-herdr.rb` to
+2. Download `super-herdr.rb` from the finished release.
+3. Commit it to
    [`mikro-design/homebrew-tap`](https://github.com/mikro-design/homebrew-tap)
    as `Formula/super-herdr.rb`, unchanged. Users then install with
    `brew install mikro-design/tap/super-herdr`.
-4. AUR: commit `PKGBUILD` and `super-herdr-bin.SRCINFO` (renamed to `.SRCINFO`)
-   to the `super-herdr-bin` AUR repository and push:
 
-   ```sh
-   git clone ssh://aur@aur.archlinux.org/super-herdr-bin.git
-   cp PKGBUILD super-herdr-bin/PKGBUILD
-   cp super-herdr-bin.SRCINFO super-herdr-bin/.SRCINFO
-   cd super-herdr-bin && git add -A && git commit -m "Update to X.Y.Z" && git push
-   ```
+This is not automated, because pushing to the tap needs credentials that this
+repository deliberately does not hold.
 
-Neither step is automated, because pushing to a tap or to the AUR needs
-credentials that this repository deliberately does not hold. The AUR push in
-particular needs an AUR account whose SSH key is registered there.
+## No Arch package
 
-## Why `.SRCINFO` is rendered rather than generated
-
-The AUR validates a push against `.SRCINFO`, not against `PKGBUILD`, so a stale
-`.SRCINFO` publishes the wrong checksums. `makepkg` cannot run on the Ubuntu
-release runner, so the script renders the same projection from the same values
-that produce the `PKGBUILD`. On a machine that has `makepkg`, the rendering can
-be confirmed against the real thing:
-
-```sh
-cd out && makepkg --printsrcinfo | diff - super-herdr-bin.SRCINFO
-```
-
-The rendered file drops the leading dot because the release workflow attaches
-`release-files/*`, and that glob skips hidden files.
+There is deliberately no AUR package. Publishing to the AUR authenticates only
+by an SSH key registered to an AUR account, so it cannot run from CI without
+parking a private key in secrets, and it would need a manual push on every
+release. Homebrew covers macOS and Linux and the Debian packages cover
+Debian and Ubuntu; Arch users take a prebuilt archive.
 
 ## Rendering locally
 

@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/mikro-design/super-herdr"
 
 [package.metadata.deb]
-maintainer = "Mikro Design <vemund.bakken@onio.com>"
+maintainer = "Mikro Design <mikrodesign@proton.me>"
 copyright = "2026 Mikro Design"
 license-file = "LICENSE-MIT"
 section = "utils"

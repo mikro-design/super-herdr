@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Verify a release's package definitions against its own checksum manifest.
 #
-# The formula, the PKGBUILD, and .SRCINFO each restate checksums a release
-# already published, and a restated value drifts silently. They are checked
-# here rather than trusted, before anything is published or submitted to a
-# package manager.
+# The formula restates checksums a release already published, and a restated
+# value drifts silently. It is checked here rather than trusted, before
+# anything is published or submitted to a package manager.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -16,10 +15,8 @@ version="$1"
 dir="$2"
 sums="${dir}/SHA256SUMS"
 formula="${dir}/super-herdr.rb"
-pkgbuild="${dir}/PKGBUILD"
-srcinfo="${dir}/super-herdr-bin.SRCINFO"
 
-for file in "${sums}" "${formula}" "${pkgbuild}" "${srcinfo}"; do
+for file in "${sums}" "${formula}"; do
   if [[ ! -f "${file}" ]]; then
     echo "missing ${file}" >&2
     exit 1
@@ -61,26 +58,13 @@ for target in \
 
   contains "${formula}" "${archive}" "the formula omits ${archive}"
   contains "${formula}" "${value}" "the formula omits the ${target} checksum"
-
-  # Only the Linux archives are packaged for the AUR.
-  if [[ "${target}" == *-unknown-linux-gnu ]]; then
-    arch="${target%%-*}"
-    contains "${pkgbuild}" "sha256sums_${arch}=('${value}')" \
-      "the PKGBUILD omits the ${target} checksum"
-    contains "${srcinfo}" "sha256sums_${arch} = ${value}" \
-      ".SRCINFO omits the ${target} checksum"
-    contains "${srcinfo}" "source_${arch} = " ".SRCINFO omits the ${arch} source"
-  fi
 done
 
-# The AUR validates a push against .SRCINFO, so it must not lag the PKGBUILD.
 contains "${formula}" "version \"${version}\"" "the formula does not name ${version}"
-contains "${pkgbuild}" "pkgver=${version}" "the PKGBUILD does not name ${version}"
-contains "${srcinfo}" "pkgver = ${version}" ".SRCINFO does not name ${version}"
 
 if (( failures > 0 )); then
-  echo "${failures} package definition check(s) failed" >&2
+  echo "${failures} formula check(s) failed" >&2
   exit 1
 fi
 
-echo "package definitions for v${version} match SHA256SUMS"
+echo "the formula for v${version} matches SHA256SUMS"

@@ -54,9 +54,8 @@ version exceeds 2.28. Lint coverage must include test code and the macOS target,
 because platform-gated code is invisible to a Linux-only lint. Release coverage must prove that every published file
 appears in the signed `SHA256SUMS`, that `cosign verify-blob` accepts the
 manifest for the tagged workflow identity, that `gh attestation verify` accepts
-each archive and Debian package, and that the generated formula, PKGBUILD, and
-`.SRCINFO` carry the checksums of the archives that release actually published,
-with the PKGBUILD and `.SRCINFO` agreeing on version and checksums.
+each archive and Debian package, and that the generated formula carries the
+checksums of the archives that release actually published.
 
 ## Manual desktop matrix
 

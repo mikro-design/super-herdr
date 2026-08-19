@@ -99,9 +99,6 @@ curl -LO https://github.com/mikro-design/super-herdr/releases/latest/download/su
 sudo dpkg -i super-herdr_0.3.1-1_amd64.deb
 ```
 
-An AUR package (`super-herdr-bin`) is generated for every release but is not
-submitted yet, so Arch users should take a prebuilt binary below until it is.
-
 ### Prebuilt binaries
 
 Each tagged release publishes stripped binaries, Debian packages, a `SHA256SUMS`
