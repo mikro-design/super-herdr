@@ -597,16 +597,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// A MIME type a client reported is untrusted text. It is metadata rather than
-/// payload and may be named in a refusal, but only bounded and without control
-/// characters.
-fn bounded_mime(mime: &str) -> String {
-    mime.chars()
-        .filter(|character| !character.is_control())
-        .take(64)
-        .collect()
-}
-
 fn target_map(config: &Config) -> BTreeMap<TargetSession, Target> {
     config
         .targets
@@ -1204,24 +1194,12 @@ impl Daemon {
             );
             return;
         }
-        // The client names a type it saw on its own clipboard; the extension
-        // that reaches a remote shell comes from this table and never from the
-        // wire.
-        let Some(media) = clipboard::KNOWN_MEDIA
-            .iter()
-            .copied()
-            .find(|media| media.mime == upload.mime)
-        else {
-            self.refuse(
-                client,
-                request,
-                format!(
-                    "this daemon cannot upload {}; it carries no extension for that type",
-                    bounded_mime(&upload.mime)
-                ),
-            );
-            return;
-        };
+        // The client names a type it saw on its own clipboard, and the
+        // extension that reaches a remote shell is resolved from that name
+        // here, never taken from the wire. A type with no entry is carried
+        // rather than refused: a file from a device has no clipboard flavor at
+        // all, and that is the same case rather than a second one.
+        let media = clipboard::media_for_mime(&upload.mime);
         let key = upload.pane.target_session();
         let Some(target) = self.targets.get(&key).cloned() else {
             self.refuse(client, request, format!("{key} is not a configured target"));
@@ -1972,7 +1950,10 @@ mod tests {
             "{refusal:?}"
         );
 
-        // A type the daemon carries no extension for.
+        // A type the table does not know is carried rather than refused: a
+        // file from a device has no clipboard flavor at all, and that is the
+        // same case. It fails here only because this harness configures no
+        // target to send it to, which is a different refusal.
         let refusal = upload(
             &mut connection,
             "application/x-invented",
@@ -1982,9 +1963,111 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("extension")),
-            "{refusal:?}"
+            matches!(&refusal, ServerMessage::Error { message, .. } if !message.contains("extension")),
+            "an unknown type must not be refused for being unknown: {refusal:?}"
         );
+    }
+
+    /// What the relay accumulates is what the sink writes.
+    ///
+    /// The transport itself is qualified separately against a real host, and
+    /// the guards are unit tested. What neither covers is the join between
+    /// them: that the bytes reassembled from chunks are the bytes that reach a
+    /// file. This runs the whole relay against a local target, so it needs no
+    /// host and no fixture, and reads the result back off disk.
+    #[tokio::test]
+    async fn a_relayed_payload_reaches_the_sink_byte_for_byte() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let socket = directory.path().join("daemon.sock");
+        let config = Config {
+            transport: Default::default(),
+            notifications: Default::default(),
+            targets: vec![Target {
+                name: "here".to_owned(),
+                // No ssh destination: the sink is this machine, which is what
+                // makes this runnable anywhere.
+                ssh: None,
+                discover_sessions: false,
+                session: None,
+                socket: None,
+                herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            }],
+            devices: Vec::new(),
+        };
+        let server = tokio::spawn(serve(
+            config,
+            None,
+            DaemonOptions {
+                socket: socket.clone(),
+                attention_state: Some(directory.path().join("attention.json")),
+                refresh_interval: Duration::from_secs(3600),
+                web_port: None,
+                web_address: None,
+            },
+        ));
+
+        let mut connection = None;
+        for _ in 0..200 {
+            if let Ok(stream) = UnixStream::connect(&socket).await {
+                connection = Some(Connection {
+                    reader: BufReader::new(stream),
+                });
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut connection = connection.expect("the daemon accepts a connection");
+        connection.hello().await;
+
+        // A payload larger than one chunk, so reassembly is actually exercised.
+        let mut payload = b"\x89PNG\r\n\x1a\n".to_vec();
+        payload.extend((0..200_000_u32).map(|index| index as u8));
+        let pane = PaneId::new("here", "default", "w1:p1");
+        connection
+            .send(ClientMessage::SubscribePane {
+                pane: pane.clone(),
+                access: TerminalAccess::Control,
+                cols: 80,
+                rows: 24,
+            })
+            .await;
+        connection
+            .send(ClientMessage::BeginUpload {
+                request: 1,
+                pane,
+                mime: "image/png".to_owned(),
+                length: payload.len() as u64,
+            })
+            .await;
+        for chunk in payload.chunks(64 * 1024) {
+            connection
+                .send(ClientMessage::UploadChunk {
+                    request: 1,
+                    bytes: chunk.to_vec(),
+                })
+                .await;
+        }
+        connection
+            .send(ClientMessage::FinishUpload {
+                request: 1,
+                digest: super::sha256_hex(&payload),
+            })
+            .await;
+
+        let result = connection.transfer_result().await;
+        let ServerMessage::UploadComplete { path, bytes, .. } = result else {
+            panic!("the relay refused a payload it should have carried: {result:?}");
+        };
+        assert_eq!(bytes as usize, payload.len());
+
+        let written = std::fs::read(&path).expect("the sink wrote the payload");
+        assert_eq!(
+            super::sha256_hex(&written),
+            super::sha256_hex(&payload),
+            "the bytes that reached the sink are not the bytes that were sent"
+        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap());
+        server.abort();
     }
 
     #[tokio::test]
