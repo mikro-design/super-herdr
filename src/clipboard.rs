@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::config::{Target, TransportConfig};
@@ -23,6 +23,7 @@ pub enum ClipboardDelivery {
     Osc52Requested,
 }
 
+#[derive(Debug)]
 pub struct UploadedFile {
     pub path: String,
     pub bytes: usize,
@@ -100,10 +101,11 @@ impl Marker {
 pub struct ClipboardMedia {
     /// MIME type as the desktop clipboard names it.
     pub mime: &'static str,
-    /// Extension given to the uploaded file. It always comes from this table
-    /// and never from the clipboard, so no untrusted text reaches the remote
-    /// command.
-    pub extension: &'static str,
+    /// Extension given to the uploaded file, when the flavor has one. It
+    /// always comes from this table and never from the clipboard, so no
+    /// untrusted text reaches the remote command. `None` means the payload is
+    /// written with no extension at all.
+    pub extension: Option<&'static str>,
     /// Alternatives that identify the format, any one of which is enough. Each
     /// alternative is a set of markers that must all match, because a format
     /// like WebP is only identified by two patterns at different offsets, and
@@ -114,7 +116,7 @@ pub struct ClipboardMedia {
 
 pub const PNG: ClipboardMedia = ClipboardMedia {
     mime: "image/png",
-    extension: "png",
+    extension: Some("png"),
     signatures: &[&[Marker {
         offset: 0,
         bytes: b"\x89PNG\r\n\x1a\n",
@@ -123,7 +125,7 @@ pub const PNG: ClipboardMedia = ClipboardMedia {
 
 pub const JPEG: ClipboardMedia = ClipboardMedia {
     mime: "image/jpeg",
-    extension: "jpg",
+    extension: Some("jpg"),
     signatures: &[&[Marker {
         offset: 0,
         bytes: b"\xff\xd8\xff",
@@ -134,7 +136,7 @@ pub const JPEG: ClipboardMedia = ClipboardMedia {
 /// actually identifies WebP.
 pub const WEBP: ClipboardMedia = ClipboardMedia {
     mime: "image/webp",
-    extension: "webp",
+    extension: Some("webp"),
     signatures: &[&[
         Marker {
             offset: 0,
@@ -149,7 +151,7 @@ pub const WEBP: ClipboardMedia = ClipboardMedia {
 
 pub const GIF: ClipboardMedia = ClipboardMedia {
     mime: "image/gif",
-    extension: "gif",
+    extension: Some("gif"),
     signatures: &[
         &[Marker {
             offset: 0,
@@ -165,7 +167,7 @@ pub const GIF: ClipboardMedia = ClipboardMedia {
 /// Little-endian and big-endian TIFF differ in their header.
 pub const TIFF: ClipboardMedia = ClipboardMedia {
     mime: "image/tiff",
-    extension: "tif",
+    extension: Some("tif"),
     signatures: &[
         &[Marker {
             offset: 0,
@@ -180,7 +182,7 @@ pub const TIFF: ClipboardMedia = ClipboardMedia {
 
 pub const PDF: ClipboardMedia = ClipboardMedia {
     mime: "application/pdf",
-    extension: "pdf",
+    extension: Some("pdf"),
     signatures: &[&[Marker {
         offset: 0,
         bytes: b"%PDF-",
@@ -192,7 +194,7 @@ pub const PDF: ClipboardMedia = ClipboardMedia {
 /// on the digest alone like any unrecognized flavor.
 pub const SVG: ClipboardMedia = ClipboardMedia {
     mime: "image/svg+xml",
-    extension: "svg",
+    extension: Some("svg"),
     signatures: &[],
 };
 
@@ -216,23 +218,66 @@ impl ClipboardMedia {
         Ok(())
     }
 
-    /// The extension reaches a remote shell command, so it must stay inert.
-    fn safe_extension(self) -> Result<&'static str> {
-        if self.extension.is_empty() || !self.extension.chars().all(|c| c.is_ascii_alphanumeric()) {
+    /// The name of the file this flavor is written to.
+    ///
+    /// The extension reaches a remote shell command, so it must stay inert; a
+    /// flavor that declares none is written as a bare `payload`.
+    fn payload_name(self) -> Result<String> {
+        let Some(extension) = self.extension else {
+            return Ok("payload".to_owned());
+        };
+        if extension.is_empty() || !extension.chars().all(|c| c.is_ascii_alphanumeric()) {
             bail!("unsupported clipboard media extension");
         }
-        Ok(self.extension)
+        Ok(format!("payload.{extension}"))
+    }
+
+    /// The suffix a local temporary file is given, if any.
+    fn file_suffix(self) -> Result<String> {
+        Ok(match self.payload_name()?.split_once('.') {
+            Some((_, extension)) => format!(".{extension}"),
+            None => String::new(),
+        })
     }
 }
+
+/// A payload whose type this bridge does not recognize.
+///
+/// It carries no extension, because the only safe name is no name. A name from
+/// the wire would be attacker-influenced text in a remote command, and a
+/// sanitizer that has to stay correct forever is exactly the thing someone
+/// widens later under pressure. The byte count and digest are what prove the
+/// transfer; a display name belongs to whichever client can still read it.
+pub const OPAQUE: ClipboardMedia = ClipboardMedia {
+    mime: "application/octet-stream",
+    extension: None,
+    signatures: &[],
+};
 
 /// Flavors the bridge can move, in the order they are preferred when a
 /// clipboard offers several at once. PNG stays first so that the common case,
 /// a screenshot, keeps behaving exactly as it always has.
 pub const KNOWN_MEDIA: &[ClipboardMedia] = &[PNG, JPEG, WEBP, GIF, TIFF, PDF, SVG];
 
+/// Resolve a media type a caller names to a flavor this bridge can carry.
+///
+/// An unrecognized type is carried opaquely rather than refused: the transfer
+/// is proven by its byte count and digest, not by its name, and refusing here
+/// would block every type the table has not learned.
+pub fn media_for_mime(mime: &str) -> ClipboardMedia {
+    KNOWN_MEDIA
+        .iter()
+        .copied()
+        .find(|media| media.mime == mime)
+        .unwrap_or(OPAQUE)
+}
+
 /// A clipboard type list is metadata, not payload, but it is still written by
 /// whichever program owns the clipboard, so it is bounded before it is read.
 const MAXIMUM_TYPE_LIST_BYTES: usize = 64 * 1024;
+/// Chunk size for a streamed upload. Large enough to keep SSH busy, small
+/// enough that nothing buffers a whole payload.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAXIMUM_REPORTED_TYPES: usize = 12;
 const MAXIMUM_TYPE_NAME_CHARS: usize = 80;
 
@@ -469,6 +514,203 @@ pub async fn upload_media(
     upload_local_media(media, bytes, &expected_digest)
 }
 
+/// Upload a payload that is being read rather than held.
+///
+/// The clipboard path has its bytes in memory and computes a digest before
+/// sending. A device file does not, and hashing it in a separate earlier pass
+/// would attest to what the source held during that pass rather than to what
+/// was sent. Hashing on the way past attests to exactly the bytes that went
+/// out, in one pass, with no window in between.
+///
+/// `expected_bytes` is enforced rather than believed: a source that yields more
+/// is cut off rather than allowed to write unbounded data onto the host, and
+/// one that yields fewer is refused as truncated. Each refusal names the check
+/// that failed, because only a short read is likely to be worth retrying, and
+/// every refusal removes whatever reached the host.
+///
+/// No overall timeout applies. A large transfer legitimately outlives the
+/// per-command timeout that bounds clipboard-sized uploads; progress is bounded
+/// by the source and by `expected_bytes` instead.
+pub async fn upload_stream<R>(
+    target: &Target,
+    transport: &TransportConfig,
+    media: ClipboardMedia,
+    source: R,
+    expected_bytes: u64,
+) -> Result<UploadedFile>
+where
+    R: AsyncRead + Unpin,
+{
+    if let Some(destination) = target.ssh.as_deref() {
+        let (receipt, digest, written) =
+            upload_remote_stream(destination, transport, media, source, expected_bytes).await?;
+        let verdict = verify_transfer(&receipt, &digest, written, expected_bytes);
+        if let Err(error) = verdict {
+            remove_remote_upload(destination, transport, &receipt.path).await;
+            return Err(error);
+        }
+        return Ok(UploadedFile {
+            path: receipt.path,
+            bytes: receipt.bytes,
+            mime: media.mime,
+        });
+    }
+    upload_local_stream(media, source, expected_bytes).await
+}
+
+/// Compare a receipt against what was actually sent, naming the failed check.
+fn verify_transfer(
+    receipt: &RemoteUploadReceipt,
+    digest: &str,
+    written: u64,
+    expected_bytes: u64,
+) -> Result<()> {
+    if written != expected_bytes {
+        bail!("transfer ended after {written} of {expected_bytes} declared bytes");
+    }
+    if receipt.bytes as u64 != written {
+        bail!(
+            "host stored {} bytes of the {written} that were sent",
+            receipt.bytes
+        );
+    }
+    if receipt.digest != digest {
+        bail!("stored payload does not match the digest of the bytes that were sent");
+    }
+    Ok(())
+}
+
+async fn upload_remote_stream<R>(
+    destination: &str,
+    transport: &TransportConfig,
+    media: ClipboardMedia,
+    mut source: R,
+    expected_bytes: u64,
+) -> Result<(RemoteUploadReceipt, String, u64)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut command = build_ssh_command(destination, transport, upload_script(media)?);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to start the SSH media upload")?;
+    let mut input = child
+        .stdin
+        .take()
+        .context("the SSH media upload did not expose stdin")?;
+    let output = child
+        .stdout
+        .take()
+        .context("the SSH media upload did not expose stdout")?;
+
+    let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
+    while written < expected_bytes {
+        let wanted = usize::try_from(expected_bytes - written)
+            .unwrap_or(STREAM_CHUNK_BYTES)
+            .min(STREAM_CHUNK_BYTES);
+        let read = source
+            .read(&mut buffer[..wanted])
+            .await
+            .context("failed to read the upload source")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        input
+            .write_all(&buffer[..read])
+            .await
+            .context("failed to send upload bytes")?;
+        written += read as u64;
+    }
+    input
+        .shutdown()
+        .await
+        .context("failed to finish the media upload")?;
+
+    let receipt = read_upload_receipt(output).await;
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for the SSH media upload")?;
+    if !status.success() {
+        bail!("SSH media upload failed (diagnostics redacted)");
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((receipt?, digest, written))
+}
+
+async fn upload_local_stream<R>(
+    media: ClipboardMedia,
+    mut source: R,
+    expected_bytes: u64,
+) -> Result<UploadedFile>
+where
+    R: AsyncRead + Unpin,
+{
+    let file = tempfile::Builder::new()
+        .prefix("super-herdr-clipboard-")
+        .suffix(&media.file_suffix()?)
+        .tempfile()
+        .context("failed to create a local media file")?;
+    let (_, path) = file
+        .keep()
+        .context("failed to retain the local media file")?;
+    let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    {
+        let mut sink = fs::File::create(&path).context("failed to open the local media file")?;
+        let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
+        while written < expected_bytes {
+            let wanted = usize::try_from(expected_bytes - written)
+                .unwrap_or(STREAM_CHUNK_BYTES)
+                .min(STREAM_CHUNK_BYTES);
+            let read = source
+                .read(&mut buffer[..wanted])
+                .await
+                .context("failed to read the upload source")?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            sink.write_all(&buffer[..read])
+                .context("failed to write the local media file")?;
+            written += read as u64;
+        }
+        sink.flush()
+            .context("failed to flush the local media file")?;
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let stored = fs::read(&path).context("failed to verify the local media file")?;
+    let receipt = RemoteUploadReceipt {
+        path: path.display().to_string(),
+        bytes: stored.len(),
+        digest: sha256_hex(&stored),
+    };
+    if let Err(error) = verify_transfer(&receipt, &digest, written, expected_bytes) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(UploadedFile {
+        path: receipt.path,
+        bytes: receipt.bytes,
+        mime: media.mime,
+    })
+}
+
 async fn read_command_bytes(
     spec: CommandSpec,
     maximum_bytes: usize,
@@ -693,7 +935,7 @@ async fn read_macos_media(media: ClipboardMedia, maximum_bytes: usize) -> Result
     };
     let output = tempfile::Builder::new()
         .prefix("super-herdr-clipboard-")
-        .suffix(&format!(".{}", media.safe_extension()?))
+        .suffix(&media.file_suffix()?)
         .tempfile()
         .context("failed to create a temporary clipboard media file")?;
     let path = output.path().to_owned();
@@ -745,29 +987,48 @@ struct RemoteUploadReceipt {
     digest: String,
 }
 
+/// The remote side of every upload: stage into a private directory, then report
+/// what was actually stored.
+///
+/// The file name is the only part that is not a literal, and it comes from the
+/// media table with an alphanumeric-only extension, so the command carries no
+/// caller-supplied text.
+fn upload_script(media: ClipboardMedia) -> Result<String> {
+    Ok(format!(
+        r#"set -eu
+umask 077
+base=${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}
+dir=$(mktemp -d "$base/super-herdr-clipboard.XXXXXXXX")
+path="$dir/{name}"
+cat > "$path"
+size=$(wc -c < "$path" | tr -d '[:space:]')
+digest=$(sha256sum "$path" | awk '{{print $1}}')
+printf '%s\t%s\t%s\n' "$path" "$size" "$digest"
+"#,
+        name = media.payload_name()?
+    ))
+}
+
+async fn read_upload_receipt(output: tokio::process::ChildStdout) -> Result<RemoteUploadReceipt> {
+    let mut receipt = Vec::new();
+    output
+        .take(4097)
+        .read_to_end(&mut receipt)
+        .await
+        .context("failed to read the media upload receipt")?;
+    if receipt.len() > 4096 {
+        bail!("the media upload returned an oversized receipt");
+    }
+    parse_remote_upload_receipt(&receipt)
+}
+
 async fn upload_remote_media(
     destination: &str,
     transport: &TransportConfig,
     media: ClipboardMedia,
     bytes: &[u8],
 ) -> Result<RemoteUploadReceipt> {
-    // The extension is the only part of this script that is not a literal, and
-    // it is checked to be alphanumeric first, so the command still carries no
-    // clipboard-derived text.
-    let script = format!(
-        r#"set -eu
-umask 077
-base=${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}
-dir=$(mktemp -d "$base/super-herdr-clipboard.XXXXXXXX")
-path="$dir/payload.{extension}"
-cat > "$path"
-size=$(wc -c < "$path" | tr -d '[:space:]')
-digest=$(sha256sum "$path" | awk '{{print $1}}')
-printf '%s\t%s\t%s\n' "$path" "$size" "$digest"
-"#,
-        extension = media.safe_extension()?
-    );
-    let mut command = build_ssh_command(destination, transport, script);
+    let mut command = build_ssh_command(destination, transport, upload_script(media)?);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -791,16 +1052,7 @@ printf '%s\t%s\t%s\n' "$path" "$size" "$digest"
         .shutdown()
         .await
         .context("failed to finish clipboard media upload")?;
-    let mut receipt = Vec::new();
-    output
-        .take(4097)
-        .read_to_end(&mut receipt)
-        .await
-        .context("failed to read the SSH clipboard media upload receipt")?;
-    if receipt.len() > 4096 {
-        let _ = child.kill().await;
-        bail!("SSH clipboard media upload returned an oversized receipt");
-    }
+    let receipt = read_upload_receipt(output).await;
     let status = child
         .wait()
         .await
@@ -808,7 +1060,7 @@ printf '%s\t%s\t%s\n' "$path" "$size" "$digest"
     if !status.success() {
         bail!("SSH clipboard media upload failed (diagnostics redacted)");
     }
-    parse_remote_upload_receipt(&receipt)
+    receipt
 }
 
 /// The directory a receipt's payload lives in, if it is one this bridge made.
@@ -897,7 +1149,7 @@ fn upload_local_media(
 ) -> Result<UploadedFile> {
     let mut file = tempfile::Builder::new()
         .prefix("super-herdr-clipboard-")
-        .suffix(&format!(".{}", media.safe_extension()?))
+        .suffix(&media.file_suffix()?)
         .tempfile()
         .context("failed to create a local clipboard media file")?;
     file.write_all(bytes)
@@ -988,9 +1240,11 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{
-        ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, PDF, PNG, SVG, TIFF, WEBP,
-        parse_remote_upload_receipt, removable_upload_directory, sha256_hex,
+        ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, OPAQUE, PDF, PNG,
+        RemoteUploadReceipt, SVG, TIFF, WEBP, media_for_mime, parse_remote_upload_receipt,
+        removable_upload_directory, sha256_hex, upload_stream, verify_transfer,
     };
+    use crate::config::{Target, TransportConfig};
 
     fn context(
         ssh_connection: Option<&OsStr>,
@@ -1043,11 +1297,11 @@ mod tests {
         // payload would block every flavor the table has not learned yet.
         const OPAQUE: ClipboardMedia = ClipboardMedia {
             mime: "application/octet-stream",
-            extension: "bin",
+            extension: Some("bin"),
             signatures: &[],
         };
         assert!(OPAQUE.validate(b"anything at all").is_ok());
-        assert_eq!(OPAQUE.safe_extension().unwrap(), "bin");
+        assert_eq!(OPAQUE.payload_name().unwrap(), "payload.bin");
         // SVG is XML text and is carried the same way.
         assert!(SVG.validate(b"<?xml version=\"1.0\"?><svg/>").is_ok());
         assert!(SVG.validate(b"not xml at all").is_ok());
@@ -1102,6 +1356,107 @@ mod tests {
         assert!(TIFF.validate(b"MM*\x00body").is_err());
     }
 
+    fn local_target() -> Target {
+        Target {
+            name: "local".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_upload_is_verified_against_the_bytes_that_were_sent() {
+        let payload = vec![7u8; 200_000];
+        let uploaded = upload_stream(
+            &local_target(),
+            &TransportConfig::default(),
+            OPAQUE,
+            payload.as_slice(),
+            payload.len() as u64,
+        )
+        .await
+        .unwrap();
+        let stored = std::fs::read(&uploaded.path).unwrap();
+        assert_eq!(stored, payload);
+        assert_eq!(uploaded.bytes, payload.len());
+        // An unrecognized type is written with no extension at all.
+        assert!(uploaded.path.ends_with("payload") || !uploaded.path.contains('.'));
+        let _ = std::fs::remove_file(&uploaded.path);
+    }
+
+    #[tokio::test]
+    async fn a_short_source_is_refused_as_truncated() {
+        let payload = vec![1u8; 1024];
+        let error = upload_stream(
+            &local_target(),
+            &TransportConfig::default(),
+            PNG,
+            payload.as_slice(),
+            4096,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        // The refusal names the check that failed, because a short read is the
+        // one worth retrying.
+        assert!(error.contains("1024 of 4096"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_source_longer_than_declared_is_cut_off_rather_than_believed() {
+        let payload = vec![9u8; 10_000];
+        let uploaded = upload_stream(
+            &local_target(),
+            &TransportConfig::default(),
+            OPAQUE,
+            payload.as_slice(),
+            4096,
+        )
+        .await
+        .unwrap();
+        // Only the declared length reaches the host: a lying length must not
+        // write unbounded data there.
+        assert_eq!(uploaded.bytes, 4096);
+        let _ = std::fs::remove_file(&uploaded.path);
+    }
+
+    #[test]
+    fn each_refusal_names_the_check_that_failed() {
+        // Only a short read is likely to be a dropped connection worth
+        // retrying, so the three refusals must be distinguishable.
+        let receipt = |bytes, digest: &str| RemoteUploadReceipt {
+            path: "/tmp/super-herdr-clipboard.aa/payload".to_owned(),
+            bytes,
+            digest: digest.to_owned(),
+        };
+        let truncated = verify_transfer(&receipt(10, "abc"), "abc", 10, 20).unwrap_err();
+        assert!(truncated.to_string().contains("10 of 20"), "{truncated}");
+
+        let short_write = verify_transfer(&receipt(5, "abc"), "abc", 10, 10).unwrap_err();
+        assert!(
+            short_write.to_string().contains("host stored 5"),
+            "{short_write}"
+        );
+
+        let corrupt = verify_transfer(&receipt(10, "zzz"), "abc", 10, 10).unwrap_err();
+        assert!(corrupt.to_string().contains("digest"), "{corrupt}");
+
+        assert!(verify_transfer(&receipt(10, "abc"), "abc", 10, 10).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_type_is_carried_opaquely_rather_than_refused() {
+        assert_eq!(media_for_mime("image/png"), PNG);
+        assert_eq!(media_for_mime("application/x-anything"), OPAQUE);
+        assert_eq!(media_for_mime("").extension, None);
+        assert_eq!(OPAQUE.payload_name().unwrap(), "payload");
+        assert_eq!(OPAQUE.file_suffix().unwrap(), "");
+        assert!(OPAQUE.validate(b"\x00\x01\x02").is_ok());
+    }
+
     #[test]
     fn only_a_directory_this_bridge_made_is_ever_removed() {
         assert_eq!(
@@ -1127,7 +1482,7 @@ mod tests {
     fn every_table_entry_carries_an_inert_extension() {
         for media in KNOWN_MEDIA {
             assert!(
-                media.safe_extension().is_ok(),
+                media.payload_name().is_ok(),
                 "{} has an extension that could reach a shell",
                 media.mime
             );
@@ -1141,14 +1496,14 @@ mod tests {
         for extension in ["", "png; rm -rf /", "../etc", "p ng", "png\"", "$(id)"] {
             let media = ClipboardMedia {
                 mime: "test/hostile",
-                extension: Box::leak(extension.to_owned().into_boxed_str()),
+                extension: Some(Box::leak(extension.to_owned().into_boxed_str())),
                 signatures: &[],
             };
             assert!(
-                media.safe_extension().is_err(),
+                media.payload_name().is_err(),
                 "accepted hostile extension {extension:?}"
             );
         }
-        assert!(PNG.safe_extension().is_ok());
+        assert_eq!(PNG.payload_name().unwrap(), "payload.png");
     }
 }

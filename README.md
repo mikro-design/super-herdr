@@ -642,7 +642,14 @@ Explicit file upload:
 - sends only the verified target path to the pane.
 
 The transfer itself is format-agnostic: it moves bytes, verifies them, and
-injects a path. A format is recognized by byte patterns at fixed offsets, so
+injects a path. A payload too large to hold in memory is streamed instead,
+hashed on the way past so the digest attests to exactly the bytes that were
+sent, with the declared length enforced in both directions: a source that ends
+early is refused as truncated, and one that runs long is cut off rather than
+allowed to write unbounded data onto the host. Each refusal names the check that
+failed, and removes whatever reached the host. A type the table does not carry
+is uploaded with no extension at all rather than refused, because a name from
+outside would be untrusted text in a remote command. A format is recognized by byte patterns at fixed offsets, so
 WebP is identified by its container tag rather than by the `RIFF` prefix it
 shares with AVI and WAV, and formats with more than one valid header, such as
 GIF and TIFF, carry every form. A flavor with no dependable signature, such as

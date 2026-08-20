@@ -24,7 +24,11 @@ signature, recognition of each supported flavor by its own bytes and by no other
 flavor's, signature matching at the offset a format actually uses rather than by
 prefix alone, acceptance of every valid header form for a format that has more
 than one, removal of an upload that failed verification and refusal to name
-any directory this bridge did not create,
+any directory this bridge did not create, enforcement of a streamed
+transfer's declared length in both directions so a short source is refused as
+truncated and a long one is cut off rather than believed, a refusal that names
+which check failed, and carriage of an unrecognized media type with no
+extension at all,
 persisted UI selection, and independently scrolling split-sidebar viewports with
 offset-aware mouse targets. Attention coverage must include qualified transition
 deduplication, disconnect isolation, unread handling, atomic metadata-only
