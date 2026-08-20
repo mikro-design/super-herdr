@@ -68,6 +68,28 @@ manifest for the tagged workflow identity, that `gh attestation verify` accepts
 each archive and Debian package, and that the generated formula carries the
 checksums of the archives that release actually published.
 
+## What automated checks cannot reach
+
+Every check above runs in one process, on one machine, under whatever shell the
+test harness happens to use. Three things sit outside that boundary, and each
+has already hidden a fault that shipped:
+
+- **A remote login shell.** The host's shell runs anything sent over SSH, and it
+  is not the shell the tests use. zsh, the default on macOS, ties several
+  lowercase names to its own variables, so a staging script that assigned `path`
+  replaced the command search path and every command after it failed. No CI
+  runner has a login shell in the sense that matters here.
+- **A real process boundary.** A pipe that is shut down but still held delivers
+  no end of input, so a remote reader waits forever. In-process tests never see
+  it, because they never hand a descriptor to another process.
+- **A desktop session.** Clipboard, notification delivery and pointer input are
+  properties of a session a person is logged into, not of a machine.
+
+The rule this implies: a path that has only ever been reasoned about has not
+been tested, however carefully the reasoning was done. Prefer a run against a
+real target, even a loopback one, over another round of argument about
+invariants.
+
 ## Manual desktop matrix
 
 | Frontend | Remote path | Text copy/paste | PNG paste | Mouse/select/scroll | Host/session refresh | Recorded |
