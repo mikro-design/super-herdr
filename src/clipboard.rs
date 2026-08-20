@@ -632,6 +632,7 @@ where
         .shutdown()
         .await
         .context("failed to finish the media upload")?;
+    drop(input);
 
     let receipt = read_upload_receipt(output).await;
     let status = child
@@ -994,16 +995,21 @@ struct RemoteUploadReceipt {
 /// media table with an alphanumeric-only extension, so the command carries no
 /// caller-supplied text.
 fn upload_script(media: ClipboardMedia) -> Result<String> {
+    // The remote login shell runs this, and zsh ties several lowercase names to
+    // its own variables — `path` is tied to PATH, so assigning it replaces the
+    // command search path with one file and everything after it fails to be
+    // found. That is the default shell on macOS, so the names here are chosen
+    // to collide with nothing.
     Ok(format!(
         r#"set -eu
 umask 077
-base=${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}
-dir=$(mktemp -d "$base/super-herdr-clipboard.XXXXXXXX")
-path="$dir/{name}"
-cat > "$path"
-size=$(wc -c < "$path" | tr -d '[:space:]')
-digest=$(sha256sum "$path" | awk '{{print $1}}')
-printf '%s\t%s\t%s\n' "$path" "$size" "$digest"
+staging_base=${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}
+staging_dir=$(mktemp -d "$staging_base/super-herdr-clipboard.XXXXXXXX")
+staged_file="$staging_dir/{name}"
+cat > "$staged_file"
+staged_size=$(wc -c < "$staged_file" | tr -d '[:space:]')
+staged_digest=$(sha256sum "$staged_file" | awk '{{print $1}}')
+printf '%s\t%s\t%s\n' "$staged_file" "$staged_size" "$staged_digest"
 "#,
         name = media.payload_name()?
     ))
@@ -1052,6 +1058,7 @@ async fn upload_remote_media(
         .shutdown()
         .await
         .context("failed to finish clipboard media upload")?;
+    drop(input);
     let receipt = read_upload_receipt(output).await;
     let status = child
         .wait()
@@ -1091,12 +1098,12 @@ async fn remove_remote_upload(destination: &str, transport: &TransportConfig, pa
         return;
     };
     const SCRIPT: &str = r#"set -eu
-IFS= read -r dir
-case "$dir" in
+IFS= read -r staging_dir
+case "$staging_dir" in
   /*/super-herdr-clipboard.*) ;;
   *) exit 1 ;;
 esac
-rm -rf -- "$dir"
+rm -rf -- "$staging_dir"
 "#;
     let mut command = build_ssh_command(destination, transport, SCRIPT.to_owned());
     let Ok(mut child) = command
@@ -1455,6 +1462,56 @@ mod tests {
         assert_eq!(OPAQUE.payload_name().unwrap(), "payload");
         assert_eq!(OPAQUE.file_suffix().unwrap(), "");
         assert!(OPAQUE.validate(b"\x00\x01\x02").is_ok());
+    }
+
+    #[test]
+    fn the_upload_script_runs_under_every_shell_a_host_might_use() {
+        // The remote login shell runs this script, and it is not necessarily
+        // the one running the tests. zsh ties `path` to PATH, so an earlier
+        // version replaced the command search path with the staged file and
+        // every command after it vanished — invisible to a unit test that only
+        // ever tried one shell, and fatal on macOS, where zsh is the default.
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let script = super::upload_script(PNG).unwrap();
+        let payload = b"\x89PNG\r\n\x1a\nqualification";
+        let mut tried = 0;
+        for shell in ["sh", "bash", "zsh", "dash", "ksh"] {
+            // A shell that is not installed simply fails to spawn and is
+            // skipped; the assertion at the end catches a host with none.
+            let Ok(mut child) = Command::new(shell)
+                .arg("-c")
+                .arg(&script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            tried += 1;
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "the upload script failed under {shell}"
+            );
+            let receipt = parse_remote_upload_receipt(&output.stdout)
+                .unwrap_or_else(|error| panic!("{shell} produced no usable receipt: {error}"));
+            assert_eq!(
+                receipt.bytes,
+                payload.len(),
+                "{shell} stored the wrong size"
+            );
+            assert_eq!(
+                receipt.digest,
+                sha256_hex(payload),
+                "{shell} stored wrong bytes"
+            );
+            let _ = std::fs::remove_dir_all(std::path::Path::new(&receipt.path).parent().unwrap());
+        }
+        assert!(tried > 0, "no shell was available to run the upload script");
     }
 
     #[test]

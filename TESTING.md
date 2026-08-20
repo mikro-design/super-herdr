@@ -78,6 +78,10 @@ checksums of the archives that release actually published.
 | Linux X11 with `xsel` only | OpenSSH alias | Required | Not supported | Required | Required | No |
 | Nested SSH or Herdr | terminal-mediated copy | Copy request only; local paste | Not supported | Required | Required | Command line only, 2026-08-19 |
 
+The remote half of the upload path is qualified separately from the frontends,
+because it depends on the target host's login shell rather than on the desktop:
+see the SSH record below.
+
 For every applicable row, verify:
 
 1. `super-herdr clipboard check` reports capabilities without reading payloads.
@@ -162,6 +166,36 @@ already redacted. It sends only `Ctrl+] q`, which Super-Herdr intercepts, so no
 keystroke reaches a pane and no running process is disturbed. Run it first on
 each frontend; what it does not cover needs a person at that desktop, and a row
 stays unrecorded until someone does it.
+
+### 2026-08-20 — verified upload over a real SSH target
+
+Run with `cargo run --example qualify-upload -- <ssh-destination>` against a host
+reached over OpenSSH. The unit tests cover the local sink and the guards; only a
+real host exercises the remote half, and this run is why two faults were found
+that no unit test could see.
+
+- 64 KiB through `upload_media`: remote digest matched the source
+- 3 MiB through `upload_stream`: remote digest matched the source
+- a source shorter than its declared length: refused as
+  `transfer ended after 1024 of 8192 declared bytes`, with the staged directory
+  count unchanged before and after, so the refusal left nothing on the host
+
+Both faults were in shipped code and made every SSH upload fail:
+
+1. The staging script assigned a shell variable named `path`. zsh ties `path` to
+   `PATH`, so the assignment replaced the command search path with the staged
+   file and every command after it was not found. zsh is the default login shell
+   on macOS. Covered now by a test that runs the generated script under every
+   shell present on the machine, which fails under zsh if the name comes back.
+2. The child's stdin was shut down but still held, so the remote `cat` never saw
+   end of input and every upload ran to the command timeout. Closing the write
+   half is what ends the transfer.
+
+The SSH target for this run was an OpenSSH loopback alias to this same host,
+which exercises the real transport — command construction, a remote login shell,
+a separate process — without needing a second machine. Recreate it by adding a
+public key to this account's own `authorized_keys` and an ssh alias pointing at
+`127.0.0.1`; it is a fixture rather than something to leave configured.
 
 ### 2026-08-20 — Homebrew formula, macOS Apple Silicon
 
