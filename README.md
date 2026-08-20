@@ -97,7 +97,7 @@ brew install mikro-design/tap/super-herdr
 
 # Debian and Ubuntu. The version is part of the asset name, so there is no
 # stable "latest" URL; set these to a published release and your architecture.
-version=0.6.0
+version=0.7.0
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -121,7 +121,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.6.0
+tag=v0.7.0
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -175,8 +175,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.6.0`
-must be tagged `v0.6.0`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.7.0`
+must be tagged `v0.7.0`.
 
 ### macOS
 
