@@ -72,7 +72,10 @@ Work is ordered by dependency and product risk.
    per-device token in the existing atomic TOML store, and a network transport.
    Until then a remote client reaches the daemon's Unix socket over OpenSSH
    forwarding, which is why this can be decided deliberately rather than in a
-   hurry.
+   hurry. Surface the daemon's version to the client while doing it: the
+   handshake already carries it and nothing reads it, and once the two are on
+   different machines the version that decides host-side behaviour is the
+   daemon's, not the client's.
 6. Generalize the clipboard broker's verified upload into a file bridge —
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target

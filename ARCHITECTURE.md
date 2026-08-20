@@ -400,6 +400,16 @@ events — and moving it is one step with native notification delivery rather th
 two half-steps. A daemon hosted inside a frontend therefore does not derive
 attention; a standalone one does.
 
+A protocol version says what a daemon can speak, not which fixes it carries.
+That distinction is invisible while the frontend hosts its own daemon, and
+becomes load-bearing the moment they are separate machines: behaviour that runs
+on the daemon host — an upload that leaves nothing behind when it fails
+verification, say — is a property of the binary installed there, and no client
+can observe it. The handshake already carries the daemon's version alongside its
+protocol number for exactly this reason, but nothing yet reads it. A client
+should learn the version and be able to say what it is, so the machine in the
+middle is identifiable rather than assumed current.
+
 The first remote client is a web client the daemon itself serves, which covers
 tablet and phone from one codebase and can be saved to a home screen. Native
 clients can follow on the same protocol without changing it. Push delivery for
@@ -426,6 +436,26 @@ supplied by the caller, the ceiling is configurable and separate from the image
 ceiling, and a transfer is chunked and resumable so a large file survives a
 reconnect. Bytes stream through every hop rather than being buffered whole, so
 peak memory does not track file size at either end.
+
+Verification is what makes the relay hop safe to not buffer, so the framing
+around it carries the weight. The digest is always computed at the source and
+never by the middle. It travels in the offer when the bytes are already in
+memory, and in a trailer when they are streamed: hashing while sending attests
+to the bytes that actually went out, where a digest computed in an earlier pass
+attests only to what the source held during that pass, and a file that changes
+in between fails a correct transfer against a stale promise.
+
+Four rules follow, and none of them are optional. A declared length is enforced
+rather than believed: an offer above the ceiling is refused before any bytes
+move, and the relay stops at the declared length, because a lying length is a
+disk-fill on the target host that no digest would catch. The end of a stream is
+an explicit frame carrying the digest, never end-of-input, so a dropped
+connection cannot be mistaken for a finished transfer. A transfer that ends
+without a digest is refused. And a refusal leaves nothing behind — a staged file
+from a refused transfer is a verified-looking artifact reached by another route,
+and a path injected into a pane cannot be told apart from one that passed. A
+refusal names which check failed, because only a missing trailer is likely to be
+a dropped connection worth retrying.
 
 Three directions share that one path. A client uploads through the daemon to a
 target. A target's file is pulled by the daemon and handed to the client. A file
