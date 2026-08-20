@@ -10,6 +10,7 @@ pub mod pairing;
 pub mod probe;
 pub mod protocol;
 pub mod resource_action;
+pub mod screen;
 pub mod state;
 pub mod terminal;
 pub mod transport;
