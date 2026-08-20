@@ -84,6 +84,13 @@ has already hidden a fault that shipped:
   it, because they never hand a descriptor to another process.
 - **A desktop session.** Clipboard, notification delivery and pointer input are
   properties of a session a person is logged into, not of a machine.
+- **Which artifact is actually running.** A build from a working tree reports
+  the version in `Cargo.toml` at that commit, which during a release cycle is
+  the tag it branched from rather than the code it contains. A binary carrying
+  a feature can therefore report a version released before that feature existed.
+  Check the commit, not the version string, before concluding what a running
+  process does — an installed artifact and a built one are not the same thing
+  and nothing in the version distinguishes them.
 
 The rule this implies: a path that has only ever been reasoned about has not
 been tested, however carefully the reasoning was done. Prefer a run against a
