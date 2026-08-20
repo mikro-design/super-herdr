@@ -30,6 +30,13 @@ use crate::protocol::{
 use crate::state::FederationState;
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 
+/// How much of a payload travels in one message.
+///
+/// Comfortably inside the protocol's own bound once base64 has inflated it, so
+/// a large clipboard image becomes many ordinary messages rather than one the
+/// far side must refuse.
+pub const UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
+
 /// A connection to a daemon.
 ///
 /// Dropping this ends the connection: the daemon releases every lease and route
@@ -249,8 +256,52 @@ impl ClientCommands {
     /// Ask the daemon to run one operation, returning the request identifier
     /// its result will carry.
     pub fn run_operation(&self, operation: Operation) -> u64 {
-        let request = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let request = self.next_request();
         self.send(ClientMessage::RunOperation { request, operation });
+        request
+    }
+
+    /// Ask the daemon to deliver text to a pane as one atomic paste.
+    pub fn paste_pane_text(&self, pane: PaneId, text: String) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::PastePaneText {
+            request,
+            pane,
+            text,
+        });
+        request
+    }
+
+    /// Offer a clipboard payload for upload, chunked to stay inside the message
+    /// bound, with the digest computed over the bytes actually sent.
+    ///
+    /// Sent whole rather than streamed because a clipboard payload is already
+    /// in memory; a device file that is not would compute its digest while
+    /// sending instead, which is why the trailer carries it either way.
+    pub fn upload_media(&self, pane: PaneId, mime: String, bytes: &[u8]) -> u64 {
+        use sha2::{Digest, Sha256};
+
+        let request = self.next_request();
+        self.send(ClientMessage::BeginUpload {
+            request,
+            pane,
+            mime,
+            length: bytes.len() as u64,
+        });
+        let mut hasher = Sha256::new();
+        for chunk in bytes.chunks(UPLOAD_CHUNK_BYTES) {
+            hasher.update(chunk);
+            self.send(ClientMessage::UploadChunk {
+                request,
+                bytes: chunk.to_vec(),
+            });
+        }
+        let digest = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.send(ClientMessage::FinishUpload { request, digest });
         request
     }
 
@@ -264,6 +315,12 @@ impl ClientCommands {
 
     pub fn clear_seen_attention(&self) {
         self.send(ClientMessage::ClearSeenAttention);
+    }
+
+    /// Requests share one counter, so a result can be matched to whatever asked
+    /// for it without knowing which kind of request it was.
+    fn next_request(&self) -> u64 {
+        self.next_request.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Commands are fire-and-forget. A dead connection is reported by the event

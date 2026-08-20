@@ -102,6 +102,52 @@ pub enum ClientMessage {
     /// client, so what arrives here is already agreed to.
     #[serde(rename = "operation.run")]
     RunOperation { request: u64, operation: Operation },
+    /// Deliver text to a pane as one atomic paste.
+    ///
+    /// This is not `PaneInput`: Herdr writes it in one piece through the
+    /// session's own socket, adding bracketed-paste markers where they belong,
+    /// so a multiline paste cannot arrive as several messages. It needs a route
+    /// to the target, which is why it is the daemon's to perform.
+    #[serde(rename = "pane.paste")]
+    PastePaneText {
+        request: u64,
+        pane: PaneId,
+        text: String,
+    },
+    /// Offer a clipboard payload for upload to the pane's host.
+    ///
+    /// Reading a clipboard is a desktop-session capability and stays with the
+    /// client; moving the bytes needs a route to the host and does not. The
+    /// MIME type is what the client saw, and the daemon resolves it to a file
+    /// extension — a client never names a path.
+    ///
+    /// `length` is enforced rather than believed: an offer above the ceiling is
+    /// refused before any bytes move, and the transfer is stopped at the
+    /// declared length, because a lying length would otherwise write unbounded
+    /// bytes onto the target host.
+    #[serde(rename = "upload.begin")]
+    BeginUpload {
+        request: u64,
+        pane: PaneId,
+        mime: String,
+        length: u64,
+    },
+    #[serde(rename = "upload.chunk")]
+    UploadChunk {
+        request: u64,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// End the transfer and attest to what was sent.
+    ///
+    /// The digest is computed by the sender over the bytes it sent, so it
+    /// attests to those rather than to a separate earlier read. An explicit
+    /// frame rather than end-of-input is what keeps a dropped connection from
+    /// being mistaken for a finished transfer.
+    #[serde(rename = "upload.finish")]
+    FinishUpload { request: u64, digest: String },
+    #[serde(rename = "upload.cancel")]
+    CancelUpload { request: u64 },
     /// Attention state is durable and lives with the daemon, so marking events
     /// read is a request rather than a local edit.
     #[serde(rename = "attention.mark_seen")]
@@ -163,6 +209,15 @@ pub enum ServerMessage {
         request: u64,
         applied: bool,
         message: String,
+    },
+    /// A transfer that arrived intact and verified on the host. The path is
+    /// the daemon's, derived from a private staging directory; nothing a client
+    /// sent is used to name it.
+    #[serde(rename = "upload.complete")]
+    UploadComplete {
+        request: u64,
+        path: String,
+        bytes: u64,
     },
     #[serde(rename = "attention.event")]
     Attention { event: AttentionEvent },
@@ -313,6 +368,26 @@ mod tests {
                 direction: SplitDirection::Down,
             },
         });
+        round_trip_client(ClientMessage::PastePaneText {
+            request: 3,
+            pane: pane(),
+            text: "one\ntwo\n".to_owned(),
+        });
+        round_trip_client(ClientMessage::BeginUpload {
+            request: 4,
+            pane: pane(),
+            mime: "image/png".to_owned(),
+            length: 2048,
+        });
+        round_trip_client(ClientMessage::UploadChunk {
+            request: 4,
+            bytes: vec![0x89, b'P', b'N', b'G'],
+        });
+        round_trip_client(ClientMessage::FinishUpload {
+            request: 4,
+            digest: "abc123".to_owned(),
+        });
+        round_trip_client(ClientMessage::CancelUpload { request: 4 });
         round_trip_client(ClientMessage::MarkAttentionSeen { pane: pane() });
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
@@ -346,6 +421,11 @@ mod tests {
                 occurred_at_ms: 1_700_000_000_000,
                 unread: true,
             },
+        });
+        round_trip_server(ServerMessage::UploadComplete {
+            request: 4,
+            path: "/tmp/super-herdr-clipboard.abc/payload.png".to_owned(),
+            bytes: 2048,
         });
         round_trip_server(ServerMessage::AttentionHistory { events: Vec::new() });
         round_trip_server(ServerMessage::Error {

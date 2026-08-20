@@ -496,6 +496,16 @@ mode is not carried across hosts, and no command is inferred from its name or
 content—the same reasoning that drops pane commands and environment during
 cross-session recreation.
 
+That framing is not hypothetical: it is what a clipboard upload already uses.
+A client offers a type and a length, sends the payload in chunks that fit inside
+the message bound, and ends with a digest over the bytes it sent. Nothing
+reaches the target host until that digest verifies, so an abandoned transfer and
+a refused one have the same result — the daemon holds the payload in memory and
+discards it, rather than leaving a file nothing checked. Atomic multiline paste
+travels the same way but needs no framing at all: it is one documented request
+through the session's socket, which is why it was the half that had no local
+capability behind it.
+
 The clipboard divides along the same line rather than moving as a unit. Reading
 one is a desktop-session capability: it shells out to the compositor or window
 system the person is sitting in front of, and already refuses to run over SSH or

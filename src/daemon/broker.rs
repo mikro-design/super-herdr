@@ -79,6 +79,35 @@ pub enum Effect {
         request: u64,
         operation: Operation,
     },
+    PastePaneText {
+        client: ClientId,
+        request: u64,
+        pane: PaneId,
+        text: String,
+    },
+    /// Transfer steps carry their payload through the broker rather than being
+    /// held by it: the rules about who may do this live here, the bytes do not.
+    BeginUpload {
+        client: ClientId,
+        request: u64,
+        pane: PaneId,
+        mime: String,
+        length: u64,
+    },
+    UploadChunk {
+        client: ClientId,
+        request: u64,
+        bytes: Vec<u8>,
+    },
+    FinishUpload {
+        client: ClientId,
+        request: u64,
+        digest: String,
+    },
+    CancelUpload {
+        client: ClientId,
+        request: u64,
+    },
     MarkAttentionSeen {
         pane: PaneId,
     },
@@ -307,6 +336,55 @@ impl Broker {
                     request,
                     operation,
                 });
+            }
+            ClientMessage::PastePaneText {
+                request,
+                pane,
+                text,
+            } => {
+                // Pasting is input, so it needs the same lease typing does.
+                // Herdr writes it through the session socket rather than the
+                // terminal stream, but an observer putting text into somebody
+                // else's pane is the thing being prevented, not the mechanism.
+                if self.holds_control(client, &pane, &mut effects) {
+                    effects.push(Effect::PastePaneText {
+                        client,
+                        request,
+                        pane,
+                        text,
+                    });
+                }
+            }
+            ClientMessage::BeginUpload {
+                request,
+                pane,
+                mime,
+                length,
+            } => {
+                if self.holds_control(client, &pane, &mut effects) {
+                    effects.push(Effect::BeginUpload {
+                        client,
+                        request,
+                        pane,
+                        mime,
+                        length,
+                    });
+                }
+            }
+            ClientMessage::UploadChunk { request, bytes } => effects.push(Effect::UploadChunk {
+                client,
+                request,
+                bytes,
+            }),
+            ClientMessage::FinishUpload { request, digest } => {
+                effects.push(Effect::FinishUpload {
+                    client,
+                    request,
+                    digest,
+                });
+            }
+            ClientMessage::CancelUpload { request } => {
+                effects.push(Effect::CancelUpload { client, request });
             }
             ClientMessage::MarkAttentionSeen { pane } => {
                 effects.push(Effect::MarkAttentionSeen { pane });
@@ -1549,6 +1627,60 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn pasting_and_uploading_need_the_lease_that_typing_needs() {
+        let mut broker = broker();
+        let holder = greet(&mut broker);
+        let observer = greet(&mut broker);
+        subscribe(
+            &mut broker,
+            holder,
+            "w1:p1",
+            TerminalAccess::Control,
+            80,
+            24,
+        );
+        subscribe(
+            &mut broker,
+            observer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+        );
+
+        for message in [
+            ClientMessage::PastePaneText {
+                request: 1,
+                pane: pane("w1:p1"),
+                text: "rm -rf /\n".to_owned(),
+            },
+            ClientMessage::BeginUpload {
+                request: 2,
+                pane: pane("w1:p1"),
+                mime: "image/png".to_owned(),
+                length: 16,
+            },
+        ] {
+            let effects = broker.handle(observer, message.clone());
+            assert!(matches!(
+                messages_for(&effects, observer).as_slice(),
+                [ServerMessage::Error { request: None, .. }]
+            ));
+            assert!(effects.iter().all(|effect| !matches!(
+                effect,
+                Effect::PastePaneText { .. } | Effect::BeginUpload { .. }
+            )));
+
+            // The same message from the lease holder is forwarded.
+            let effects = broker.handle(holder, message);
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::PastePaneText { .. } | Effect::BeginUpload { .. }
+            )));
+        }
     }
 
     #[test]

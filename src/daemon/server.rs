@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::attention::{AttentionIndex, AttentionStore};
+use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
 use crate::daemon::broker::{Broker, ClientId, Effect};
 use crate::model::{PaneId, TargetSession};
@@ -43,7 +44,9 @@ use crate::terminal::{
     TerminalAccess, TerminalEvent, parse_terminal_event, spawn_terminal, terminal_input_command,
     terminal_resize_command, terminal_scroll_command,
 };
-use crate::transport::{CliSnapshotTransport, expand_discovered_sessions, run_herdr_operation};
+use crate::transport::{
+    CliSnapshotTransport, expand_discovered_sessions, run_herdr_operation, send_pane_input,
+};
 use crate::workspace_move;
 
 /// How often the daemon re-reads its configuration and re-runs session
@@ -114,6 +117,11 @@ enum Input {
         applied: bool,
         message: String,
     },
+    UploadFinished {
+        client: ClientId,
+        request: u64,
+        result: Result<(String, u64), String>,
+    },
     /// Stop serving. The loop leaves through the same exit a closed input
     /// channel uses, so shutdown has one path rather than two.
     Shutdown,
@@ -122,6 +130,25 @@ enum Input {
     /// A completed refresh. `None` means the read failed and the running
     /// federation keeps whatever it already had.
     Reconfigured(Option<Config>),
+}
+
+/// The largest payload a client may offer for upload.
+///
+/// It matches the frontend's own clipboard ceiling, and is enforced here
+/// because the daemon is what writes to the target host.
+pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A transfer in progress, held only in memory.
+///
+/// Nothing reaches the target until the digest verifies, so a connection that
+/// drops mid-transfer leaves nothing behind — the refusal and the abandonment
+/// have the same result rather than the abandonment producing a file nothing
+/// checked.
+struct Upload {
+    pane: PaneId,
+    mime: String,
+    length: u64,
+    bytes: Vec<u8>,
 }
 
 struct Route {
@@ -156,6 +183,7 @@ struct Daemon {
     attention_cursor: Option<u64>,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
+    uploads: BTreeMap<(ClientId, u64), Upload>,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
     downgraded: Vec<PaneId>,
@@ -312,6 +340,7 @@ async fn run(
         attention_cursor,
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
+        uploads: BTreeMap::new(),
         downgraded: Vec::new(),
         active,
         config_path: config_path.clone(),
@@ -376,6 +405,28 @@ async fn run(
     }
     daemon.stop_federation().await;
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A MIME type a client reported is untrusted text. It is metadata rather than
+/// payload and may be named in a refusal, but only bounded and without control
+/// characters.
+fn bounded_mime(mime: &str) -> String {
+    mime.chars()
+        .filter(|character| !character.is_control())
+        .take(64)
+        .collect()
 }
 
 fn target_map(config: &Config) -> BTreeMap<TargetSession, Target> {
@@ -527,6 +578,10 @@ impl Daemon {
             Input::Received { client, message } => self.broker.handle(client, message),
             Input::Disconnected { client } => {
                 self.outboxes.remove(&client);
+                // An abandoned transfer is discarded rather than completed. It
+                // never reached the host, so there is nothing to clean up
+                // there.
+                self.uploads.retain(|(owner, _), _| *owner != client);
                 self.broker.disconnect(client)
             }
             Input::Federation(state) => {
@@ -559,6 +614,27 @@ impl Daemon {
             } => self
                 .broker
                 .operation_completed(client, request, applied, message),
+            Input::UploadFinished {
+                client,
+                request,
+                result,
+            } => {
+                let message = match result {
+                    Ok((path, bytes)) => ServerMessage::UploadComplete {
+                        request,
+                        path,
+                        bytes,
+                    },
+                    Err(message) => ServerMessage::Error {
+                        request: Some(request),
+                        message,
+                    },
+                };
+                if let Some(outbox) = self.outboxes.get(&client) {
+                    let _ = outbox.send(message);
+                }
+                Vec::new()
+            }
             // The loop intercepts this before it reaches here; the arm exists so
             // adding a shutdown path later cannot silently do nothing.
             Input::Shutdown => Vec::new(),
@@ -632,6 +708,77 @@ impl Daemon {
                     request,
                     operation,
                 } => self.run_operation(client, request, operation),
+                Effect::PastePaneText {
+                    client,
+                    request,
+                    pane,
+                    text,
+                } => self.paste_pane_text(client, request, pane, text),
+                Effect::BeginUpload {
+                    client,
+                    request,
+                    pane,
+                    mime,
+                    length,
+                } => {
+                    // Refused before any bytes move, which is the only point at
+                    // which refusing is free.
+                    if length > MAX_UPLOAD_BYTES {
+                        self.refuse(
+                            client,
+                            request,
+                            format!(
+                                "refusing a {length} byte upload; the limit is {MAX_UPLOAD_BYTES}"
+                            ),
+                        );
+                    } else {
+                        self.uploads.insert(
+                            (client, request),
+                            Upload {
+                                pane,
+                                mime,
+                                length,
+                                bytes: Vec::new(),
+                            },
+                        );
+                    }
+                }
+                Effect::UploadChunk {
+                    client,
+                    request,
+                    bytes,
+                } => {
+                    // Stopped at the declared length rather than trusting it: a
+                    // lying length is a disk-fill on the target that no digest
+                    // would catch.
+                    let outcome = match self.uploads.get_mut(&(client, request)) {
+                        None => Err("no transfer is in progress".to_owned()),
+                        Some(upload)
+                            if upload.bytes.len() as u64 + bytes.len() as u64 > upload.length =>
+                        {
+                            Err(format!(
+                                "transfer sent more than the {} bytes it declared",
+                                upload.length
+                            ))
+                        }
+                        Some(upload) => {
+                            upload.bytes.extend_from_slice(&bytes);
+                            Ok(())
+                        }
+                    };
+                    if let Err(message) = outcome {
+                        self.uploads.remove(&(client, request));
+                        self.refuse(client, request, message);
+                    }
+                }
+                Effect::FinishUpload {
+                    client,
+                    request,
+                    digest,
+                } => self.finish_upload(client, request, &digest),
+                Effect::CancelUpload { client, request } => {
+                    self.uploads.remove(&(client, request));
+                }
                 Effect::MarkAttentionSeen { pane } => {
                     if self.attention.mark_seen_for_pane(&pane) {
                         pending.extend(self.attention_changed());
@@ -750,6 +897,124 @@ impl Daemon {
         if let Some(store) = self.store.take() {
             store.shutdown().await;
         }
+    }
+
+    /// Report a refusal, naming which check failed. Only a missing trailer is
+    /// likely to be a dropped connection worth retrying, so the three are not
+    /// collapsed into one message.
+    fn refuse(&self, client: ClientId, request: u64, message: String) {
+        if let Some(outbox) = self.outboxes.get(&client) {
+            let _ = outbox.send(ServerMessage::Error {
+                request: Some(request),
+                message,
+            });
+        }
+    }
+
+    /// Hand one atomic paste to Herdr through the session's own socket, which
+    /// is what makes it arrive in one piece with the markers Herdr owns.
+    fn paste_pane_text(&mut self, client: ClientId, request: u64, pane: PaneId, text: String) {
+        let key = pane.target_session();
+        let Some(target) = self.targets.get(&key).cloned() else {
+            self.refuse(client, request, format!("{key} is not a configured target"));
+            return;
+        };
+        if target.socket.is_none() {
+            self.refuse(
+                client,
+                request,
+                format!("{key} has no known Herdr API socket, so an atomic paste is not available"),
+            );
+            return;
+        }
+        let transport = self.transport.clone();
+        let timeout = self.command_timeout;
+        let inputs = self.inputs.clone();
+        let local = pane.server_local_id().to_owned();
+        tokio::spawn(async move {
+            let (applied, message) =
+                match send_pane_input(&target, &transport, &local, &text, timeout).await {
+                    Ok(()) => (true, "pasted terminal text".to_owned()),
+                    Err(error) => (false, error.message),
+                };
+            let _ = inputs.send(Input::OperationDone {
+                client,
+                request,
+                applied,
+                message,
+            });
+        });
+    }
+
+    /// Verify a completed transfer and move it to the target host.
+    fn finish_upload(&mut self, client: ClientId, request: u64, digest: &str) {
+        let Some(upload) = self.uploads.remove(&(client, request)) else {
+            self.refuse(client, request, "no transfer is in progress".to_owned());
+            return;
+        };
+        if upload.bytes.len() as u64 != upload.length {
+            self.refuse(
+                client,
+                request,
+                format!(
+                    "transfer ended with {} of the {} bytes it declared",
+                    upload.bytes.len(),
+                    upload.length
+                ),
+            );
+            return;
+        }
+        if sha256_hex(&upload.bytes) != digest {
+            self.refuse(
+                client,
+                request,
+                "transfer does not match the digest its sender attested to".to_owned(),
+            );
+            return;
+        }
+        // The client names a type it saw on its own clipboard; the extension
+        // that reaches a remote shell comes from this table and never from the
+        // wire.
+        let Some(media) = clipboard::KNOWN_MEDIA
+            .iter()
+            .copied()
+            .find(|media| media.mime == upload.mime)
+        else {
+            self.refuse(
+                client,
+                request,
+                format!(
+                    "this daemon cannot upload {}; it carries no extension for that type",
+                    bounded_mime(&upload.mime)
+                ),
+            );
+            return;
+        };
+        let key = upload.pane.target_session();
+        let Some(target) = self.targets.get(&key).cloned() else {
+            self.refuse(client, request, format!("{key} is not a configured target"));
+            return;
+        };
+        let transport = self.transport.clone();
+        let inputs = self.inputs.clone();
+        tokio::spawn(async move {
+            match clipboard::upload_media(&target, &transport, media, &upload.bytes).await {
+                Ok(uploaded) => {
+                    let _ = inputs.send(Input::UploadFinished {
+                        client,
+                        request,
+                        result: Ok((uploaded.path, uploaded.bytes as u64)),
+                    });
+                }
+                Err(error) => {
+                    let _ = inputs.send(Input::UploadFinished {
+                        client,
+                        request,
+                        result: Err(error.to_string()),
+                    });
+                }
+            }
+        });
     }
 
     fn send_to_route(&self, pane: &PaneId, command: Vec<u8>) {
@@ -1071,10 +1336,11 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::task::JoinHandle;
 
-    use super::{DaemonOptions, invalidated_routes, serve, serve_until};
+    use super::{DaemonOptions, MAX_UPLOAD_BYTES, invalidated_routes, serve, serve_until};
     use crate::config::{Config, Target};
     use crate::model::PaneId;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, decode, encode};
+    use crate::terminal::TerminalAccess;
 
     /// A federation with no targets exercises the whole I/O path without
     /// starting a single Herdr command.
@@ -1158,6 +1424,18 @@ mod tests {
             }
             line.pop();
             Some(decode(&line).expect("the daemon sends a valid message"))
+        }
+
+        /// Read past whatever else the daemon is saying — a lease, a route that
+        /// could not open — until the transfer reports.
+        async fn transfer_result(&mut self) -> ServerMessage {
+            loop {
+                match self.receive().await.expect("the daemon answers") {
+                    message @ (ServerMessage::Error { .. }
+                    | ServerMessage::UploadComplete { .. }) => return message,
+                    _ => continue,
+                }
+            }
         }
 
         async fn hello(&mut self) -> ServerMessage {
@@ -1345,6 +1623,162 @@ mod tests {
         assert!(
             connection.receive().await.is_none(),
             "the daemon closes the connection after refusing it"
+        );
+    }
+
+    /// Drive one upload through a real daemon and read what it says back.
+    async fn upload(
+        connection: &mut Connection,
+        mime: &str,
+        declared: u64,
+        chunks: &[&[u8]],
+        digest: Option<&str>,
+    ) -> ServerMessage {
+        // A lease dies with its route, and no route can open without a Herdr
+        // server, so each attempt takes the lease again.
+        let pane = leased_pane(connection).await;
+        connection
+            .send(ClientMessage::BeginUpload {
+                request: 1,
+                pane,
+                mime: mime.to_owned(),
+                length: declared,
+            })
+            .await;
+        for chunk in chunks {
+            connection
+                .send(ClientMessage::UploadChunk {
+                    request: 1,
+                    bytes: chunk.to_vec(),
+                })
+                .await;
+        }
+        if let Some(digest) = digest {
+            connection
+                .send(ClientMessage::FinishUpload {
+                    request: 1,
+                    digest: digest.to_owned(),
+                })
+                .await;
+        }
+        connection.transfer_result().await
+    }
+
+    /// A pane the daemon will accept a lease for without a Herdr server behind
+    /// it: subscribing grants the lease locally, and the route failing after
+    /// that does not retract it.
+    async fn leased_pane(connection: &mut Connection) -> PaneId {
+        let pane = PaneId::new("first", "default", "w1:p1");
+        connection
+            .send(ClientMessage::SubscribePane {
+                pane: pane.clone(),
+                access: TerminalAccess::Control,
+                cols: 80,
+                rows: 24,
+            })
+            .await;
+        pane
+    }
+
+    #[tokio::test]
+    async fn a_transfer_is_refused_for_each_check_it_fails() {
+        let harness = Harness::start().await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        // Declared above the ceiling: refused before a byte moves.
+        let refusal = upload(
+            &mut connection,
+            "image/png",
+            MAX_UPLOAD_BYTES + 1,
+            &[],
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("limit")),
+            "{refusal:?}"
+        );
+
+        // More bytes than declared: stopped rather than believed.
+        let refusal = upload(&mut connection, "image/png", 2, &[b"four".as_slice()], None).await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("declared")),
+            "{refusal:?}"
+        );
+
+        // Fewer bytes than declared, with a trailer: the length is checked
+        // even though a digest arrived.
+        let refusal = upload(
+            &mut connection,
+            "image/png",
+            8,
+            &[b"two".as_slice()],
+            Some("whatever"),
+        )
+        .await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("declared")),
+            "{refusal:?}"
+        );
+
+        // A digest that does not match what was sent.
+        let refusal = upload(
+            &mut connection,
+            "image/png",
+            4,
+            &[b"four".as_slice()],
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        )
+        .await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("digest")),
+            "{refusal:?}"
+        );
+
+        // A type the daemon carries no extension for.
+        let refusal = upload(
+            &mut connection,
+            "application/x-invented",
+            4,
+            &[b"four".as_slice()],
+            Some(&super::sha256_hex(b"four")),
+        )
+        .await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("extension")),
+            "{refusal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_transfer_cannot_be_finished_later() {
+        let harness = Harness::start().await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        connection
+            .send(ClientMessage::BeginUpload {
+                request: 1,
+                pane,
+                mime: "image/png".to_owned(),
+                length: 4,
+            })
+            .await;
+        connection
+            .send(ClientMessage::CancelUpload { request: 1 })
+            .await;
+        connection
+            .send(ClientMessage::FinishUpload {
+                request: 1,
+                digest: super::sha256_hex(b"four"),
+            })
+            .await;
+
+        let refusal = connection.transfer_result().await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("no transfer")),
+            "{refusal:?}"
         );
     }
 

@@ -40,7 +40,6 @@ use crate::state::{
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 use crate::transport::{
     DiscoveredSession, SessionDiscovery, discover_running_sessions, expand_discovered_sessions,
-    send_pane_input,
 };
 use crate::ui_state::{UiState, UiStateStore};
 
@@ -657,6 +656,24 @@ struct ActiveRoute {
 struct PendingOperation {
     description: String,
     follow_server_focus: bool,
+    /// Reported through the transient feedback line instead of the message
+    /// line, which is how clipboard results have always been shown.
+    clipboard_feedback: Option<String>,
+}
+
+/// Whether a target can take an atomic paste, which needs a documented Herdr
+/// API socket rather than a terminal stream.
+fn atomic_paste_available(configured: &[Target], key: &TargetSession) -> bool {
+    configured
+        .iter()
+        .any(|target| target.name == key.target && target.socket.is_some())
+}
+
+/// What the frontend needs to remember while the daemon moves a payload. The
+/// path comes back verified, and pasting it is this side's job because
+/// bracketed-paste state lives with the parser.
+struct PendingUpload {
+    mime: String,
 }
 
 enum ConfigRefresh {
@@ -678,13 +695,6 @@ struct TargetTestEvent {
 enum NotificationEvent {
     Delivered(Result<(), String>),
     Activated(PaneId),
-}
-
-struct HerdrActionEvent {
-    result: Result<(), String>,
-    description: String,
-    follow_server_focus: bool,
-    clipboard_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -736,6 +746,7 @@ struct App {
     /// carries its other senders.
     client: Option<ClientCommands>,
     pending_operations: BTreeMap<u64, PendingOperation>,
+    pending_uploads: BTreeMap<u64, PendingUpload>,
     last_frame_area: Option<Rect>,
     last_terminal_area: Option<Rect>,
     selection: Option<TerminalSelection>,
@@ -767,7 +778,6 @@ struct App {
     context_menu: Option<ContextMenu>,
     text_prompt: Option<TextPrompt>,
     close_confirmation: Option<CloseConfirmation>,
-    herdr_action_sender: Option<mpsc::UnboundedSender<HerdrActionEvent>>,
     herdr_action_inflight: bool,
 }
 
@@ -783,6 +793,7 @@ impl Default for App {
             route_retry_after: BTreeMap::new(),
             client: None,
             pending_operations: BTreeMap::new(),
+            pending_uploads: BTreeMap::new(),
             last_frame_area: None,
             last_terminal_area: None,
             selection: None,
@@ -814,7 +825,6 @@ impl Default for App {
             context_menu: None,
             text_prompt: None,
             close_confirmation: None,
-            herdr_action_sender: None,
             herdr_action_inflight: false,
         }
     }
@@ -825,12 +835,10 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let configured_notifications = config.notifications.clone();
     let mut active_config = expand_discovered_sessions(config).await;
     let (mut terminal, _guard) = enter_terminal()?;
-    let mut targets = active_config
-        .targets
-        .iter()
-        .cloned()
-        .map(|target| (target_key(&target), target))
-        .collect::<BTreeMap<_, _>>();
+    // The frontend keeps no target map: nothing it does reaches a Herdr server
+    // directly any more. What it still needs from configuration is the
+    // transport for its own connection tests, and the list the target manager
+    // shows.
     let mut transport_config = active_config.transport.clone();
     // The frontend hosts its own daemon, so a single-machine install still runs
     // as one command with no socket and no service to operate. It is the same
@@ -848,7 +856,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let mut updates = client.state();
     let (input_sender, mut input) = mpsc::unbounded_channel();
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
-    let (herdr_action_sender, mut herdr_action_events) = mpsc::unbounded_channel();
     let (target_test_sender, mut target_test_events) = mpsc::unbounded_channel();
     let (notification_sender, mut notification_events) = mpsc::unbounded_channel();
     spawn_input_reader(input_sender);
@@ -876,7 +883,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         notification_sender: Some(notification_sender),
         config_path: Some(config_path.clone()),
         configured_targets,
-        herdr_action_sender: Some(herdr_action_sender),
         target_test_sender: Some(target_test_sender),
         client: Some(client.commands()),
         ..App::default()
@@ -926,7 +932,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                     if handle_decoded_input(
                         event,
                         &updates.borrow(),
-                        &targets,
                         &transport_config,
                         &mut app,
                     ).await? {
@@ -959,12 +964,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                         // clipboard transport and the list the target manager
                         // shows.
                         if federation_routes_changed(&active_config, &expanded) {
-                            targets = expanded
-                                .targets
-                                .iter()
-                                .cloned()
-                                .map(|target| (target_key(&target), target))
-                                .collect();
                             transport_config = expanded.transport.clone();
                             app.message = Some("refreshed configured hosts and running sessions".to_owned());
                         }
@@ -984,32 +983,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                     None => {}
                 }
                 should_draw = true;
-            }
-            action = herdr_action_events.recv() => {
-                if let Some(action) = action {
-                    app.herdr_action_inflight = false;
-                    match action.result {
-                        Ok(()) => {
-                            if let Some(feedback) = action.clipboard_feedback {
-                                app.clipboard_feedback = Some(ClipboardFeedback {
-                                    text: feedback,
-                                    expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
-                                });
-                                app.message = None;
-                            } else {
-                                app.message = Some(format!("Herdr: {}", action.description));
-                            }
-                            if action.follow_server_focus {
-                                app.selection_explicit = false;
-                                app.selected_pane = None;
-                            }
-                        }
-                        Err(error) => {
-                            app.message = Some(format!("Herdr action failed: {error}"));
-                        }
-                    }
-                    should_draw = true;
-                }
             }
             event = target_test_events.recv() => {
                 if let Some(event) = event {
@@ -1068,7 +1041,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                     if handle_decoded_input(
                         event,
                         &updates.borrow(),
-                        &targets,
                         &transport_config,
                         &mut app,
                     ).await? {
@@ -1231,7 +1203,6 @@ fn jump_from_notification(state: &FederationState, app: &mut App, pane: PaneId) 
 async fn handle_decoded_input(
     input: DecodedInput,
     state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
     transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<bool> {
@@ -1247,11 +1218,11 @@ async fn handle_decoded_input(
                     _ => None,
                 };
                 if let Some(key) = navigation {
-                    return handle_input(key, state, targets, transport_config, app).await;
+                    return handle_input(key, state, transport_config, app).await;
                 }
             }
             for byte in bytes {
-                if handle_input(byte, state, targets, transport_config, app).await? {
+                if handle_input(byte, state, transport_config, app).await? {
                     return Ok(true);
                 }
             }
@@ -1280,8 +1251,6 @@ async fn handle_decoded_input(
                 let characters = text.chars().count();
                 paste_text_into_selected(
                     state,
-                    targets,
-                    transport_config,
                     app,
                     text,
                     format!("pasted {characters} characters from terminal clipboard"),
@@ -1695,6 +1664,35 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
+/// Paste a path the daemon verified into the selected pane.
+fn paste_verified_path(app: &mut App, path: &str, feedback: String) {
+    let Some(selected) = app.selected_pane.clone() else {
+        app.message = Some("no pane is selected for the uploaded path".to_owned());
+        return;
+    };
+    let Some(route) = app.routes.get(&selected) else {
+        app.message = Some("terminal control route closed during media upload".to_owned());
+        return;
+    };
+    if route.access != TerminalAccess::Control {
+        app.message = Some("read-only: the uploaded path was not pasted".to_owned());
+        return;
+    }
+    let bracketed = route.parser.screen().bracketed_paste();
+    let Ok(payload) = terminal_paste_payload(path.as_bytes(), bracketed) else {
+        app.message = Some("the uploaded path could not be encoded for paste".to_owned());
+        return;
+    };
+    let Some(client) = app.client.clone() else {
+        return;
+    };
+    client.send_input(selected, payload);
+    app.clipboard_feedback = Some(ClipboardFeedback {
+        text: feedback,
+        expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
+    });
+}
+
 /// Mark a pane's events read here and ask the daemon to do the same.
 ///
 /// The local edit is optimistic so a badge clears in the frame the person acted
@@ -1963,7 +1961,6 @@ fn capture_screen_rows(screen: &vt100::Screen) -> Vec<CapturedRow> {
 async fn handle_input(
     key: u8,
     state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
     transport_config: &crate::config::TransportConfig,
     app: &mut App,
 ) -> Result<bool> {
@@ -2039,8 +2036,8 @@ async fn handle_input(
                 b'k' => cycle_pane(state, app, -1),
                 b'n' => cycle_tab(state, app, 1),
                 b'p' => cycle_tab(state, app, -1),
-                b'v' => paste_system_clipboard(state, targets, transport_config, app).await?,
-                b'i' => paste_clipboard_media(state, targets, transport_config, app).await?,
+                b'v' => paste_system_clipboard(state, app).await?,
+                b'i' => paste_clipboard_media(state, app).await?,
                 b'h' => {
                     app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
                 }
@@ -2176,6 +2173,7 @@ fn run_operation(
         PendingOperation {
             description,
             follow_server_focus,
+            clipboard_feedback: None,
         },
     );
 }
@@ -3641,12 +3639,7 @@ fn agent_priority(status: &str, interactive_ready: bool) -> u8 {
     }
 }
 
-async fn paste_system_clipboard(
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<()> {
+async fn paste_system_clipboard(state: &FederationState, app: &mut App) -> Result<()> {
     let text = match clipboard::read_text(MAX_CLIPBOARD_BYTES).await {
         Ok(text) => text,
         Err(error) => {
@@ -3661,8 +3654,6 @@ async fn paste_system_clipboard(
     let characters = text.chars().count();
     paste_text_into_selected(
         state,
-        targets,
-        transport_config,
         app,
         text,
         format!("pasted {characters} characters from system clipboard"),
@@ -3672,8 +3663,6 @@ async fn paste_system_clipboard(
 
 async fn paste_text_into_selected(
     state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
     app: &mut App,
     text: String,
     feedback: String,
@@ -3720,36 +3709,25 @@ async fn paste_text_into_selected(
         app.message = Some("control route became stale".to_owned());
         return Ok(());
     }
-    let Some(target) = targets.get(&key).cloned() else {
-        app.message = Some("selected target is unavailable".to_owned());
-        return Ok(());
-    };
-
-    if target.socket.is_some() {
-        if app.herdr_action_inflight {
-            app.message = Some("Herdr action already in progress; paste not sent".to_owned());
-            return Ok(());
-        }
-        let Some(sender) = app.herdr_action_sender.clone() else {
-            app.message = Some("Herdr action routing is unavailable; paste not sent".to_owned());
+    // An atomic paste goes through the session's own socket so Herdr writes it
+    // in one piece, and only the daemon has a route there. Which targets can do
+    // that is the daemon's knowledge too, so it is asked rather than guessed at
+    // from configuration this frontend happens to hold.
+    if atomic_paste_available(&app.configured_targets, &key) {
+        let Some(client) = app.client.clone() else {
+            app.message = Some("paste routing is unavailable; paste not sent".to_owned());
             return Ok(());
         };
-        let transport = transport_config.clone();
-        let command_timeout = Duration::from_secs(transport.command_timeout_seconds);
-        let pane_id = selected.server_local_id().to_owned();
-        app.herdr_action_inflight = true;
-        app.message = Some("sending one atomic paste…".to_owned());
-        tokio::spawn(async move {
-            let result = send_pane_input(&target, &transport, &pane_id, &text, command_timeout)
-                .await
-                .map_err(|error| error.message);
-            let _ = sender.send(HerdrActionEvent {
-                result,
+        let request = client.paste_pane_text(selected.clone(), text);
+        app.pending_operations.insert(
+            request,
+            PendingOperation {
                 description: "pasted terminal text".to_owned(),
                 follow_server_focus: false,
                 clipboard_feedback: Some(feedback),
-            });
-        });
+            },
+        );
+        app.message = Some("sending one atomic paste…".to_owned());
         return Ok(());
     }
 
@@ -3778,12 +3756,7 @@ async fn paste_text_into_selected(
     Ok(())
 }
 
-async fn paste_clipboard_media(
-    state: &FederationState,
-    targets: &BTreeMap<TargetSession, Target>,
-    transport_config: &crate::config::TransportConfig,
-    app: &mut App,
-) -> Result<()> {
+async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result<()> {
     let Some(selected) = app.selected_pane.clone() else {
         app.message = Some("no terminal pane is selected".to_owned());
         return Ok(());
@@ -3791,10 +3764,6 @@ async fn paste_clipboard_media(
     let key = selected.target_session();
     let Some(runtime) = state.targets.get(&key) else {
         app.message = Some("selected target is unavailable".to_owned());
-        return Ok(());
-    };
-    let Some(target) = targets.get(&key) else {
-        app.message = Some("selected target is missing from configuration".to_owned());
         return Ok(());
     };
     let Some(route) = app.routes.get(&selected) else {
@@ -3811,6 +3780,8 @@ async fn paste_clipboard_media(
         app.message = Some("control route became stale".to_owned());
         return Ok(());
     }
+    // Reading the clipboard is a desktop-session capability and stays here.
+    // Moving the bytes needs a route to the host, so that half is the daemon's.
     let (media, payload) = match clipboard::read_offered_media(MAX_CLIPBOARD_MEDIA_BYTES).await {
         Ok(offered) => offered,
         Err(error) => {
@@ -3818,42 +3789,19 @@ async fn paste_clipboard_media(
             return Ok(());
         }
     };
-    let upload = match clipboard::upload_media(target, transport_config, media, &payload).await {
-        Ok(upload) => upload,
-        Err(error) => {
-            app.message = Some(format!("clipboard media upload failed: {error}"));
-            return Ok(());
-        }
-    };
-    let Some(route) = app.routes.get(&selected) else {
-        app.message = Some("terminal control route closed during media upload".to_owned());
+    let Some(client) = app.client.clone() else {
+        app.message = Some("clipboard upload routing is unavailable".to_owned());
         return Ok(());
     };
-    if !runtime.accepts_generation(route.generation) {
-        app.routes.remove(&selected);
-        app.message = Some("control route became stale during media upload".to_owned());
-        return Ok(());
-    }
-    let payload = terminal_paste_payload(
-        upload.path.as_bytes(),
-        route.parser.screen().bracketed_paste(),
-    )?;
-    let controlling = app
-        .routes
-        .get(&selected)
-        .is_some_and(|route| route.access == TerminalAccess::Control);
-    let Some(client) = app.client.clone().filter(|_| controlling) else {
-        app.message = Some("terminal control route closed before media path paste".to_owned());
-        return Ok(());
-    };
-    client.send_input(selected.clone(), payload);
-    app.clipboard_feedback = Some(ClipboardFeedback {
-        text: format!(
-            "uploaded and verified {} {} bytes; pasted remote path",
-            upload.bytes, upload.mime
-        ),
-        expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
-    });
+    let bytes = payload.len();
+    let request = client.upload_media(selected, media.mime.to_owned(), &payload);
+    app.pending_uploads.insert(
+        request,
+        PendingUpload {
+            mime: media.mime.to_owned(),
+        },
+    );
+    app.message = Some(format!("uploading {} {bytes} bytes…", media.mime));
     Ok(())
 }
 
@@ -4329,12 +4277,26 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
             app.herdr_action_inflight = false;
             let pending = app.pending_operations.remove(&request);
             if applied {
-                app.message = Some(format!(
-                    "Herdr: {}",
-                    pending
-                        .as_ref()
-                        .map_or(message.as_str(), |pending| pending.description.as_str())
-                ));
+                match pending
+                    .as_ref()
+                    .and_then(|pending| pending.clipboard_feedback.clone())
+                {
+                    Some(feedback) => {
+                        app.clipboard_feedback = Some(ClipboardFeedback {
+                            text: feedback,
+                            expires_at: Instant::now() + CLIPBOARD_FEEDBACK_DURATION,
+                        });
+                        app.message = None;
+                    }
+                    None => {
+                        app.message = Some(format!(
+                            "Herdr: {}",
+                            pending
+                                .as_ref()
+                                .map_or(message.as_str(), |pending| pending.description.as_str())
+                        ));
+                    }
+                }
                 if pending.is_some_and(|pending| pending.follow_server_focus) {
                     app.selection_explicit = false;
                     app.selected_pane = None;
@@ -4343,7 +4305,32 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                 app.message = Some(format!("Herdr action failed: {message}"));
             }
         }
-        ServerMessage::Error { message, .. } => {
+        ServerMessage::UploadComplete {
+            request,
+            path,
+            bytes,
+        } => {
+            let mime = app
+                .pending_uploads
+                .remove(&request)
+                .map_or_else(|| "payload".to_owned(), |pending| pending.mime);
+            // Only a verified path is ever injected, and pasting it happens
+            // here because bracketed-paste state lives with the parser.
+            paste_verified_path(
+                app,
+                &path,
+                format!("uploaded and verified {mime} {bytes} bytes; pasted remote path"),
+            );
+        }
+        ServerMessage::Error { request, message } => {
+            // A refusal ends whatever asked for it, so a failed transfer does
+            // not leave the frontend waiting on a result that will not come.
+            if let Some(request) = request {
+                app.pending_uploads.remove(&request);
+                if app.pending_operations.remove(&request).is_some() {
+                    app.herdr_action_inflight = false;
+                }
+            }
             app.message = Some(message);
         }
         ServerMessage::Attention { event } => {
@@ -6138,10 +6125,6 @@ fn short_session(session: &str) -> String {
     safe.chars().take(LIMIT - 1).chain(['…']).collect()
 }
 
-fn target_key(target: &Target) -> TargetSession {
-    TargetSession::new(&target.name, target.session_name())
-}
-
 fn federation_routes_changed(current: &Config, next: &Config) -> bool {
     current.transport != next.transport || current.targets != next.targets
 }
@@ -6261,17 +6244,16 @@ mod tests {
     async fn ctrl_b_enters_herdr_action_mode_instead_of_the_raw_terminal() {
         let mut app = App::default();
         let state = FederationState::default();
-        let targets = BTreeMap::new();
         let transport = crate::config::TransportConfig::default();
 
-        handle_input(HERDR_PREFIX_KEY, &state, &targets, &transport, &mut app)
+        handle_input(HERDR_PREFIX_KEY, &state, &transport, &mut app)
             .await
             .unwrap();
 
         assert_eq!(app.mode, InputMode::HerdrPrefix);
         assert!(app.routes.is_empty());
 
-        handle_input(b'?', &state, &targets, &transport, &mut app)
+        handle_input(b'?', &state, &transport, &mut app)
             .await
             .unwrap();
         assert_eq!(app.mode, InputMode::Terminal);
@@ -6317,17 +6299,16 @@ mod tests {
                 Some(snapshot(&second_key, "second")),
             ),
         );
-        let targets = BTreeMap::new();
         let transport = crate::config::TransportConfig::default();
         let mut app = App {
             selected_pane: Some(PaneId::new("host-b", "work", "w1:p1")),
             ..App::default()
         };
 
-        handle_input(PREFIX_KEY, &state, &targets, &transport, &mut app)
+        handle_input(PREFIX_KEY, &state, &transport, &mut app)
             .await
             .unwrap();
-        handle_input(b'd', &state, &targets, &transport, &mut app)
+        handle_input(b'd', &state, &transport, &mut app)
             .await
             .unwrap();
 
@@ -6339,7 +6320,7 @@ mod tests {
         assert_eq!(label, "second");
         assert_eq!(app.mode, InputMode::Terminal);
 
-        handle_input(b'n', &state, &targets, &transport, &mut app)
+        handle_input(b'n', &state, &transport, &mut app)
             .await
             .unwrap();
         assert!(app.close_confirmation.is_none());
@@ -6613,20 +6594,18 @@ mod tests {
     #[tokio::test]
     async fn command_palette_consumes_arrow_navigation_as_one_input() {
         let state = FederationState::default();
-        let targets = BTreeMap::new();
         let transport = crate::config::TransportConfig::default();
         let mut app = App::default();
 
-        handle_input(PREFIX_KEY, &state, &targets, &transport, &mut app)
+        handle_input(PREFIX_KEY, &state, &transport, &mut app)
             .await
             .unwrap();
-        handle_input(b' ', &state, &targets, &transport, &mut app)
+        handle_input(b' ', &state, &transport, &mut app)
             .await
             .unwrap();
         handle_decoded_input(
             DecodedInput::Bytes(b"\x1b[B".to_vec()),
             &state,
-            &targets,
             &transport,
             &mut app,
         )
