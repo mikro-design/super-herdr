@@ -52,6 +52,9 @@ Work is ordered by dependency and product risk.
 - Atomic multiline paste and clipboard media upload through the daemon, with the
   upload offered as a declared length, chunked payload, and digest trailer that
   is verified before anything reaches the target host.
+- A browser client the daemon serves over loopback HTTP, carrying the protocol
+  on a server-sent event stream with commands posted back, showing the
+  federation and the attention feed on a phone or tablet.
 
 ## Next
 
@@ -71,9 +74,12 @@ Work is ordered by dependency and product risk.
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target
    transfers.
-4. Ship the first remote client as a web client the daemon serves, covering
-   tablet and phone from one codebase. Navigation, the attention feed, and
-   read-only pane observation come before input.
+4. Add read-only pane observation to the browser client. Navigation and the
+   attention feed are served; rendering a terminal needs a VT implementation in
+   the page, which means vendoring one — the first third-party code the client
+   would carry, and worth deciding deliberately rather than reaching for.
+   Typing into a pane needs the socket upgrade a post-per-keystroke would
+   deserve.
 5. Add push delivery of attention events to paired devices, as a further sink
    under the existing filters, coalescing, and rate limits. Native desktop
    delivery is not moving with it: notifying a desktop is a desktop-session

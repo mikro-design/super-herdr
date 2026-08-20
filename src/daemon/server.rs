@@ -36,6 +36,7 @@ use crate::attention::{AttentionIndex, AttentionStore};
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
 use crate::daemon::broker::{Broker, ClientId, Effect};
+use crate::daemon::web;
 use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, ServerMessage, decode, encode};
@@ -61,6 +62,10 @@ pub struct DaemonOptions {
     /// state path.
     pub attention_state: Option<PathBuf>,
     pub refresh_interval: Duration,
+    /// Serve the browser client on this loopback port. `None` serves no web
+    /// client at all, which is the default: a daemon should not open a port
+    /// nobody asked for.
+    pub web_port: Option<u16>,
 }
 
 impl DaemonOptions {
@@ -81,6 +86,7 @@ impl DaemonOptions {
             socket: root.join("super-herdr/daemon.sock"),
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
+            web_port: None,
         })
     }
 }
@@ -268,7 +274,31 @@ async fn serve_until(
 ) -> Result<()> {
     let listener = bind(&options.socket)?;
     let socket = options.socket.clone();
-    let (_attach, attachments) = mpsc::unbounded_channel();
+    let (attach, attachments) = mpsc::unbounded_channel();
+
+    // The browser client is an ordinary in-process attachment, so it speaks the
+    // same framing through the same handshake as every other client.
+    let web = match options.web_port {
+        Some(port) => {
+            let address = web::loopback(port);
+            let listener = web::bind(address).await?;
+            let attach = attach.clone();
+            let open: web::Attach = std::sync::Arc::new(move || {
+                let (theirs, ours) = tokio::io::duplex(IN_PROCESS_BUFFER);
+                attach
+                    .send(theirs)
+                    .map_err(|_| anyhow::anyhow!("the daemon is no longer running"))?;
+                Ok(ours)
+            });
+            Some((address, tokio::spawn(web::serve(listener, open))))
+        }
+        None => None,
+    };
+    if let Some((address, _)) = web.as_ref() {
+        // Printed rather than logged, because the address is what a person
+        // needs in order to forward it.
+        println!("super-herdr web client on http://{address}");
+    }
     let result = run(
         config,
         config_path,
@@ -280,6 +310,9 @@ async fn serve_until(
     .await;
     // The socket outlives the daemon otherwise, and the next start would have
     // to decide whether the path it found belongs to a live process.
+    if let Some((_, task)) = web {
+        task.abort();
+    }
     let _ = fs::remove_file(&socket);
     result
 }
@@ -1365,6 +1398,7 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
+                web_port: None,
             };
             let server = tokio::spawn(serve(empty_config(), None, options));
             Self { directory, server }
@@ -1534,6 +1568,7 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
+                web_port: None,
             },
         ));
 
@@ -1794,6 +1829,7 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
+                web_port: None,
             },
             async move {
                 let _ = stopped.await;
@@ -1830,6 +1866,7 @@ mod tests {
             socket: harness.socket(),
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
+            web_port: None,
         };
         let error = serve(empty_config(), None, options)
             .await
@@ -1853,6 +1890,7 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
+                web_port: None,
             },
         ));
 

@@ -362,6 +362,7 @@ mod tests {
             socket: directory.path().join("unused.sock"),
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
+            web_port: None,
         };
         (spawn_in_process(config, None, options), directory)
     }

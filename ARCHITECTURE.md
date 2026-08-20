@@ -433,6 +433,32 @@ protocol number for exactly this reason, but nothing yet reads it. A client
 should learn the version and be able to say what it is, so the machine in the
 middle is identifiable rather than assumed current.
 
+A browser cannot open a Unix socket, so the daemon can also serve the same
+protocol over two ordinary HTTP requests: its messages arrive on a server-sent
+event stream, and a client's messages are posted back. That needs no framing,
+no masking, and no handshake beyond HTTP, which is why it is a small
+hand-written server rather than a web stack. Behind both requests is one
+ordinary in-process attachment, so a browser is a client of the same daemon in
+the same way the frontend is, through the same handshake, receiving the same
+vocabulary rather than a translation of it. When the client needs to type into a
+pane, the latency of a post per keystroke will argue for a socket upgrade; while
+it only observes, it does not.
+
+A stream and the posts that steer it are separate requests, joined by an
+identifier the browser generates. Without that join, a subscription posted by
+one request would be made on a connection another request is reading — which
+works until a second tab is open. The identifier is only ever a map key, so it
+keeps the characters that can be one and nothing else.
+
+That listener binds loopback and nothing else. There is no authentication yet,
+because that is device pairing and it is deliberately a separate decision, so a
+device reaches the browser client the way it reaches any other loopback service
+on another machine: forwarded over OpenSSH. Binding elsewhere is not offered
+rather than discouraged — a flag that publishes an unauthenticated federation is
+the kind of thing that gets used once and regretted. The page is held in the
+binary and refers to nothing it is not served, because a forwarded port has no
+route to anywhere else.
+
 The first remote client is a web client the daemon itself serves, which covers
 tablet and phone from one codebase and can be saved to a home screen. Native
 clients can follow on the same protocol without changing it. Push delivery for

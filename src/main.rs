@@ -67,6 +67,11 @@ enum Commands {
         /// Socket path. Defaults to the XDG runtime directory.
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
+        /// Also serve the browser client on this loopback port. It is not
+        /// authenticated, so reach it from another device by forwarding the
+        /// port over SSH rather than by publishing it.
+        #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "8790")]
+        web: Option<u16>,
     },
     /// Inspect clipboard copy and paste capabilities without reading clipboard contents.
     Clipboard {
@@ -330,11 +335,12 @@ async fn run() -> Result<ExitCode> {
             tui::run(config, path).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Daemon { socket } => {
+        Commands::Daemon { socket, web } => {
             let mut options = DaemonOptions::discover()?;
             if let Some(socket) = socket {
                 options.socket = socket;
             }
+            options.web_port = web;
             stdout_line(format_args!(
                 "super-herdr daemon listening on {}",
                 options.socket.display()

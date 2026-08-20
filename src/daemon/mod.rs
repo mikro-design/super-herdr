@@ -5,6 +5,7 @@
 
 pub mod broker;
 pub mod server;
+pub mod web;
 
 pub use broker::{Broker, ClientId, Effect};
 pub use server::{DaemonOptions, serve};

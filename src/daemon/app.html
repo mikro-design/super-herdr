@@ -1,0 +1,269 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Super-Herdr</title>
+<style>
+  :root {
+    --bg: #11131a; --panel: #171a23; --line: #262b38;
+    --text: #e6e9f0; --dim: #8b93a7; --accent: #6ea8fe;
+    --wait: #ffb454; --work: #6ee7a8; --gone: #6b7280;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7fa; --panel: #fff; --line: #dfe3ec;
+      --text: #12151c; --dim: #5b6376; --accent: #2563eb;
+      --wait: #b45309; --work: #047857; --gone: #6b7280;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 ui-sans-serif, -apple-system, system-ui, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header {
+    position: sticky; top: 0; z-index: 2; display: flex; gap: .6rem;
+    align-items: baseline; padding: .85rem 1rem; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 1rem; margin: 0; font-weight: 620; letter-spacing: .01em; }
+  #link { margin-left: auto; font-size: .78rem; color: var(--dim); }
+  #link.live { color: var(--work); }
+  #link.down { color: var(--wait); }
+  main { padding: 1rem; max-width: 46rem; margin: 0 auto; }
+  h2 {
+    font-size: .74rem; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--dim); margin: 1.6rem 0 .6rem; font-weight: 600;
+  }
+  h2:first-child { margin-top: 0; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: .7rem; margin-bottom: .45rem; padding: .7rem .85rem;
+  }
+  li.tap { cursor: pointer; }
+  li.tap:active { border-color: var(--accent); }
+  .row { display: flex; gap: .5rem; align-items: baseline; }
+  .name { font-weight: 560; }
+  .where { color: var(--dim); font-size: .82rem; margin-left: auto; text-align: right; }
+  .note { color: var(--dim); font-size: .82rem; }
+  .badge {
+    font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+    padding: .13rem .42rem; border-radius: .35rem; border: 1px solid currentColor;
+  }
+  .wait { color: var(--wait); } .work { color: var(--work); } .gone { color: var(--gone); }
+  .unread { box-shadow: inset 3px 0 0 var(--wait); }
+  .empty { color: var(--dim); padding: .6rem .1rem; }
+  button {
+    font: inherit; color: var(--accent); background: none;
+    border: 1px solid var(--line); border-radius: .55rem;
+    padding: .35rem .7rem; cursor: pointer;
+  }
+  .actions { display: flex; gap: .5rem; margin-top: .7rem; }
+</style>
+
+<header>
+  <h1>Super-Herdr</h1>
+  <span id="link">connecting…</span>
+</header>
+<main>
+  <h2>Waiting for you</h2>
+  <ul id="waiting"><li class="empty">nothing waiting</li></ul>
+
+  <h2>Recent</h2>
+  <ul id="history"><li class="empty">no transitions yet</li></ul>
+  <div class="actions"><button id="mark">Mark all read</button></div>
+
+  <h2>Federation</h2>
+  <ul id="targets"><li class="empty">no targets</li></ul>
+</main>
+
+<script>
+// One session joins the event stream to the commands that steer it. The daemon
+// keys its attachment on this, so a second tab is a second client rather than
+// two halves of one.
+const session = (crypto.randomUUID && crypto.randomUUID() || String(Math.random()).slice(2))
+  .replace(/[^a-zA-Z0-9-]/g, '');
+
+// The daemon's own vocabulary, mirrored here. Nothing is derived locally: the
+// federation and the attention history are what the daemon last said they were.
+const targets = new Map();
+let history = [];
+
+const el = id => document.getElementById(id);
+const text = value => String(value == null ? '' : value);
+
+function send(message) {
+  return fetch(`/command?session=${session}`, {
+    method: 'POST',
+    body: JSON.stringify(message),
+  });
+}
+
+function qualify(pane) {
+  return `${pane.target}/${pane.session}`;
+}
+
+function phase(status) {
+  const value = text(status).toLowerCase();
+  if (['blocked', 'waiting', 'waiting_for_input', 'needs_input', 'ready'].includes(value)) return 'wait';
+  if (['working', 'running', 'busy', 'active'].includes(value)) return 'work';
+  return 'gone';
+}
+
+function renderWaiting() {
+  const rows = [];
+  for (const runtime of targets.values()) {
+    const snapshot = runtime.snapshot;
+    if (!snapshot || runtime.connection !== 'live') continue;
+    for (const agent of snapshot.agents || []) {
+      const status = agent.status || '';
+      if (phase(status) !== 'wait' && !agent.interactive_ready) continue;
+      rows.push({
+        name: agent.name || agent.agent || 'agent',
+        status,
+        where: qualify(agent.pane),
+      });
+    }
+  }
+  const list = el('waiting');
+  list.innerHTML = '';
+  if (!rows.length) {
+    list.innerHTML = '<li class="empty">nothing waiting</li>';
+    return;
+  }
+  for (const row of rows) {
+    const item = document.createElement('li');
+    item.innerHTML = `<div class="row">
+        <span class="name"></span>
+        <span class="badge wait"></span>
+        <span class="where"></span>
+      </div>`;
+    item.querySelector('.name').textContent = row.name;
+    item.querySelector('.badge').textContent = row.status || 'waiting';
+    item.querySelector('.where').textContent = row.where;
+    list.append(item);
+  }
+}
+
+function renderHistory() {
+  const list = el('history');
+  list.innerHTML = '';
+  const recent = history.slice(-40).reverse();
+  if (!recent.length) {
+    list.innerHTML = '<li class="empty">no transitions yet</li>';
+    return;
+  }
+  for (const event of recent) {
+    const item = document.createElement('li');
+    item.className = 'tap' + (event.unread ? ' unread' : '');
+    item.innerHTML = `<div class="row">
+        <span class="name"></span>
+        <span class="badge"></span>
+        <span class="where"></span>
+      </div><div class="note"></div>`;
+    item.querySelector('.name').textContent = event.agent || 'agent';
+    const badge = item.querySelector('.badge');
+    badge.textContent = text(event.kind).replace(/_/g, ' ');
+    badge.classList.add(phase(event.status));
+    item.querySelector('.where').textContent = qualify(event.pane);
+    item.querySelector('.note').textContent =
+      `${text(event.workspace)} · ${text(event.status)}`;
+    // Reading it here marks it read everywhere, because the history belongs to
+    // the daemon rather than to this page.
+    item.onclick = () => send({ type: 'attention.mark_seen', pane: event.pane });
+    list.append(item);
+  }
+}
+
+function renderTargets() {
+  const list = el('targets');
+  list.innerHTML = '';
+  if (!targets.size) {
+    list.innerHTML = '<li class="empty">no targets</li>';
+    return;
+  }
+  for (const [key, runtime] of [...targets.entries()].sort()) {
+    const snapshot = runtime.snapshot;
+    const item = document.createElement('li');
+    item.innerHTML = `<div class="row">
+        <span class="name"></span>
+        <span class="badge"></span>
+        <span class="where"></span>
+      </div><div class="note"></div>`;
+    item.querySelector('.name').textContent = key;
+    const badge = item.querySelector('.badge');
+    const live = runtime.connection === 'live';
+    badge.textContent = typeof runtime.connection === 'string'
+      ? runtime.connection
+      : Object.keys(runtime.connection)[0];
+    badge.classList.add(live ? 'work' : 'wait');
+    item.querySelector('.where').textContent = text(runtime.endpoint);
+    const counts = snapshot && snapshot.counts;
+    item.querySelector('.note').textContent = counts
+      ? `${counts.workspaces} workspaces · ${counts.panes} panes · ${counts.agents} agents`
+      : text(runtime.last_error) || 'no snapshot yet';
+    list.append(item);
+  }
+}
+
+function apply(message) {
+  switch (message.type) {
+    case 'server.hello':
+      send({ type: 'state.subscribe' });
+      break;
+    case 'state.full':
+      targets.clear();
+      for (const runtime of message.state.targets) {
+        targets.set(`${runtime.key.target}/${runtime.key.session}`, runtime);
+      }
+      renderTargets();
+      renderWaiting();
+      break;
+    case 'state.target': {
+      const key = `${message.target.target}/${message.target.session}`;
+      if (message.state) targets.set(key, message.state);
+      else targets.delete(key);
+      renderTargets();
+      renderWaiting();
+      break;
+    }
+    case 'attention.history':
+      history = message.events;
+      renderHistory();
+      break;
+    case 'attention.event':
+      history = history.filter(held => held.id !== message.event.id).concat(message.event);
+      renderHistory();
+      break;
+  }
+}
+
+function connect() {
+  const stream = new EventSource(`/events?session=${session}`);
+  stream.onopen = () => {
+    el('link').textContent = 'live';
+    el('link').className = 'live';
+  };
+  stream.onmessage = event => {
+    try {
+      apply(JSON.parse(event.data));
+    } catch (_) {
+      // A message this page does not understand is not a reason to stop
+      // rendering the ones it does.
+    }
+  };
+  // EventSource reconnects on its own; the daemon treats each reconnect as a
+  // new client and resends the state and the history, so nothing here has to
+  // remember where it was.
+  stream.onerror = () => {
+    el('link').textContent = 'reconnecting…';
+    el('link').className = 'down';
+  };
+}
+
+el('mark').onclick = () => send({ type: 'attention.mark_all_seen' });
+connect();
+</script>
