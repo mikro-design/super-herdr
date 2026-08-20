@@ -305,6 +305,13 @@ impl ClientCommands {
         request
     }
 
+    /// Ask for a pairing code to show a person.
+    pub fn request_pairing_code(&self) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::RequestPairingCode { request });
+        request
+    }
+
     pub fn mark_attention_seen(&self, pane: PaneId) {
         self.send(ClientMessage::MarkAttentionSeen { pane });
     }
@@ -356,6 +363,7 @@ mod tests {
             transport: Default::default(),
             notifications: Default::default(),
             targets,
+            devices: Vec::new(),
         };
         let options = DaemonOptions {
             // No socket is bound in this mode; the path is never used.
@@ -363,6 +371,7 @@ mod tests {
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
+            web_address: None,
         };
         (spawn_in_process(config, None, options), directory)
     }

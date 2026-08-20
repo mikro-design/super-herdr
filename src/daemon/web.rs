@@ -49,12 +49,54 @@ const MAX_SESSION_CHARS: usize = 64;
 
 pub const DEFAULT_WEB_PORT: u16 = 8790;
 
+/// How long a paired device's cookie lasts before the browser drops it. The
+/// token itself does not expire — revoking is what ends it — but a browser that
+/// has not been used in a month should ask again rather than hold a credential
+/// indefinitely.
+const COOKIE_LIFETIME_SECONDS: u64 = 60 * 60 * 24 * 30;
+
 pub fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
+/// Whether the daemon will bind here.
+///
+/// A token authenticates a device; it does not encrypt anything. On a private
+/// mesh the network already provides confidentiality, and on the open internet
+/// it would not — so a public address is refused rather than warned about, and
+/// the way to reach a daemon from outside remains a forwarded port, which is an
+/// explicit act rather than a flag someone set once.
+pub fn bindable(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                // 100.64.0.0/10, the shared range Tailscale and other meshes use.
+                || (address.octets()[0] == 100 && (64..128).contains(&address.octets()[1]))
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback()
+                // Unique local (fc00::/7) and link local (fe80::/10).
+                || (address.segments()[0] & 0xfe00) == 0xfc00
+                || (address.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 /// Opens one in-process attachment to the daemon.
 pub type Attach = Arc<dyn Fn() -> Result<DuplexStream> + Send + Sync>;
+
+/// What the web layer asks of pairing, so it holds no policy of its own.
+pub trait Devices: Send + Sync {
+    /// Whether this token belongs to a paired device.
+    fn admits(&self, token: &str) -> bool;
+    /// Exchange a pairing code for a new device's token, or refuse.
+    fn pair(&self, code: &str, name: &str) -> Result<String>;
+    /// The daemon's own version, shown to a person so a stale daemon is
+    /// visible where it would otherwise be invisible.
+    fn version(&self) -> String;
+}
 
 /// Browser sessions, each holding the writing half of its own attachment.
 ///
@@ -69,20 +111,27 @@ struct Sessions {
 }
 
 pub async fn bind(address: SocketAddr) -> Result<TcpListener> {
+    anyhow::ensure!(
+        bindable(address.ip()),
+        "refusing to serve the web client on {address}: a device token authenticates but does not \
+         encrypt, so this is offered only on loopback or a private network. Forward the port \
+         instead."
+    );
     TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to serve the web client on {address}"))
 }
 
-pub async fn serve(listener: TcpListener, attach: Attach) {
+pub async fn serve(listener: TcpListener, attach: Attach, devices: Arc<dyn Devices>) {
     let sessions = Arc::new(Sessions::default());
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let attach = attach.clone();
                 let sessions = sessions.clone();
+                let devices = devices.clone();
                 tokio::spawn(async move {
-                    let _ = handle(stream, attach, sessions).await;
+                    let _ = handle(stream, peer, attach, sessions, devices).await;
                 });
             }
             // One failed accept must not end the server.
@@ -95,18 +144,69 @@ struct Request {
     method: String,
     path: String,
     session: Option<String>,
+    token: Option<String>,
     length: usize,
 }
 
-async fn handle(stream: TcpStream, attach: Attach, sessions: Arc<Sessions>) -> Result<()> {
+async fn handle(
+    stream: TcpStream,
+    peer: SocketAddr,
+    attach: Attach,
+    sessions: Arc<Sessions>,
+    devices: Arc<dyn Devices>,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let Some(request) = read_request(&mut reader).await? else {
         return Ok(());
     };
 
+    // Loopback is not asked for a token. Anyone who can reach it can already
+    // read the daemon's socket, so requiring one would be ceremony rather than
+    // a boundary. Everything arriving over a network must present one.
+    let admitted = peer.ip().is_loopback()
+        || request
+            .token
+            .as_deref()
+            .is_some_and(|token| devices.admits(token));
+
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => write_page(&mut writer, APP).await,
+        ("GET", "/session") => {
+            // What the page needs before it can decide what to show: whether
+            // this browser is already paired, and which daemon it is talking
+            // to.
+            let body = format!(
+                "{{\"paired\":{admitted},\"version\":\"{}\"}}",
+                devices.version().replace('"', "")
+            );
+            write_json(&mut writer, &body).await
+        }
+        ("POST", "/pair") => {
+            let body = read_body(&mut reader, request.length).await?;
+            let text = String::from_utf8_lossy(&body);
+            let code = json_field(&text, "code").unwrap_or_default();
+            let name = json_field(&text, "name").unwrap_or_default();
+            match devices.pair(&code, &name) {
+                Ok(token) => {
+                    let cookie = format!(
+                        "sh_device={token}; Path=/; Max-Age={COOKIE_LIFETIME_SECONDS}; HttpOnly; SameSite=Strict"
+                    );
+                    write_with_cookie(&mut writer, "204 No Content", &cookie).await
+                }
+                // The reason is the daemon's, and says which check failed
+                // without saying anything about codes that would have worked.
+                Err(error) => write_status(&mut writer, "403 Forbidden", &error.to_string()).await,
+            }
+        }
+        _ if !admitted => {
+            write_status(
+                &mut writer,
+                "401 Unauthorized",
+                "this device is not paired with this daemon",
+            )
+            .await
+        }
         ("GET", "/events") => {
             let Some(session) = request.session else {
                 return write_status(&mut writer, "400 Bad Request", "a session is required").await;
@@ -184,11 +284,20 @@ async fn read_request(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Re
         .filter(|session| !session.is_empty());
 
     let mut length = 0;
+    let mut token = None;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
             length = value.trim().parse::<usize>().unwrap_or_default();
+        }
+        if name.eq_ignore_ascii_case("cookie") {
+            token = value
+                .split(';')
+                .filter_map(|pair| pair.trim().strip_prefix("sh_device="))
+                .map(sanitized_token)
+                .find(|token| !token.is_empty());
         }
     }
 
@@ -196,6 +305,7 @@ async fn read_request(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Re
         method,
         path: path.to_owned(),
         session,
+        token,
         length: length.min(MAX_MESSAGE_BYTES),
     }))
 }
@@ -208,6 +318,54 @@ fn sanitized_session(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
         .take(MAX_SESSION_CHARS)
         .collect()
+}
+
+/// A token is hex from this daemon, so anything else is not one and is dropped
+/// rather than compared.
+fn sanitized_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(128)
+        .collect()
+}
+
+/// Read one string field out of a small JSON object.
+///
+/// The pairing request is two short fields from a page this daemon served, so
+/// it is read directly rather than through a model that would have to be kept
+/// in step with the page.
+fn json_field(text: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\"");
+    let start = text.find(&key)? + key.len();
+    let rest = text
+        .get(start..)?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest.get(..end)?.to_owned())
+}
+
+async fn write_json(writer: &mut OwnedWriteHalf, body: &str) -> Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(head.as_bytes()).await?;
+    writer.write_all(body.as_bytes()).await?;
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+async fn write_with_cookie(writer: &mut OwnedWriteHalf, status: &str, cookie: &str) -> Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nset-cookie: {cookie}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    );
+    writer.write_all(head.as_bytes()).await?;
+    let _ = writer.shutdown().await;
+    Ok(())
 }
 
 async fn read_body(reader: &mut BufReader<OwnedReadHalf>, length: usize) -> Result<Vec<u8>> {
@@ -307,6 +465,7 @@ async fn stream_events(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -315,6 +474,42 @@ mod tests {
     use super::{APP, DEFAULT_WEB_PORT, loopback, sanitized_session};
     use crate::config::Config;
     use crate::daemon::server::{DaemonOptions, spawn_in_process};
+
+    /// Stands in for the daemon's pairing policy. Loopback tests never consult
+    /// it, which is itself the property the network tests check.
+    #[derive(Default)]
+    struct TestDevices {
+        admitted: Mutex<Vec<String>>,
+        code: Mutex<Option<String>>,
+    }
+
+    impl super::Devices for TestDevices {
+        fn admits(&self, token: &str) -> bool {
+            self.admitted
+                .lock()
+                .map(|held| held.iter().any(|held| held == token))
+                .unwrap_or(false)
+        }
+
+        fn pair(&self, code: &str, _name: &str) -> anyhow::Result<String> {
+            let waiting = self.code.lock().ok().and_then(|mut held| held.take());
+            match waiting {
+                Some(waiting) if waiting == code => {
+                    let token = "ab".repeat(32);
+                    if let Ok(mut admitted) = self.admitted.lock() {
+                        admitted.push(token.clone());
+                    }
+                    Ok(token)
+                }
+                Some(_) => anyhow::bail!("that pairing code is not the one waiting"),
+                None => anyhow::bail!("no pairing code is waiting"),
+            }
+        }
+
+        fn version(&self) -> String {
+            "0.0.0-test".to_owned()
+        }
+    }
 
     #[test]
     fn a_session_identifier_is_only_ever_a_map_key() {
@@ -346,13 +541,19 @@ mod tests {
         );
     }
 
-    async fn serve_test_daemon() -> (u16, tokio::task::JoinHandle<()>, tempfile::TempDir) {
+    async fn serve_test_daemon() -> (
+        u16,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+        Arc<TestDevices>,
+    ) {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let daemon = spawn_in_process(
             Config {
                 transport: Default::default(),
                 notifications: Default::default(),
                 targets: Vec::new(),
+                devices: Vec::new(),
             },
             None,
             DaemonOptions {
@@ -360,6 +561,7 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
+                web_address: None,
             },
         );
         // Port zero so tests never collide with a daemon somebody is running.
@@ -367,10 +569,11 @@ mod tests {
         let port = listener.local_addr().expect("a bound address").port();
         let daemon = std::sync::Arc::new(daemon);
         let attach: super::Attach = std::sync::Arc::new(move || daemon.attach());
-        let task = tokio::spawn(super::serve(listener, attach));
+        let devices = Arc::new(TestDevices::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices.clone()));
         // The directory is returned rather than leaked, so a test run does not
         // accumulate state directories.
-        (port, task, directory)
+        (port, task, directory, devices)
     }
 
     async fn request(port: u16, request: &str) -> String {
@@ -392,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_page_is_served_and_unknown_paths_are_not() {
-        let (port, task, _directory) = serve_test_daemon().await;
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
 
         assert!(
             request(port, "GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
@@ -409,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_without_its_stream_is_refused() {
-        let (port, task, _directory) = serve_test_daemon().await;
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
 
         // No event stream has claimed this session, so there is no attachment
         // to steer and the post is refused rather than opening one.
@@ -433,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_carries_the_handshake_the_socket_carries() {
-        let (port, task, _directory) = serve_test_daemon().await;
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
             .write_all(b"GET /events?session=one HTTP/1.1\r\nhost: localhost\r\n\r\n")
@@ -458,6 +661,101 @@ mod tests {
         assert!(greeting.contains("server.hello"), "{greeting}");
         assert!(greeting.contains("\"protocol\":1"), "{greeting}");
         task.abort();
+    }
+
+    #[test]
+    fn a_public_address_is_refused_and_a_private_one_is_not() {
+        use std::net::IpAddr;
+
+        for private in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.4",
+            // The shared range meshes such as Tailscale hand out.
+            "100.87.78.39",
+            "::1",
+            "fd00::1",
+        ] {
+            let address: IpAddr = private.parse().unwrap();
+            assert!(super::bindable(address), "{private} should be bindable");
+        }
+        for public in [
+            "8.8.8.8",
+            "203.0.113.7",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2606:4700::1111",
+        ] {
+            let address: IpAddr = public.parse().unwrap();
+            assert!(
+                !super::bindable(address),
+                "{public} must not be bindable: a token authenticates but does not encrypt"
+            );
+        }
+        // Nor the wildcard, which would include every public interface.
+        assert!(!super::bindable("0.0.0.0".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn pairing_exchanges_a_code_for_a_cookie_once() {
+        let (port, task, _directory, devices) = serve_test_daemon().await;
+        if let Ok(mut code) = devices.code.lock() {
+            *code = Some("ABCD2345".to_owned());
+        }
+        let body = r#"{"code":"ABCD2345","name":"phone"}"#;
+        let pair = format!(
+            "POST /pair HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request(port, &pair).await;
+        assert!(response.contains("204"), "{response}");
+
+        // A code is spent by the match, so the same one does not pair a second
+        // device.
+        let response = request(port, &pair).await;
+        assert!(response.contains("403"), "{response}");
+        task.abort();
+    }
+
+    /// Cookie attributes are split off before a value reaches the filter, so
+    /// what it sees is one value. The filter's job is only to refuse anything
+    /// that is not shaped like a digest this daemon issued.
+    #[test]
+    fn a_token_value_is_hex_or_nothing() {
+        assert_eq!(super::sanitized_token("00ff"), "00ff");
+        assert_eq!(super::sanitized_token(" 00ff "), "00ff");
+        assert_eq!(super::sanitized_token("zz!!"), "");
+        assert_eq!(super::sanitized_token(&"a".repeat(500)).len(), 128);
+
+        // The invariant rather than a hand-computed result: whatever arrives,
+        // what comes out is hex and bounded, so nothing structural survives to
+        // be compared against a stored digest.
+        for hostile in [
+            "../../etc/passwd",
+            "00ff\r\nx: y",
+            "'; DROP--",
+            "\u{0}\u{7f}",
+        ] {
+            let cleaned = super::sanitized_token(hostile);
+            assert!(
+                cleaned
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()),
+                "{hostile:?} produced {cleaned:?}"
+            );
+            assert!(cleaned.len() <= 128);
+        }
+    }
+
+    #[test]
+    fn one_json_field_is_read_without_a_parser() {
+        let text = r#"{"code":"ABCD-2345","name":"my phone"}"#;
+        assert_eq!(super::json_field(text, "code").unwrap(), "ABCD-2345");
+        assert_eq!(super::json_field(text, "name").unwrap(), "my phone");
+        assert!(super::json_field(text, "absent").is_none());
+        assert!(super::json_field("not json at all", "code").is_none());
     }
 
     #[test]

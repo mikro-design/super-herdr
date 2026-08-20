@@ -154,6 +154,13 @@ pub enum ClientMessage {
     MarkAttentionSeen { pane: PaneId },
     #[serde(rename = "attention.mark_all_seen")]
     MarkAllAttentionSeen,
+    /// Ask for a pairing code to show a person.
+    ///
+    /// Pairing is initiated from a client that is already trusted, so the code
+    /// is shown on a screen someone already has rather than mailed, printed, or
+    /// left in a file.
+    #[serde(rename = "pairing.request")]
+    RequestPairingCode { request: u64 },
     /// Drop events that have been read. History is durable and shared, so
     /// forgetting part of it is a request like any other mutation.
     #[serde(rename = "attention.clear_seen")]
@@ -209,6 +216,14 @@ pub enum ServerMessage {
         request: u64,
         applied: bool,
         message: String,
+    },
+    /// A pairing code and how long it lasts. Never persisted: a code that
+    /// survived a restart would be a credential nobody knew was outstanding.
+    #[serde(rename = "pairing.code")]
+    PairingCode {
+        request: u64,
+        code: String,
+        expires_in_seconds: u64,
     },
     /// A transfer that arrived intact and verified on the host. The path is
     /// the daemon's, derived from a private staging directory; nothing a client
@@ -391,6 +406,7 @@ mod tests {
         round_trip_client(ClientMessage::MarkAttentionSeen { pane: pane() });
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
+        round_trip_client(ClientMessage::RequestPairingCode { request: 9 });
     }
 
     #[test]
@@ -428,6 +444,11 @@ mod tests {
             bytes: 2048,
         });
         round_trip_server(ServerMessage::AttentionHistory { events: Vec::new() });
+        round_trip_server(ServerMessage::PairingCode {
+            request: 9,
+            code: "ABCD-2345".to_owned(),
+            expires_in_seconds: 300,
+        });
         round_trip_server(ServerMessage::Error {
             request: Some(7),
             message: "target is unreachable".to_owned(),

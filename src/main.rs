@@ -67,11 +67,15 @@ enum Commands {
         /// Socket path. Defaults to the XDG runtime directory.
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
-        /// Also serve the browser client on this loopback port. It is not
-        /// authenticated, so reach it from another device by forwarding the
-        /// port over SSH rather than by publishing it.
+        /// Also serve the browser client on this port.
         #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "8790")]
         web: Option<u16>,
+        /// Address for the browser client. Loopback by default; a private or
+        /// mesh address lets paired devices reach it directly. A public
+        /// address is refused, because a device token authenticates but does
+        /// not encrypt.
+        #[arg(long, value_name = "ADDRESS", requires = "web")]
+        web_address: Option<std::net::IpAddr>,
     },
     /// Inspect clipboard copy and paste capabilities without reading clipboard contents.
     Clipboard {
@@ -82,6 +86,11 @@ enum Commands {
     Notifications {
         #[command(subcommand)]
         command: NotificationCommands,
+    },
+    /// List or revoke devices paired with this daemon.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommands,
     },
     /// Add or inspect configured Herdr hosts.
     Target {
@@ -106,6 +115,17 @@ enum NotificationCommands {
     Disable,
     /// Deliver one synthetic metadata-only desktop notification.
     Test,
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceCommands {
+    /// List paired devices without revealing anything they hold.
+    List,
+    /// Revoke a device. What it holds stops working at once.
+    Remove {
+        /// Name shown by `device list`.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -240,6 +260,9 @@ async fn run() -> Result<ExitCode> {
         Commands::Target { command } => {
             return run_target_command(cli.config.as_deref(), command);
         }
+        Commands::Device { command } => {
+            return run_device_command(cli.config.as_deref(), command);
+        }
         command => command,
     };
     let (config, path) = Config::load(cli.config.as_deref())?;
@@ -335,16 +358,19 @@ async fn run() -> Result<ExitCode> {
             tui::run(config, path).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Daemon { socket, web } => {
+        Commands::Daemon {
+            socket,
+            web,
+            web_address,
+        } => {
             let mut options = DaemonOptions::discover()?;
             if let Some(socket) = socket {
                 options.socket = socket;
             }
             options.web_port = web;
-            stdout_line(format_args!(
-                "super-herdr daemon listening on {}",
-                options.socket.display()
-            ))?;
+            options.web_address = web_address;
+            // The daemon announces itself once it is actually listening; a
+            // line printed here would be a claim rather than a report.
             serve(config, Some(path), options).await?;
             Ok(ExitCode::SUCCESS)
         }
@@ -377,6 +403,50 @@ async fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Target { .. } => unreachable!("target commands return before config load"),
+        Commands::Device { .. } => unreachable!("device commands return before config load"),
+    }
+}
+
+fn run_device_command(
+    config_path: Option<&std::path::Path>,
+    command: DeviceCommands,
+) -> Result<ExitCode> {
+    match command {
+        DeviceCommands::List => {
+            let (config, path) = Config::load(config_path)?;
+            stdout_line(format_args!(
+                "{}: {} paired device(s)",
+                path.display(),
+                config.devices.len()
+            ))?;
+            for device in &config.devices {
+                // The digest is shown truncated: enough to tell two entries
+                // apart, and useless to anyone who reads it over a shoulder.
+                stdout_line(format_args!(
+                    "  {}: paired {} (…{})",
+                    device.name,
+                    device.paired_at_ms,
+                    &device.token_sha256[device.token_sha256.len().saturating_sub(8)..]
+                ))?;
+            }
+            if config.devices.is_empty() {
+                stdout_line(format_args!(
+                    "the browser client serves loopback only until a device is paired"
+                ))?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        DeviceCommands::Remove { name } => {
+            let path = Config::remove_device_file(config_path, &name)?;
+            stdout_line(format_args!(
+                "revoked device {name:?} in {}",
+                path.display()
+            ))?;
+            stdout_line(format_args!(
+                "it stops working at that device's next request; no Herdr session was touched"
+            ))?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

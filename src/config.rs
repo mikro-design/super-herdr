@@ -16,6 +16,25 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "NotificationsConfig::is_default")]
     pub notifications: NotificationsConfig,
     pub targets: Vec<Target>,
+    /// Devices allowed to reach this daemon over a network. Empty means none,
+    /// which is why a daemon with no paired device serves loopback only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<Device>,
+}
+
+/// One paired device.
+///
+/// The secret itself is never here: a configuration file that held working
+/// credentials would make a backup of it a way in. Revoking is deleting the
+/// entry, which cannot be undone by anything the device still holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Device {
+    /// What a person calls it when deciding whether to revoke it.
+    pub name: String,
+    /// SHA-256 of the device's token, as lowercase hex.
+    pub token_sha256: String,
+    pub paired_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +181,7 @@ impl Config {
                 transport: TransportConfig::default(),
                 notifications: NotificationsConfig::default(),
                 targets: vec![target],
+                devices: Vec::new(),
             };
             config.validate()?;
             toml::to_string_pretty(&config)?
@@ -182,6 +202,55 @@ impl Config {
 
     pub fn remove_target_file(explicit_path: Option<&Path>, name: &str) -> Result<PathBuf> {
         mutate_target_file(explicit_path, name, None)
+    }
+
+    /// Record a paired device, keeping every existing line of the file.
+    pub fn add_device_file(explicit_path: Option<&Path>, device: Device) -> Result<PathBuf> {
+        let path = resolve_path(explicit_path)?;
+        let mut text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let config =
+            Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        if config
+            .devices
+            .iter()
+            .any(|existing| existing.name == device.name)
+        {
+            anyhow::bail!("a device named {:?} is already paired", device.name);
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push('\n');
+        text.push_str(&toml::to_string_pretty(&DeviceAppend {
+            devices: vec![&device],
+        })?);
+        Self::parse(&text).context("generated configuration is invalid")?;
+        write_private_atomic(&path, text.as_bytes())?;
+        Ok(path)
+    }
+
+    /// Revoke a device. What it holds stops working immediately, because the
+    /// daemon has nothing left to compare it against.
+    pub fn remove_device_file(explicit_path: Option<&Path>, name: &str) -> Result<PathBuf> {
+        let path = resolve_path(explicit_path)?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut config =
+            Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        let before = config.devices.len();
+        config.devices.retain(|device| device.name != name);
+        if config.devices.len() == before {
+            anyhow::bail!("no device named {name:?} is paired");
+        }
+        let updated = remove_device_block(&text, name);
+        let parsed = Self::parse(&updated).context("generated configuration is invalid")?;
+        anyhow::ensure!(
+            parsed.devices.len() == config.devices.len(),
+            "removing the device would have changed more than its own entry"
+        );
+        write_private_atomic(&path, updated.as_bytes())?;
+        Ok(path)
     }
 
     pub fn set_notifications_enabled_file(
@@ -454,6 +523,54 @@ fn table_headers(text: &str) -> Vec<(usize, &str)> {
     headers
 }
 
+#[derive(Serialize)]
+struct DeviceAppend<'a> {
+    devices: Vec<&'a Device>,
+}
+
+/// Drop one `[[devices]]` block, leaving every other line as it was.
+///
+/// Rewriting the file from the parsed model would silently discard comments a
+/// person put there, so the text is edited instead and the result is parsed
+/// back to prove only the intended entry left.
+fn remove_device_block(text: &str, name: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut in_target_block = false;
+    let mut dropping = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_target_block = trimmed == "[[devices]]";
+            dropping = false;
+        }
+        if in_target_block
+            && trimmed.starts_with("name")
+            && let Some((_, value)) = trimmed.split_once('=')
+        {
+            {
+                dropping = value.trim().trim_matches('"') == name;
+                if dropping {
+                    // Remove the header line that was already written.
+                    while kept.ends_with('\n') {
+                        kept.pop();
+                    }
+                    let header = kept.rfind("[[devices]]").unwrap_or(kept.len());
+                    kept.truncate(header);
+                }
+            }
+        }
+        if dropping {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    while kept.ends_with("\n\n") {
+        kept.pop();
+    }
+    kept
+}
+
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let directory = path
         .parent()
@@ -552,7 +669,7 @@ const fn default_notification_timeout() -> u64 {
 mod tests {
     use std::fs;
 
-    use super::{Config, Target};
+    use super::{Config, Device, Target};
 
     #[test]
     fn parses_local_and_ssh_targets() {
@@ -866,6 +983,100 @@ ssh = "build-host"
         let config = Config::load(Some(&path)).unwrap().0;
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.targets[0].name, "development");
+    }
+
+    #[test]
+    fn pairing_a_device_keeps_the_rest_of_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# my hosts\n[[targets]]\nname = \"development\"\nssh = \"dev-host\"\n",
+        )
+        .unwrap();
+
+        Config::add_device_file(
+            Some(&path),
+            Device {
+                name: "phone".to_owned(),
+                token_sha256: "aa".repeat(32),
+                paired_at_ms: 1,
+            },
+        )
+        .unwrap();
+        Config::add_device_file(
+            Some(&path),
+            Device {
+                name: "tablet".to_owned(),
+                token_sha256: "bb".repeat(32),
+                paired_at_ms: 2,
+            },
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my hosts"), "comments survive");
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(
+            config
+                .devices
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "tablet"]
+        );
+
+        // Pairing twice under one name is refused rather than silently
+        // shadowing the first, which would leave a credential nobody can see.
+        assert!(
+            Config::add_device_file(
+                Some(&path),
+                Device {
+                    name: "phone".to_owned(),
+                    token_sha256: "cc".repeat(32),
+                    paired_at_ms: 3,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn revoking_a_device_removes_only_that_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "[[targets]]\nname = \"development\"\nssh = \"dev-host\"\n",
+        )
+        .unwrap();
+        for (name, digest) in [("phone", "aa"), ("tablet", "bb"), ("laptop", "cc")] {
+            Config::add_device_file(
+                Some(&path),
+                Device {
+                    name: name.to_owned(),
+                    token_sha256: digest.repeat(32),
+                    paired_at_ms: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        Config::remove_device_file(Some(&path), "tablet").unwrap();
+
+        let config = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config
+                .devices
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "laptop"]
+        );
+        assert_eq!(config.targets.len(), 1, "targets are untouched");
+        // Revoking what is not paired says so rather than reporting success.
+        assert!(Config::remove_device_file(Some(&path), "tablet").is_err());
     }
 
     #[test]

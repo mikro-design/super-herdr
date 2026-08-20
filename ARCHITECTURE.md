@@ -450,14 +450,30 @@ one request would be made on a connection another request is reading — which
 works until a second tab is open. The identifier is only ever a map key, so it
 keeps the characters that can be one and nothing else.
 
-That listener binds loopback and nothing else. There is no authentication yet,
-because that is device pairing and it is deliberately a separate decision, so a
-device reaches the browser client the way it reaches any other loopback service
-on another machine: forwarded over OpenSSH. Binding elsewhere is not offered
-rather than discouraged — a flag that publishes an unauthenticated federation is
-the kind of thing that gets used once and regretted. The page is held in the
-binary and refers to nothing it is not served, because a forwarded port has no
-route to anywhere else.
+A paired device may reach that listener directly; anything else must forward
+the port. Pairing starts from a client that is already trusted: it asks the
+daemon for a short code, the code appears on a screen someone already has, and a
+browser exchanges it for a token. The daemon stores only the token's digest, so
+the configuration file is not itself a set of credentials — a copy of it hands
+nobody a working device — and revoking one is deleting a line, which takes
+effect at that device's next request rather than at the next restart. A code is
+spent by a match rather than by an attempt, because a wrong entry is far more
+often a typo than an attack; it survives a few of those and is discarded after
+that, so a flood cannot keep one alive.
+
+A token authenticates a device. It does not encrypt anything, and the daemon
+does not pretend otherwise: it binds loopback or a private and mesh address and
+refuses a public one. On a mesh like WireGuard or Tailscale the network already
+provides confidentiality; on the open internet it would not, and the way in from
+there stays a forwarded port, which is an explicit act rather than a flag
+somebody set once. Loopback is never asked for a token, since anyone who can
+reach it can already read the daemon's socket.
+
+The page is held in the binary and refers to nothing it is not served, because a
+forwarded port has no route to anywhere else. It shows the daemon's version,
+which the handshake has always carried: the page ships inside that binary, so
+the client a device loads is whichever version is installed on the daemon host,
+and a browser is exactly where a stale daemon would otherwise be invisible.
 
 The first remote client is a web client the daemon itself serves, which covers
 tablet and phone from one codebase and can be saved to a home screen. Native

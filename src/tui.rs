@@ -480,6 +480,7 @@ impl TargetForm {
             transport: TransportConfig::default(),
             notifications: crate::config::NotificationsConfig::default(),
             targets,
+            devices: Vec::new(),
         }
         .validate()
         .err()
@@ -677,11 +678,16 @@ struct PendingUpload {
 }
 
 enum ConfigRefresh {
-    Ready {
-        configured: Config,
-        expanded: Config,
-    },
+    /// Boxed because a refresh carries two whole configurations and a failure
+    /// carries a sentence, and every message of this type would otherwise be
+    /// sized for the larger.
+    Ready(Box<ConfigRefreshed>),
     Failed(String),
+}
+
+struct ConfigRefreshed {
+    configured: Config,
+    expanded: Config,
 }
 
 struct TargetTestEvent {
@@ -950,7 +956,8 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
             refresh = config_refreshes.recv() => {
                 config_refresh_inflight = false;
                 match refresh {
-                    Some(ConfigRefresh::Ready { configured, expanded }) => {
+                    Some(ConfigRefresh::Ready(refreshed)) => {
+                        let ConfigRefreshed { configured, expanded } = *refreshed;
                         if app
                             .notification_queue
                             .reconfigure(configured.notifications.clone())
@@ -1146,10 +1153,10 @@ fn spawn_config_refresh(path: PathBuf, sender: mpsc::UnboundedSender<ConfigRefre
         let refresh = match Config::load(Some(&path)) {
             Ok((configured, _)) => {
                 let expanded = expand_discovered_sessions(configured.clone()).await;
-                ConfigRefresh::Ready {
+                ConfigRefresh::Ready(Box::new(ConfigRefreshed {
                     configured,
                     expanded,
-                }
+                }))
             }
             Err(error) => ConfigRefresh::Failed(error.to_string()),
         };
@@ -2043,6 +2050,16 @@ async fn handle_input(
                 }
                 b'a' => app.agent_navigator = Some(AgentNavigator::default()),
                 b'e' => app.attention_center = Some(AttentionCenter::default()),
+                // Pairing starts from a client that is already trusted, so the
+                // code appears on a screen someone already has rather than in a
+                // file or a log.
+                b'P' => match app.client.as_ref() {
+                    Some(client) => {
+                        client.request_pairing_code();
+                        app.message = Some("asking the daemon for a pairing code…".to_owned());
+                    }
+                    None => app.message = Some("pairing is unavailable".to_owned()),
+                },
                 b'd' => request_workspace_close(state, app),
                 b' ' => app.command_palette = Some(CommandPalette::default()),
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
@@ -2060,7 +2077,7 @@ async fn handle_input(
                 0x1b => {}
                 _ => {
                     app.message = Some(
-                        "prefix: Space actions, 1-9 workspace, p/n tab, j/k pane, d close workspace, a agents, e events, h hosts, v paste, i image, q quit, Ctrl+] literal"
+                        "prefix: Space actions, 1-9 workspace, p/n tab, j/k pane, d close workspace, a agents, e events, h hosts, v paste, i image, P pair a device, q quit, Ctrl+] literal"
                             .into(),
                     );
                 }
@@ -4322,6 +4339,16 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                 format!("uploaded and verified {mime} {bytes} bytes; pasted remote path"),
             );
         }
+        ServerMessage::PairingCode {
+            code,
+            expires_in_seconds,
+            ..
+        } => {
+            let minutes = expires_in_seconds / 60;
+            app.message = Some(format!(
+                "pairing code {code} — enter it in the browser client within {minutes} minutes"
+            ));
+        }
         ServerMessage::Error { request, message } => {
             // A refusal ends whatever asked for it, so a failed transfer does
             // not leave the frontend waiting on a result that will not come.
@@ -5955,7 +5982,7 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
         );
         let (text, style) = match app.mode {
             InputMode::Prefix => (
-                " Ctrl+]  Space actions  1-9 workspace  p/n tab  j/k pane  d close  a agents  h hosts  v paste  i image  q quit "
+                " Ctrl+]  Space actions  1-9 workspace  p/n tab  j/k pane  d close  a agents  h hosts  v paste  i image  P pair  q quit "
                     .to_owned(),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),

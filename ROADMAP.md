@@ -55,6 +55,10 @@ Work is ordered by dependency and product risk.
 - A browser client the daemon serves over loopback HTTP, carrying the protocol
   on a server-sent event stream with commands posted back, showing the
   federation and the attention feed on a phone or tablet.
+- Device pairing: a code requested from the terminal client, exchanged by a
+  browser for a token whose digest alone is stored, revocable with immediate
+  effect, and a listener that refuses any address a token could not safely
+  authenticate over.
 
 ## Next
 
@@ -62,25 +66,17 @@ Work is ordered by dependency and product risk.
    machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
    recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
    needing a pointer or a notification click, are still unrecorded.
-2. Add device pairing: a pairing code presented by the TUI, a revocable
-   per-device token in the existing atomic TOML store, and a network transport.
-   Until then a remote client reaches the daemon's Unix socket over OpenSSH
-   forwarding, which is why this can be decided deliberately rather than in a
-   hurry. Surface the daemon's version to the client while doing it: the
-   handshake already carries it and nothing reads it, and once the two are on
-   different machines the version that decides host-side behaviour is the
-   daemon's, not the client's.
-3. Generalize the clipboard broker's verified upload into a file bridge —
+2. Generalize the clipboard broker's verified upload into a file bridge —
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target
    transfers.
-4. Add read-only pane observation to the browser client. Navigation and the
+3. Add read-only pane observation to the browser client. Navigation and the
    attention feed are served; rendering a terminal needs a VT implementation in
    the page, which means vendoring one — the first third-party code the client
    would carry, and worth deciding deliberately rather than reaching for.
    Typing into a pane needs the socket upgrade a post-per-keystroke would
    deserve.
-5. Add push delivery of attention events to paired devices, as a further sink
+4. Add push delivery of attention events to paired devices, as a further sink
    under the existing filters, coalescing, and rate limits. Native desktop
    delivery is not moving with it: notifying a desktop is a desktop-session
    capability and stays with the client, for the same reason reading a

@@ -113,6 +113,10 @@ pub enum Effect {
     },
     MarkAllAttentionSeen,
     ClearSeenAttention,
+    IssuePairingCode {
+        client: ClientId,
+        request: u64,
+    },
     /// Send this client the durable history. The broker does not hold it, so
     /// the I/O layer fills it in.
     SendAttentionHistory {
@@ -391,6 +395,9 @@ impl Broker {
             }
             ClientMessage::MarkAllAttentionSeen => effects.push(Effect::MarkAllAttentionSeen),
             ClientMessage::ClearSeenAttention => effects.push(Effect::ClearSeenAttention),
+            ClientMessage::RequestPairingCode { request } => {
+                effects.push(Effect::IssuePairingCode { client, request });
+            }
         }
 
         effects

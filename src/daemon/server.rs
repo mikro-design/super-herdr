@@ -19,8 +19,8 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{
@@ -34,11 +34,12 @@ use tokio::task::JoinHandle;
 
 use crate::attention::{AttentionIndex, AttentionStore};
 use crate::clipboard;
-use crate::config::{Config, Target, TransportConfig};
+use crate::config::{Config, Device, Target, TransportConfig};
 use crate::daemon::broker::{Broker, ClientId, Effect};
 use crate::daemon::web;
 use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
+use crate::pairing::{self, PendingPairing};
 use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, ServerMessage, decode, encode};
 use crate::state::{FederationState, FederationStore, SupervisorOptions, target_key};
 use crate::terminal::{
@@ -66,6 +67,8 @@ pub struct DaemonOptions {
     /// client at all, which is the default: a daemon should not open a port
     /// nobody asked for.
     pub web_port: Option<u16>,
+    /// Where the browser client listens. `None` is loopback.
+    pub web_address: Option<std::net::IpAddr>,
 }
 
 impl DaemonOptions {
@@ -87,6 +90,7 @@ impl DaemonOptions {
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
             web_port: None,
+            web_address: None,
         })
     }
 }
@@ -190,6 +194,7 @@ struct Daemon {
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
     uploads: BTreeMap<(ClientId, u64), Upload>,
+    pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
     downgraded: Vec<PaneId>,
@@ -247,6 +252,8 @@ pub fn spawn_in_process(
         None,
         attachments,
         std::future::pending(),
+        // A hosted daemon serves no browser, so no code is ever outstanding.
+        Arc::new(Mutex::new(None)),
     ));
     DaemonHandle { attach, task }
 }
@@ -275,12 +282,20 @@ async fn serve_until(
     let listener = bind(&options.socket)?;
     let socket = options.socket.clone();
     let (attach, attachments) = mpsc::unbounded_channel();
+    let pending_pairing: Arc<Mutex<Option<PendingPairing>>> = Arc::new(Mutex::new(None));
 
     // The browser client is an ordinary in-process attachment, so it speaks the
     // same framing through the same handshake as every other client.
+    // Devices are not affected by session discovery, so the configuration is
+    // read as given rather than expanded a second time — discovery reaches
+    // every host, and doing it twice at startup would double that for nothing.
+    let paired = config.devices.clone();
     let web = match options.web_port {
         Some(port) => {
-            let address = web::loopback(port);
+            let address = match options.web_address {
+                Some(address) => std::net::SocketAddr::new(address, port),
+                None => web::loopback(port),
+            };
             let listener = web::bind(address).await?;
             let attach = attach.clone();
             let open: web::Attach = std::sync::Arc::new(move || {
@@ -290,14 +305,32 @@ async fn serve_until(
                     .map_err(|_| anyhow::anyhow!("the daemon is no longer running"))?;
                 Ok(ours)
             });
-            Some((address, tokio::spawn(web::serve(listener, open))))
+            let policy: std::sync::Arc<dyn web::Devices> = std::sync::Arc::new(DevicePolicy {
+                config_path: config_path.clone(),
+                devices: Mutex::new(paired.clone()),
+                pending: pending_pairing.clone(),
+            });
+            Some((address, tokio::spawn(web::serve(listener, open, policy))))
         }
         None => None,
     };
+    // Announced only once everything it names is actually listening. Printing
+    // as each one binds meant a daemon that failed to start still said it was
+    // serving, which is the first thing an operator reads and the last thing
+    // they should have to doubt.
+    println!(
+        "super-herdr daemon listening on {}",
+        options.socket.display()
+    );
     if let Some((address, _)) = web.as_ref() {
         // Printed rather than logged, because the address is what a person
         // needs in order to forward it.
         println!("super-herdr web client on http://{address}");
+        if address.ip().is_loopback() {
+            println!("  forward this port to reach it from another device");
+        } else if paired.is_empty() {
+            println!("  no device is paired yet; ask the terminal client for a pairing code");
+        }
     }
     let result = run(
         config,
@@ -306,6 +339,7 @@ async fn serve_until(
         Some(listener),
         attachments,
         shutdown,
+        pending_pairing,
     )
     .await;
     // The socket outlives the daemon otherwise, and the next start would have
@@ -348,6 +382,9 @@ async fn run(
     listener: Option<UnixListener>,
     mut attachments: mpsc::UnboundedReceiver<DuplexStream>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    // Shared with the web layer when one is serving, so a code minted for a
+    // person on one screen is the code a browser can spend.
+    pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
 ) -> Result<()> {
     let active = expand_discovered_sessions(config).await;
     let (inputs, mut received) = mpsc::unbounded_channel();
@@ -374,6 +411,7 @@ async fn run(
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
         uploads: BTreeMap::new(),
+        pending_pairing,
         downgraded: Vec::new(),
         active,
         config_path: config_path.clone(),
@@ -440,6 +478,113 @@ async fn run(
     Ok(())
 }
 
+/// The daemon's answer to the web layer's pairing questions.
+///
+/// Devices are read from the durable configuration on every check rather than
+/// cached, so revoking one takes effect at the next request instead of at the
+/// next restart — which is the whole point of being able to revoke it.
+struct DevicePolicy {
+    config_path: Option<PathBuf>,
+    devices: Mutex<Vec<Device>>,
+    pending: Arc<Mutex<Option<PendingPairing>>>,
+}
+
+impl DevicePolicy {
+    fn current(&self) -> Vec<Device> {
+        if let Some(path) = self.config_path.as_ref()
+            && let Ok((config, _)) = Config::load(Some(path))
+        {
+            if let Ok(mut held) = self.devices.lock() {
+                held.clone_from(&config.devices);
+            }
+            return config.devices;
+        }
+        self.devices
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl web::Devices for DevicePolicy {
+    fn admits(&self, token: &str) -> bool {
+        let offered = pairing::fingerprint(token);
+        self.current()
+            .iter()
+            .any(|device| pairing::matches(&device.token_sha256, &offered))
+    }
+
+    fn pair(&self, code: &str, name: &str) -> Result<String> {
+        let Some(path) = self.config_path.clone() else {
+            anyhow::bail!("this daemon has no configuration file to record a device in");
+        };
+        let now = SystemTime::now();
+        // The code is consumed by a match, not by an attempt: a wrong entry is
+        // far more often a typo than an attack, and making somebody fetch a new
+        // code for each slip would teach them to leave one outstanding.
+        {
+            let mut held = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pairing state is unavailable"))?;
+            let Some(pending) = held.as_mut() else {
+                anyhow::bail!("no pairing code is waiting; ask for one from the terminal client");
+            };
+            if pending.expired(now) {
+                *held = None;
+                anyhow::bail!("that pairing code has expired; ask for another");
+            }
+            if !pending.accepts(code, now) {
+                let spent = pending.record_failure();
+                let remaining = pending.attempts_remaining();
+                if spent {
+                    *held = None;
+                    anyhow::bail!("too many wrong codes; ask for another");
+                }
+                anyhow::bail!(
+                    "that is not the code waiting; {remaining} attempt(s) left before it is discarded"
+                );
+            }
+            // Matched, so it is spent: a code overheard after use opens nothing.
+            *held = None;
+        }
+        let name = device_name(name);
+        let token = pairing::token()?;
+        Config::add_device_file(
+            Some(&path),
+            Device {
+                name,
+                token_sha256: pairing::fingerprint(&token),
+                paired_at_ms: pairing::now_ms(now),
+            },
+        )?;
+        Ok(token)
+    }
+
+    fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_owned()
+    }
+}
+
+/// A device name comes from a person typing into a browser, so it is bounded
+/// and stripped of anything that would make the configuration file or a listing
+/// hard to read.
+fn device_name(offered: &str) -> String {
+    let cleaned = offered
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.')
+        })
+        .take(48)
+        .collect::<String>();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "paired device".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -494,10 +639,27 @@ fn invalidated_routes<'a>(
         .collect()
 }
 
+/// The longest socket path a Unix domain socket can carry.
+///
+/// `sun_path` is 108 bytes on Linux and 104 on macOS, so the smaller is used:
+/// a path that bound on one and not the other would be a difference nobody
+/// would think to look for.
+const MAX_SOCKET_PATH: usize = 103;
+
 /// Bind the socket without evicting a daemon that is already serving it. A path
 /// that refuses a connection is a leftover from a process that did not clean up
 /// and is safe to replace; a path that accepts one is somebody else's.
 fn bind(path: &Path) -> Result<UnixListener> {
+    // Checked first, because every failure below reports what the kernel said
+    // about a path it never accepted — and "No such file or directory" for a
+    // socket nobody expected to exist reads as a bug rather than a path that is
+    // simply too long.
+    let length = path.as_os_str().len();
+    anyhow::ensure!(
+        length <= MAX_SOCKET_PATH,
+        "the socket path is {length} bytes; a Unix socket allows at most {MAX_SOCKET_PATH}. \
+         Choose a shorter --socket path."
+    );
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -822,6 +984,9 @@ impl Daemon {
                         pending.extend(self.attention_changed());
                     }
                 }
+                Effect::IssuePairingCode { client, request } => {
+                    self.issue_pairing_code(client, request);
+                }
                 Effect::ClearSeenAttention => {
                     if self.attention.clear_seen() {
                         pending.extend(self.attention_changed());
@@ -929,6 +1094,40 @@ impl Daemon {
         }
         if let Some(store) = self.store.take() {
             store.shutdown().await;
+        }
+    }
+
+    /// Mint a pairing code and hold it in memory for a bounded time.
+    ///
+    /// One code is outstanding at a time: asking again replaces the previous
+    /// one, so a code shown on a screen somebody walked away from stops working
+    /// as soon as the next is asked for.
+    fn issue_pairing_code(&mut self, client: ClientId, request: u64) {
+        let now = SystemTime::now();
+        let message = match PendingPairing::new(now) {
+            Ok(pending) => {
+                let code = pending.code().to_owned();
+                let expires_in_seconds = pending
+                    .expires_at()
+                    .duration_since(now)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Ok(mut held) = self.pending_pairing.lock() {
+                    *held = Some(pending);
+                }
+                ServerMessage::PairingCode {
+                    request,
+                    code,
+                    expires_in_seconds,
+                }
+            }
+            Err(error) => ServerMessage::Error {
+                request: Some(request),
+                message: error.to_string(),
+            },
+        };
+        if let Some(outbox) = self.outboxes.get(&client) {
+            let _ = outbox.send(message);
         }
     }
 
@@ -1382,6 +1581,7 @@ mod tests {
             transport: Default::default(),
             notifications: Default::default(),
             targets: Vec::new(),
+            devices: Vec::new(),
         }
     }
 
@@ -1399,6 +1599,7 @@ mod tests {
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
+                web_address: None,
             };
             let server = tokio::spawn(serve(empty_config(), None, options));
             Self { directory, server }
@@ -1569,6 +1770,7 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
                 web_port: None,
+                web_address: None,
             },
         ));
 
@@ -1830,6 +2032,7 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
+                web_address: None,
             },
             async move {
                 let _ = stopped.await;
@@ -1867,6 +2070,7 @@ mod tests {
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
+            web_address: None,
         };
         let error = serve(empty_config(), None, options)
             .await
@@ -1891,6 +2095,7 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
+                web_address: None,
             },
         ));
 

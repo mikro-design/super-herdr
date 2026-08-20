@@ -62,13 +62,37 @@
     padding: .35rem .7rem; cursor: pointer;
   }
   .actions { display: flex; gap: .5rem; margin-top: .7rem; }
+  #version { font-size: .72rem; color: var(--dim); }
+  #pairing { padding: 1rem; max-width: 26rem; margin: 0 auto; }
+  #pairing label { display: block; margin: .8rem 0; color: var(--dim); font-size: .82rem; }
+  #pairing input {
+    display: block; width: 100%; margin-top: .3rem; padding: .6rem .7rem;
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: .55rem;
+  }
+  #code { text-transform: uppercase; letter-spacing: .12em; font-family: ui-monospace, monospace; }
+  #pair-error { color: var(--wait); min-height: 1.2em; }
 </style>
 
 <header>
   <h1>Super-Herdr</h1>
+  <span id="version"></span>
   <span id="link">connecting…</span>
 </header>
-<main>
+<section id="pairing" hidden>
+  <h2>Pair this device</h2>
+  <p class="note">
+    Ask the terminal client for a pairing code, then enter it here. The code is
+    good once and expires in a few minutes.
+  </p>
+  <label>Code <input id="code" autocomplete="off" autocapitalize="characters"
+    spellcheck="false" placeholder="ABCD-2345"></label>
+  <label>Name this device <input id="name" autocomplete="off"
+    placeholder="phone"></label>
+  <div class="actions"><button id="pair">Pair</button></div>
+  <p class="note" id="pair-error"></p>
+</section>
+<main hidden>
   <h2>Waiting for you</h2>
   <ul id="waiting"><li class="empty">nothing waiting</li></ul>
 
@@ -265,5 +289,40 @@ function connect() {
 }
 
 el('mark').onclick = () => send({ type: 'attention.mark_all_seen' });
-connect();
+
+// The version of the daemon, not of this page: the page ships inside that
+// binary, so a stale daemon is otherwise invisible from here.
+async function start() {
+  let session_state = { paired: true, version: '' };
+  try {
+    session_state = await (await fetch('/session')).json();
+  } catch (_) {
+    // If this cannot be reached, the stream will not connect either, and the
+    // link indicator is the honest place to show that.
+  }
+  el('version').textContent = session_state.version ? `daemon ${session_state.version}` : '';
+  if (!session_state.paired) {
+    el('pairing').hidden = false;
+    return;
+  }
+  document.querySelector('main').hidden = false;
+  connect();
+}
+
+el('pair').onclick = async () => {
+  el('pair-error').textContent = '';
+  const response = await fetch('/pair', {
+    method: 'POST',
+    body: JSON.stringify({ code: el('code').value, name: el('name').value }),
+  });
+  if (response.ok) {
+    // The token arrived as a cookie the page cannot read, so there is nothing
+    // to store here; reloading picks it up.
+    location.reload();
+    return;
+  }
+  el('pair-error').textContent = await response.text();
+};
+
+start();
 </script>
