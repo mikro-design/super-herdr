@@ -364,7 +364,12 @@ there is no second credential store — and leaves device pairing and a network
 transport as one deliberate decision rather than something that arrives by
 accident with the first remote client. A socket that refuses a connection is a
 leftover from a process that did not clean up and is replaced; one that accepts
-a connection belongs to a running daemon and is never evicted.
+a connection belongs to a running daemon and is never evicted. A daemon asked to
+stop removes its own socket, so a path found on disk means a process that died
+rather than one that exited — the replacement rule stays as the answer to a
+crash rather than as ordinary behaviour. SIGHUP is not handled: it conventionally
+means reload, the configuration already refreshes on its own schedule, and
+exiting on it would surprise anyone who closed a terminal.
 
 Exposure is deliberately delegated. The daemon binds to loopback or a private
 interface and is not published to the public internet; reachability from

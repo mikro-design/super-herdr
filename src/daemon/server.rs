@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ use tokio::io::{
 };
 use tokio::net::UnixListener;
 use tokio::process::Child;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -112,6 +114,9 @@ enum Input {
         applied: bool,
         message: String,
     },
+    /// Stop serving. The loop leaves through the same exit a closed input
+    /// channel uses, so shutdown has one path rather than two.
+    Shutdown,
     /// The refresh deadline arrived. Reading the file happens off the loop.
     RefreshDue,
     /// A completed refresh. `None` means the read failed and the running
@@ -199,7 +204,16 @@ pub fn spawn_in_process(
     options: DaemonOptions,
 ) -> DaemonHandle {
     let (attach, attachments) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run(config, config_path, options, None, attachments));
+    // A hosted daemon does not watch for signals: the process belongs to the
+    // frontend, which decides what a signal means for itself.
+    let task = tokio::spawn(run(
+        config,
+        config_path,
+        options,
+        None,
+        attachments,
+        std::future::pending(),
+    ));
     DaemonHandle { attach, task }
 }
 
@@ -213,12 +227,57 @@ pub async fn serve(
     config_path: Option<PathBuf>,
     options: DaemonOptions,
 ) -> Result<()> {
+    serve_until(config, config_path, options, terminated()).await
+}
+
+/// Serve until the given future resolves. Tests supply their own stop signal so
+/// the cleanup below is exercised without sending the test runner a signal.
+async fn serve_until(
+    config: Config,
+    config_path: Option<PathBuf>,
+    options: DaemonOptions,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let listener = bind(&options.socket)?;
     let socket = options.socket.clone();
     let (_attach, attachments) = mpsc::unbounded_channel();
-    let result = run(config, config_path, options, Some(listener), attachments).await;
+    let result = run(
+        config,
+        config_path,
+        options,
+        Some(listener),
+        attachments,
+        shutdown,
+    )
+    .await;
+    // The socket outlives the daemon otherwise, and the next start would have
+    // to decide whether the path it found belongs to a live process.
     let _ = fs::remove_file(&socket);
     result
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// A daemon is normally ended by a signal rather than by returning, so without
+/// this the cleanup below would only ever run in tests. SIGHUP is deliberately
+/// not included: it conventionally means reload, the configuration is already
+/// refreshed on its own schedule, and exiting on it would surprise anyone who
+/// closed a terminal.
+async fn terminated() {
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(interrupt) => interrupt,
+        // Without a handler the default disposition still ends the process; the
+        // daemon simply loses its cleanup rather than refusing to run.
+        Err(_) => return std::future::pending().await,
+    };
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(_) => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
 }
 
 async fn run(
@@ -227,6 +286,7 @@ async fn run(
     options: DaemonOptions,
     listener: Option<UnixListener>,
     mut attachments: mpsc::UnboundedReceiver<DuplexStream>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let active = expand_discovered_sessions(config).await;
     let (inputs, mut received) = mpsc::unbounded_channel();
@@ -278,11 +338,20 @@ async fn run(
         })
     });
 
+    let stopping = inputs.clone();
+    let signalled = tokio::spawn(async move {
+        shutdown.await;
+        let _ = stopping.send(Input::Shutdown);
+    });
+
     let accepting = listener.map(|listener| tokio::spawn(accept(listener, inputs.clone())));
     loop {
         tokio::select! {
             input = received.recv() => {
                 let Some(input) = input else { break };
+                if matches!(input, Input::Shutdown) {
+                    break;
+                }
                 daemon.handle(input);
             }
             attachment = attachments.recv() => {
@@ -301,6 +370,7 @@ async fn run(
     if let Some(accepting) = accepting {
         accepting.abort();
     }
+    signalled.abort();
     if let Some(refreshing) = refreshing {
         refreshing.abort();
     }
@@ -489,6 +559,9 @@ impl Daemon {
             } => self
                 .broker
                 .operation_completed(client, request, applied, message),
+            // The loop intercepts this before it reaches here; the arm exists so
+            // adding a shutdown path later cannot silently do nothing.
+            Input::Shutdown => Vec::new(),
             Input::RefreshDue => {
                 self.start_refresh();
                 Vec::new()
@@ -998,7 +1071,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::task::JoinHandle;
 
-    use super::{DaemonOptions, invalidated_routes, serve};
+    use super::{DaemonOptions, invalidated_routes, serve, serve_until};
     use crate::config::{Config, Target};
     use crate::model::PaneId;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, decode, encode};
@@ -1272,6 +1345,45 @@ mod tests {
         assert!(
             connection.receive().await.is_none(),
             "the daemon closes the connection after refusing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_daemon_takes_its_socket_with_it() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let socket = directory.path().join("daemon.sock");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(
+            empty_config(),
+            None,
+            DaemonOptions {
+                socket: socket.clone(),
+                attention_state: Some(directory.path().join("attention.json")),
+                refresh_interval: Duration::from_secs(3600),
+            },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        for _ in 0..200 {
+            if UnixStream::connect(&socket).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "the daemon bound its socket");
+
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the daemon stops when asked")
+            .expect("the task completes")
+            .expect("serving ends without error");
+
+        assert!(
+            !socket.exists(),
+            "a stopped daemon leaves no socket for the next start to interpret"
         );
     }
 
