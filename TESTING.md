@@ -159,6 +159,21 @@ keystroke reaches a pane and no running process is disturbed. Run it first on
 each frontend; what it does not cover needs a person at that desktop, and a row
 stays unrecorded until someone does it.
 
+### 2026-08-20 — Homebrew formula, macOS Apple Silicon
+
+- Homebrew 6.0.18 on Apple Silicon, prefix `/opt/homebrew`
+- `brew install mikro-design/tap/super-herdr` tapped and installed v0.4.1
+- Homebrew verified the download against the checksum the formula carries,
+  independently of the signed manifest that checksum was rendered from
+- `brew test super-herdr` passed, so the installed binary reports the version
+  the formula claims
+
+This is the step `scripts/verify-packaging.sh` cannot reach: the gate proves the
+formula names the checksums a release published, and only an install proves
+Homebrew accepts the formula and the tap resolves. A shell that had already run
+another `super-herdr` reported the older version until `rehash`, which is a
+command-path cache rather than an install fault.
+
 ### 2026-08-19 — nested inside Herdr
 
 - Host: Linux 6.8.0 x86_64
