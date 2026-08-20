@@ -47,6 +47,19 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// or a header.
 const MAX_SESSION_CHARS: usize = 64;
 
+/// Headers that mean a request was relayed rather than made locally.
+///
+/// A client could send these itself, which costs it the loopback exemption
+/// rather than gaining anything — the failure is toward asking for a token, so
+/// a header nobody validated cannot let anyone in.
+const FORWARDING_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "forwarded",
+    "tailscale-user-login",
+];
+
 pub const DEFAULT_WEB_PORT: u16 = 8790;
 
 /// How long a paired device's cookie lasts before the browser drops it. The
@@ -145,6 +158,14 @@ struct Request {
     path: String,
     session: Option<String>,
     token: Option<String>,
+    /// Whether this request reached the daemon through a proxy.
+    ///
+    /// It matters because the loopback exemption assumes a local process, and a
+    /// proxy that terminates TLS on a network and forwards to loopback breaks
+    /// that assumption without changing the peer address. A forwarded request
+    /// says so in its headers, so the daemon reads them rather than trusting
+    /// where the connection appears to come from.
+    forwarded: bool,
     length: usize,
 }
 
@@ -161,10 +182,13 @@ async fn handle(
         return Ok(());
     };
 
-    // Loopback is not asked for a token. Anyone who can reach it can already
-    // read the daemon's socket, so requiring one would be ceremony rather than
-    // a boundary. Everything arriving over a network must present one.
-    let admitted = peer.ip().is_loopback()
+    // A genuinely local process is not asked for a token: anyone who can reach
+    // loopback can already read the daemon's socket, so requiring one would be
+    // ceremony rather than a boundary. A request forwarded to loopback by a
+    // proxy is not that, however local it looks, so it is asked like anything
+    // else arriving over a network.
+    let local = peer.ip().is_loopback() && !request.forwarded;
+    let admitted = local
         || request
             .token
             .as_deref()
@@ -285,12 +309,19 @@ async fn read_request(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Re
 
     let mut length = 0;
     let mut token = None;
+    let mut forwarded = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         if name.eq_ignore_ascii_case("content-length") {
             length = value.trim().parse::<usize>().unwrap_or_default();
+        }
+        if FORWARDING_HEADERS
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
+        {
+            forwarded = true;
         }
         if name.eq_ignore_ascii_case("cookie") {
             token = value
@@ -306,6 +337,7 @@ async fn read_request(reader: &mut BufReader<OwnedReadHalf>) -> Result<Option<Re
         path: path.to_owned(),
         session,
         token,
+        forwarded,
         length: length.min(MAX_MESSAGE_BYTES),
     }))
 }
@@ -576,6 +608,22 @@ mod tests {
         (port, task, directory, devices)
     }
 
+    /// The whole response, for checks that care what the body said.
+    async fn request_body(port: u16, request: &str) -> String {
+        let mut stream = TcpStream::connect(loopback(port))
+            .await
+            .expect("the web client accepts a connection");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is written");
+        let mut response = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut response)
+            .await
+            .expect("the response is readable");
+        response
+    }
+
     async fn request(port: u16, request: &str) -> String {
         let mut stream = TcpStream::connect(loopback(port))
             .await
@@ -695,6 +743,48 @@ mod tests {
         }
         // Nor the wildcard, which would include every public interface.
         assert!(!super::bindable("0.0.0.0".parse().unwrap()));
+    }
+
+    /// The bug this prevents: a proxy terminating TLS on a network and
+    /// forwarding to loopback made every visitor look local, so the daemon
+    /// stopped asking anyone to pair. The peer address alone cannot tell those
+    /// apart; the headers can.
+    #[tokio::test]
+    async fn a_forwarded_request_is_not_a_local_one() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+
+        // Straight from loopback: local, and admitted without a token.
+        let direct = request(port, "GET /session HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+        assert!(direct.contains("200"), "{direct}");
+        let body = request_body(port, "GET /session HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+        assert!(body.contains("\"paired\":true"), "{body}");
+
+        // The same connection, carrying what a proxy adds: not local, and asked
+        // to pair like anything else off the machine.
+        for header in [
+            "x-forwarded-for: 100.64.0.1",
+            "X-Forwarded-Proto: https",
+            "Tailscale-User-Login: someone@example.com",
+        ] {
+            let body = request_body(
+                port,
+                &format!("GET /session HTTP/1.1\r\nhost: localhost\r\n{header}\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                body.contains("\"paired\":false"),
+                "{header} was treated as local: {body}"
+            );
+        }
+
+        // And a forwarded request cannot reach the federation at all.
+        let refused = request(
+            port,
+            "GET /events?session=x HTTP/1.1\r\nhost: localhost\r\nx-forwarded-for: 100.64.0.1\r\n\r\n",
+        )
+        .await;
+        assert!(refused.contains("401"), "{refused}");
+        task.abort();
     }
 
     #[tokio::test]
