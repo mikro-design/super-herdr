@@ -56,13 +56,6 @@ pub struct DaemonOptions {
     /// state path.
     pub attention_state: Option<PathBuf>,
     pub refresh_interval: Duration,
-    /// Whether this daemon derives and persists attention itself.
-    ///
-    /// Exactly one process may own the durable index, because two would write
-    /// the same file with independently numbered events. A standalone daemon
-    /// owns it; a daemon hosted inside a frontend that still tracks attention
-    /// locally does not.
-    pub attention: bool,
 }
 
 impl DaemonOptions {
@@ -83,7 +76,6 @@ impl DaemonOptions {
             socket: root.join("super-herdr/daemon.sock"),
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
-            attention: true,
         })
     }
 }
@@ -159,7 +151,6 @@ struct Daemon {
     attention_cursor: Option<u64>,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
-    owns_attention: bool,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
     downgraded: Vec<PaneId>,
@@ -240,10 +231,9 @@ async fn run(
     let active = expand_discovered_sessions(config).await;
     let (inputs, mut received) = mpsc::unbounded_channel();
 
-    let attention_store = match (options.attention, options.attention_state.clone()) {
-        (false, _) => None,
-        (true, Some(path)) => Some(AttentionStore::at(path)),
-        (true, None) => AttentionStore::discover().ok(),
+    let attention_store = match options.attention_state.clone() {
+        Some(path) => Some(AttentionStore::at(path)),
+        None => AttentionStore::discover().ok(),
     };
     let attention = attention_store
         .as_ref()
@@ -260,7 +250,6 @@ async fn run(
         attention,
         attention_store,
         attention_cursor,
-        owns_attention: options.attention,
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
         downgraded: Vec::new(),
@@ -572,12 +561,24 @@ impl Daemon {
                 } => self.run_operation(client, request, operation),
                 Effect::MarkAttentionSeen { pane } => {
                     if self.attention.mark_seen_for_pane(&pane) {
-                        self.persist_attention();
+                        pending.extend(self.attention_changed());
                     }
                 }
                 Effect::MarkAllAttentionSeen => {
                     if self.attention.mark_all_seen() {
-                        self.persist_attention();
+                        pending.extend(self.attention_changed());
+                    }
+                }
+                Effect::ClearSeenAttention => {
+                    if self.attention.clear_seen() {
+                        pending.extend(self.attention_changed());
+                    }
+                }
+                Effect::SendAttentionHistory { client } => {
+                    if let Some(outbox) = self.outboxes.get(&client) {
+                        let _ = outbox.send(ServerMessage::AttentionHistory {
+                            events: self.attention.events().cloned().collect(),
+                        });
                     }
                 }
             }
@@ -879,7 +880,7 @@ impl Daemon {
     /// is what lets a phone learn an agent is waiting without the desktop being
     /// awake.
     fn observe_attention(&mut self) -> Vec<Effect> {
-        if !self.owns_attention || !self.attention.observe(&self.state) {
+        if !self.attention.observe(&self.state) {
             return Vec::new();
         }
         self.persist_attention();
@@ -897,6 +898,14 @@ impl Daemon {
             .into_iter()
             .flat_map(|event| self.broker.attention_observed(event))
             .collect()
+    }
+
+    /// Persist the index and republish it, so every attached client sees the
+    /// same read state rather than its own guess at the result.
+    fn attention_changed(&mut self) -> Vec<Effect> {
+        self.persist_attention();
+        let events = self.attention.events().cloned().collect();
+        self.broker.attention_changed(events)
     }
 
     fn persist_attention(&self) {
@@ -1017,7 +1026,6 @@ mod tests {
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
-                attention: true,
             };
             let server = tokio::spawn(serve(empty_config(), None, options));
             Self { directory, server }
@@ -1175,7 +1183,6 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
-                attention: true,
             },
         ));
 
@@ -1277,7 +1284,6 @@ mod tests {
             socket: harness.socket(),
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
-            attention: true,
         };
         let error = serve(empty_config(), None, options)
             .await
@@ -1301,7 +1307,6 @@ mod tests {
                 socket: socket.clone(),
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
-                attention: true,
             },
         ));
 

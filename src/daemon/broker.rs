@@ -83,6 +83,12 @@ pub enum Effect {
         pane: PaneId,
     },
     MarkAllAttentionSeen,
+    ClearSeenAttention,
+    /// Send this client the durable history. The broker does not hold it, so
+    /// the I/O layer fills it in.
+    SendAttentionHistory {
+        client: ClientId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +239,9 @@ impl Broker {
                         state: self.state.clone(),
                     },
                 });
+                // A client renders attention it did not derive, so it needs the
+                // history before the next event rather than after it.
+                effects.push(Effect::SendAttentionHistory { client });
             }
             ClientMessage::SubscribePane {
                 pane,
@@ -303,6 +312,7 @@ impl Broker {
                 effects.push(Effect::MarkAttentionSeen { pane });
             }
             ClientMessage::MarkAllAttentionSeen => effects.push(Effect::MarkAllAttentionSeen),
+            ClientMessage::ClearSeenAttention => effects.push(Effect::ClearSeenAttention),
         }
 
         effects
@@ -423,6 +433,15 @@ impl Broker {
     pub fn attention_observed(&mut self, event: AttentionEvent) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.broadcast_state(ServerMessage::Attention { event }, &mut effects);
+        effects
+    }
+
+    /// Republish the durable history to everyone watching. Read state changes
+    /// touch many events at once, so the authoritative result is sent rather
+    /// than a change each client would have to reproduce.
+    pub fn attention_changed(&mut self, events: Vec<AttentionEvent>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.broadcast_state(ServerMessage::AttentionHistory { events }, &mut effects);
         effects
     }
 
@@ -1584,6 +1603,39 @@ mod tests {
                 .operation_completed(client, 1, true, "done")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn subscribing_asks_for_the_history_a_client_cannot_derive() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+
+        let effects = broker.handle(client, ClientMessage::SubscribeState);
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendAttentionHistory { .. })),
+            "a client that does not derive attention is given it"
+        );
+    }
+
+    #[test]
+    fn a_read_state_change_republishes_the_whole_history() {
+        let mut broker = broker();
+        let subscribed = greet(&mut broker);
+        let silent = greet(&mut broker);
+        broker.handle(subscribed, ClientMessage::SubscribeState);
+
+        let effects = broker.attention_changed(Vec::new());
+
+        // Every subscriber is corrected by the authority rather than left to
+        // reproduce the change.
+        assert!(matches!(
+            messages_for(&effects, subscribed).as_slice(),
+            [ServerMessage::AttentionHistory { .. }]
+        ));
+        assert!(messages_for(&effects, silent).is_empty());
     }
 
     #[test]

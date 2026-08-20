@@ -108,6 +108,10 @@ pub enum ClientMessage {
     MarkAttentionSeen { pane: PaneId },
     #[serde(rename = "attention.mark_all_seen")]
     MarkAllAttentionSeen,
+    /// Drop events that have been read. History is durable and shared, so
+    /// forgetting part of it is a request like any other mutation.
+    #[serde(rename = "attention.clear_seen")]
+    ClearSeenAttention,
 }
 
 /// Sent by the daemon.
@@ -162,6 +166,15 @@ pub enum ServerMessage {
     },
     #[serde(rename = "attention.event")]
     Attention { event: AttentionEvent },
+    /// The whole bounded history, sent when a client subscribes and again after
+    /// any change to what is read or retained.
+    ///
+    /// Read state changes touch many events at once, and a client that applied
+    /// such a change locally would be guessing at the daemon's result. The
+    /// index is capped at a few hundred payload-free entries, so resending it
+    /// costs less than a way to desynchronize from it.
+    #[serde(rename = "attention.history")]
+    AttentionHistory { events: Vec<AttentionEvent> },
     /// A failure that is scoped to one request when `request` is present, and
     /// to the connection otherwise. Diagnostics are summarized here; raw
     /// command output never crosses this boundary.
@@ -302,6 +315,7 @@ mod tests {
         });
         round_trip_client(ClientMessage::MarkAttentionSeen { pane: pane() });
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
+        round_trip_client(ClientMessage::ClearSeenAttention);
     }
 
     #[test]
@@ -333,6 +347,7 @@ mod tests {
                 unread: true,
             },
         });
+        round_trip_server(ServerMessage::AttentionHistory { events: Vec::new() });
         round_trip_server(ServerMessage::Error {
             request: Some(7),
             message: "target is unreachable".to_owned(),

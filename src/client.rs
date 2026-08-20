@@ -262,6 +262,10 @@ impl ClientCommands {
         self.send(ClientMessage::MarkAllAttentionSeen);
     }
 
+    pub fn clear_seen_attention(&self) {
+        self.send(ClientMessage::ClearSeenAttention);
+    }
+
     /// Commands are fire-and-forget. A dead connection is reported by the event
     /// stream ending, so every call site does not have to handle it.
     fn send(&self, message: ClientMessage) {
@@ -301,7 +305,6 @@ mod tests {
             socket: directory.path().join("unused.sock"),
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
-            attention: true,
         };
         (spawn_in_process(config, None, options), directory)
     }

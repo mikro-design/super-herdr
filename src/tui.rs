@@ -23,7 +23,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep_until};
 
-use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex, AttentionStore};
+use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex};
 use crate::client::{Client, ClientCommands};
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
@@ -758,7 +758,6 @@ struct App {
     next_target_test_request: u64,
     agent_navigator: Option<AgentNavigator>,
     attention: AttentionIndex,
-    attention_store: Option<AttentionStore>,
     attention_center: Option<AttentionCenter>,
     notification_queue: NotificationQueue,
     notification_sender: Option<mpsc::UnboundedSender<NotificationEvent>>,
@@ -806,7 +805,6 @@ impl Default for App {
             next_target_test_request: 1,
             agent_navigator: None,
             attention: AttentionIndex::default(),
-            attention_store: None,
             attention_center: None,
             notification_queue: NotificationQueue::default(),
             notification_sender: None,
@@ -839,13 +837,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     // daemon a phone would reach, spoken over an in-memory pipe rather than a
     // socket, so both paths exercise one implementation.
     //
-    // Attention stays with the frontend for now: exactly one process may own
-    // the durable index, and moving it is a separate step that carries native
-    // notification delivery with it.
-    let daemon_options = DaemonOptions {
-        attention: false,
-        ..DaemonOptions::discover()?
-    };
+    let daemon_options = DaemonOptions::discover()?;
     let daemon = spawn_in_process(
         active_config.clone(),
         Some(config_path.clone()),
@@ -868,20 +860,15 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let mut input_decoder = InputDecoder::default();
     let state_store = UiStateStore::discover()?;
     let restore_pending = state_store.load().unwrap_or_default().selected_pane;
-    let attention_store = AttentionStore::discover()?;
-    let (attention, attention_message) = match attention_store.load() {
-        Ok(attention) => (attention, None),
-        Err(_) => (
-            AttentionIndex::default(),
-            Some("persisted attention state was invalid; starting with an empty index".to_owned()),
-        ),
-    };
-    let last_attention_event_id = attention.events().next_back().map(|event| event.id);
+    // Attention is the daemon's: it owns the durable index, and this is a
+    // mirror of it. Seeding it from the wire rather than from the file means a
+    // frontend and a daemon can never disagree about what has been read.
+    let attention = AttentionIndex::default();
+    let last_attention_event_id = None;
     let mut app = App {
         restore_pending,
         state_store: Some(state_store),
         attention,
-        attention_store: Some(attention_store),
         notification_queue: NotificationQueue::new(
             configured_notifications,
             last_attention_event_id,
@@ -892,7 +879,6 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         herdr_action_sender: Some(herdr_action_sender),
         target_test_sender: Some(target_test_sender),
         client: Some(client.commands()),
-        message: attention_message,
         ..App::default()
     };
     let mut should_draw = true;
@@ -905,7 +891,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 .is_none_or(|last_render| now.duration_since(last_render) >= MIN_RENDER_INTERVAL)
         {
             let state = updates.borrow().clone();
-            refresh_attention(&state, &mut app);
+            refresh_attention(&mut app);
             reconcile_selection(&state, &mut app);
             ensure_routes(&state, &mut terminal, &mut app)?;
             let frame_area: Rect = terminal
@@ -1235,9 +1221,7 @@ fn jump_from_notification(state: &FederationState, app: &mut App, pane: PaneId) 
         app.message = Some(format!("jumped to the notified pane on {target}"));
         return;
     }
-    if app.attention.mark_seen_for_pane(&pane) {
-        persist_attention(app);
-    }
+    mark_attention_seen(app, &pane);
     app.message = Some(format!(
         "the notified pane on {} is no longer live",
         pane.target_session()
@@ -1711,26 +1695,27 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
-fn refresh_attention(state: &FederationState, app: &mut App) {
-    let previous_unread = app.attention.unread_count();
-    if app.attention.observe(state) {
-        if app.attention.unread_count() > previous_unread {
-            app.attention_sidebar_offset = 0;
-        }
-        persist_attention(app);
+/// Mark a pane's events read here and ask the daemon to do the same.
+///
+/// The local edit is optimistic so a badge clears in the frame the person acted
+/// in rather than a round trip later. It is not authoritative: the daemon
+/// answers every change with the whole history, so a request that does not land
+/// is corrected back rather than silently believed.
+fn mark_attention_seen(app: &mut App, pane: &PaneId) {
+    if app.attention.mark_seen_for_pane(pane)
+        && let Some(client) = app.client.as_ref()
+    {
+        client.mark_attention_seen(pane.clone());
     }
+}
+
+/// Hand every held event to the notification queue, which decides for itself
+/// what is new and what is worth delivering.
+fn refresh_attention(app: &mut App) {
     let events = app.attention.events().cloned().collect::<Vec<_>>();
     let now = Instant::now();
     for event in &events {
         app.notification_queue.enqueue(event, now);
-    }
-}
-
-fn persist_attention(app: &mut App) {
-    if let Some(store) = app.attention_store.as_ref()
-        && store.save(&app.attention).is_err()
-    {
-        app.message = Some("failed to persist attention metadata".to_owned());
     }
 }
 
@@ -1744,9 +1729,7 @@ fn select_pane(app: &mut App, pane: PaneId) {
     app.selected_pane = Some(pane.clone());
     app.route_retry_after.remove(&pane);
     app.message = None;
-    if app.attention.mark_seen_for_pane(&pane) {
-        persist_attention(app);
-    }
+    mark_attention_seen(app, &pane);
     if let Some(store) = app.state_store.as_ref()
         && store.save(&UiState::selected_pane(pane)).is_err()
     {
@@ -3509,13 +3492,17 @@ fn handle_attention_center_input(key: u8, state: &FederationState, app: &mut App
         }
         b'k' => center.selected = center.selected.saturating_sub(1),
         b'r' => {
-            if app.attention.mark_all_seen() {
-                persist_attention(app);
+            if app.attention.mark_all_seen()
+                && let Some(client) = app.client.as_ref()
+            {
+                client.mark_all_attention_seen();
             }
         }
         b'c' => {
-            if app.attention.clear_seen() {
-                persist_attention(app);
+            if app.attention.clear_seen()
+                && let Some(client) = app.client.as_ref()
+            {
+                client.clear_seen_attention();
             }
             center.selected = center
                 .selected
@@ -3534,9 +3521,7 @@ fn handle_attention_center_input(key: u8, state: &FederationState, app: &mut App
                     ));
                     return Ok(false);
                 }
-                if app.attention.mark_seen_for_pane(&event.pane) {
-                    persist_attention(app);
-                }
+                mark_attention_seen(app, &event.pane);
                 app.message = Some(format!(
                     "{} on {}/{} is no longer live",
                     safe_text(&event.agent),
@@ -4361,10 +4346,15 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         ServerMessage::Error { message, .. } => {
             app.message = Some(message);
         }
-        // Attention is still derived by this frontend from the same
-        // authoritative state; see the note where the daemon is started.
-        ServerMessage::Attention { .. }
-        | ServerMessage::Hello { .. }
+        ServerMessage::Attention { event } => {
+            if event.unread && app.attention.apply(event) {
+                app.attention_sidebar_offset = 0;
+            }
+        }
+        ServerMessage::AttentionHistory { events } => {
+            app.attention = AttentionIndex::mirror(events);
+        }
+        ServerMessage::Hello { .. }
         | ServerMessage::FederationState { .. }
         | ServerMessage::TargetState { .. } => {}
     }
@@ -6196,6 +6186,19 @@ mod tests {
     use crate::terminal::{TerminalAccess, TerminalScrollDirection};
     use crate::transport::{DiscoveredSession, SessionDiscovery};
 
+    /// Derive attention the way the daemon does, then hand it to the frontend
+    /// the way the wire does. A frontend cannot reach `observe` any more, and a
+    /// test that called it directly would be testing a path that no longer
+    /// exists.
+    fn mirror_attention(app: &mut App, states: &[&FederationState]) {
+        let mut index = AttentionIndex::default();
+        for state in states {
+            index.observe(state);
+        }
+        app.attention = AttentionIndex::mirror(index.events().cloned().collect());
+        refresh_attention(app);
+    }
+
     #[test]
     fn desktop_layout_reserves_most_space_for_the_terminal() {
         let (sidebar, tabs, terminal) = ui_areas(ratatui::layout::Rect::new(0, 0, 120, 40));
@@ -6483,10 +6486,7 @@ mod tests {
         };
         let working = state_with_status("working");
         let live = state_with_status("blocked");
-        let notify = |app: &mut App| {
-            refresh_attention(&working, app);
-            refresh_attention(&live, app);
-        };
+        let notify = |app: &mut App| mirror_attention(app, &[&working, &live]);
         let mut app = App::default();
         notify(&mut app);
         assert_eq!(app.attention.unread_count(), 1);
@@ -7003,9 +7003,7 @@ mod tests {
         let blocked = state_with_status("blocked");
         let mut app = App::default();
 
-        refresh_attention(&working, &mut app);
-        refresh_attention(&blocked, &mut app);
-        refresh_attention(&blocked, &mut app);
+        mirror_attention(&mut app, &[&working, &blocked, &blocked]);
         assert_eq!(app.attention.events().count(), 1);
         assert_eq!(app.attention.unread_count(), 1);
 

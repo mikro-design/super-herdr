@@ -44,6 +44,9 @@ Work is ordered by dependency and product risk.
 - The TUI as a client of that daemon, hosting one in-process so a
   single-machine install still runs as one command and binds nothing, and
   reaching Herdr only through resolved operations and shared pane routes.
+- A daemon-owned durable attention index, mirrored by each client from the
+  history it is sent on subscribe, with read state as a request the daemon
+  answers by republishing the authoritative history.
 
 ## Next
 
@@ -51,11 +54,7 @@ Work is ordered by dependency and product risk.
    machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
    recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
    needing a pointer or a notification click, are still unrecorded.
-2. Move the durable attention index and native notification delivery into the
-   daemon. The frontend still owns both, so a hosted daemon is told not to
-   derive attention; until this lands, an attached phone cannot learn that an
-   agent is waiting unless the desktop frontend is running.
-3. Give a remote client a path for atomic multiline paste and clipboard media
+2. Give a remote client a path for atomic multiline paste and clipboard media
    upload. Both still run from the frontend against the target's own Herdr API
    socket, which works only while the frontend and the daemon share a machine.
    The clipboard does not move as a unit: reading one is a desktop-session
@@ -65,10 +64,10 @@ Work is ordered by dependency and product risk.
    names one; the daemon resolves the extension and injects the verified path.
    Atomic paste is the easier half — one documented request with no local
    capability behind it.
-4. Remove the daemon's socket on a signalled shutdown. A stale socket is
+3. Remove the daemon's socket on a signalled shutdown. A stale socket is
    already replaced on the next start, so this costs a leftover file rather
    than a failed restart, but the daemon should not rely on that.
-5. Add device pairing: a pairing code presented by the TUI, a revocable
+4. Add device pairing: a pairing code presented by the TUI, a revocable
    per-device token in the existing atomic TOML store, and a network transport.
    Until then a remote client reaches the daemon's Unix socket over OpenSSH
    forwarding, which is why this can be decided deliberately rather than in a
@@ -76,15 +75,19 @@ Work is ordered by dependency and product risk.
    handshake already carries it and nothing reads it, and once the two are on
    different machines the version that decides host-side behaviour is the
    daemon's, not the client's.
-6. Generalize the clipboard broker's verified upload into a file bridge —
+5. Generalize the clipboard broker's verified upload into a file bridge —
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target
    transfers.
-7. Ship the first remote client as a web client the daemon serves, covering
+6. Ship the first remote client as a web client the daemon serves, covering
    tablet and phone from one codebase. Navigation, the attention feed, and
    read-only pane observation come before input.
-8. Extend attention delivery with push notifications to paired devices, as a
-   further sink under the existing filters, coalescing, and rate limits.
+7. Add push delivery of attention events to paired devices, as a further sink
+   under the existing filters, coalescing, and rate limits. Native desktop
+   delivery is not moving with it: notifying a desktop is a desktop-session
+   capability and stays with the client, for the same reason reading a
+   clipboard does. Push is the half that needs a process awake when no
+   frontend is.
 
 ## Blocked on Herdr
 

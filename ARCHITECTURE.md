@@ -394,11 +394,29 @@ distinguishes what it asked for from what it was granted: comparing the two
 would otherwise make a downgraded lease look like a stale subscription and
 resubscribe it forever.
 
-The durable attention index stays with the frontend for now, because exactly one
-process may own it — two would write the same file with independently numbered
-events — and moving it is one step with native notification delivery rather than
-two half-steps. A daemon hosted inside a frontend therefore does not derive
-attention; a standalone one does.
+The daemon owns the durable attention index, so an agent that starts waiting is
+recorded whether or not anyone is watching. Exactly one process may own it —
+two would number their events independently and write the same file over each
+other — so a client does not derive attention at all. It holds a mirror, seeded
+with the history when it subscribes and extended by each event as it arrives.
+
+Read state is part of that history rather than a local view of it. Marking a
+pane read is a request, and the daemon answers every change by republishing the
+whole bounded index instead of a description of what changed: a change touches
+many events at once, and a client reproducing it locally would be guessing at
+the authority's result. A client still edits its mirror immediately so a badge
+clears in the frame the person acted in, but that edit is optimistic — the
+republished history overrides it, so a request that never lands is corrected
+rather than silently believed.
+
+Delivering a notification is a separate question from owning the index, and it
+divides the way the clipboard does. Native desktop delivery is a desktop-session
+capability: it belongs to the client, because a daemon on another machine
+notifying its own desktop reaches nobody. Push delivery to a paired device is
+the opposite — it needs a process that is awake when no frontend is, which is
+what the daemon is for. Both are sinks on the same event stream, and the filters,
+deduplication, coalescing, and rate limits that decide what is worth delivering
+sit with the index rather than being reimplemented per sink.
 
 A protocol version says what a daemon can speak, not which fixes it carries.
 That distinction is invisible while the frontend hosts its own daemon, and

@@ -177,6 +177,43 @@ impl AttentionIndex {
         changed
     }
 
+    /// Adopt a history observed elsewhere.
+    ///
+    /// A client does not derive attention: the daemon owns the durable index,
+    /// because two processes deriving it would number their events
+    /// independently and write the same file over each other. What a client
+    /// keeps is a mirror, and this is how it is seeded and resynchronized.
+    pub fn mirror(events: Vec<AttentionEvent>) -> Self {
+        let next_event_id = events
+            .iter()
+            .map(|event| event.id.saturating_add(1))
+            .max()
+            .unwrap_or_default();
+        Self {
+            next_event_id,
+            observations: BTreeMap::new(),
+            events,
+        }
+    }
+
+    /// Apply one event observed elsewhere, replacing any earlier copy of it.
+    /// Returns whether this was new, so a client can tell an arrival from a
+    /// repeat without comparing histories.
+    pub fn apply(&mut self, event: AttentionEvent) -> bool {
+        if let Some(existing) = self.events.iter_mut().find(|held| held.id == event.id) {
+            *existing = event;
+            return false;
+        }
+        self.next_event_id = self.next_event_id.max(event.id.saturating_add(1));
+        self.events.push(event);
+        self.events.sort_by_key(|event| event.id);
+        if self.events.len() > MAX_ATTENTION_EVENTS {
+            self.events
+                .drain(..self.events.len().saturating_sub(MAX_ATTENTION_EVENTS));
+        }
+        true
+    }
+
     pub fn events(&self) -> impl DoubleEndedIterator<Item = &AttentionEvent> {
         self.events.iter()
     }
@@ -467,6 +504,65 @@ fn set_file_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::{AttentionEvent, AttentionEventKind, AttentionIndex, MAX_ATTENTION_EVENTS};
+    use crate::model::PaneId;
+
+    fn event(id: u64, unread: bool) -> AttentionEvent {
+        AttentionEvent {
+            id,
+            pane: PaneId::new("host-a", "dev", "w1:p1"),
+            agent: "claude".to_owned(),
+            workspace: "review".to_owned(),
+            status: "waiting".to_owned(),
+            kind: AttentionEventKind::NeedsAttention,
+            occurred_at_ms: id,
+            unread,
+        }
+    }
+
+    #[test]
+    fn a_mirror_holds_what_it_was_given_without_deriving_anything() {
+        let index = AttentionIndex::mirror(vec![event(4, true), event(5, false)]);
+
+        assert_eq!(index.events().count(), 2);
+        assert_eq!(index.unread_count(), 1);
+        // The next identifier follows the history, so a mirror that later
+        // derives nothing still cannot reuse an identifier it has seen.
+        assert_eq!(index.next_event_id, 6);
+    }
+
+    #[test]
+    fn applying_the_same_event_twice_updates_rather_than_duplicates() {
+        let mut index = AttentionIndex::mirror(Vec::new());
+
+        assert!(index.apply(event(1, true)));
+        assert!(!index.apply(event(1, false)));
+
+        assert_eq!(index.events().count(), 1);
+        assert_eq!(index.unread_count(), 0, "the later copy wins");
+    }
+
+    #[test]
+    fn a_mirror_stays_ordered_and_bounded() {
+        let mut index = AttentionIndex::mirror(Vec::new());
+        // Arriving out of order is normal: a history and a live event can race.
+        index.apply(event(9, true));
+        index.apply(event(2, true));
+
+        assert_eq!(
+            index.events().map(|event| event.id).collect::<Vec<_>>(),
+            vec![2, 9]
+        );
+
+        for id in 100..(100 + MAX_ATTENTION_EVENTS as u64 + 10) {
+            index.apply(event(id, true));
+        }
+        assert_eq!(index.events().count(), MAX_ATTENTION_EVENTS);
+    }
 }
 
 #[cfg(test)]
