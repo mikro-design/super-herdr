@@ -378,6 +378,35 @@ impl ClientCommands {
         request
     }
 
+    /// Ask for a file on the pane's host.
+    ///
+    /// Nothing arrives until it is pulled. The daemon answers with
+    /// `download.offer` — a length and the host's digest — and then waits,
+    /// because the queue to a client is unbounded and a file that outran a slow
+    /// link would otherwise sit in the daemon's memory.
+    pub fn begin_download(&self, pane: PaneId, path: String) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::BeginDownload {
+            request,
+            pane,
+            path,
+        });
+        request
+    }
+
+    /// Allow the daemon to send up to this many more chunks.
+    ///
+    /// A caller grants a window at the start and tops it up as it consumes, so
+    /// what is in flight is bounded by what it asked for rather than by the
+    /// size of the file.
+    pub fn pull_download(&self, request: u64, chunks: u32) {
+        self.send(ClientMessage::PullDownload { request, chunks });
+    }
+
+    pub fn cancel_download(&self, request: u64) {
+        self.send(ClientMessage::CancelDownload { request });
+    }
+
     /// Ask for a pairing code to show a person.
     pub fn request_pairing_code(&self) -> u64 {
         let request = self.next_request();

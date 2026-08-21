@@ -4332,6 +4332,12 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         // nowhere to keep a token, so it notes neither — a client that outlives
         // its connection is the one these are for.
         ServerMessage::UploadAccepted { .. } | ServerMessage::UploadInterrupted { .. } => {}
+        // The frontend does not ask for files off a host: it has a shell on
+        // one, and somewhere to put what it reads is a question about this
+        // machine's filesystem that no key in the TUI currently asks.
+        ServerMessage::DownloadOffer { .. }
+        | ServerMessage::DownloadChunk { .. }
+        | ServerMessage::DownloadFinished { .. } => {}
         ServerMessage::UploadComplete {
             request,
             path,

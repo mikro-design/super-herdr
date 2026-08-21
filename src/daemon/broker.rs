@@ -117,6 +117,21 @@ pub enum Effect {
         client: ClientId,
         request: u64,
     },
+    BeginDownload {
+        client: ClientId,
+        request: u64,
+        pane: PaneId,
+        path: String,
+    },
+    PullDownload {
+        client: ClientId,
+        request: u64,
+        chunks: u32,
+    },
+    CancelDownload {
+        client: ClientId,
+        request: u64,
+    },
     MarkAttentionSeen {
         pane: PaneId,
     },
@@ -505,6 +520,33 @@ impl Broker {
             }
             ClientMessage::CancelUpload { request } => {
                 effects.push(Effect::CancelUpload { client, request });
+            }
+            ClientMessage::BeginDownload {
+                request,
+                pane,
+                path,
+            } => {
+                // Reading a host's files is the reach a shell on that host
+                // already has, so it answers to the lease that grants the
+                // shell rather than to the one that grants a view of it.
+                if self.holds_control(client, &pane, &mut effects) {
+                    effects.push(Effect::BeginDownload {
+                        client,
+                        request,
+                        pane,
+                        path,
+                    });
+                }
+            }
+            ClientMessage::PullDownload { request, chunks } => {
+                effects.push(Effect::PullDownload {
+                    client,
+                    request,
+                    chunks,
+                });
+            }
+            ClientMessage::CancelDownload { request } => {
+                effects.push(Effect::CancelDownload { client, request });
             }
             ClientMessage::MarkAttentionSeen { pane } => {
                 effects.push(Effect::MarkAttentionSeen { pane });

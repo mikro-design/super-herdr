@@ -207,6 +207,35 @@ pub enum ClientMessage {
     FinishUpload { request: u64, digest: String },
     #[serde(rename = "upload.cancel")]
     CancelUpload { request: u64 },
+    /// Ask for a file on the pane's host.
+    ///
+    /// A client names the path here, which is the reverse of an upload, where
+    /// it never does. That is not new authority: a client holding the pane's
+    /// control lease can already type `cat` into a shell on that host and read
+    /// the same bytes back through the terminal. This is the same reach through
+    /// a channel that can say what it moved.
+    ///
+    /// The daemon answers with `download.offer` — a length and the digest the
+    /// host computed — and then sends nothing until it is asked to.
+    #[serde(rename = "download.begin")]
+    BeginDownload {
+        request: u64,
+        pane: PaneId,
+        path: String,
+    },
+    /// Allow the daemon to send up to this many more chunks.
+    ///
+    /// Flow control lives in the protocol for this direction only, and the
+    /// asymmetry is not an oversight. An upload is backpressured by the socket
+    /// itself: the daemon stops reading, so the client stops writing. Going the
+    /// other way the daemon is the sender, and the queue to a client is
+    /// unbounded — a browser on a slow link would otherwise have a gigabyte
+    /// waiting for it in the daemon's memory. So a client says how much it is
+    /// ready for, and peak memory is a window rather than a file.
+    #[serde(rename = "download.pull")]
+    PullDownload { request: u64, chunks: u32 },
+    #[serde(rename = "download.cancel")]
+    CancelDownload { request: u64 },
     /// Attention state is durable and lives with the daemon, so marking events
     /// read is a request rather than a local edit.
     #[serde(rename = "attention.mark_seen")]
@@ -323,6 +352,35 @@ pub enum ServerMessage {
         transfer: String,
         staged: u64,
     },
+    /// What a requested file is, before any of it is sent.
+    ///
+    /// The digest is the host's, computed in its own pass over the file, and
+    /// the daemon carries it without checking it — verifying is the receiving
+    /// end's job, exactly as attesting is the sending end's in the other
+    /// direction. Nothing follows this until the client pulls.
+    #[serde(rename = "download.offer")]
+    DownloadOffer {
+        request: u64,
+        /// The file's own last path component, never a path.
+        name: String,
+        length: u64,
+        digest: String,
+    },
+    #[serde(rename = "download.chunk")]
+    DownloadChunk {
+        request: u64,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// Every byte the offer declared has been sent.
+    ///
+    /// It carries no digest, because for this direction the digest arrived
+    /// first: a host cannot hash while it sends without leaving POSIX behind.
+    /// What this frame is for is the same as a trailer's — a client that has
+    /// counted fewer bytes than the offer declared knows the difference between
+    /// a transfer still arriving and one that stopped.
+    #[serde(rename = "download.finished")]
+    DownloadFinished { request: u64 },
     /// A transfer that arrived intact and verified on the host. The path is
     /// the daemon's, derived from a private staging directory; nothing a client
     /// sent is used to name it.
@@ -518,6 +576,16 @@ mod tests {
             digest: "abc123".to_owned(),
         });
         round_trip_client(ClientMessage::CancelUpload { request: 4 });
+        round_trip_client(ClientMessage::BeginDownload {
+            request: 6,
+            pane: pane(),
+            path: "/var/log/build.txt".to_owned(),
+        });
+        round_trip_client(ClientMessage::PullDownload {
+            request: 6,
+            chunks: 4,
+        });
+        round_trip_client(ClientMessage::CancelDownload { request: 6 });
         round_trip_client(ClientMessage::MarkAttentionSeen { pane: pane() });
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
@@ -553,6 +621,17 @@ mod tests {
                 unread: true,
             },
         });
+        round_trip_server(ServerMessage::DownloadOffer {
+            request: 6,
+            name: "build.txt".to_owned(),
+            length: 4096,
+            digest: "a".repeat(64),
+        });
+        round_trip_server(ServerMessage::DownloadChunk {
+            request: 6,
+            bytes: vec![1, 2, 3],
+        });
+        round_trip_server(ServerMessage::DownloadFinished { request: 6 });
         round_trip_server(ServerMessage::UploadComplete {
             request: 4,
             path: "/tmp/super-herdr-clipboard.abc/payload.png".to_owned(),

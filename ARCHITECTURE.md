@@ -623,6 +623,32 @@ daemon holds live connections to both—the direction the current desktop-bound
 design cannot express, and the one that removes the laptop from the middle of a
 build-host-to-development-host copy.
 
+Reading a file back off a target inverts two things and keeps everything else.
+The client names the path, where an upload never does; that is not a widening of
+what it may reach, because a client holding the pane's control lease can already
+type `cat` into a shell on that host and read the same bytes through the
+terminal. This is the same reach through a channel that can say what it moved,
+and it answers to the same lease for exactly that reason.
+
+The digest inverts with the direction: the host computes it and the client
+checks it, where an upload has the client attest and the host store. The daemon
+computes nothing either way. What does change is when the digest is available.
+An uploading client hashes while it sends, so its digest attests to the bytes
+that went out; a portable shell cannot tee a stream through a hash, so a host
+hashes in its own pass and sends the result ahead of the file. A file modified
+between those passes therefore fails at the client — a false refusal rather than
+a false acceptance, which is the direction an unavoidable weakness has to point.
+
+Flow control also inverts, and this is the part that needed inventing rather
+than mirroring. An upload is backpressured by the socket: the daemon stops
+reading and the client stops writing. Going the other way the daemon is the
+sender and the queue to a client is unbounded, so nothing in the transport can
+push back — a browser on a slow link would have a gigabyte waiting for it in the
+daemon's memory. So the protocol carries it: a client grants credit in chunks
+and the daemon sends no more than it has been given, reading nothing from the
+host while nobody is ready for it. Peak memory is a window rather than a file,
+which is the same promise the other direction makes by a different means.
+
 Where the bytes land is a mutation question, so the default is conservative. A
 transfer completes into a private staging directory and the verified path is
 injected into the pane; the bridge does not write into a working directory the

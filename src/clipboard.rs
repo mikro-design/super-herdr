@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::config::{Target, TransportConfig};
@@ -729,6 +729,172 @@ async fn finish_attempt(
         mime: plan.media.mime,
         digest: receipt.digest,
     }))
+}
+
+/// Read one file back off a target host.
+///
+/// The digest is computed by the host in its own pass and sent ahead of the
+/// bytes, which is a deliberate difference from the upload direction and worth
+/// stating. An uploading client hashes while it sends, so its digest attests to
+/// the bytes that actually went out. A portable shell cannot do that — there is
+/// no way to tee a stream through a hash without leaving POSIX behind — so this
+/// hashes first and sends second. The consequence is precise: a file modified
+/// between those two passes fails verification at the client. That is a false
+/// refusal rather than a false acceptance, which is the direction an
+/// unavoidable weakness has to point.
+///
+/// The path arrives on standard input rather than in the script, for the same
+/// reason a transfer's name does: nothing from the wire is ever parsed as
+/// shell. It is refused unless it names a readable regular file, so a directory
+/// or a device does not become a stream with no end.
+const DOWNLOAD_SCRIPT: &str = r#"set -eu
+IFS= read -r source_file
+[ -f "$source_file" ] || exit 1
+[ -r "$source_file" ] || exit 1
+source_size=$(wc -c < "$source_file" | tr -d '[:space:]')
+source_digest=$(sha256sum "$source_file" | awk '{print $1}')
+printf '%s\t%s\n' "$source_size" "$source_digest"
+cat "$source_file"
+"#;
+
+/// A file on a target, open and ready to be read.
+///
+/// What a client is told about it comes from the host: how long it is, and what
+/// it hashes to. The daemon counts what passes through and computes nothing,
+/// exactly as it does in the other direction.
+pub struct SourceFile {
+    /// The last component of the path, so a client has something to call it.
+    /// Never a path: what a client does with a name is its own business, and
+    /// handing it separators would make that business worse.
+    pub name: String,
+    pub length: u64,
+    pub digest: String,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    /// Held so that dropping this kills the reader rather than leaving it
+    /// filling a pipe nobody is emptying.
+    _child: Option<tokio::process::Child>,
+}
+
+impl AsyncRead for SourceFile {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.reader).poll_read(context, buffer)
+    }
+}
+
+/// Open a file on a target for reading.
+///
+/// A client names the path, which is the reverse of the upload direction, where
+/// it never does. That is not a widening of what a client may reach: it holds
+/// the pane's control lease, so it can already type `cat` into a shell on that
+/// host and read the same bytes back through the terminal. This is the same
+/// authority through a channel that can verify what it moved.
+pub async fn open_source(
+    target: &Target,
+    transport: &TransportConfig,
+    path: &str,
+) -> Result<SourceFile> {
+    anyhow::ensure!(
+        !path.is_empty() && !path.contains('\n') && !path.chars().any(char::is_control),
+        "a source path must be one line of ordinary text"
+    );
+    let name = path
+        .rsplit_once('/')
+        .map_or(path, |(_, tail)| tail)
+        .to_owned();
+    anyhow::ensure!(!name.is_empty(), "a source path must name a file");
+
+    let Some(destination) = target.ssh.as_deref() else {
+        return open_local_source(path, name).await;
+    };
+    let mut command = build_ssh_command(destination, transport, DOWNLOAD_SCRIPT.to_owned());
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to start the SSH file read")?;
+    let mut input = child
+        .stdin
+        .take()
+        .context("the SSH file read did not expose stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("the SSH file read did not expose stdout")?;
+    input
+        .write_all(format!("{path}\n").as_bytes())
+        .await
+        .context("failed to send the source path")?;
+    input.shutdown().await.ok();
+    drop(input);
+
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut header = String::new();
+    let read = timeout(
+        Duration::from_secs(transport.command_timeout_seconds),
+        reader.read_line(&mut header),
+    )
+    .await
+    .context("the host took too long to describe the file")?
+    .context("failed to read what the host said about the file")?;
+    if read == 0 {
+        bail!("the host has no readable file at that path");
+    }
+    let (length, digest) = parse_source_header(&header)?;
+    Ok(SourceFile {
+        name,
+        length,
+        digest,
+        reader: Box::new(reader),
+        _child: Some(child),
+    })
+}
+
+/// The same, when the target is this machine.
+async fn open_local_source(path: &str, name: String) -> Result<SourceFile> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .context("there is no readable file at that path")?;
+    anyhow::ensure!(metadata.is_file(), "that path does not name a regular file");
+    // Read once for the digest and once for the bytes, which is what the
+    // remote side does, so both directions fail the same way on a file that
+    // changes underneath them.
+    let contents = tokio::fs::read(path)
+        .await
+        .context("failed to read the file")?;
+    let digest = sha256_hex(&contents);
+    let file = tokio::fs::File::open(path)
+        .await
+        .context("failed to open the file")?;
+    Ok(SourceFile {
+        name,
+        length: metadata.len(),
+        digest,
+        reader: Box::new(file),
+        _child: None,
+    })
+}
+
+fn parse_source_header(line: &str) -> Result<(u64, String)> {
+    let (length, digest) = line
+        .trim_end_matches('\n')
+        .split_once('\t')
+        .context("the host described the file in a shape this does not understand")?;
+    let length: u64 = length
+        .trim()
+        .parse()
+        .context("the host reported a length that is not a number")?;
+    let digest = digest.trim();
+    anyhow::ensure!(
+        digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "the host reported a digest that is not a SHA-256"
+    );
+    Ok((length, digest.to_owned()))
 }
 
 /// How much of an interrupted transfer the host still holds.
@@ -1596,10 +1762,11 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{
-        ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, OPAQUE, PDF, PNG, RESUME_SCRIPT,
-        SVG, StagedName, Staging, TIFF, TransferPlan, Transferred, UPLOAD_SCRIPT, UploadedFile,
-        WEBP, discard_local_upload, parse_remote_upload_receipt, removable_upload_directory,
-        sha256_hex, staged_bytes, upload_stream,
+        ClipboardContext, ClipboardMedia, DOWNLOAD_SCRIPT, GIF, JPEG, KNOWN_MEDIA, OPAQUE, PDF,
+        PNG, RESUME_SCRIPT, SVG, StagedName, Staging, TIFF, TransferPlan, Transferred,
+        UPLOAD_SCRIPT, UploadedFile, WEBP, discard_local_upload, open_source,
+        parse_remote_upload_receipt, removable_upload_directory, sha256_hex, staged_bytes,
+        upload_stream,
     };
     use crate::config::{Target, TransportConfig};
 
@@ -2013,6 +2180,126 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[test]
+    fn the_download_script_describes_then_sends_under_every_shell() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("read-me.bin");
+        let contents = b"a file to be read back off a host".as_slice();
+        std::fs::write(&source, contents).unwrap();
+
+        let mut tried = 0;
+        for shell in ["sh", "bash", "zsh", "dash", "ksh"] {
+            let Ok(mut child) = Command::new(shell)
+                .arg("-c")
+                .arg(DOWNLOAD_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            tried += 1;
+            let mut input = child.stdin.take().unwrap();
+            input
+                .write_all(format!("{}\n", source.display()).as_bytes())
+                .unwrap();
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "the script failed under {shell}");
+
+            // The header is one line and everything after it is the file. A
+            // shell that framed that boundary differently is what this checks.
+            let split = output
+                .stdout
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap();
+            let header = std::str::from_utf8(&output.stdout[..=split]).unwrap();
+            let (length, digest) = super::parse_source_header(header).unwrap();
+            assert_eq!(
+                length as usize,
+                contents.len(),
+                "{shell} reported a bad size"
+            );
+            assert_eq!(
+                digest,
+                sha256_hex(contents),
+                "{shell} reported a bad digest"
+            );
+            assert_eq!(
+                &output.stdout[split + 1..],
+                contents,
+                "{shell} sent the wrong bytes"
+            );
+        }
+        assert!(
+            tried > 0,
+            "no shell was available to run the download script"
+        );
+
+        // Anything that is not a readable regular file is refused before a byte
+        // is sent: a directory would otherwise be a stream with no end.
+        for path in [
+            directory.path().display().to_string(),
+            "/nonexistent/nothing-here".to_owned(),
+            String::new(),
+        ] {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(DOWNLOAD_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("sh is available");
+            let mut input = child.stdin.take().unwrap();
+            let _ = input.write_all(format!("{path}\n").as_bytes());
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success(), "the script accepted {path:?}");
+            assert!(output.stdout.is_empty(), "the script described {path:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_is_described_by_the_host_and_named_without_a_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("notes.txt");
+        let contents = b"read this back".as_slice();
+        std::fs::write(&source, contents).unwrap();
+
+        let mut opened = open_source(
+            &local_target(),
+            &TransportConfig::default(),
+            source.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.name, "notes.txt", "a name, never a path");
+        assert_eq!(opened.length as usize, contents.len());
+        assert_eq!(opened.digest, sha256_hex(contents));
+
+        let mut read = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut opened, &mut read)
+            .await
+            .unwrap();
+        assert_eq!(read, contents);
+
+        // A path that is not one line of ordinary text never reaches a host.
+        for path in ["", "two\nlines", "bell\u{7}"] {
+            assert!(
+                open_source(&local_target(), &TransportConfig::default(), path)
+                    .await
+                    .is_err(),
+                "{path:?} should be refused"
+            );
+        }
     }
 
     #[test]

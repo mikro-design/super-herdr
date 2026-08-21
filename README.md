@@ -25,6 +25,10 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Verified transfer of arbitrary content to a target through the daemon, relayed
   as it arrives rather than held, under a name the caller chooses, bounded by
   `transfers.max_bytes` and unstaged on the host if any check fails.
+- Verified read-back of a file from a target to the client that asked, paced by
+  credit the client grants so a slow reader bounds what is in flight rather than
+  filling the daemon. The host computes the digest, the client checks it, and
+  the daemon computes nothing.
 - Transfers that survive a lost connection: an interrupted one keeps what
   reached the host, a sender returns with the token it was issued, and the
   offset it continues from is the host's own count rather than anyone's

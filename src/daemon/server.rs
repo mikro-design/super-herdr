@@ -148,6 +148,12 @@ enum Input {
         transfer: String,
         outcome: Relayed,
     },
+    /// A download finished, failed, or ran out of client. Either way the daemon
+    /// stops holding it.
+    DownloadEnded {
+        client: ClientId,
+        request: u64,
+    },
     /// The host has been asked what it already holds, and a resuming sender can
     /// be told where to continue from.
     ResumeOffset {
@@ -179,6 +185,29 @@ enum Input {
 /// other messages meanwhile. One ordered stream per connection is what makes
 /// that so, and it is the transfer's own client that waits for it.
 const RELAY_DEPTH: usize = 4;
+
+/// How much of a downloaded file travels in one message.
+///
+/// The same size the client's own uploads use, and for the same reason: it sits
+/// comfortably inside the protocol's message bound once base64 has inflated it.
+const DOWNLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// A download in progress, and the way to tell it to keep going.
+///
+/// The task holds the client's outbox and writes to it directly rather than
+/// through the loop, because routing a file through the daemon's single input
+/// channel would put it in memory a second time. What bounds it is credit: the
+/// task sends what it has been asked for and then waits.
+struct Download {
+    credit: mpsc::UnboundedSender<u32>,
+    task: JoinHandle<()>,
+}
+
+impl Download {
+    fn stop(self) {
+        self.task.abort();
+    }
+}
 
 /// How long an interrupted transfer is kept before the host gets its disk back.
 ///
@@ -443,6 +472,69 @@ async fn relay(
     Relayed::Refused(refusal)
 }
 
+/// Send one file to a client, at the rate the client asks for.
+///
+/// The daemon counts and carries; it does not hash. The digest in the offer is
+/// the host's, and whoever receives the bytes is the one who checks them
+/// against it — the same division as an upload, with the ends swapped.
+async fn download(
+    target: &Target,
+    transport: &TransportConfig,
+    path: &str,
+    request: u64,
+    outbox: &mpsc::UnboundedSender<ServerMessage>,
+    mut granted: mpsc::UnboundedReceiver<u32>,
+) -> Result<()> {
+    let mut source = clipboard::open_source(target, transport, path).await?;
+    let length = source.length;
+    outbox
+        .send(ServerMessage::DownloadOffer {
+            request,
+            name: source.name.clone(),
+            length,
+            digest: source.digest.clone(),
+        })
+        .map_err(|_| anyhow::anyhow!("the client stopped listening"))?;
+
+    let mut sent = 0u64;
+    let mut credit = 0u32;
+    let mut buffer = vec![0u8; DOWNLOAD_CHUNK_BYTES];
+    while sent < length {
+        if credit == 0 {
+            // Nothing is read from the host while nobody is ready for it, so a
+            // client that stops pulling stops the pipe rather than filling this
+            // process with what it has not asked for.
+            let Some(granted) = granted.recv().await else {
+                return Ok(());
+            };
+            credit = credit.saturating_add(granted);
+            continue;
+        }
+        let wanted = usize::try_from(length - sent)
+            .unwrap_or(DOWNLOAD_CHUNK_BYTES)
+            .min(DOWNLOAD_CHUNK_BYTES);
+        let read = source
+            .read(&mut buffer[..wanted])
+            .await
+            .context("failed to read the file from the host")?;
+        if read == 0 {
+            bail!("the host sent {sent} of the {length} bytes it declared");
+        }
+        outbox
+            .send(ServerMessage::DownloadChunk {
+                request,
+                bytes: buffer[..read].to_vec(),
+            })
+            .map_err(|_| anyhow::anyhow!("the client stopped listening"))?;
+        sent += read as u64;
+        credit -= 1;
+    }
+    // Explicit, so a client that has counted fewer bytes than the offer
+    // declared can tell a transfer still arriving from one that stopped.
+    let _ = outbox.send(ServerMessage::DownloadFinished { request });
+    Ok(())
+}
+
 struct Route {
     child: Child,
     commands: Option<mpsc::UnboundedSender<Vec<u8>>>,
@@ -483,6 +575,10 @@ struct Daemon {
     /// given. Keyed by token rather than by client, because surviving the
     /// client is the entire point.
     retained: BTreeMap<String, Retained>,
+    /// Files being read back off a target, by the client and request that asked.
+    /// These do not outlive their client: a download nobody is receiving is a
+    /// pipe nobody is emptying.
+    downloads: BTreeMap<(ClientId, u64), Download>,
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
@@ -701,6 +797,7 @@ async fn run(
         inputs: inputs.clone(),
         offers: BTreeMap::new(),
         retained: BTreeMap::new(),
+        downloads: BTreeMap::new(),
         pending_pairing,
         downgraded: Vec::new(),
         active,
@@ -1151,6 +1248,20 @@ impl Daemon {
                 // it declared — so an abandoned transfer is refused and
                 // unstaged rather than left on the host.
                 self.offers.retain(|(owner, _), _| *owner != client);
+                // A download outliving its client is a pipe nobody is
+                // emptying, and unlike an upload there is nothing to come back
+                // for: the file is still on the host, where it always was.
+                let reading: Vec<(ClientId, u64)> = self
+                    .downloads
+                    .keys()
+                    .filter(|(owner, _)| *owner == client)
+                    .copied()
+                    .collect();
+                for key in reading {
+                    if let Some(download) = self.downloads.remove(&key) {
+                        download.stop();
+                    }
+                }
                 self.broker.disconnect(client)
             }
             Input::UploadOffered {
@@ -1198,6 +1309,10 @@ impl Daemon {
                 outcome,
             } => {
                 self.relay_finished(client, request, transfer, outcome);
+                Vec::new()
+            }
+            Input::DownloadEnded { client, request } => {
+                self.downloads.remove(&(client, request));
                 Vec::new()
             }
             Input::ResumeOffset {
@@ -1334,6 +1449,20 @@ impl Daemon {
                 } => self.refuse(client, request, "no transfer is in progress".to_owned()),
                 Effect::CancelUpload { client, request } => {
                     self.offers.remove(&(client, request));
+                }
+                Effect::BeginDownload {
+                    client,
+                    request,
+                    pane,
+                    path,
+                } => self.begin_download(client, request, pane, path),
+                Effect::PullDownload {
+                    client,
+                    request,
+                    chunks,
+                } => self.pull_download(client, request, chunks),
+                Effect::CancelDownload { client, request } => {
+                    self.stop_download(client, request);
                 }
                 Effect::MarkAttentionSeen { pane } => {
                     if self.attention.mark_seen_for_pane(&pane) {
@@ -1767,6 +1896,59 @@ impl Daemon {
                 outcome,
             });
         });
+    }
+
+    /// Start reading a file back off a target.
+    ///
+    /// Nothing is sent until the client asks for it. The offer goes out as soon
+    /// as the host has described the file, and then the task waits for credit,
+    /// so a client that never pulls costs a pipe and a task rather than a
+    /// gigabyte of this process.
+    fn begin_download(&mut self, client: ClientId, request: u64, pane: PaneId, path: String) {
+        if self.downloads.contains_key(&(client, request)) {
+            self.refuse(
+                client,
+                request,
+                "that request is already reading a file".to_owned(),
+            );
+            return;
+        }
+        let Some(target) = self.transfer_target(client, request, &pane) else {
+            return;
+        };
+        let Some(outbox) = self.outboxes.get(&client).cloned() else {
+            return;
+        };
+        let (credit, granted) = mpsc::unbounded_channel();
+        let transport = self.transport.clone();
+        let inputs = self.inputs.clone();
+        let task = tokio::spawn(async move {
+            let outcome = download(&target, &transport, &path, request, &outbox, granted).await;
+            if let Err(error) = outcome {
+                let _ = outbox.send(ServerMessage::Error {
+                    request: Some(request),
+                    message: error.to_string(),
+                });
+            }
+            let _ = inputs.send(Input::DownloadEnded { client, request });
+        });
+        self.downloads
+            .insert((client, request), Download { credit, task });
+    }
+
+    /// Let a download send more.
+    fn pull_download(&mut self, client: ClientId, request: u64, chunks: u32) {
+        let Some(download) = self.downloads.get(&(client, request)) else {
+            self.refuse(client, request, "no file is being read".to_owned());
+            return;
+        };
+        let _ = download.credit.send(chunks);
+    }
+
+    fn stop_download(&mut self, client: ClientId, request: u64) {
+        if let Some(download) = self.downloads.remove(&(client, request)) {
+            download.stop();
+        }
     }
 
     /// The target a transfer's pane belongs to, refusing the request if there
@@ -2364,6 +2546,46 @@ mod tests {
                     message @ (ServerMessage::Error { .. }
                     | ServerMessage::UploadComplete { .. }
                     | ServerMessage::UploadInterrupted { .. }) => return message,
+                    _ => continue,
+                }
+            }
+        }
+
+        /// Whether the daemon stays quiet about chunks for this long.
+        ///
+        /// Other messages are allowed through — a lease, a route that could not
+        /// open — because what is being asserted is that no *bytes* were sent,
+        /// not that the daemon said nothing at all.
+        async fn no_chunk_within(&mut self, patience: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + patience;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return true;
+                }
+                let mut line = Vec::new();
+                let read =
+                    tokio::time::timeout(remaining, self.reader.read_until(b'\n', &mut line)).await;
+                match read {
+                    Err(_) => return true,
+                    Ok(Ok(0)) | Ok(Err(_)) => return true,
+                    Ok(Ok(_)) => {
+                        line.pop();
+                        if let Ok(ServerMessage::DownloadChunk { .. }) = decode(&line) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Whatever the daemon says about a download.
+        async fn download_offer(&mut self) -> ServerMessage {
+            loop {
+                match self.receive().await.expect("the daemon answers") {
+                    message @ (ServerMessage::DownloadOffer { .. }
+                    | ServerMessage::DownloadFinished { .. }
+                    | ServerMessage::Error { .. }) => return message,
                     _ => continue,
                 }
             }
@@ -3141,6 +3363,168 @@ mod tests {
             !staged_anywhere(&escaping),
             "a refused name still put bytes on the target"
         );
+    }
+
+    /// A file on a target reaches the client that asked for it, intact.
+    ///
+    /// The whole point of the direction: the daemon carries and counts, the
+    /// host says what the file is, and the client is the one that checks. So
+    /// the assertion is the client's — the digest the daemon relayed is the
+    /// digest of the bytes that arrived.
+    #[tokio::test]
+    async fn a_file_on_a_target_is_read_back_to_the_client_that_asked() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let source = directory.path().join("build.log");
+        // Larger than one chunk, so the pull loop runs more than once.
+        let contents: Vec<u8> = (0..600_000_u32).map(|index| index as u8).collect();
+        std::fs::write(&source, &contents).unwrap();
+
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        connection
+            .send(ClientMessage::BeginDownload {
+                request: 1,
+                pane,
+                path: source.display().to_string(),
+            })
+            .await;
+        let offer = connection.download_offer().await;
+        let ServerMessage::DownloadOffer {
+            name,
+            length,
+            digest,
+            ..
+        } = &offer
+        else {
+            panic!("the daemon refused a readable file: {offer:?}");
+        };
+        assert_eq!(name, "build.log", "a client is told a name, never a path");
+        assert_eq!(*length as usize, contents.len());
+
+        let expected = digest.clone();
+        let length = *length;
+        let mut received = Vec::new();
+        while (received.len() as u64) < length {
+            // Asked for one at a time, which is the case worth exercising: if
+            // credit were not honoured, everything would arrive anyway.
+            connection
+                .send(ClientMessage::PullDownload {
+                    request: 1,
+                    chunks: 1,
+                })
+                .await;
+            match connection.receive().await.expect("the daemon answers") {
+                ServerMessage::DownloadChunk { bytes, .. } => received.extend_from_slice(&bytes),
+                ServerMessage::Error { message, .. } => panic!("{message}"),
+                _ => continue,
+            }
+        }
+        assert_eq!(received, contents);
+        // The client verifies, because the daemon deliberately did not.
+        assert_eq!(super::sha256_hex(&received), expected);
+
+        let finished = connection.download_offer().await;
+        assert!(
+            matches!(finished, ServerMessage::DownloadFinished { .. }),
+            "a finished download says so rather than simply stopping: {finished:?}"
+        );
+        harness.stop().await;
+    }
+
+    /// Nothing is sent to a client that has not asked for it.
+    ///
+    /// This is the whole of the flow control, and it is easy to write a version
+    /// that looks right and sends anyway. The queue to a client is unbounded,
+    /// so a download that ignored credit would put the file in the daemon's
+    /// memory whether or not anybody was reading.
+    #[tokio::test]
+    async fn a_download_sends_nothing_until_it_is_pulled() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let source = directory.path().join("quiet.bin");
+        std::fs::write(&source, vec![4u8; 400_000]).unwrap();
+
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        connection
+            .send(ClientMessage::BeginDownload {
+                request: 1,
+                pane,
+                path: source.display().to_string(),
+            })
+            .await;
+        assert!(
+            matches!(
+                connection.download_offer().await,
+                ServerMessage::DownloadOffer { .. }
+            ),
+            "the offer arrives without being asked for; the bytes do not"
+        );
+
+        // The assertion has to be about silence, not about what arrives first.
+        // A daemon ignoring credit fills the client's queue immediately, and
+        // reading from a full queue looks exactly like reading from one being
+        // filled on request — which is how a version of this test that pulled
+        // and then read passed against a daemon that ignored credit entirely.
+        assert!(
+            connection.no_chunk_within(Duration::from_millis(300)).await,
+            "a download sent bytes nobody had asked for"
+        );
+
+        connection
+            .send(ClientMessage::PullDownload {
+                request: 1,
+                chunks: 1,
+            })
+            .await;
+        let first = connection.receive().await.expect("the daemon answers");
+        let ServerMessage::DownloadChunk { bytes, .. } = &first else {
+            panic!("the first thing after a pull must be a chunk: {first:?}");
+        };
+        assert_eq!(
+            bytes.len(),
+            super::DOWNLOAD_CHUNK_BYTES,
+            "one pull is one chunk"
+        );
+        // And then silence again, because one chunk of credit is one chunk.
+        assert!(
+            connection.no_chunk_within(Duration::from_millis(300)).await,
+            "a download kept sending past the credit it was given"
+        );
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_is_refused_rather_than_streamed() {
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        for path in [
+            "/nonexistent/nothing-is-here",
+            // A directory would otherwise be a stream with no end.
+            "/tmp",
+        ] {
+            connection
+                .send(ClientMessage::BeginDownload {
+                    request: 1,
+                    pane: pane.clone(),
+                    path: path.to_owned(),
+                })
+                .await;
+            let refusal = connection.download_offer().await;
+            assert!(
+                matches!(&refusal, ServerMessage::Error { .. }),
+                "{path} should not be readable as a file: {refusal:?}"
+            );
+        }
+        harness.stop().await;
     }
 
     /// A transfer that fails its trailer is unstaged, not merely reported.

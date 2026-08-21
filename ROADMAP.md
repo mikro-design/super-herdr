@@ -77,8 +77,11 @@ Work is ordered by dependency and product risk.
    `transfers.max_bytes` rather than the clipboard's, and a transfer survives a
    reconnect: an interruption keeps what arrived, a sender returns with the
    token it was issued, and the offset comes from the host's own count. What
-   remains is the two directions that are not client-to-target —
-   target-to-client, and target-to-target without the device in the middle.
+   Target-to-client is done too: a client names a file on the pane's host, the
+   host describes it and sends it, credit in the protocol bounds what is in
+   flight because the queue to a client cannot push back, and the client is the
+   one that verifies. What remains is target-to-target without the device in
+   the middle.
 3. Add read-only pane observation to the browser client. Navigation and the
    attention feed are served; rendering a terminal needs a VT implementation in
    the page, which means vendoring one — the first third-party code the client
