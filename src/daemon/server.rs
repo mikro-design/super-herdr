@@ -192,6 +192,19 @@ const RELAY_DEPTH: usize = 4;
 /// comfortably inside the protocol's message bound once base64 has inflated it.
 const DOWNLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
+/// The most a download will hold for a client, whatever the client asks for.
+///
+/// Credit is what a client says it is ready for, and a client is not a reliable
+/// witness about itself — a grant computed from a file's size rather than from a
+/// buffer is not an attack, just a loop written the obvious way. Since the queue
+/// to a client is unbounded, an unclamped grant is the whole file in this
+/// process, which is what credit exists to prevent. So a grant is a request and
+/// this is the answer: pull as often as you like, at any rate the link
+/// sustains, but the daemon decides how much it is holding. It is the same
+/// decision `RELAY_DEPTH` makes for the other direction, and the same reasoning
+/// as a resume token — a grant is not authority either.
+const MAX_OUTSTANDING_CHUNKS: u32 = 8;
+
 /// A download in progress, and the way to tell it to keep going.
 ///
 /// The task holds the client's outbox and writes to it directly rather than
@@ -507,7 +520,7 @@ async fn download(
             let Some(granted) = granted.recv().await else {
                 return Ok(());
             };
-            credit = credit.saturating_add(granted);
+            credit = credit.saturating_add(granted).min(MAX_OUTSTANDING_CHUNKS);
             continue;
         }
         let wanted = usize::try_from(length - sent)
@@ -3495,6 +3508,62 @@ mod tests {
         assert!(
             connection.no_chunk_within(Duration::from_millis(300)).await,
             "a download kept sending past the credit it was given"
+        );
+        harness.stop().await;
+    }
+
+    /// A client cannot instruct the daemon to hold more than it agreed to.
+    ///
+    /// Credit says what a client is ready for, and a client is not a reliable
+    /// witness about itself: a window computed from a file's size rather than
+    /// from a buffer is an ordinary mistake, and the queue to a client is
+    /// unbounded, so an unclamped grant puts the whole file in this process —
+    /// exactly what credit exists to prevent.
+    #[tokio::test]
+    async fn a_grant_larger_than_the_daemon_agreed_to_is_not_authority() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let source = directory.path().join("large.bin");
+        // Comfortably more than the daemon will hold at once.
+        let contents = vec![7u8; super::DOWNLOAD_CHUNK_BYTES * 20];
+        std::fs::write(&source, &contents).unwrap();
+
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        connection
+            .send(ClientMessage::BeginDownload {
+                request: 1,
+                pane,
+                path: source.display().to_string(),
+            })
+            .await;
+        assert!(matches!(
+            connection.download_offer().await,
+            ServerMessage::DownloadOffer { .. }
+        ));
+
+        // Everything, at once, from a client that means well.
+        connection
+            .send(ClientMessage::PullDownload {
+                request: 1,
+                chunks: u32::MAX,
+            })
+            .await;
+
+        let mut chunks = 0usize;
+        while chunks < super::MAX_OUTSTANDING_CHUNKS as usize {
+            match connection.receive().await.expect("the daemon answers") {
+                ServerMessage::DownloadChunk { .. } => chunks += 1,
+                ServerMessage::Error { message, .. } => panic!("{message}"),
+                _ => continue,
+            }
+        }
+        // And then it waits, because what it was granted is not what it holds.
+        assert!(
+            connection.no_chunk_within(Duration::from_millis(300)).await,
+            "a client's grant decided how much the daemon would hold"
         );
         harness.stop().await;
     }

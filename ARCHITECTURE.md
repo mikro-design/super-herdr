@@ -646,8 +646,18 @@ sender and the queue to a client is unbounded, so nothing in the transport can
 push back — a browser on a slow link would have a gigabyte waiting for it in the
 daemon's memory. So the protocol carries it: a client grants credit in chunks
 and the daemon sends no more than it has been given, reading nothing from the
-host while nobody is ready for it. Peak memory is a window rather than a file,
-which is the same promise the other direction makes by a different means.
+host while nobody is ready for it.
+
+A grant is a request rather than an instruction, and the daemon clamps it. That
+half is not optional and is easy to leave out: credit says what a client is
+ready for, and a client is not a reliable witness about itself — a window
+computed from a file's size rather than from a buffer is an ordinary mistake
+rather than an attack. Since the queue to a client is unbounded, an unclamped
+grant is the whole file in the daemon's memory, which is the outcome credit
+exists to prevent. A client may pull as often as it likes at whatever rate the
+link sustains; how much is held while it does is the daemon's decision, exactly
+as it is in the other direction. Peak memory is a window rather than a file
+either way, which is the same promise reached by different means.
 
 Where the bytes land is a mutation question, so the default is conservative. A
 transfer completes into a private staging directory and the verified path is
