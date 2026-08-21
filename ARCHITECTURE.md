@@ -560,22 +560,36 @@ this exists to remove. The cost is that a connection moving a large file is not
 reading its own other messages meanwhile — a consequence of one ordered stream
 per connection, paid by the transfer's own client.
 
-One transfer may take more than one attempt, and that is the single exception to
-"a refusal leaves nothing behind". A connection that drops mid-transfer is not a
-refusal: nobody decided anything, and discarding a gigabyte because a laptop
-closed is a cost with nothing on the other side of it. So an interruption keeps
-what arrived, and a sender that comes back with the token it was issued
-continues from there.
+One transfer may take more than one attempt. A connection that drops
+mid-transfer is not a refusal — nobody decided anything — and discarding a
+gigabyte because a laptop closed is a cost with nothing on the other side of it.
+So an interruption keeps what arrived, and a sender that comes back with the
+token it was issued continues from there.
 
-The distinction that makes this safe is that an interruption is the *absence* of
-a decision. A withdrawal is discarded, because the sender asked. A sender that
-attests to a transfer it did not deliver is refused and discarded, because it
-said it was finished and it was not. Only a stream that stops without saying
-anything is kept — and what is kept is inert: no path is reported and nothing is
-injected into a pane until a digest verifies, so a partial file is not a
-verified-looking artifact reachable by another route. It is bounded by a clock
-and by a count, because a clock alone bounds how long one sender may occupy a
-host while a count is what bounds how many of them may at once.
+That reads like a contradiction of the rule above, and it is worth being precise
+rather than carving out an exception. What "a refusal leaves nothing behind"
+protects is that a partial file must never be mistaken for a complete one, and
+the rule stated exactly is that *nothing partial is ever named, reported, or
+acted on*: no path is reported, what a sender is told is a byte count rather
+than a location, and nothing reaches a pane until a digest verifies. That holds
+before this change and after it. Emptiness was the means and not the rule, and
+an exception would only invite the next reader to ask whether their case is
+inside it.
+
+The distinction that decides what is kept is that an interruption is the
+*absence* of a decision. A withdrawal is discarded, because the sender asked. A
+sender that attests to a transfer it did not deliver is refused and discarded,
+because it said it was finished and it was not. Only a stream that stops without
+saying anything is kept, bounded by a clock and by a count — a clock alone
+bounds how long one sender may occupy a host, while a count is what bounds how
+many of them may at once.
+
+Retention also ends with the process. The token that names a retained transfer
+lives in the daemon's memory, so a transfer outliving the daemon is unresumable
+by construction: a stopping daemon gives the host its bytes back rather than
+leaving partial files that nothing can name and nothing will collect. A crash
+still leaves them, which is a crashed process holding temporary files and the
+one case this cannot reach.
 
 Where the next byte belongs is asked of the host rather than remembered. An
 attempt that died mid-chunk left a length nobody predicted, and a daemon that

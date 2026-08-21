@@ -197,11 +197,10 @@ const MAX_RETAINED_TRANSFERS: usize = 4;
 
 /// A transfer that has not finished, kept in case its sender returns.
 ///
-/// This is the exception to "an abandoned transfer leaves nothing behind", and
-/// it is deliberately narrow. What is kept is never reachable as a result: no
-/// path is reported and nothing is injected into a pane until a digest
-/// verifies, so a partial file is inert rather than a verified-looking
-/// artifact. What it buys is the difference between a dropped connection
+/// Keeping it does not weaken the rule that nothing partial is ever named,
+/// reported, or acted on: no path is reported, what a sender is told is a byte
+/// count rather than a location, and nothing reaches a pane until a digest
+/// verifies. What it buys is the difference between a dropped connection
 /// costing a reconnect and costing a gigabyte.
 struct Retained {
     /// The pane it was for. A resuming client must still hold that pane's
@@ -765,6 +764,7 @@ async fn run(
     if let Some(refreshing) = refreshing {
         refreshing.abort();
     }
+    daemon.discard_retained().await;
     daemon.stop_federation().await;
     Ok(())
 }
@@ -1447,6 +1447,42 @@ impl Daemon {
             }
         }));
         self.store = Some(store);
+    }
+
+    /// Give a host back everything nobody can come for any more.
+    ///
+    /// `RETAIN_TIMEOUT` is the right bound for a daemon that is running and no
+    /// bound at all for one that is stopping. The token that names a retained
+    /// transfer lives in this process, so a transfer that outlives it is
+    /// unresumable by construction: keeping the bytes past this point cannot
+    /// serve anybody, and what it leaves is partial files in a private
+    /// directory on somebody else's machine, with the reaper that would remove
+    /// them living inside a process that no longer exists.
+    ///
+    /// Two cases are out of reach, and both are the same case. A crash leaves
+    /// them, and so does an attempt still in flight: a remote staging path is
+    /// made by the script and only reported when the attempt ends, so a
+    /// transfer stopped mid-flight has bytes on a host that nothing in this
+    /// process can name. That is a killed process holding a temporary file,
+    /// which the sweep on the next start cannot help with either — it is the
+    /// limit of what a daemon can clean up about itself.
+    async fn discard_retained(&mut self) {
+        let mut discarding = tokio::task::JoinSet::new();
+        for (_, retained) in std::mem::take(&mut self.retained) {
+            let Some(path) = retained.path else {
+                continue;
+            };
+            let Some(target) = self.targets.get(&retained.pane.target_session()).cloned() else {
+                continue;
+            };
+            let transport = self.transport.clone();
+            discarding.spawn(async move {
+                clipboard::discard_upload(&target, &transport, &path).await;
+            });
+        }
+        // Together rather than in turn: each of these is a bounded SSH command,
+        // and a stopping daemon should not take four timeouts to stop.
+        while discarding.join_next().await.is_some() {}
     }
 
     async fn stop_federation(&mut self) {
@@ -2196,6 +2232,7 @@ mod tests {
     struct Harness {
         directory: tempfile::TempDir,
         server: JoinHandle<anyhow::Result<()>>,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
     /// One target on this machine, so a transfer has somewhere to go without a
@@ -2230,8 +2267,35 @@ mod tests {
                 web_port: None,
                 web_address: None,
             };
-            let server = tokio::spawn(serve(config, None, options));
-            Self { directory, server }
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(serve_until(config, None, options, async move {
+                let _ = stopped.await;
+            }));
+            Self {
+                directory,
+                server,
+                stop: Some(stop),
+            }
+        }
+
+        /// Stop the daemon the way a person does, and wait for it.
+        ///
+        /// Aborting the task instead is a killed process, which leaves whatever
+        /// a killed process leaves. A test that ends that way litters a host —
+        /// here, the machine running the suite.
+        async fn stop(mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            // Waited for rather than abandoned: a stopping daemon gives a host
+            // back what it was holding, and that is the thing being relied on.
+            for _ in 0..500 {
+                if self.server.is_finished() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the daemon did not stop when asked");
         }
 
         fn socket(&self) -> std::path::PathBuf {
@@ -2818,6 +2882,35 @@ mod tests {
         false
     }
 
+    /// Remove whichever staging directory holds these bytes, if any.
+    ///
+    /// For the one case a stopping daemon cannot reach: an attempt in flight,
+    /// whose path exists only on the host until it finishes.
+    fn discard_staged(marker: &[u8]) {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for directory in entries.flatten().filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("super-herdr-clipboard.")
+        }) {
+            let holds = std::fs::read_dir(directory.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    std::fs::read(entry.path()).is_ok_and(|bytes| {
+                        bytes.windows(marker.len()).any(|window| window == marker)
+                    })
+                });
+            if holds {
+                let _ = std::fs::remove_dir_all(directory.path());
+            }
+        }
+    }
+
     async fn settles_on(condition: impl Fn() -> bool) -> bool {
         for _ in 0..400 {
             if condition() {
@@ -2830,11 +2923,10 @@ mod tests {
 
     /// A transfer nobody finished is kept for its sender to come back to.
     ///
-    /// This is the one place the rule "an abandoned transfer leaves nothing
-    /// behind" is deliberately not followed, and it is worth stating why it is
-    /// safe: what is kept is never reachable as a result. No path is reported
-    /// and nothing is injected into a pane until a digest verifies, so a
-    /// partial file is inert rather than a verified-looking artifact. What it
+    /// What is kept stays inert: no path is reported, what a sender is told is
+    /// a byte count rather than a location, and nothing is injected into a pane
+    /// until a digest verifies. The rule is that nothing partial is ever named,
+    /// reported, or acted on, and keeping the bytes does not touch it — what it
     /// buys is a dropped connection costing a reconnect rather than a
     /// gigabyte.
     #[tokio::test]
@@ -2941,6 +3033,7 @@ mod tests {
     async fn only_so_many_unfinished_transfers_are_kept() {
         let harness = Harness::start_with(local_target_config()).await;
         let mut first: Option<Vec<u8>> = None;
+        let mut last: Option<Vec<u8>> = None;
 
         for index in 0..=MAX_RETAINED_TRANSFERS {
             let mut connection = harness.connect().await;
@@ -2971,15 +3064,28 @@ mod tests {
             );
             drop(connection);
             if first.is_none() {
-                first = Some(payload);
+                first = Some(payload.clone());
             }
+            last = Some(payload);
         }
 
-        let first = first.expect("the first transfer was recorded");
+        let (first, last) = (
+            first.expect("the first transfer was recorded"),
+            last.expect("the last transfer was recorded"),
+        );
         assert!(
             settles_on(|| !staged_anywhere(&first)).await,
             "the oldest unfinished transfer was kept past the limit"
         );
+        // Stopped rather than abandoned, so the ones still retained go back to
+        // the host instead of onto whichever machine ran this.
+        harness.stop().await;
+        // Except the last, whose attempt may still have been in flight: its
+        // staging path is not known to the daemon until the attempt ends, so
+        // stopping cannot reach it. That is the one case `discard_retained`
+        // documents, and the test cleans up after it rather than pretending it
+        // does not exist.
+        discard_staged(&last);
     }
 
     /// A caller's name reaches the host, and a bad one never leaves the daemon.
@@ -3096,6 +3202,88 @@ mod tests {
         assert!(
             matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("no transfer")),
             "{refusal:?}"
+        );
+    }
+
+    /// A stopping daemon takes its unfinished transfers with it.
+    ///
+    /// Retention exists so a sender can come back with a token, and the token
+    /// lives in the daemon's memory: a transfer that outlives the process is
+    /// unresumable by construction, so bytes kept past that point serve nobody
+    /// and sit in a private directory on a host nobody will look at.
+    #[tokio::test]
+    async fn a_stopped_daemon_takes_its_unfinished_transfers_with_it() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let socket = directory.path().join("daemon.sock");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(
+            local_target_config(),
+            None,
+            DaemonOptions {
+                socket: socket.clone(),
+                attention_state: Some(directory.path().join("attention.json")),
+                refresh_interval: Duration::from_secs(3600),
+                web_port: None,
+                web_address: None,
+            },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        let mut connection = None;
+        for _ in 0..200 {
+            if let Ok(stream) = UnixStream::connect(&socket).await {
+                connection = Some(Connection {
+                    reader: BufReader::new(stream),
+                });
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut connection = connection.expect("the daemon accepts a connection");
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        let payload = marked_payload("stopped");
+        connection
+            .send(ClientMessage::BeginUpload {
+                request: 1,
+                pane,
+                mime: "image/png".to_owned(),
+                name: None,
+                // More than will be sent, so it is still unfinished when the
+                // daemon is asked to stop.
+                length: payload.len() as u64 + 64,
+            })
+            .await;
+        let _ = connection.accepted().await;
+        connection
+            .send(ClientMessage::UploadChunk {
+                request: 1,
+                bytes: payload.clone(),
+            })
+            .await;
+        assert!(
+            settles_on(|| staged_anywhere(&payload)).await,
+            "the transfer never reached the sink"
+        );
+        drop(connection);
+        assert!(
+            !settles_on_absence(|| staged_anywhere(&payload)).await,
+            "a running daemon should still be holding this"
+        );
+
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the daemon stops when asked")
+            .expect("the task completes")
+            .expect("serving ends without error");
+
+        assert!(
+            !staged_anywhere(&payload),
+            "a stopped daemon left bytes nothing can name and nothing will collect"
         );
     }
 
