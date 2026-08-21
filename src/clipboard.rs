@@ -558,6 +558,29 @@ where
     upload_local_stream(media, source, expected_bytes).await
 }
 
+/// Remove a staged upload the caller has decided not to accept.
+///
+/// [`upload_stream`] verifies what it sent against what the host stored, but a
+/// relay has a second promise to check that only it can see: the digest its own
+/// sender attested to, which arrives after the last byte. A transfer that fails
+/// that check has already reached the host, and leaving it there would leave a
+/// verified-looking artifact reachable by another route — a path injected into
+/// a pane cannot be told apart from one that passed.
+///
+/// Nothing here is taken from the wire. The path came from a receipt this
+/// process read, and is checked against the shape the staging script produces
+/// before anything is removed.
+pub async fn discard_upload(target: &Target, transport: &TransportConfig, path: &str) {
+    if let Some(destination) = target.ssh.as_deref() {
+        remove_remote_upload(destination, transport, path).await;
+        return;
+    }
+    let name = path.rsplit_once('/').map_or(path, |(_, tail)| tail);
+    if name.starts_with("super-herdr-clipboard-") {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Compare a receipt against what was actually sent, naming the failed check.
 fn verify_transfer(
     receipt: &RemoteUploadReceipt,
@@ -610,35 +633,50 @@ where
     let mut hasher = Sha256::new();
     let mut written = 0u64;
     let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
+    // A failure moving the bytes is recorded rather than returned. By the time
+    // one can happen the host has already staged part of a file, and the only
+    // way to learn where is to finish the exchange and read the receipt.
+    // Returning early would strand exactly the artifact a refusal must not
+    // leave behind.
+    let mut failure: Option<anyhow::Error> = None;
     while written < expected_bytes {
         let wanted = usize::try_from(expected_bytes - written)
             .unwrap_or(STREAM_CHUNK_BYTES)
             .min(STREAM_CHUNK_BYTES);
-        let read = source
-            .read(&mut buffer[..wanted])
-            .await
-            .context("failed to read the upload source")?;
-        if read == 0 {
-            break;
+        match source.read(&mut buffer[..wanted]).await {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                if let Err(error) = input.write_all(&buffer[..read]).await {
+                    failure =
+                        Some(anyhow::Error::new(error).context("failed to send upload bytes"));
+                    break;
+                }
+                written += read as u64;
+            }
+            Err(error) => {
+                failure =
+                    Some(anyhow::Error::new(error).context("failed to read the upload source"));
+                break;
+            }
         }
-        hasher.update(&buffer[..read]);
-        input
-            .write_all(&buffer[..read])
-            .await
-            .context("failed to send upload bytes")?;
-        written += read as u64;
     }
-    input
-        .shutdown()
-        .await
-        .context("failed to finish the media upload")?;
+    if let Err(error) = input.shutdown().await {
+        failure.get_or_insert_with(|| {
+            anyhow::Error::new(error).context("failed to finish the media upload")
+        });
+    }
     drop(input);
 
     let receipt = read_upload_receipt(output).await;
-    let status = child
-        .wait()
-        .await
-        .context("failed to wait for the SSH media upload")?;
+    let waited = child.wait().await;
+    if let Some(error) = failure {
+        if let Ok(receipt) = &receipt {
+            remove_remote_upload(destination, transport, &receipt.path).await;
+        }
+        return Err(error);
+    }
+    let status = waited.context("failed to wait for the SSH media upload")?;
     if !status.success() {
         bail!("SSH media upload failed (diagnostics redacted)");
     }

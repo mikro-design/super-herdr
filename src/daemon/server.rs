@@ -13,18 +13,22 @@
 //! until then the daemon inherits SSH's authentication rather than inventing
 //! its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
+    ReadBuf,
 };
 use tokio::net::UnixListener;
 use tokio::process::Child;
@@ -127,6 +131,17 @@ enum Input {
         applied: bool,
         message: String,
     },
+    /// A transfer's chunks, handed over by the connection that will carry them.
+    ///
+    /// It arrives immediately before the `upload.begin` it belongs to, because
+    /// the connection creates the queue in order to be able to block on it. The
+    /// rules about whether the transfer may happen at all are still the
+    /// broker's, and a refusal drops this end of the queue.
+    UploadOffered {
+        client: ClientId,
+        request: u64,
+        chunks: mpsc::Receiver<RelayItem>,
+    },
     UploadFinished {
         client: ClientId,
         request: u64,
@@ -145,20 +160,204 @@ enum Input {
 /// The largest payload a client may offer for upload.
 ///
 /// It matches the frontend's own clipboard ceiling, and is enforced here
-/// because the daemon is what writes to the target host.
+/// because the daemon is what writes to the target host. Since the transfer is
+/// relayed rather than held, this bounds what may be written onto a target's
+/// disk rather than what this process can hold, and raising it is a decision
+/// about the host rather than about memory here.
 pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
-/// A transfer in progress, held only in memory.
+/// How many chunks a relay holds between the connection carrying a transfer
+/// and the target taking it.
 ///
-/// Nothing reaches the target until the digest verifies, so a connection that
-/// drops mid-transfer leaves nothing behind — the refusal and the abandonment
-/// have the same result rather than the abandonment producing a file nothing
-/// checked.
-struct Upload {
-    pane: PaneId,
-    mime: String,
+/// A queue rather than a buffer: when it fills, the connection stops reading,
+/// which stops the client writing, which is the only backpressure that reaches
+/// the sender at all. Four of the client's 512 KiB chunks keep a
+/// screenshot-sized payload from ever stalling, while a genuinely large file
+/// waits for the target instead of accumulating here.
+///
+/// The cost is that a connection moving a large file is not reading its own
+/// other messages meanwhile. One ordered stream per connection is what makes
+/// that so, and it is the transfer's own client that waits for it.
+const RELAY_DEPTH: usize = 4;
+
+/// How long a relay waits for a trailer after the last declared byte.
+///
+/// A client that sends everything it declared and then goes quiet would
+/// otherwise hold a staged file on the target host for as long as it kept the
+/// connection open.
+const TRAILER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One step of a transfer, crossing from the connection that received it to the
+/// relay that is moving it.
+enum RelayItem {
+    Chunk(Vec<u8>),
+    /// The digest the sender attests to, over the bytes it sent.
+    Finish(String),
+    /// The sender withdrew. The transfer is still refused and unstaged like any
+    /// other that stops short, but nobody is told about a refusal they asked
+    /// for.
+    Cancel,
+}
+
+/// What a sender attested to, once its declared bytes had been relayed.
+enum Trailer {
+    Digest(String),
+    /// A frame arrived after the declared length was already met.
+    Overrun,
+    /// The transfer ended without one. A dropped connection ends this way,
+    /// which is why it is refused rather than treated as an ending.
+    Missing,
+}
+
+/// The client's side of a transfer, read as a stream.
+///
+/// It yields what a client sends and hashes it on the way past, so what the
+/// daemon compares against the trailer is what it actually relayed rather than
+/// a copy it kept. Nothing is held here beyond the chunk being handed over.
+struct RelayReader {
+    chunks: mpsc::Receiver<RelayItem>,
+    pending: Vec<u8>,
+    offset: usize,
+    hasher: Sha256,
+    attested: Option<String>,
+    cancelled: bool,
+}
+
+impl RelayReader {
+    fn new(chunks: mpsc::Receiver<RelayItem>) -> Self {
+        Self {
+            chunks,
+            pending: Vec::new(),
+            offset: 0,
+            hasher: Sha256::new(),
+            attested: None,
+            cancelled: false,
+        }
+    }
+
+    /// What the sender attested to, once the declared bytes have been relayed.
+    ///
+    /// A source is only read up to the length it declared, so on a transfer
+    /// that delivers exactly what it promised the trailer is still queued when
+    /// the transfer itself is finished. This is where it is collected.
+    async fn trailer(&mut self) -> Trailer {
+        if let Some(digest) = self.attested.take() {
+            return Trailer::Digest(digest);
+        }
+        // Bytes still held here are bytes the transfer did not want, which
+        // means the sender declared a length shorter than what it sent.
+        if self.offset < self.pending.len() {
+            return Trailer::Overrun;
+        }
+        match tokio::time::timeout(TRAILER_TIMEOUT, self.chunks.recv()).await {
+            Ok(Some(RelayItem::Finish(digest))) => Trailer::Digest(digest),
+            Ok(Some(RelayItem::Chunk(_))) => Trailer::Overrun,
+            Ok(Some(RelayItem::Cancel)) => {
+                self.cancelled = true;
+                Trailer::Missing
+            }
+            Ok(None) | Err(_) => Trailer::Missing,
+        }
+    }
+
+    /// The digest of everything this reader handed over.
+    fn relayed(&self) -> String {
+        self.hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+impl AsyncRead for RelayReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if this.offset < this.pending.len() {
+                let taken = buffer.remaining().min(this.pending.len() - this.offset);
+                buffer.put_slice(&this.pending[this.offset..this.offset + taken]);
+                this.offset += taken;
+                return Poll::Ready(Ok(()));
+            }
+            match this.chunks.poll_recv(context) {
+                Poll::Pending => return Poll::Pending,
+                // Ending here is a transfer that stopped early — an abandoned
+                // one, or a cancelled one. It is reported as the end of the
+                // stream rather than as an error, so the check it fails is
+                // named by whoever is counting bytes rather than by this.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(RelayItem::Finish(digest))) => {
+                    this.attested = Some(digest);
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(RelayItem::Cancel)) => {
+                    this.cancelled = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(RelayItem::Chunk(bytes))) => {
+                    // An empty chunk is not the end of anything, and returning
+                    // it as read bytes would say it was.
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    this.hasher.update(&bytes);
+                    this.pending = bytes;
+                    this.offset = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Move one transfer to its target, and check the promise its sender made.
+///
+/// The declared length is enforced by the transfer itself, which reads exactly
+/// what was declared: a sender that declares more than it sends runs out of
+/// stream and is refused as truncated, and one that declares less leaves bytes
+/// behind that show up here as an overrun. What nothing else can check is the
+/// trailer. It arrives after the last byte, so by the time it is wrong the file
+/// is already on the host — which is why failing it unstages what arrived
+/// rather than merely reporting it.
+/// `None` means the sender withdrew: the transfer is refused and unstaged like
+/// any other that stops short, but a client is not told about a refusal it
+/// asked for.
+async fn relay(
+    target: &Target,
+    transport: &TransportConfig,
+    media: clipboard::ClipboardMedia,
+    chunks: mpsc::Receiver<RelayItem>,
     length: u64,
-    bytes: Vec<u8>,
+) -> Option<Result<(String, u64)>> {
+    let mut source = RelayReader::new(chunks);
+    let uploaded =
+        match clipboard::upload_stream(target, transport, media, &mut source, length).await {
+            Ok(uploaded) => uploaded,
+            // The stream stopping short is how a withdrawal reaches the transfer,
+            // so which of the two happened is only knowable from the reader.
+            Err(error) => return (!source.cancelled).then_some(Err(error)),
+        };
+    let refusal = match source.trailer().await {
+        Trailer::Digest(digest) if digest == source.relayed() => {
+            return Some(Ok((uploaded.path, uploaded.bytes as u64)));
+        }
+        Trailer::Digest(_) => {
+            "transfer does not match the digest its sender attested to".to_owned()
+        }
+        Trailer::Overrun => format!("transfer sent more than the {length} bytes it declared"),
+        Trailer::Missing => {
+            "transfer ended without the digest its sender must attest to".to_owned()
+        }
+    };
+    // Nothing is left behind by a refusal: a staged file cannot be told apart
+    // from one that passed once its path has been injected into a pane.
+    clipboard::discard_upload(target, transport, &uploaded.path).await;
+    (!source.cancelled).then(|| Err(anyhow::anyhow!("{refusal}")))
 }
 
 struct Route {
@@ -193,7 +392,10 @@ struct Daemon {
     attention_cursor: Option<u64>,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
-    uploads: BTreeMap<(ClientId, u64), Upload>,
+    /// Queues handed over by connections, waiting for the broker to say whether
+    /// their transfer may proceed. An entry lives only from the `upload.begin`
+    /// that precedes it until that message has been decided.
+    offers: BTreeMap<(ClientId, u64), mpsc::Receiver<RelayItem>>,
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
@@ -410,7 +612,7 @@ async fn run(
         attention_cursor,
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
-        uploads: BTreeMap::new(),
+        offers: BTreeMap::new(),
         pending_pairing,
         downgraded: Vec::new(),
         active,
@@ -585,9 +787,10 @@ fn device_name(offered: &str) -> String {
     }
 }
 
+/// The digest a sender attests to, which the daemon now only ever computes
+/// while relaying. Tests still need it over a payload they hold whole.
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher
@@ -718,6 +921,11 @@ where
         let _ = writer.shutdown().await;
     });
 
+    // Transfers this connection is carrying. Their chunks never reach the
+    // central loop: forwarding them from here is what lets a full queue stop
+    // this connection being read, and a loop serving every client cannot wait
+    // on one client's target.
+    let mut relays: HashMap<u64, mpsc::Sender<RelayItem>> = HashMap::new();
     let mut buffered = BufReader::new(reader);
     let mut line = Vec::new();
     loop {
@@ -738,8 +946,81 @@ where
         let Ok(message) = decode::<ClientMessage>(&line) else {
             break;
         };
-        if inputs.send(Input::Received { client, message }).is_err() {
-            break;
+        match message {
+            ClientMessage::BeginUpload { request, .. } => {
+                let (sender, chunks) = mpsc::channel(RELAY_DEPTH);
+                // Handed over before the message it belongs to, so the loop
+                // has the queue by the time it decides whether to use it.
+                if inputs
+                    .send(Input::UploadOffered {
+                        client,
+                        request,
+                        chunks,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                relays.insert(request, sender);
+                if inputs.send(Input::Received { client, message }).is_err() {
+                    break;
+                }
+            }
+            ClientMessage::UploadChunk { request, bytes } => {
+                // Awaiting here is the whole point: a queue that is full stops
+                // this loop, which stops draining the socket, which stops the
+                // client. A refused transfer has closed its queue, and its
+                // remaining chunks fall through to be refused one by one, the
+                // same as a chunk for a transfer that never began.
+                match relays.get(&request) {
+                    Some(sender) => {
+                        if sender.send(RelayItem::Chunk(bytes)).await.is_err() {
+                            relays.remove(&request);
+                        }
+                    }
+                    None => {
+                        let message = ClientMessage::UploadChunk { request, bytes };
+                        if inputs.send(Input::Received { client, message }).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            ClientMessage::FinishUpload { request, digest } => match relays.remove(&request) {
+                Some(sender) => {
+                    let _ = sender.send(RelayItem::Finish(digest)).await;
+                }
+                None => {
+                    let message = ClientMessage::FinishUpload { request, digest };
+                    if inputs.send(Input::Received { client, message }).is_err() {
+                        break;
+                    }
+                }
+            },
+            ClientMessage::CancelUpload { request } => {
+                // Withdrawn rather than dropped, so the relay can tell a
+                // transfer somebody stopped from one that died: both are
+                // refused and unstaged, only one is worth reporting. The loop
+                // is told as well, so an offer it has not yet decided on does
+                // not outlive the transfer it belongs to.
+                if let Some(sender) = relays.remove(&request) {
+                    let _ = sender.send(RelayItem::Cancel).await;
+                }
+                if inputs
+                    .send(Input::Received {
+                        client,
+                        message: ClientMessage::CancelUpload { request },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            message => {
+                if inputs.send(Input::Received { client, message }).is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -749,6 +1030,13 @@ where
 
 impl Daemon {
     fn handle(&mut self, input: Input) {
+        let offered = match &input {
+            Input::Received {
+                client,
+                message: ClientMessage::BeginUpload { request, .. },
+            } => Some((*client, *request)),
+            _ => None,
+        };
         let effects = match input {
             Input::Connected { outbox, reply } => {
                 let client = self.broker.connect();
@@ -763,11 +1051,21 @@ impl Daemon {
             Input::Received { client, message } => self.broker.handle(client, message),
             Input::Disconnected { client } => {
                 self.outboxes.remove(&client);
-                // An abandoned transfer is discarded rather than completed. It
-                // never reached the host, so there is nothing to clean up
-                // there.
-                self.uploads.retain(|(owner, _), _| *owner != client);
+                // An offer that never became a transfer is dropped here. One
+                // that did is ended by its own connection releasing the queue,
+                // which the relay sees as a stream that stopped short of what
+                // it declared — so an abandoned transfer is refused and
+                // unstaged rather than left on the host.
+                self.offers.retain(|(owner, _), _| *owner != client);
                 self.broker.disconnect(client)
+            }
+            Input::UploadOffered {
+                client,
+                request,
+                chunks,
+            } => {
+                self.offers.insert((client, request), chunks);
+                Vec::new()
             }
             Input::Federation(state) => {
                 self.state = state.clone();
@@ -830,6 +1128,12 @@ impl Daemon {
             Input::Reconfigured(config) => self.reconfigure(config),
         };
         self.apply(effects);
+        // An offer nothing claimed — one whose transfer the lease check refused
+        // before it ever became an effect — does not outlive the message it
+        // arrived with.
+        if let Some(key) = offered {
+            self.offers.remove(&key);
+        }
     }
 
     fn apply(&mut self, effects: Vec<Effect>) {
@@ -905,64 +1209,18 @@ impl Daemon {
                     pane,
                     mime,
                     length,
-                } => {
-                    // Refused before any bytes move, which is the only point at
-                    // which refusing is free.
-                    if length > MAX_UPLOAD_BYTES {
-                        self.refuse(
-                            client,
-                            request,
-                            format!(
-                                "refusing a {length} byte upload; the limit is {MAX_UPLOAD_BYTES}"
-                            ),
-                        );
-                    } else {
-                        self.uploads.insert(
-                            (client, request),
-                            Upload {
-                                pane,
-                                mime,
-                                length,
-                                bytes: Vec::new(),
-                            },
-                        );
-                    }
-                }
+                } => self.begin_relay(client, request, pane, mime, length),
+                // A chunk only arrives here when its connection has no queue to
+                // put it in, which means the transfer was refused or never
+                // began.
                 Effect::UploadChunk {
-                    client,
-                    request,
-                    bytes,
-                } => {
-                    // Stopped at the declared length rather than trusting it: a
-                    // lying length is a disk-fill on the target that no digest
-                    // would catch.
-                    let outcome = match self.uploads.get_mut(&(client, request)) {
-                        None => Err("no transfer is in progress".to_owned()),
-                        Some(upload)
-                            if upload.bytes.len() as u64 + bytes.len() as u64 > upload.length =>
-                        {
-                            Err(format!(
-                                "transfer sent more than the {} bytes it declared",
-                                upload.length
-                            ))
-                        }
-                        Some(upload) => {
-                            upload.bytes.extend_from_slice(&bytes);
-                            Ok(())
-                        }
-                    };
-                    if let Err(message) = outcome {
-                        self.uploads.remove(&(client, request));
-                        self.refuse(client, request, message);
-                    }
+                    client, request, ..
                 }
-                Effect::FinishUpload {
-                    client,
-                    request,
-                    digest,
-                } => self.finish_upload(client, request, &digest),
+                | Effect::FinishUpload {
+                    client, request, ..
+                } => self.refuse(client, request, "no transfer is in progress".to_owned()),
                 Effect::CancelUpload { client, request } => {
-                    self.uploads.remove(&(client, request));
+                    self.offers.remove(&(client, request));
                 }
                 Effect::MarkAttentionSeen { pane } => {
                     if self.attention.mark_seen_for_pane(&pane) {
@@ -1168,29 +1426,30 @@ impl Daemon {
         });
     }
 
-    /// Verify a completed transfer and move it to the target host.
-    fn finish_upload(&mut self, client: ClientId, request: u64, digest: &str) {
-        let Some(upload) = self.uploads.remove(&(client, request)) else {
+    /// Start moving a transfer to the target host as its bytes arrive.
+    ///
+    /// Everything that can be refused for free is refused here, before a byte
+    /// moves: a length above the ceiling, and a pane whose target is not
+    /// configured. What cannot — that the bytes are the ones their sender
+    /// attested to — is checked at the far end, where a failure has to unstage
+    /// what already arrived.
+    fn begin_relay(
+        &mut self,
+        client: ClientId,
+        request: u64,
+        pane: PaneId,
+        mime: String,
+        length: u64,
+    ) {
+        let Some(chunks) = self.offers.remove(&(client, request)) else {
             self.refuse(client, request, "no transfer is in progress".to_owned());
             return;
         };
-        if upload.bytes.len() as u64 != upload.length {
+        if length > MAX_UPLOAD_BYTES {
             self.refuse(
                 client,
                 request,
-                format!(
-                    "transfer ended with {} of the {} bytes it declared",
-                    upload.bytes.len(),
-                    upload.length
-                ),
-            );
-            return;
-        }
-        if sha256_hex(&upload.bytes) != digest {
-            self.refuse(
-                client,
-                request,
-                "transfer does not match the digest its sender attested to".to_owned(),
+                format!("refusing a {length} byte upload; the limit is {MAX_UPLOAD_BYTES}"),
             );
             return;
         }
@@ -1199,8 +1458,8 @@ impl Daemon {
         // here, never taken from the wire. A type with no entry is carried
         // rather than refused: a file from a device has no clipboard flavor at
         // all, and that is the same case rather than a second one.
-        let media = clipboard::media_for_mime(&upload.mime);
-        let key = upload.pane.target_session();
+        let media = clipboard::media_for_mime(&mime);
+        let key = pane.target_session();
         let Some(target) = self.targets.get(&key).cloned() else {
             self.refuse(client, request, format!("{key} is not a configured target"));
             return;
@@ -1208,21 +1467,12 @@ impl Daemon {
         let transport = self.transport.clone();
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
-            match clipboard::upload_media(&target, &transport, media, &upload.bytes).await {
-                Ok(uploaded) => {
-                    let _ = inputs.send(Input::UploadFinished {
-                        client,
-                        request,
-                        result: Ok((uploaded.path, uploaded.bytes as u64)),
-                    });
-                }
-                Err(error) => {
-                    let _ = inputs.send(Input::UploadFinished {
-                        client,
-                        request,
-                        result: Err(error.to_string()),
-                    });
-                }
+            if let Some(result) = relay(&target, &transport, media, chunks, length).await {
+                let _ = inputs.send(Input::UploadFinished {
+                    client,
+                    request,
+                    result: result.map_err(|error| error.to_string()),
+                });
             }
         });
     }
@@ -1568,8 +1818,29 @@ mod tests {
         server: JoinHandle<anyhow::Result<()>>,
     }
 
+    /// One target on this machine, so a transfer has somewhere to go without a
+    /// host or a fixture. `ssh: None` is what makes the sink local, and the
+    /// name is the one `leased_pane` qualifies its pane with.
+    fn local_target_config() -> Config {
+        Config {
+            targets: vec![Target {
+                name: "first".to_owned(),
+                ssh: None,
+                discover_sessions: false,
+                session: None,
+                socket: None,
+                herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            }],
+            ..empty_config()
+        }
+    }
+
     impl Harness {
         async fn start() -> Self {
+            Self::start_with(empty_config()).await
+        }
+
+        async fn start_with(config: Config) -> Self {
             let directory = tempfile::tempdir().expect("a temporary directory");
             let options = DaemonOptions {
                 socket: directory.path().join("daemon.sock"),
@@ -1579,7 +1850,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
             };
-            let server = tokio::spawn(serve(empty_config(), None, options));
+            let server = tokio::spawn(serve(config, None, options));
             Self { directory, server }
         }
 
@@ -1897,7 +2168,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_transfer_is_refused_for_each_check_it_fails() {
-        let harness = Harness::start().await;
+        // A real sink, because the daemon no longer holds a transfer long
+        // enough to judge it on its own: the bytes are relayed as they arrive,
+        // and every check below is decided against what actually moved.
+        let harness = Harness::start_with(local_target_config()).await;
         let mut connection = harness.connect().await;
         connection.hello().await;
         // Declared above the ceiling: refused before a byte moves.
@@ -1952,9 +2226,9 @@ mod tests {
 
         // A type the table does not know is carried rather than refused: a
         // file from a device has no clipboard flavor at all, and that is the
-        // same case. It fails here only because this harness configures no
-        // target to send it to, which is a different refusal.
-        let refusal = upload(
+        // same case rather than a second one. With a sink configured it does
+        // not merely avoid one refusal, it arrives.
+        let carried = upload(
             &mut connection,
             "application/x-invented",
             4,
@@ -1962,10 +2236,11 @@ mod tests {
             Some(&super::sha256_hex(b"four")),
         )
         .await;
-        assert!(
-            matches!(&refusal, ServerMessage::Error { message, .. } if !message.contains("extension")),
-            "an unknown type must not be refused for being unknown: {refusal:?}"
-        );
+        let ServerMessage::UploadComplete { path, bytes, .. } = &carried else {
+            panic!("an unknown type must not be refused for being unknown: {carried:?}");
+        };
+        assert_eq!(*bytes, 4);
+        let _ = std::fs::remove_file(path);
     }
 
     /// What the relay accumulates is what the sink writes.
@@ -2066,13 +2341,146 @@ mod tests {
             super::sha256_hex(&payload),
             "the bytes that reached the sink are not the bytes that were sent"
         );
-        let _ = std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap());
+        // The file, not the directory holding it: a local sink stages into the
+        // system temporary directory itself, so removing the parent would mean
+        // removing everything else anyone has in there.
+        let _ = std::fs::remove_file(&path);
         server.abort();
+    }
+
+    /// A payload no other transfer carries, in this run or a previous one.
+    ///
+    /// Content is what identifies a staged file here, so the marker has to be
+    /// unique per process as well as per test: a leftover from an earlier run —
+    /// or from a run that deliberately broke the cleanup to check this test can
+    /// fail — would otherwise fail every run after it.
+    fn marked_payload(name: &str) -> Vec<u8> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut payload = b"\x89PNG\r\n\x1a\n".to_vec();
+        payload
+            .extend_from_slice(format!("marker/{name}/{}/{serial}", std::process::id()).as_bytes());
+        payload
+    }
+
+    /// Whether anything a local sink could have staged holds these bytes.
+    ///
+    /// Identified by content rather than by counting files, so it does not
+    /// depend on what else is running in the same temporary directory at the
+    /// same moment.
+    fn staged_anywhere(marker: &[u8]) -> bool {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("super-herdr-clipboard-")
+                && std::fs::read(entry.path())
+                    .is_ok_and(|bytes| bytes.windows(marker.len()).any(|window| window == marker))
+        })
+    }
+
+    async fn settles_on(condition: impl Fn() -> bool) -> bool {
+        for _ in 0..400 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A transfer nobody finishes leaves nothing on the target.
+    ///
+    /// While the daemon held a transfer whole and verified it before sending
+    /// any of it, this cost nothing by construction: an abandoned transfer had
+    /// never reached the host. A relay has already written there by the time it
+    /// can learn the transfer will never be attested to, so unstaging becomes
+    /// something that has to happen rather than something that cannot be
+    /// needed. Both halves are asserted — that the bytes reached the sink at
+    /// all, and that they are gone afterwards — because a check for absence
+    /// alone would pass on a transfer that never started.
+    #[tokio::test]
+    async fn an_abandoned_transfer_leaves_nothing_staged() {
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let pane = leased_pane(&mut connection).await;
+
+        let payload = marked_payload("abandoned");
+        let marker = payload.as_slice();
+
+        connection
+            .send(ClientMessage::BeginUpload {
+                request: 1,
+                pane,
+                // More than will ever be sent, so the transfer is still open
+                // when the connection goes away.
+                length: payload.len() as u64 + 64,
+                mime: "image/png".to_owned(),
+            })
+            .await;
+        connection
+            .send(ClientMessage::UploadChunk {
+                request: 1,
+                bytes: payload.clone(),
+            })
+            .await;
+        assert!(
+            settles_on(|| staged_anywhere(marker)).await,
+            "the relay never reached the sink, so what follows would prove nothing"
+        );
+
+        // The client goes away without ever attesting to what it sent.
+        drop(connection);
+
+        assert!(
+            settles_on(|| !staged_anywhere(marker)).await,
+            "an abandoned transfer left its bytes staged on the target"
+        );
+        harness.server.abort();
+    }
+
+    /// A transfer that fails its trailer is unstaged, not merely reported.
+    ///
+    /// This is the case the relay alone can catch. Every declared byte has
+    /// arrived and the host has stored them, so the file exists and passes the
+    /// host's own count-and-digest check; only the promise its sender made
+    /// about those bytes is wrong.
+    #[tokio::test]
+    async fn a_refused_digest_takes_the_staged_file_with_it() {
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+
+        let payload = marked_payload("refused-digest");
+        let marker = payload.as_slice();
+        let refusal = upload(
+            &mut connection,
+            "image/png",
+            payload.len() as u64,
+            &[payload.as_slice()],
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        )
+        .await;
+
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("digest")),
+            "{refusal:?}"
+        );
+        assert!(
+            !staged_anywhere(marker),
+            "a refused transfer left its bytes staged on the target"
+        );
     }
 
     #[tokio::test]
     async fn an_abandoned_transfer_cannot_be_finished_later() {
-        let harness = Harness::start().await;
+        let harness = Harness::start_with(local_target_config()).await;
         let mut connection = harness.connect().await;
         connection.hello().await;
         let pane = leased_pane(&mut connection).await;

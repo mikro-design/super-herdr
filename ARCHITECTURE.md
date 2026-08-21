@@ -466,8 +466,13 @@ does not pretend otherwise: it binds loopback or a private and mesh address and
 refuses a public one. On a mesh like WireGuard or Tailscale the network already
 provides confidentiality; on the open internet it would not, and the way in from
 there stays a forwarded port, which is an explicit act rather than a flag
-somebody set once. Loopback is never asked for a token, since anyone who can
-reach it can already read the daemon's socket.
+somebody set once. A genuinely local request is never asked for a token, since
+anyone who can reach loopback can already read the daemon's socket — but that
+is a claim about a process, not about an address. A proxy terminating TLS on a
+network and forwarding to loopback makes every visitor look local while being
+nothing of the kind, so a request carrying forwarding headers is asked like
+anything else arriving over a network. A client can of course set those headers
+itself, which costs it the exemption rather than gaining anything.
 
 The page is held in the binary and refers to nothing it is not served, because a
 forwarded port has no route to anywhere else. It shows the daemon's version,
@@ -521,6 +526,25 @@ from a refused transfer is a verified-looking artifact reached by another route,
 and a path injected into a pane cannot be told apart from one that passed. A
 refusal names which check failed, because only a missing trailer is likely to be
 a dropped connection worth retrying.
+
+Backpressure is what makes the middle hop a relay rather than a rename. Chunks
+are forwarded by the connection that receives them rather than by the loop that
+serves every client: a queue that fills then stops that connection being read,
+which stops its client writing, which is the only signal that reaches a sender
+at all. A shared loop could not wait on one client's target without stalling
+every other client, and a queue deep enough never to fill would be the buffer
+this exists to remove. The cost is that a connection moving a large file is not
+reading its own other messages meanwhile — a consequence of one ordered stream
+per connection, paid by the transfer's own client.
+
+Refusing early is free and refusing late is not, which decides where each check
+lives. A length above the ceiling, and a pane whose target is not configured,
+are both settled before a byte moves. The trailer cannot be: it attests to bytes
+that have already reached the host by the time it arrives, so failing it means
+removing a file that exists there. That is the same unstaging an abandoned
+transfer needs — a client that vanishes mid-transfer is a stream that stopped
+short — and it is why the ceiling now bounds what may be written onto a target's
+disk rather than what the daemon can hold.
 
 Three directions share that one path. A client uploads through the daemon to a
 target. A target's file is pulled by the daemon and handed to the client. A file
