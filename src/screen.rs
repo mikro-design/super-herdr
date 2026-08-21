@@ -61,6 +61,20 @@ pub struct Style {
     pub italic: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub underline: bool,
+    /// Inverse video that swapping colours cannot express.
+    ///
+    /// Inverse is resolved here by exchanging the two colours, which says
+    /// nothing at all when both are the terminal's defaults: swapping `Default`
+    /// with `Default` yields `Default`, and the highlight disappears into a
+    /// plain run. That is not a rare corner — `\x1b[7m` with no colours set is
+    /// the usual way selections, status lines and highlighted rows are drawn.
+    ///
+    /// Resolving it here would mean naming concrete colours, which belong to
+    /// whoever paints them. So the one case that cannot be expressed as a swap
+    /// travels as itself: a viewer exchanging its own two default colours needs
+    /// no palette knowledge either.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inverse: bool,
 }
 
 fn is_default_color(color: &Option<Color>) -> bool {
@@ -255,6 +269,10 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> Vec<Run> {
         }
         let mut foreground = Color::from(cell.fgcolor());
         let mut background = Color::from(cell.bgcolor());
+        // A swap carries inverse whenever either side names a colour. When
+        // neither does, it carries nothing, and the flag is what survives.
+        let unresolvable =
+            cell.inverse() && foreground == Color::Default && background == Color::Default;
         if cell.inverse() {
             std::mem::swap(&mut foreground, &mut background);
         }
@@ -267,6 +285,7 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> Vec<Run> {
             dim: cell.dim(),
             italic: cell.italic(),
             underline: cell.underline(),
+            inverse: unresolvable,
         };
         let text = if cell.has_contents() {
             cell.contents()
@@ -346,6 +365,35 @@ mod tests {
         let style = snapshot.rows[0][0].style;
         assert_eq!(style.foreground, Some(Color::Indexed { index: 4 }));
         assert_eq!(style.background, Some(Color::Indexed { index: 1 }));
+    }
+
+    #[test]
+    fn inverse_over_default_colours_survives_as_itself() {
+        // The case a swap cannot express. `\x1b[7m` with no colours set is how
+        // selections, status lines and highlighted rows are usually drawn, and
+        // exchanging two default colours yields a default colour — so without
+        // this the run comes back plain and a viewer paints ordinary text where
+        // the terminal showed a highlight.
+        let parser = screen(10, 1, b"\x1b[7minv");
+        let snapshot = Snapshot::of(parser.screen(), 0);
+        let run = &snapshot.rows[0][0];
+        assert_eq!(run.text, "inv");
+        assert!(run.style.inverse, "{run:?}");
+        assert_eq!(run.style.foreground, None);
+        assert_eq!(run.style.background, None);
+
+        // A swap that does say something is still resolved rather than
+        // deferred: one named colour is enough to express it.
+        let parser = screen(10, 1, b"\x1b[31;7mx");
+        let style = Snapshot::of(parser.screen(), 0).rows[0][0].style;
+        assert!(!style.inverse, "{style:?}");
+        assert_eq!(style.background, Some(Color::Indexed { index: 1 }));
+
+        // And a plain run is still plain, so trailing blanks still vanish.
+        let parser = screen(10, 2, b"plain");
+        let snapshot = Snapshot::of(parser.screen(), 0);
+        assert!(!snapshot.rows[0][0].style.inverse);
+        assert!(snapshot.rows[1].is_empty());
     }
 
     #[test]
