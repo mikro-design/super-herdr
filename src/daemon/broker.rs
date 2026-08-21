@@ -92,6 +92,7 @@ pub enum Effect {
         request: u64,
         pane: PaneId,
         mime: String,
+        name: Option<String>,
         length: u64,
     },
     UploadChunk {
@@ -363,6 +364,7 @@ impl Broker {
                 request,
                 pane,
                 mime,
+                name,
                 length,
             } => {
                 if self.holds_control(client, &pane, &mut effects) {
@@ -371,6 +373,7 @@ impl Broker {
                         request,
                         pane,
                         mime,
+                        name,
                         length,
                     });
                 }
@@ -1668,6 +1671,7 @@ mod tests {
                 request: 2,
                 pane: pane("w1:p1"),
                 mime: "image/png".to_owned(),
+                name: None,
                 length: 16,
             },
         ] {

@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -218,10 +218,24 @@ impl ClipboardMedia {
         Ok(())
     }
 
-    /// The name of the file this flavor is written to.
+    /// The suffix a macOS pasteboard read gives its temporary file.
     ///
-    /// The extension reaches a remote shell command, so it must stay inert; a
-    /// flavor that declares none is written as a bare `payload`.
+    /// Only that path still needs one: a staged transfer takes its name from
+    /// the caller or from [`payload_name`](Self::payload_name), inside a
+    /// private directory of its own.
+    #[cfg(target_os = "macos")]
+    fn file_suffix(self) -> Result<String> {
+        Ok(match self.payload_name()?.split_once('.') {
+            Some((_, extension)) => format!(".{extension}"),
+            None => String::new(),
+        })
+    }
+
+    /// What a payload of this flavor is called when nobody named it.
+    ///
+    /// The extension comes from this table rather than from the wire, and stays
+    /// inert regardless: the resulting path is pasted into a pane, where a name
+    /// that is not plain text would be a command somebody's shell runs.
     fn payload_name(self) -> Result<String> {
         let Some(extension) = self.extension else {
             return Ok("payload".to_owned());
@@ -231,28 +245,83 @@ impl ClipboardMedia {
         }
         Ok(format!("payload.{extension}"))
     }
-
-    /// The suffix a local temporary file is given, if any.
-    fn file_suffix(self) -> Result<String> {
-        Ok(match self.payload_name()?.split_once('.') {
-            Some((_, extension)) => format!(".{extension}"),
-            None => String::new(),
-        })
-    }
 }
 
 /// A payload whose type this bridge does not recognize.
 ///
-/// It carries no extension, because the only safe name is no name. A name from
-/// the wire would be attacker-influenced text in a remote command, and a
-/// sanitizer that has to stay correct forever is exactly the thing someone
-/// widens later under pressure. The byte count and digest are what prove the
-/// transfer; a display name belongs to whichever client can still read it.
+/// It carries no extension of its own: a clipboard flavor with no entry in the
+/// table is written as a bare `payload` unless the caller named it. The byte
+/// count and digest are what prove the transfer either way.
 pub const OPAQUE: ClipboardMedia = ClipboardMedia {
     mime: "application/octet-stream",
     extension: None,
     signatures: &[],
 };
+
+/// The longest name a caller may ask for.
+///
+/// Well under any filesystem's limit, because the point is not to fit but to
+/// stay something a person can read in a refusal and in a path pasted into a
+/// pane.
+const MAX_TRANSFER_NAME_BYTES: usize = 96;
+
+/// What a transfer is called on the target host.
+///
+/// This once could not be asked for at all: the name was interpolated into a
+/// remote shell script, where anything from the wire would have been
+/// attacker-influenced text in a command, guarded only by a sanitizer that has
+/// to stay correct forever. Two things changed, and both are load-bearing. The
+/// name now travels to the staging script as data on its standard input rather
+/// than as part of the script, so it is never parsed as shell in the first
+/// place; and the script refuses a separator itself, so neither side is trusted
+/// alone.
+///
+/// The character class stays narrow anyway, for a reason that outlives the
+/// quoting: the resulting path is pasted into a pane, where a name carrying a
+/// space, a quote, a semicolon or a `$` would be a command somebody's shell
+/// runs. Inert as text is the requirement, not merely inert as an argument.
+/// A name that does not qualify is refused rather than mangled, because
+/// silently renaming a file tells the caller it got what it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedName(String);
+
+impl StagedName {
+    /// Resolve what a caller asked for, falling back to the flavor's own name.
+    pub fn resolve(requested: Option<&str>, media: ClipboardMedia) -> Result<Self> {
+        let Some(requested) = requested else {
+            return Ok(Self(media.payload_name()?));
+        };
+        if requested.is_empty() || requested.len() > MAX_TRANSFER_NAME_BYTES {
+            bail!(
+                "a transfer name must be between 1 and {MAX_TRANSFER_NAME_BYTES} bytes; \
+                 this one is {}",
+                requested.len()
+            );
+        }
+        if requested == "." || requested == ".." {
+            bail!("a transfer cannot be named {requested:?}");
+        }
+        if requested.starts_with('.') || requested.starts_with('-') {
+            // A leading dot hides the file from whoever goes looking for it; a
+            // leading dash is an option to the next command that sees the path.
+            bail!("a transfer name cannot begin with {:?}", &requested[..1]);
+        }
+        if !requested
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            bail!(
+                "a transfer name may use only letters, digits, dots, dashes and \
+                 underscores; {requested:?} does not"
+            );
+        }
+        Ok(Self(requested.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Flavors the bridge can move, in the order they are preferred when a
 /// clipboard offers several at once. PNG stays first so that the common case,
@@ -491,11 +560,14 @@ pub async fn upload_media(
     bytes: &[u8],
 ) -> Result<UploadedFile> {
     media.validate(bytes)?;
+    // A clipboard flavor names itself; nobody is holding a file whose name this
+    // could be.
+    let staged = StagedName::resolve(None, media)?;
     let expected_digest = sha256_hex(bytes);
     if let Some(destination) = target.ssh.as_deref() {
         let upload = timeout(
             Duration::from_secs(transport.command_timeout_seconds),
-            upload_remote_media(destination, transport, media, bytes),
+            upload_remote_media(destination, transport, &staged, bytes),
         )
         .await
         .context("clipboard media upload timed out")??;
@@ -511,7 +583,7 @@ pub async fn upload_media(
             mime: media.mime,
         });
     }
-    upload_local_media(media, bytes, &expected_digest)
+    upload_local_media(media, &staged, bytes, &expected_digest)
 }
 
 /// Upload a payload that is being read rather than held.
@@ -535,15 +607,19 @@ pub async fn upload_stream<R>(
     target: &Target,
     transport: &TransportConfig,
     media: ClipboardMedia,
+    name: Option<&str>,
     source: R,
     expected_bytes: u64,
 ) -> Result<UploadedFile>
 where
     R: AsyncRead + Unpin,
 {
+    // Refused before a connection is opened, because a name is the one thing
+    // about a transfer that can be judged without moving anything.
+    let staged = StagedName::resolve(name, media)?;
     if let Some(destination) = target.ssh.as_deref() {
         let (receipt, digest, written) =
-            upload_remote_stream(destination, transport, media, source, expected_bytes).await?;
+            upload_remote_stream(destination, transport, &staged, source, expected_bytes).await?;
         let verdict = verify_transfer(&receipt, &digest, written, expected_bytes);
         if let Err(error) = verdict {
             remove_remote_upload(destination, transport, &receipt.path).await;
@@ -555,7 +631,7 @@ where
             mime: media.mime,
         });
     }
-    upload_local_stream(media, source, expected_bytes).await
+    upload_local_stream(media, &staged, source, expected_bytes).await
 }
 
 /// Remove a staged upload the caller has decided not to accept.
@@ -575,10 +651,21 @@ pub async fn discard_upload(target: &Target, transport: &TransportConfig, path: 
         remove_remote_upload(destination, transport, path).await;
         return;
     }
-    let name = path.rsplit_once('/').map_or(path, |(_, tail)| tail);
-    if name.starts_with("super-herdr-clipboard-") {
-        let _ = fs::remove_file(path);
-    }
+    discard_local_upload(Path::new(path));
+}
+
+/// Remove a locally staged transfer, directory and all.
+///
+/// The directory is the unit because that is what was created for it: the file
+/// inside carries a caller's name, and removing only the file would leave an
+/// empty private directory per refused transfer. The same shape check the
+/// remote side applies is applied here, since a path this process assembled is
+/// no reason to skip the check that keeps `rm -rf` pointed at one place.
+fn discard_local_upload(path: &Path) {
+    let Some(directory) = path.to_str().and_then(removable_upload_directory) else {
+        return;
+    };
+    let _ = fs::remove_dir_all(directory);
 }
 
 /// Compare a receipt against what was actually sent, naming the failed check.
@@ -606,14 +693,14 @@ fn verify_transfer(
 async fn upload_remote_stream<R>(
     destination: &str,
     transport: &TransportConfig,
-    media: ClipboardMedia,
+    staged: &StagedName,
     mut source: R,
     expected_bytes: u64,
 ) -> Result<(RemoteUploadReceipt, String, u64)>
 where
     R: AsyncRead + Unpin,
 {
-    let mut command = build_ssh_command(destination, transport, upload_script(media)?);
+    let mut command = build_ssh_command(destination, transport, UPLOAD_SCRIPT.to_owned());
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -629,6 +716,9 @@ where
         .stdout
         .take()
         .context("the SSH media upload did not expose stdout")?;
+    // Ahead of the payload, and not hashed with it: the digest attests to the
+    // file, and the name is framing around it.
+    write_transfer_name(&mut input, staged).await?;
 
     let mut hasher = Sha256::new();
     let mut written = 0u64;
@@ -690,22 +780,20 @@ where
 
 async fn upload_local_stream<R>(
     media: ClipboardMedia,
+    staged: &StagedName,
     mut source: R,
     expected_bytes: u64,
 ) -> Result<UploadedFile>
 where
     R: AsyncRead + Unpin,
 {
-    let file = tempfile::Builder::new()
-        .prefix("super-herdr-clipboard-")
-        .suffix(&media.file_suffix()?)
-        .tempfile()
-        .context("failed to create a local media file")?;
-    let (_, path) = file
-        .keep()
-        .context("failed to retain the local media file")?;
+    let path = local_staging(staged)?;
     let mut hasher = Sha256::new();
     let mut written = 0u64;
+    // Recorded rather than returned, for the same reason the remote path does
+    // it: a file exists here by now, and leaving before removing it would be a
+    // refusal that left something behind.
+    let mut failure: Option<anyhow::Error> = None;
     {
         let mut sink = fs::File::create(&path).context("failed to open the local media file")?;
         let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
@@ -713,20 +801,34 @@ where
             let wanted = usize::try_from(expected_bytes - written)
                 .unwrap_or(STREAM_CHUNK_BYTES)
                 .min(STREAM_CHUNK_BYTES);
-            let read = source
-                .read(&mut buffer[..wanted])
-                .await
-                .context("failed to read the upload source")?;
-            if read == 0 {
-                break;
+            match source.read(&mut buffer[..wanted]).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    hasher.update(&buffer[..read]);
+                    if let Err(error) = sink.write_all(&buffer[..read]) {
+                        failure = Some(
+                            anyhow::Error::new(error).context("failed to write the local media"),
+                        );
+                        break;
+                    }
+                    written += read as u64;
+                }
+                Err(error) => {
+                    failure =
+                        Some(anyhow::Error::new(error).context("failed to read the upload source"));
+                    break;
+                }
             }
-            hasher.update(&buffer[..read]);
-            sink.write_all(&buffer[..read])
-                .context("failed to write the local media file")?;
-            written += read as u64;
         }
-        sink.flush()
-            .context("failed to flush the local media file")?;
+        if let Err(error) = sink.flush() {
+            failure.get_or_insert_with(|| {
+                anyhow::Error::new(error).context("failed to flush the local media file")
+            });
+        }
+    }
+    if let Some(error) = failure {
+        discard_local_upload(&path);
+        return Err(error);
     }
     let digest = hasher
         .finalize()
@@ -740,7 +842,7 @@ where
         digest: sha256_hex(&stored),
     };
     if let Err(error) = verify_transfer(&receipt, &digest, written, expected_bytes) {
-        let _ = fs::remove_file(&path);
+        discard_local_upload(&path);
         return Err(error);
     }
     Ok(UploadedFile {
@@ -1032,26 +1134,34 @@ struct RemoteUploadReceipt {
 /// The file name is the only part that is not a literal, and it comes from the
 /// media table with an alphanumeric-only extension, so the command carries no
 /// caller-supplied text.
-fn upload_script(media: ClipboardMedia) -> Result<String> {
-    // The remote login shell runs this, and zsh ties several lowercase names to
-    // its own variables — `path` is tied to PATH, so assigning it replaces the
-    // command search path with one file and everything after it fails to be
-    // found. That is the default shell on macOS, so the names here are chosen
-    // to collide with nothing.
-    Ok(format!(
-        r#"set -eu
+/// The staging script, which no longer knows what it is about to be called.
+///
+/// The name arrives as the first line of the same stream that carries the
+/// payload, so it is data to this script rather than part of it. That is what
+/// makes a caller-supplied name possible at all: nothing from the wire is ever
+/// parsed as shell. The separator check here is not redundant with the one the
+/// daemon performs — it is the half that holds if the daemon's ever widens.
+///
+/// The remote login shell runs this, and zsh ties several lowercase names to
+/// its own variables — `path` is tied to PATH, so assigning it replaces the
+/// command search path with one file and everything after it fails to be found.
+/// That is the default shell on macOS, so the names here are chosen to collide
+/// with nothing.
+const UPLOAD_SCRIPT: &str = r#"set -eu
 umask 077
-staging_base=${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}
+IFS= read -r transfer_name
+case "$transfer_name" in
+  ""|.|..) exit 1 ;;
+  */*) exit 1 ;;
+esac
+staging_base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
 staging_dir=$(mktemp -d "$staging_base/super-herdr-clipboard.XXXXXXXX")
-staged_file="$staging_dir/{name}"
+staged_file="$staging_dir/$transfer_name"
 cat > "$staged_file"
 staged_size=$(wc -c < "$staged_file" | tr -d '[:space:]')
-staged_digest=$(sha256sum "$staged_file" | awk '{{print $1}}')
+staged_digest=$(sha256sum "$staged_file" | awk '{print $1}')
 printf '%s\t%s\t%s\n' "$staged_file" "$staged_size" "$staged_digest"
-"#,
-        name = media.payload_name()?
-    ))
-}
+"#;
 
 async fn read_upload_receipt(output: tokio::process::ChildStdout) -> Result<RemoteUploadReceipt> {
     let mut receipt = Vec::new();
@@ -1069,10 +1179,10 @@ async fn read_upload_receipt(output: tokio::process::ChildStdout) -> Result<Remo
 async fn upload_remote_media(
     destination: &str,
     transport: &TransportConfig,
-    media: ClipboardMedia,
+    staged: &StagedName,
     bytes: &[u8],
 ) -> Result<RemoteUploadReceipt> {
-    let mut command = build_ssh_command(destination, transport, upload_script(media)?);
+    let mut command = build_ssh_command(destination, transport, UPLOAD_SCRIPT.to_owned());
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1088,6 +1198,7 @@ async fn upload_remote_media(
         .stdout
         .take()
         .context("SSH clipboard media upload did not expose stdout")?;
+    write_transfer_name(&mut input, staged).await?;
     input
         .write_all(bytes)
         .await
@@ -1106,6 +1217,35 @@ async fn upload_remote_media(
         bail!("SSH clipboard media upload failed (diagnostics redacted)");
     }
     receipt
+}
+
+/// Hand the staging script its name, ahead of the payload it belongs to.
+///
+/// The newline is the whole framing: the script reads one line and everything
+/// after it is the file. A name that could contain one would break that, which
+/// is among the reasons the character class is what it is.
+async fn write_transfer_name<W>(input: &mut W, staged: &StagedName) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    input
+        .write_all(format!("{}\n", staged.as_str()).as_bytes())
+        .await
+        .context("failed to send the transfer name")
+}
+
+/// Stage a local transfer the way the remote script does: a private directory,
+/// with the file inside it under its own name.
+///
+/// The shape is deliberately identical to the remote one, so a staged file has
+/// one set of rules, one cleanup, and one thing `removable_upload_directory`
+/// has to recognize — whichever side it is on.
+fn local_staging(staged: &StagedName) -> Result<PathBuf> {
+    let directory = tempfile::Builder::new()
+        .prefix("super-herdr-clipboard.")
+        .tempdir()
+        .context("failed to create a local staging directory")?;
+    Ok(directory.keep().join(staged.as_str()))
 }
 
 /// The directory a receipt's payload lives in, if it is one this bridge made.
@@ -1189,24 +1329,20 @@ fn parse_remote_upload_receipt(bytes: &[u8]) -> Result<RemoteUploadReceipt> {
 
 fn upload_local_media(
     media: ClipboardMedia,
+    staged: &StagedName,
     bytes: &[u8],
     expected_digest: &str,
 ) -> Result<UploadedFile> {
-    let mut file = tempfile::Builder::new()
-        .prefix("super-herdr-clipboard-")
-        .suffix(&media.file_suffix()?)
-        .tempfile()
-        .context("failed to create a local clipboard media file")?;
+    let path = local_staging(staged)?;
+    let mut file = fs::File::create(&path).context("failed to create a local clipboard media")?;
     file.write_all(bytes)
         .context("failed to write the local clipboard media")?;
     file.flush()
         .context("failed to flush the local clipboard media")?;
-    let (_, path) = file
-        .keep()
-        .context("failed to retain the local clipboard media")?;
+    drop(file);
     let verified = fs::read(&path).context("failed to verify the local clipboard media")?;
     if verified.len() != bytes.len() || sha256_hex(&verified) != expected_digest {
-        let _ = fs::remove_file(&path);
+        discard_local_upload(&path);
         bail!("local clipboard media verification failed");
     }
     Ok(UploadedFile {
@@ -1286,8 +1422,9 @@ mod tests {
 
     use super::{
         ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, OPAQUE, PDF, PNG,
-        RemoteUploadReceipt, SVG, TIFF, WEBP, media_for_mime, parse_remote_upload_receipt,
-        removable_upload_directory, sha256_hex, upload_stream, verify_transfer,
+        RemoteUploadReceipt, SVG, StagedName, TIFF, UPLOAD_SCRIPT, WEBP, discard_local_upload,
+        media_for_mime, parse_remote_upload_receipt, removable_upload_directory, sha256_hex,
+        upload_stream, verify_transfer,
     };
     use crate::config::{Target, TransportConfig};
 
@@ -1419,6 +1556,7 @@ mod tests {
             &local_target(),
             &TransportConfig::default(),
             OPAQUE,
+            None,
             payload.as_slice(),
             payload.len() as u64,
         )
@@ -1428,8 +1566,8 @@ mod tests {
         assert_eq!(stored, payload);
         assert_eq!(uploaded.bytes, payload.len());
         // An unrecognized type is written with no extension at all.
-        assert!(uploaded.path.ends_with("payload") || !uploaded.path.contains('.'));
-        let _ = std::fs::remove_file(&uploaded.path);
+        assert!(uploaded.path.ends_with("/payload"), "{}", uploaded.path);
+        discard_local_upload(std::path::Path::new(&uploaded.path));
     }
 
     #[tokio::test]
@@ -1439,6 +1577,7 @@ mod tests {
             &local_target(),
             &TransportConfig::default(),
             PNG,
+            None,
             payload.as_slice(),
             4096,
         )
@@ -1457,6 +1596,7 @@ mod tests {
             &local_target(),
             &TransportConfig::default(),
             OPAQUE,
+            None,
             payload.as_slice(),
             4096,
         )
@@ -1465,7 +1605,7 @@ mod tests {
         // Only the declared length reaches the host: a lying length must not
         // write unbounded data there.
         assert_eq!(uploaded.bytes, 4096);
-        let _ = std::fs::remove_file(&uploaded.path);
+        discard_local_upload(std::path::Path::new(&uploaded.path));
     }
 
     #[test]
@@ -1498,6 +1638,7 @@ mod tests {
         assert_eq!(media_for_mime("application/x-anything"), OPAQUE);
         assert_eq!(media_for_mime("").extension, None);
         assert_eq!(OPAQUE.payload_name().unwrap(), "payload");
+        #[cfg(target_os = "macos")]
         assert_eq!(OPAQUE.file_suffix().unwrap(), "");
         assert!(OPAQUE.validate(b"\x00\x01\x02").is_ok());
     }
@@ -1509,10 +1650,14 @@ mod tests {
         // version replaced the command search path with the staged file and
         // every command after it vanished — invisible to a unit test that only
         // ever tried one shell, and fatal on macOS, where zsh is the default.
+        // The name now arrives as the first line of the same stream as the
+        // payload, which asks something of every one of these shells: `read`
+        // must stop at the newline and leave the rest for `cat`. A shell that
+        // buffers ahead would eat the beginning of the file, so the digest
+        // below is what proves the framing rather than only the transfer.
         use std::io::Write as _;
         use std::process::{Command, Stdio};
 
-        let script = super::upload_script(PNG).unwrap();
         let payload = b"\x89PNG\r\n\x1a\nqualification";
         let mut tried = 0;
         for shell in ["sh", "bash", "zsh", "dash", "ksh"] {
@@ -1520,7 +1665,7 @@ mod tests {
             // skipped; the assertion at the end catches a host with none.
             let Ok(mut child) = Command::new(shell)
                 .arg("-c")
-                .arg(&script)
+                .arg(UPLOAD_SCRIPT)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -1529,7 +1674,10 @@ mod tests {
                 continue;
             };
             tried += 1;
-            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let mut input = child.stdin.take().unwrap();
+            input.write_all(b"qualification.png\n").unwrap();
+            input.write_all(payload).unwrap();
+            drop(input);
             let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
@@ -1537,6 +1685,11 @@ mod tests {
             );
             let receipt = parse_remote_upload_receipt(&output.stdout)
                 .unwrap_or_else(|error| panic!("{shell} produced no usable receipt: {error}"));
+            assert!(
+                receipt.path.ends_with("/qualification.png"),
+                "{shell} ignored the name it was given: {}",
+                receipt.path
+            );
             assert_eq!(
                 receipt.bytes,
                 payload.len(),
@@ -1550,6 +1703,130 @@ mod tests {
             let _ = std::fs::remove_dir_all(std::path::Path::new(&receipt.path).parent().unwrap());
         }
         assert!(tried > 0, "no shell was available to run the upload script");
+    }
+
+    #[test]
+    fn a_transfer_name_is_refused_rather_than_repaired() {
+        // What a caller may have. Dots, dashes and underscores are what real
+        // filenames are made of.
+        for name in [
+            "report.pdf",
+            "build-log.txt",
+            "core_dump",
+            "v1.2.3-rc4.tar.gz",
+            "a",
+        ] {
+            assert!(
+                StagedName::resolve(Some(name), OPAQUE).is_ok(),
+                "{name:?} should be allowed"
+            );
+        }
+
+        // What it may not, and why. Each of these is a path that would be
+        // pasted into a pane, so the bar is inert as text rather than merely
+        // inert as an argument.
+        for name in [
+            "../etc/passwd",  // leaves the staging directory
+            "sub/dir.txt",    // same, by a shorter route
+            "..",             // the directory itself
+            ".",              //
+            ".hidden",        // invisible to whoever goes looking for it
+            "-rf",            // an option to the next command that sees it
+            "a b.txt",        // two arguments once pasted
+            "$(whoami).txt",  // a command once pasted
+            "`id`.txt",       //
+            "a;rm -rf ~.txt", //
+            "quote\".txt",    //
+            "new\nline.txt",  // would break the framing outright
+            "naïve.txt",      // not refused for being foreign, but for being
+            "",               // outside a class narrow enough to reason about
+        ] {
+            assert!(
+                StagedName::resolve(Some(name), OPAQUE).is_err(),
+                "{name:?} should be refused"
+            );
+        }
+
+        // Longer than the ceiling, by one byte.
+        let long = "a".repeat(super::MAX_TRANSFER_NAME_BYTES + 1);
+        assert!(StagedName::resolve(Some(&long), OPAQUE).is_err());
+        let limit = "a".repeat(super::MAX_TRANSFER_NAME_BYTES);
+        assert!(StagedName::resolve(Some(&limit), OPAQUE).is_ok());
+
+        // No name is not a refusal: it is the clipboard's case, and the flavor
+        // names it.
+        assert_eq!(
+            StagedName::resolve(None, PNG).unwrap(),
+            StagedName("payload.png".to_owned())
+        );
+        assert_eq!(
+            StagedName::resolve(None, OPAQUE).unwrap(),
+            StagedName("payload".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_transfer_is_staged_under_the_name_it_was_given() {
+        let payload = vec![3u8; 4096];
+        let uploaded = upload_stream(
+            &local_target(),
+            &TransportConfig::default(),
+            OPAQUE,
+            Some("release-notes.md"),
+            payload.as_slice(),
+            payload.len() as u64,
+        )
+        .await
+        .unwrap();
+        assert!(
+            uploaded.path.ends_with("/release-notes.md"),
+            "{}",
+            uploaded.path
+        );
+        assert_eq!(std::fs::read(&uploaded.path).unwrap(), payload);
+        // The staging directory is the unit that goes, so a refused or
+        // finished transfer leaves no empty directory behind either.
+        discard_local_upload(std::path::Path::new(&uploaded.path));
+        assert!(!std::path::Path::new(&uploaded.path).exists());
+        assert!(
+            !std::path::Path::new(&uploaded.path)
+                .parent()
+                .unwrap()
+                .exists()
+        );
+    }
+
+    /// The script refuses a separator even though nothing should ever send it
+    /// one. Two independent checks is the point: this one holds if the
+    /// daemon's is ever widened, and it is the only one that runs on the host
+    /// where the file is actually written.
+    #[test]
+    fn the_upload_script_refuses_a_name_that_would_leave_its_directory() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        for name in ["../escape", "sub/dir", "..", ".", ""] {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(UPLOAD_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("sh is available");
+            let mut input = child.stdin.take().unwrap();
+            let _ = input.write_all(format!("{name}\npayload").as_bytes());
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !output.status.success(),
+                "the script accepted the name {name:?}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "the script staged something for the name {name:?}"
+            );
+        }
     }
 
     #[test]

@@ -80,6 +80,7 @@ struct SessionList {
 pub async fn expand_discovered_sessions(config: crate::config::Config) -> crate::config::Config {
     let transport = config.transport.clone();
     let notifications = config.notifications.clone();
+    let transfers = config.transfers.clone();
     let devices = config.devices.clone();
     let originals = config.targets;
     let mut tasks = tokio::task::JoinSet::new();
@@ -104,6 +105,7 @@ pub async fn expand_discovered_sessions(config: crate::config::Config) -> crate:
     crate::config::Config {
         transport,
         notifications,
+        transfers,
         targets: expanded,
         devices,
     }

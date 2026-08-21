@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         &target,
         &transport,
         PNG,
+        Some("qualification-streamed.png"),
         streamed.as_slice(),
         streamed.len() as u64,
     )
@@ -95,7 +96,7 @@ async fn main() -> Result<()> {
         &transport,
         "ls -d ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/super-herdr-clipboard.* 2>/dev/null | wc -l",
     )?;
-    let error = clipboard::upload_stream(&target, &transport, PNG, short.as_slice(), 8192)
+    let error = clipboard::upload_stream(&target, &transport, PNG, None, short.as_slice(), 8192)
         .await
         .expect_err("a short source must be refused");
     let after = remote(
@@ -146,6 +147,7 @@ async fn relay(
         super_herdr::config::Config {
             transport: transport.clone(),
             notifications: Default::default(),
+            transfers: Default::default(),
             targets: vec![Target {
                 name: "qualify".to_owned(),
                 ssh: Some(destination.to_owned()),
@@ -229,6 +231,9 @@ async fn relay(
             request: 1,
             pane: pane.clone(),
             mime: "image/png".to_owned(),
+            // A name the caller chose, so the qualification covers the path a
+            // file takes rather than only the one a screenshot takes.
+            name: Some("qualification-6mib.png".to_owned()),
             length: payload.len() as u64,
         })?)
         .await?;
@@ -283,6 +288,7 @@ async fn relay(
             request: 2,
             pane,
             mime: "image/png".to_owned(),
+            name: None,
             length: 4096,
         })?)
         .await?;

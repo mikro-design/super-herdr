@@ -157,15 +157,6 @@ enum Input {
     Reconfigured(Option<Config>),
 }
 
-/// The largest payload a client may offer for upload.
-///
-/// It matches the frontend's own clipboard ceiling, and is enforced here
-/// because the daemon is what writes to the target host. Since the transfer is
-/// relayed rather than held, this bounds what may be written onto a target's
-/// disk rather than what this process can hold, and raising it is a decision
-/// about the host rather than about memory here.
-pub const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
-
 /// How many chunks a relay holds between the connection carrying a transfer
 /// and the target taking it.
 ///
@@ -331,12 +322,13 @@ async fn relay(
     target: &Target,
     transport: &TransportConfig,
     media: clipboard::ClipboardMedia,
+    name: Option<&str>,
     chunks: mpsc::Receiver<RelayItem>,
     length: u64,
 ) -> Option<Result<(String, u64)>> {
     let mut source = RelayReader::new(chunks);
     let uploaded =
-        match clipboard::upload_stream(target, transport, media, &mut source, length).await {
+        match clipboard::upload_stream(target, transport, media, name, &mut source, length).await {
             Ok(uploaded) => uploaded,
             // The stream stopping short is how a withdrawal reaches the transfer,
             // so which of the two happened is only knowable from the reader.
@@ -1208,8 +1200,9 @@ impl Daemon {
                     request,
                     pane,
                     mime,
+                    name,
                     length,
-                } => self.begin_relay(client, request, pane, mime, length),
+                } => self.begin_relay(client, request, pane, mime, name, length),
                 // A chunk only arrives here when its connection has no queue to
                 // put it in, which means the transfer was refused or never
                 // began.
@@ -1439,25 +1432,27 @@ impl Daemon {
         request: u64,
         pane: PaneId,
         mime: String,
+        name: Option<String>,
         length: u64,
     ) {
         let Some(chunks) = self.offers.remove(&(client, request)) else {
             self.refuse(client, request, "no transfer is in progress".to_owned());
             return;
         };
-        if length > MAX_UPLOAD_BYTES {
+        let ceiling = self.active.transfers.max_bytes;
+        if length > ceiling {
             self.refuse(
                 client,
                 request,
-                format!("refusing a {length} byte upload; the limit is {MAX_UPLOAD_BYTES}"),
+                format!("refusing a {length} byte upload; the limit is {ceiling}"),
             );
             return;
         }
-        // The client names a type it saw on its own clipboard, and the
-        // extension that reaches a remote shell is resolved from that name
-        // here, never taken from the wire. A type with no entry is carried
-        // rather than refused: a file from a device has no clipboard flavor at
-        // all, and that is the same case rather than a second one.
+        // The client names a type it saw on its own clipboard, and where no
+        // name is given the extension is resolved from that type here rather
+        // than taken from the wire. A type with no entry is carried rather than
+        // refused: a file from a device has no clipboard flavor at all, and
+        // that is the same case rather than a second one.
         let media = clipboard::media_for_mime(&mime);
         let key = pane.target_session();
         let Some(target) = self.targets.get(&key).cloned() else {
@@ -1467,7 +1462,9 @@ impl Daemon {
         let transport = self.transport.clone();
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
-            if let Some(result) = relay(&target, &transport, media, chunks, length).await {
+            if let Some(result) =
+                relay(&target, &transport, media, name.as_deref(), chunks, length).await
+            {
                 let _ = inputs.send(Input::UploadFinished {
                     client,
                     request,
@@ -1796,7 +1793,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::task::JoinHandle;
 
-    use super::{DaemonOptions, MAX_UPLOAD_BYTES, invalidated_routes, serve, serve_until};
+    use super::{DaemonOptions, invalidated_routes, serve, serve_until};
     use crate::config::{Config, Target};
     use crate::model::PaneId;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, decode, encode};
@@ -1808,6 +1805,7 @@ mod tests {
         Config {
             transport: Default::default(),
             notifications: Default::default(),
+            transfers: Default::default(),
             targets: Vec::new(),
             devices: Vec::new(),
         }
@@ -2120,6 +2118,18 @@ mod tests {
         chunks: &[&[u8]],
         digest: Option<&str>,
     ) -> ServerMessage {
+        offer(connection, mime, None, declared, chunks, digest).await
+    }
+
+    /// The same, for a caller that has a name for what it is sending.
+    async fn offer(
+        connection: &mut Connection,
+        mime: &str,
+        name: Option<&str>,
+        declared: u64,
+        chunks: &[&[u8]],
+        digest: Option<&str>,
+    ) -> ServerMessage {
         // A lease dies with its route, and no route can open without a Herdr
         // server, so each attempt takes the lease again.
         let pane = leased_pane(connection).await;
@@ -2128,6 +2138,7 @@ mod tests {
                 request: 1,
                 pane,
                 mime: mime.to_owned(),
+                name: name.map(str::to_owned),
                 length: declared,
             })
             .await;
@@ -2148,6 +2159,12 @@ mod tests {
                 .await;
         }
         connection.transfer_result().await
+    }
+
+    /// What this daemon will refuse to exceed, straight from the configuration
+    /// rather than restated here.
+    fn ceiling() -> u64 {
+        crate::config::TransferConfig::default().max_bytes
     }
 
     /// A pane the daemon will accept a lease for without a Herdr server behind
@@ -2175,14 +2192,7 @@ mod tests {
         let mut connection = harness.connect().await;
         connection.hello().await;
         // Declared above the ceiling: refused before a byte moves.
-        let refusal = upload(
-            &mut connection,
-            "image/png",
-            MAX_UPLOAD_BYTES + 1,
-            &[],
-            None,
-        )
-        .await;
+        let refusal = upload(&mut connection, "image/png", ceiling() + 1, &[], None).await;
         assert!(
             matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("limit")),
             "{refusal:?}"
@@ -2257,6 +2267,7 @@ mod tests {
         let config = Config {
             transport: Default::default(),
             notifications: Default::default(),
+            transfers: Default::default(),
             targets: vec![Target {
                 name: "here".to_owned(),
                 // No ssh destination: the sink is this machine, which is what
@@ -2311,6 +2322,7 @@ mod tests {
                 request: 1,
                 pane,
                 mime: "image/png".to_owned(),
+                name: None,
                 length: payload.len() as u64,
             })
             .await;
@@ -2374,14 +2386,23 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
             return false;
         };
-        entries.flatten().any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("super-herdr-clipboard-")
-                && std::fs::read(entry.path())
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("super-herdr-clipboard.")
+            })
+            // A staged transfer is a private directory with the file inside it
+            // under its own name, so the payload is one level down.
+            .filter_map(|directory| std::fs::read_dir(directory.path()).ok())
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                std::fs::read(entry.path())
                     .is_ok_and(|bytes| bytes.windows(marker.len()).any(|window| window == marker))
-        })
+            })
     }
 
     async fn settles_on(condition: impl Fn() -> bool) -> bool {
@@ -2422,6 +2443,7 @@ mod tests {
                 // when the connection goes away.
                 length: payload.len() as u64 + 64,
                 mime: "image/png".to_owned(),
+                name: None,
             })
             .await;
         connection
@@ -2443,6 +2465,57 @@ mod tests {
             "an abandoned transfer left its bytes staged on the target"
         );
         harness.server.abort();
+    }
+
+    /// A caller's name reaches the host, and a bad one never leaves the daemon.
+    ///
+    /// The name is what makes this a file bridge rather than a clipboard
+    /// bridge, and it is the one part of a transfer that is judged before
+    /// anything is opened — so the refusal must arrive without a byte moving,
+    /// and the acceptance must show up in the path that comes back.
+    #[tokio::test]
+    async fn a_named_transfer_arrives_under_its_name() {
+        let harness = Harness::start_with(local_target_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+
+        let payload = marked_payload("named");
+        let carried = offer(
+            &mut connection,
+            "application/octet-stream",
+            Some("release-notes.md"),
+            payload.len() as u64,
+            &[payload.as_slice()],
+            Some(&super::sha256_hex(&payload)),
+        )
+        .await;
+        let ServerMessage::UploadComplete { path, .. } = &carried else {
+            panic!("a named transfer was refused: {carried:?}");
+        };
+        assert!(path.ends_with("/release-notes.md"), "{path}");
+        assert_eq!(std::fs::read(path).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(path).parent().unwrap());
+
+        // A name that would leave its directory is refused, and refused where
+        // refusing is free: nothing is staged for it anywhere.
+        let escaping = marked_payload("escaping");
+        let refusal = offer(
+            &mut connection,
+            "application/octet-stream",
+            Some("../escape.md"),
+            escaping.len() as u64,
+            &[escaping.as_slice()],
+            Some(&super::sha256_hex(&escaping)),
+        )
+        .await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("name")),
+            "{refusal:?}"
+        );
+        assert!(
+            !staged_anywhere(&escaping),
+            "a refused name still put bytes on the target"
+        );
     }
 
     /// A transfer that fails its trailer is unstaged, not merely reported.
@@ -2490,6 +2563,7 @@ mod tests {
                 request: 1,
                 pane,
                 mime: "image/png".to_owned(),
+                name: None,
                 length: 4,
             })
             .await;

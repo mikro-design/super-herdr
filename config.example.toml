@@ -20,6 +20,12 @@ status_changed = false
 minimum_interval_seconds = 5
 command_timeout_seconds = 5
 
+# What the daemon will move on someone's behalf. The ceiling bounds the target
+# host's disk rather than this process — a transfer is relayed as it arrives,
+# never held whole — and it is separate from the clipboard's own 32 MiB limit.
+[transfers]
+max_bytes = 1073741824
+
 [[targets]]
 name = "development"
 ssh = "development-host"

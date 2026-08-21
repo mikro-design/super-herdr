@@ -584,6 +584,7 @@ mod tests {
             Config {
                 transport: Default::default(),
                 notifications: Default::default(),
+                transfers: Default::default(),
                 targets: Vec::new(),
                 devices: Vec::new(),
             },

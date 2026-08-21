@@ -479,6 +479,7 @@ impl TargetForm {
         Config {
             transport: TransportConfig::default(),
             notifications: crate::config::NotificationsConfig::default(),
+            transfers: Default::default(),
             targets,
             devices: Vec::new(),
         }

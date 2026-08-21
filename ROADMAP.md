@@ -69,12 +69,15 @@ Work is ordered by dependency and product risk.
 2. Generalize the clipboard broker's verified upload into a file bridge —
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target
-   transfers. The client-to-target hop now streams: the daemon relays a transfer
-   as it arrives rather than holding it, with backpressure reaching the sending
-   client, the trailer checked against the bytes actually relayed, and a refused
-   or abandoned transfer unstaged on the host. What remains is the surface — a
-   caller-supplied name and a ceiling that is not the clipboard's — resumability
-   across a reconnect, and the two directions that are not client-to-target.
+   transfers. Client-to-target is done for content that fits one attempt: the
+   daemon relays a transfer as it arrives rather than holding it, with
+   backpressure reaching the sending client, the trailer checked against the
+   bytes actually relayed, and a refused or abandoned transfer unstaged on the
+   host. Content is arbitrary, the caller may name the file, and the ceiling is
+   `transfers.max_bytes` rather than the clipboard's. What remains is
+   resumability across a reconnect, and the two directions that are not
+   client-to-target — target-to-client, and target-to-target without the device
+   in the middle.
 3. Add read-only pane observation to the browser client. Navigation and the
    attention feed are served; rendering a terminal needs a VT implementation in
    the page, which means vendoring one — the first third-party code the client

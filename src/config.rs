@@ -15,11 +15,41 @@ pub struct Config {
     pub transport: TransportConfig,
     #[serde(default, skip_serializing_if = "NotificationsConfig::is_default")]
     pub notifications: NotificationsConfig,
+    #[serde(default, skip_serializing_if = "TransferConfig::is_default")]
+    pub transfers: TransferConfig,
     pub targets: Vec<Target>,
     /// Devices allowed to reach this daemon over a network. Empty means none,
     /// which is why a daemon with no paired device serves loopback only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<Device>,
+}
+
+/// What the daemon will move on someone's behalf.
+///
+/// The ceiling is a statement about the target's disk rather than about this
+/// process: a transfer is relayed as it arrives, so nothing here grows with the
+/// file. It is configurable because the right answer belongs to whoever owns
+/// the host being written to, and it is separate from the clipboard's own limit
+/// because a screenshot and a file are not the same question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferConfig {
+    #[serde(default = "default_max_transfer_bytes")]
+    pub max_bytes: u64,
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_max_transfer_bytes(),
+        }
+    }
+}
+
+impl TransferConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// One paired device.
@@ -180,6 +210,7 @@ impl Config {
             let config = Self {
                 transport: TransportConfig::default(),
                 notifications: NotificationsConfig::default(),
+                transfers: TransferConfig::default(),
                 targets: vec![target],
                 devices: Vec::new(),
             };
@@ -657,6 +688,13 @@ const fn default_command_timeout() -> u64 {
     20
 }
 
+/// One gibibyte. Large enough that a build artifact or a core dump is a
+/// transfer rather than a refusal, small enough that a mistyped length does not
+/// fill a host's disk before anyone notices.
+const fn default_max_transfer_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
 const fn default_notification_interval() -> u64 {
     5
 }
@@ -670,6 +708,37 @@ mod tests {
     use std::fs;
 
     use super::{Config, Device, Target};
+
+    #[test]
+    fn a_transfer_ceiling_is_configurable_and_has_a_default() {
+        // Absent is the common case, and it must not mean zero: a missing
+        // section that refused every transfer would be a silent outage.
+        let default = Config::parse(
+            r#"
+                [[targets]]
+                name = "local"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(default.transfers.max_bytes, 1024 * 1024 * 1024);
+
+        let configured = Config::parse(
+            r#"
+                [transfers]
+                max_bytes = 4096
+
+                [[targets]]
+                name = "local"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.transfers.max_bytes, 4096);
+
+        // The documented example is parsed rather than assumed to be current:
+        // a configuration file nobody reads back drifts from the code.
+        let example = Config::parse(&fs::read_to_string("config.example.toml").unwrap()).unwrap();
+        assert_eq!(example.transfers.max_bytes, 1024 * 1024 * 1024);
+    }
 
     #[test]
     fn parses_local_and_ssh_targets() {

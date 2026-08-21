@@ -507,6 +507,29 @@ ceiling, and a transfer is chunked and resumable so a large file survives a
 reconnect. Bytes stream through every hop rather than being buffered whole, so
 peak memory does not track file size at either end.
 
+A caller-supplied name was once ruled out here, and what changed is worth
+recording, because the objection was correct at the time. The name was
+interpolated into the staging script, where anything from the wire would have
+been text in a remote command guarded only by a sanitizer that has to stay
+right forever. It now arrives as the first line of the same stream that carries
+the payload: data to that script rather than part of it, so nothing from the
+wire is ever parsed as shell. The script refuses a separator itself, which is
+the half that still holds if the daemon's check is ever widened.
+
+The character class stays narrow regardless, for a reason that outlives the
+quoting. The staged path is pasted into a pane, so a name carrying a space, a
+quote, a semicolon or a `$` would be a command somebody's shell runs — inert as
+text is the requirement, not merely inert as an argument. Letters, digits, dots,
+dashes and underscores qualify, and nothing else does. A name that does not is
+refused rather than repaired, since a silently renamed file tells its sender it
+got what it asked for. Where no name is given the flavor supplies one, which is
+the clipboard's case: a screenshot has no name to keep.
+
+Both sides stage the same way — a private directory per transfer, with the file
+inside it under its own name. Local and remote then have one shape, one cleanup,
+and one rule about what may be removed, rather than a resemblance that has to be
+maintained.
+
 Verification is what makes the relay hop safe to not buffer, so the framing
 around it carries the weight. The digest is always computed at the source and
 never by the middle. It travels in the offer when the bytes are already in

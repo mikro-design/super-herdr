@@ -22,6 +22,9 @@ It never takes over, stops, starts, or restarts a Herdr session.
   selected remote pane.
 - Verified clipboard file upload to the selected host with path-only injection,
   for PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG.
+- Verified transfer of arbitrary content to a target through the daemon, relayed
+  as it arrives rather than held, under a name the caller chooses, bounded by
+  `transfers.max_bytes` and unstaged on the host if any check fails.
 - Event-driven updates when a documented Herdr socket is configured, with polling
   fallback.
 - Atomic persistence and restoration of the last explicitly selected qualified
@@ -82,7 +85,7 @@ client machine's clipboard.
   - macOS: `osascript` from the operating system.
   - Linux desktop: `notify-send` from the desktop notification tools.
 
-- `sha256sum` on an SSH target when using verified PNG upload.
+- `sha256sum` on an SSH target when transferring files or clipboard media to it.
 
 Build concurrency is capped at four jobs in `.cargo/config.toml` and in the
 provided Makefile targets.
@@ -338,6 +341,9 @@ status_changed = false
 minimum_interval_seconds = 5
 command_timeout_seconds = 5
 
+[transfers]
+max_bytes = 1073741824
+
 [[targets]]
 name = "development"
 ssh = "development-host"
@@ -370,6 +376,13 @@ Target fields:
 
 Each discovered session is supervised independently. A failed target does not
 freeze or tear down other targets.
+
+`transfers.max_bytes` is the largest transfer this daemon will accept, and it
+defaults to one gibibyte. It bounds the target host's disk rather than
+Super-Herdr's memory: a transfer is relayed onto the host as it arrives rather
+than held whole, so the ceiling is a statement about the machine being written
+to. It is separate from the frontend's own 32 MiB clipboard limit, because a
+screenshot and a file are not the same question.
 
 Notifications are disabled by default. When enabled, the event switches select
 which transitions may reach the desktop. `minimum_interval_seconds` bounds the

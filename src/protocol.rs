@@ -130,6 +130,16 @@ pub enum ClientMessage {
         request: u64,
         pane: PaneId,
         mime: String,
+        /// What to call the file on the target host, when the caller has a name
+        /// worth keeping.
+        ///
+        /// Absent is the clipboard's case: a screenshot has no name, and the
+        /// daemon writes it under one derived from its type. A name that is
+        /// present is checked before anything is opened and refused rather than
+        /// mangled, because a silently renamed file tells its sender it got
+        /// what it asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         length: u64,
     },
     #[serde(rename = "upload.chunk")]
@@ -392,6 +402,14 @@ mod tests {
             request: 4,
             pane: pane(),
             mime: "image/png".to_owned(),
+            name: None,
+            length: 2048,
+        });
+        round_trip_client(ClientMessage::BeginUpload {
+            request: 5,
+            pane: pane(),
+            mime: "application/octet-stream".to_owned(),
+            name: Some("build-log.txt".to_owned()),
             length: 2048,
         });
         round_trip_client(ClientMessage::UploadChunk {

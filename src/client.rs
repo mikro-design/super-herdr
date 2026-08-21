@@ -279,6 +279,22 @@ impl ClientCommands {
     /// in memory; a device file that is not would compute its digest while
     /// sending instead, which is why the trailer carries it either way.
     pub fn upload_media(&self, pane: PaneId, mime: String, bytes: &[u8]) -> u64 {
+        self.offer_upload(pane, mime, None, bytes)
+    }
+
+    /// Offer a file under a name, for a caller holding one that has a name
+    /// worth keeping.
+    ///
+    /// The name is what separates this from a clipboard payload: a screenshot
+    /// is bytes and a type, while a file is bytes and something a person will
+    /// look for afterwards. It is checked by the daemon before anything opens,
+    /// and refused rather than adjusted, so a caller learns its file would have
+    /// been called something else instead of discovering it later.
+    pub fn upload_file(&self, pane: PaneId, name: String, mime: String, bytes: &[u8]) -> u64 {
+        self.offer_upload(pane, mime, Some(name), bytes)
+    }
+
+    fn offer_upload(&self, pane: PaneId, mime: String, name: Option<String>, bytes: &[u8]) -> u64 {
         use sha2::{Digest, Sha256};
 
         let request = self.next_request();
@@ -286,6 +302,7 @@ impl ClientCommands {
             request,
             pane,
             mime,
+            name,
             length: bytes.len() as u64,
         });
         let mut hasher = Sha256::new();
@@ -362,6 +379,7 @@ mod tests {
         let config = Config {
             transport: Default::default(),
             notifications: Default::default(),
+            transfers: Default::default(),
             targets,
             devices: Vec::new(),
         };
