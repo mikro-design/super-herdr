@@ -72,6 +72,21 @@
   }
   #code { text-transform: uppercase; letter-spacing: .12em; font-family: ui-monospace, monospace; }
   #pair-error { color: var(--wait); min-height: 1.2em; }
+  /* The screen keeps a terminal's own dark ground in either colour scheme: a
+     program chose its colours against black, and re-grounding them on white
+     would misreport what the pane looks like. */
+  .screen {
+    position: relative; overflow-x: auto; background: #0b0d12; color: #d6dae4;
+    border: 1px solid var(--line); border-radius: .7rem; padding: .6rem .7rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    line-height: 1.25; white-space: pre; font-size: 13px;
+  }
+  .screen .line { min-height: 1.25em; }
+  .screen .cursor {
+    position: absolute; background: var(--accent); opacity: .6; pointer-events: none;
+  }
+  #viewing { font-family: ui-monospace, monospace; text-transform: none; letter-spacing: 0; }
+  #screen-note { align-self: center; }
 </style>
 
 <header>
@@ -99,6 +114,18 @@
   <h2>Recent</h2>
   <ul id="history"><li class="empty">no transitions yet</li></ul>
   <div class="actions"><button id="mark">Mark all read</button></div>
+
+  <h2>Panes</h2>
+  <ul id="panes"><li class="empty">no panes</li></ul>
+
+  <section id="viewer" hidden>
+    <h2><span id="viewing"></span></h2>
+    <div id="screen" class="screen"></div>
+    <div class="actions">
+      <button id="stop">Stop watching</button>
+      <span class="note" id="screen-note"></span>
+    </div>
+  </section>
 
   <h2>Federation</h2>
   <ul id="targets"><li class="empty">no targets</li></ul>
@@ -233,6 +260,213 @@ function renderTargets() {
   }
 }
 
+// The pane being watched, and the screen the daemon last described. Nothing is
+// derived locally: a diff that does not follow the update we hold is refused
+// rather than guessed at, because a grid painted from a missed update stays
+// wrong forever and says nothing about it.
+let watching = null;
+let screen = null;
+let cell = null;
+
+function sameId(left, right) {
+  return left && right
+    && left.target === right.target
+    && left.session === right.session
+    && left.resource === right.resource;
+}
+
+// This page's own default pair, kept in step with `.screen` in the stylesheet.
+// Inverse over defaults is resolved against these.
+const SCREEN_BG = '#0b0d12';
+const SCREEN_FG = '#d6dae4';
+
+// The sixteen the terminal names, as most terminals draw them.
+const BASE = [
+  '#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
+  '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#ffffff',
+];
+
+// Indexed colours arrive indexed rather than resolved, because the palette
+// belongs to whoever displays them. This is that decision, made here.
+function colour(value) {
+  if (!value || value.kind === 'default') return null;
+  if (value.kind === 'rgb') return `rgb(${value.red} ${value.green} ${value.blue})`;
+  const index = value.index;
+  if (index < 16) return BASE[index];
+  if (index < 232) {
+    const level = step => (step === 0 ? 0 : 55 + step * 40);
+    const offset = index - 16;
+    return `rgb(${level(Math.floor(offset / 36))} `
+      + `${level(Math.floor(offset / 6) % 6)} ${level(offset % 6)})`;
+  }
+  const grey = 8 + (index - 232) * 10;
+  return `rgb(${grey} ${grey} ${grey})`;
+}
+
+function runStyle(style) {
+  if (!style) return '';
+  const parts = [];
+  let fg = colour(style.foreground);
+  let bg = colour(style.background);
+  // Inverse that a colour swap could not express: both sides were the
+  // terminal's defaults, so the daemon sent the flag instead of two colours
+  // that would have cancelled out. Exchanging our own defaults needs no palette
+  // knowledge, which is exactly why it was left to us.
+  if (style.inverse) {
+    fg = bg || SCREEN_BG;
+    bg = SCREEN_FG;
+  }
+  if (fg) parts.push(`color:${fg}`);
+  if (bg) parts.push(`background:${bg}`);
+  if (style.bold) parts.push('font-weight:700');
+  if (style.dim) parts.push('opacity:.65');
+  if (style.italic) parts.push('font-style:italic');
+  if (style.underline) parts.push('text-decoration:underline');
+  return parts.join(';');
+}
+
+function measure() {
+  const host = el('screen');
+  const probe = document.createElement('span');
+  probe.textContent = 'M'.repeat(20);
+  probe.style.cssText = 'position:absolute;visibility:hidden';
+  host.append(probe);
+  const width = probe.getBoundingClientRect().width / 20;
+  probe.remove();
+  return { width, height: parseFloat(getComputedStyle(host).lineHeight) };
+}
+
+// Fit the pane's own width to the viewport rather than resizing the pane: this
+// is an observer, and a viewer that reshaped what it is watching would change
+// the thing for everyone else looking at it.
+function refit() {
+  const host = el('screen');
+  if (!screen || !host.clientWidth) return;
+  host.style.fontSize = '13px';
+  const reference = measure().width;
+  const room = host.clientWidth - 2 * 0.7 * parseFloat(getComputedStyle(document.body).fontSize);
+  const wanted = 13 * (room / screen.width) / reference;
+  host.style.fontSize = `${Math.max(7, Math.min(15, wanted))}px`;
+  cell = measure();
+}
+
+function paint() {
+  const host = el('screen');
+  host.innerHTML = '';
+  if (!screen) return;
+  for (const runs of screen.rows) {
+    const line = document.createElement('div');
+    line.className = 'line';
+    for (const run of runs) {
+      const span = document.createElement('span');
+      // textContent, never innerHTML: this is output from someone's terminal.
+      span.textContent = run.text;
+      const css = runStyle(run.style);
+      if (css) span.setAttribute('style', css);
+      line.append(span);
+    }
+    host.append(line);
+  }
+  if (!cell) cell = measure();
+  // Absent when the program asked for no cursor, and then none is drawn.
+  if (screen.cursor) {
+    const mark = document.createElement('div');
+    mark.className = 'cursor';
+    mark.style.width = `${cell.width}px`;
+    mark.style.height = `${cell.height}px`;
+    mark.style.left = `calc(.7rem + ${screen.cursor.column * cell.width}px)`;
+    mark.style.top = `calc(.6rem + ${screen.cursor.row * cell.height}px)`;
+    host.append(mark);
+  }
+}
+
+function observe(pane, label) {
+  if (watching && !sameId(pane, watching)) send({ type: 'pane.unsubscribe', pane: watching });
+  watching = pane;
+  screen = null;
+  cell = null;
+  el('viewer').hidden = false;
+  el('viewing').textContent = label || `${pane.target}/${pane.session}/${pane.resource}`;
+  el('screen-note').textContent = 'waiting for output…';
+  el('screen').innerHTML = '';
+  // `screen` rather than `frames`: this page has no emulator and wants none.
+  send({
+    type: 'pane.subscribe',
+    pane,
+    access: 'observe',
+    cols: 80,
+    rows: 24,
+    representation: 'screen',
+  });
+}
+
+function stopWatching(why) {
+  if (watching) send({ type: 'pane.unsubscribe', pane: watching });
+  watching = null;
+  screen = null;
+  el('viewer').hidden = true;
+  el('screen-note').textContent = text(why);
+  renderPanes();
+}
+
+// A gap in the sequence means an update was missed. Resubscribing is the
+// recovery, because it yields a whole screen.
+function resync() {
+  if (!watching) return;
+  const pane = watching;
+  el('screen-note').textContent = 'missed an update — resyncing';
+  send({ type: 'pane.unsubscribe', pane });
+  screen = null;
+  send({
+    type: 'pane.subscribe',
+    pane,
+    access: 'observe',
+    cols: 80,
+    rows: 24,
+    representation: 'screen',
+  });
+}
+
+function renderPanes() {
+  const list = el('panes');
+  const rows = [];
+  for (const runtime of targets.values()) {
+    const snapshot = runtime.snapshot;
+    if (!snapshot) continue;
+    for (const pane of snapshot.panes || []) {
+      rows.push({ pane, snapshot });
+    }
+  }
+  list.innerHTML = '';
+  if (!rows.length) {
+    list.innerHTML = '<li class="empty">no panes</li>';
+    return;
+  }
+  for (const row of rows) {
+    const id = row.pane.id;
+    const item = document.createElement('li');
+    item.className = 'tap';
+    item.innerHTML = `<div class="row">
+        <span class="name"></span>
+        <span class="badge"></span>
+        <span class="where"></span>
+      </div>`;
+    const label = row.pane.label || id.resource;
+    item.querySelector('.name').textContent = label;
+    const badge = item.querySelector('.badge');
+    if (row.pane.agent_status) {
+      badge.textContent = row.pane.agent_status;
+      badge.classList.add(phase(row.pane.agent_status));
+    } else {
+      badge.remove();
+    }
+    item.querySelector('.where').textContent = qualify(id);
+    if (sameId(id, watching)) item.classList.add('unread');
+    item.addEventListener('click', () => observe(id, `${qualify(id)}/${label}`));
+    list.append(item);
+  }
+}
+
 function apply(message) {
   switch (message.type) {
     case 'server.hello':
@@ -245,6 +479,7 @@ function apply(message) {
       }
       renderTargets();
       renderWaiting();
+      renderPanes();
       break;
     case 'state.target': {
       const key = `${message.target.target}/${message.target.session}`;
@@ -252,8 +487,37 @@ function apply(message) {
       else targets.delete(key);
       renderTargets();
       renderWaiting();
+      renderPanes();
       break;
     }
+    case 'pane.screen':
+      if (!sameId(message.pane, watching)) break;
+      screen = message.screen;
+      el('screen-note').textContent = '';
+      refit();
+      paint();
+      break;
+    case 'pane.screen_diff': {
+      if (!sameId(message.pane, watching)) break;
+      const diff = message.diff;
+      if (!screen || diff.follows !== screen.sequence) {
+        resync();
+        break;
+      }
+      for (const update of diff.rows) screen.rows[update.row] = update.runs;
+      screen.cursor = diff.cursor;
+      screen.sequence = diff.sequence;
+      paint();
+      break;
+    }
+    case 'pane.lease':
+      if (sameId(message.pane, watching) && message.access !== 'observe') {
+        el('screen-note').textContent = `holding ${message.access}`;
+      }
+      break;
+    case 'pane.closed':
+      if (sameId(message.pane, watching)) stopWatching('the pane closed');
+      break;
     case 'attention.history':
       history = message.events;
       renderHistory();
@@ -289,6 +553,14 @@ function connect() {
 }
 
 el('mark').onclick = () => send({ type: 'attention.mark_all_seen' });
+el('stop').onclick = () => stopWatching('');
+
+// A rotation or a resize changes how much of the pane fits, not the pane.
+window.addEventListener('resize', () => {
+  if (!screen) return;
+  refit();
+  paint();
+});
 
 // The version of the daemon, not of this page: the page ships inside that
 // binary, so a stale daemon is otherwise invisible from here.
