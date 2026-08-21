@@ -89,6 +89,22 @@ provided Makefile targets.
 
 ## Install
 
+Upgrade from 0.7.0 if you served the browser client through a reverse proxy.
+0.7.0 exempted loopback from pairing, on the reasoning that anyone who can reach
+loopback can already read the daemon's socket. A proxy that terminates TLS on a
+network and forwards to loopback — `tailscale serve` is one — breaks that
+reasoning without changing anything the daemon looked at: every visitor arrived
+from 127.0.0.1, so nobody was asked for a code. 0.7.1 reads the forwarding
+headers a relayed request carries, so the question the daemon answers is whether
+a request was made locally rather than whether it appears to come from nearby.
+
+If you ran 0.7.0's browser client that way, assume every device that could reach
+that proxy had the access a paired device has. `device remove` does not undo it:
+those visitors were never asked to pair and hold no token to revoke, which is
+also why devices that simply worked before will ask for a code after upgrading.
+A daemon reached over an SSH forward of its Unix socket, or bound to loopback
+with nothing in front of it, was never exposed.
+
 ### Package managers
 
 ```sh
@@ -97,7 +113,7 @@ brew install mikro-design/tap/super-herdr
 
 # Debian and Ubuntu. The version is part of the asset name, so there is no
 # stable "latest" URL; set these to a published release and your architecture.
-version=0.7.0
+version=0.7.1
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -121,7 +137,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.7.0
+tag=v0.7.1
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -175,8 +191,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.7.0`
-must be tagged `v0.7.0`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.7.1`
+must be tagged `v0.7.1`.
 
 ### macOS
 
