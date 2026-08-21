@@ -2250,7 +2250,7 @@ mod tests {
             panic!("an unknown type must not be refused for being unknown: {carried:?}");
         };
         assert_eq!(*bytes, 4);
-        let _ = std::fs::remove_file(path);
+        crate::clipboard::discard_local_upload(std::path::Path::new(path));
     }
 
     /// What the relay accumulates is what the sink writes.
@@ -2353,10 +2353,14 @@ mod tests {
             super::sha256_hex(&payload),
             "the bytes that reached the sink are not the bytes that were sent"
         );
-        // The file, not the directory holding it: a local sink stages into the
-        // system temporary directory itself, so removing the parent would mean
-        // removing everything else anyone has in there.
-        let _ = std::fs::remove_file(&path);
+        // One idiom for this, everywhere, because the shape of a staged
+        // transfer has already changed once today: it was a file in the system
+        // temporary directory this morning and is a private directory holding
+        // that file now. `remove_file` and `remove_dir_all(parent)` each read
+        // as correct under one of those and are wrong under the other, so
+        // neither is written here. The guard answers what may be removed, and
+        // it is the same guard the daemon itself uses.
+        crate::clipboard::discard_local_upload(std::path::Path::new(&path));
         server.abort();
     }
 
@@ -2494,7 +2498,7 @@ mod tests {
         };
         assert!(path.ends_with("/release-notes.md"), "{path}");
         assert_eq!(std::fs::read(path).unwrap(), payload);
-        let _ = std::fs::remove_dir_all(std::path::Path::new(path).parent().unwrap());
+        crate::clipboard::discard_local_upload(std::path::Path::new(path));
 
         // A name that would leave its directory is refused, and refused where
         // refusing is free: nothing is staged for it anywhere.

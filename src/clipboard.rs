@@ -661,7 +661,7 @@ pub async fn discard_upload(target: &Target, transport: &TransportConfig, path: 
 /// empty private directory per refused transfer. The same shape check the
 /// remote side applies is applied here, since a path this process assembled is
 /// no reason to skip the check that keeps `rm -rf` pointed at one place.
-fn discard_local_upload(path: &Path) {
+pub(crate) fn discard_local_upload(path: &Path) {
     let Some(directory) = path.to_str().and_then(removable_upload_directory) else {
         return;
     };
