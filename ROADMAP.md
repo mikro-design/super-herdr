@@ -66,7 +66,11 @@ Work is ordered by dependency and product risk.
    machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
    recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
    needing a pointer or a notification click, are still unrecorded.
-2. Generalize the clipboard broker's verified upload into a file bridge —
+2. Finish the file bridge — the three directions are carried, and what is left
+   is the surface around them: no client offers a file picker or a save
+   dialogue, so every direction is reachable through the protocol and none of
+   them through the TUI or the browser. Generalize the clipboard broker's
+   verified upload into a file bridge —
    arbitrary content, caller-supplied name, chunked and resumable, streamed at
    every hop — covering client-to-target, target-to-client, and target-to-target
    transfers. Client-to-target is done for content that fits one attempt: the
@@ -80,8 +84,10 @@ Work is ordered by dependency and product risk.
    Target-to-client is done too: a client names a file on the pane's host, the
    host describes it and sends it, credit in the protocol bounds what is in
    flight because the queue to a client cannot push back, and the client is the
-   one that verifies. What remains is target-to-target without the device in
-   the middle.
+   one that verifies. Target-to-target is the composition of the two, with the
+   daemon holding both connections so the bytes never reach the device, both
+   digests computed by the hosts and compared in the middle, and a control
+   lease required on each end.
 3. Add read-only pane observation to the browser client. Navigation and the
    attention feed are served; rendering a terminal needs a VT implementation in
    the page, which means vendoring one — the first third-party code the client

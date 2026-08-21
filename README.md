@@ -29,6 +29,9 @@ It never takes over, stops, starts, or restarts a Herdr session.
   credit the client grants so a slow reader bounds what is in flight rather than
   filling the daemon. The host computes the digest, the client checks it, and
   the daemon computes nothing.
+- Verified movement of a file from one target to another without it passing
+  through this machine, with a control lease required on both ends and each
+  host's own digest compared before the copy is kept.
 - Transfers that survive a lost connection: an interrupted one keeps what
   reached the host, a sender returns with the token it was issued, and the
   offset it continues from is the host's own count rather than anyone's

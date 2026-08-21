@@ -548,6 +548,90 @@ async fn download(
     Ok(())
 }
 
+/// Move a file from one target to another without it touching this device.
+///
+/// Both halves already existed and this is mostly their composition, which is
+/// the point: the host that has the file describes and sends it, the host
+/// receiving it stages and hashes what it stored, and the daemon holds both
+/// connections at once so the bytes never land anywhere in between. The reader
+/// is the source's SSH output and the writer is the destination's SSH input,
+/// so one chunk is in this process at a time and backpressure is end to end
+/// without anything having to arrange it.
+///
+/// Nothing is computed here either. Both digests are the hosts' own, and the
+/// daemon compares them — the only role the middle has ever had in this bridge.
+async fn between(
+    source: &Target,
+    destination: &Target,
+    transport: &TransportConfig,
+    path: &str,
+    name: Option<&str>,
+    ceiling: u64,
+) -> Result<(String, u64)> {
+    let mut reading = clipboard::open_source(source, transport, path).await?;
+    if reading.length > ceiling {
+        bail!(
+            "refusing a {} byte transfer; the limit is {ceiling}",
+            reading.length
+        );
+    }
+    // A file keeps its own name unless the caller has a better one. A source
+    // whose name this bridge will not write is refused rather than renamed
+    // behind the caller's back — naming it explicitly is the way through.
+    let staged = name.unwrap_or(&reading.name).to_owned();
+    let attested = reading.digest.clone();
+    let plan = clipboard::TransferPlan {
+        media: clipboard::OPAQUE,
+        staging: clipboard::Staging::Fresh {
+            name: Some(&staged),
+        },
+        length: reading.length,
+    };
+    let written = clipboard::upload_stream(destination, transport, plan, &mut reading).await?;
+    let stored = match written {
+        clipboard::Transferred::Complete(stored) => stored,
+        // Nothing is kept. Unlike a client's upload, the bytes still exist
+        // where they started: the source host has them, so a second attempt
+        // costs a re-read rather than a file nobody can reproduce. There is
+        // nothing here to come back for.
+        clipboard::Transferred::Interrupted { path, staged } => {
+            clipboard::discard_upload(destination, transport, &path).await;
+            bail!(
+                "transfer stopped after {staged} of {} bytes; the file is untouched on {}",
+                reading.length,
+                source.name
+            );
+        }
+    };
+    accept_copy(destination, transport, stored, &attested, &source.name).await
+}
+
+/// Keep a copy only if both hosts agree about what it is.
+///
+/// Separated from the move itself so it can be exercised: a mismatch cannot be
+/// produced on demand by a system that is working, and a check nothing can fail
+/// is a check nobody has tested. The comparison is between two digests neither
+/// of which this process computed — the source host's, and the destination
+/// host's over what it stored.
+async fn accept_copy(
+    destination: &Target,
+    transport: &TransportConfig,
+    stored: clipboard::UploadedFile,
+    attested: &str,
+    source_name: &str,
+) -> Result<(String, u64)> {
+    if stored.digest != attested {
+        // Nothing is left behind by a refusal here either, and the reason is
+        // the same: a staged file cannot be told apart from one that passed.
+        clipboard::discard_upload(destination, transport, &stored.path).await;
+        bail!(
+            "what {} stored is not what {source_name} sent",
+            destination.name
+        );
+    }
+    Ok((stored.path, stored.bytes as u64))
+}
+
 struct Route {
     child: Child,
     commands: Option<mpsc::UnboundedSender<Vec<u8>>>,
@@ -1462,6 +1546,10 @@ impl Daemon {
                 } => self.refuse(client, request, "no transfer is in progress".to_owned()),
                 Effect::CancelUpload { client, request } => {
                     self.offers.remove(&(client, request));
+                    // A transfer between hosts is cancelled the same way, since
+                    // from a client's side it is the same thing under the same
+                    // request: something it started and no longer wants.
+                    self.stop_download(client, request);
                 }
                 Effect::BeginDownload {
                     client,
@@ -1477,6 +1565,14 @@ impl Daemon {
                 Effect::CancelDownload { client, request } => {
                     self.stop_download(client, request);
                 }
+                Effect::TransferBetween {
+                    client,
+                    request,
+                    source,
+                    path,
+                    destination,
+                    name,
+                } => self.begin_between(client, request, source, path, destination, name),
                 Effect::MarkAttentionSeen { pane } => {
                     if self.attention.mark_seen_for_pane(&pane) {
                         pending.extend(self.attention_changed());
@@ -1943,6 +2039,65 @@ impl Daemon {
                     message: error.to_string(),
                 });
             }
+            let _ = inputs.send(Input::DownloadEnded { client, request });
+        });
+        self.downloads
+            .insert((client, request), Download { credit, task });
+    }
+
+    /// Start moving a file between two targets.
+    ///
+    /// The work runs off the loop because both hops are network operations, and
+    /// it is tracked so a client that goes away takes it with them: unlike a
+    /// client's upload there is nothing to retain, since the file is still on
+    /// the host it came from.
+    fn begin_between(
+        &mut self,
+        client: ClientId,
+        request: u64,
+        source: PaneId,
+        path: String,
+        destination: PaneId,
+        name: Option<String>,
+    ) {
+        if self.downloads.contains_key(&(client, request)) {
+            self.refuse(
+                client,
+                request,
+                "that request is already moving a file".to_owned(),
+            );
+            return;
+        }
+        let Some(from) = self.transfer_target(client, request, &source) else {
+            return;
+        };
+        let Some(to) = self.transfer_target(client, request, &destination) else {
+            return;
+        };
+        let Some(outbox) = self.outboxes.get(&client).cloned() else {
+            return;
+        };
+        let transport = self.transport.clone();
+        let ceiling = self.active.transfers.max_bytes;
+        let inputs = self.inputs.clone();
+        // The credit channel goes unused: nothing is being paced toward a
+        // client here, because nothing reaches one. Holding the handle is what
+        // lets a disconnect stop the work.
+        let (credit, _granted) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let message =
+                match between(&from, &to, &transport, &path, name.as_deref(), ceiling).await {
+                    Ok((path, bytes)) => ServerMessage::UploadComplete {
+                        request,
+                        path,
+                        bytes,
+                    },
+                    Err(error) => ServerMessage::Error {
+                        request: Some(request),
+                        message: error.to_string(),
+                    },
+                };
+            let _ = outbox.send(message);
             let _ = inputs.send(Input::DownloadEnded { client, request });
         });
         self.downloads
@@ -2447,6 +2602,22 @@ mod tests {
             }],
             ..empty_config()
         }
+    }
+
+    /// Two targets, both on this machine. A move between them is a real move
+    /// as far as the daemon is concerned: two configured targets, two panes,
+    /// two leases, and the same code path a pair of hosts would take.
+    fn two_local_targets_config() -> Config {
+        let mut config = local_target_config();
+        config.targets.push(Target {
+            name: "second".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+        });
+        config
     }
 
     impl Harness {
@@ -3564,6 +3735,164 @@ mod tests {
         assert!(
             connection.no_chunk_within(Duration::from_millis(300)).await,
             "a client's grant decided how much the daemon would hold"
+        );
+        harness.stop().await;
+    }
+
+    /// A file moves between hosts without the device in the middle.
+    ///
+    /// The direction that only the daemon can express, because only the daemon
+    /// holds live connections to both. What is asserted is what arrived: the
+    /// destination's copy is byte-for-byte the source's, and it was named
+    /// without anyone naming it.
+    #[tokio::test]
+    async fn a_file_moves_between_targets_without_passing_through_the_client() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let source = directory.path().join("artifact.tar");
+        // More than one stream chunk, so the copy loop runs more than once.
+        let contents: Vec<u8> = (0..300_000_u32).map(|index| (index / 7) as u8).collect();
+        std::fs::write(&source, &contents).unwrap();
+
+        let harness = Harness::start_with(two_local_targets_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        let from = leased_pane(&mut connection).await;
+        let to = PaneId::new("second", "default", "w1:p1");
+        connection
+            .send(ClientMessage::SubscribePane {
+                pane: to.clone(),
+                access: TerminalAccess::Control,
+                representation: PaneRepresentation::Frames,
+                cols: 80,
+                rows: 24,
+            })
+            .await;
+
+        connection
+            .send(ClientMessage::TransferBetween {
+                request: 1,
+                source: from,
+                path: source.display().to_string(),
+                destination: to,
+                name: None,
+            })
+            .await;
+
+        let result = connection.transfer_result().await;
+        let ServerMessage::UploadComplete { path, bytes, .. } = &result else {
+            panic!("a move between targets was refused: {result:?}");
+        };
+        assert_eq!(*bytes as usize, contents.len());
+        // Named after the file rather than after nothing, without the client
+        // having said what to call it.
+        assert!(path.ends_with("/artifact.tar"), "{path}");
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+        // And the source is where it always was.
+        assert_eq!(std::fs::read(&source).unwrap(), contents);
+        crate::clipboard::discard_local_upload(std::path::Path::new(path));
+        harness.stop().await;
+    }
+
+    /// A copy the two hosts disagree about is refused, and taken away with it.
+    ///
+    /// The check that cannot fire in a working system: both hosts hash the same
+    /// bytes, so a mismatch means something in between changed them, and no
+    /// test can arrange that through the daemon. So the comparison is exercised
+    /// where it lives instead, against a real staged file, which also asserts
+    /// the half that matters most — that a refusal does not leave one.
+    #[tokio::test]
+    async fn a_copy_the_two_hosts_disagree_about_is_refused_and_removed() {
+        let payload = b"bytes that arrived intact and are still not trusted".as_slice();
+        let staged = crate::clipboard::upload_media(
+            &Target {
+                name: "here".to_owned(),
+                ssh: None,
+                discover_sessions: false,
+                session: None,
+                socket: None,
+                herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            },
+            &Default::default(),
+            crate::clipboard::OPAQUE,
+            payload,
+        )
+        .await
+        .expect("a local sink stages the payload");
+        let path = staged.path.clone();
+        assert!(std::path::Path::new(&path).exists());
+
+        let destination = Target {
+            name: "second".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+        };
+        let error = super::accept_copy(
+            &destination,
+            &Default::default(),
+            staged,
+            // What the source said, which is not what the destination stored.
+            &"0".repeat(64),
+            "first",
+        )
+        .await
+        .expect_err("a disagreement must not be accepted")
+        .to_string();
+
+        assert!(
+            error.contains("second") && error.contains("first"),
+            "{error}"
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a refused copy was left on the destination"
+        );
+    }
+
+    /// A move needs the lease on both ends, not just the one it writes to.
+    #[tokio::test]
+    async fn a_move_answers_to_the_lease_on_each_host_it_touches() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let source = directory.path().join("artifact.tar");
+        std::fs::write(&source, b"contents").unwrap();
+
+        let harness = Harness::start_with(two_local_targets_config()).await;
+        let mut connection = harness.connect().await;
+        connection.hello().await;
+        // Only the destination is leased. Holding it is not permission to read
+        // somebody else's host.
+        let to = PaneId::new("second", "default", "w1:p1");
+        connection
+            .send(ClientMessage::SubscribePane {
+                pane: to.clone(),
+                access: TerminalAccess::Control,
+                representation: PaneRepresentation::Frames,
+                cols: 80,
+                rows: 24,
+            })
+            .await;
+        connection
+            .send(ClientMessage::TransferBetween {
+                request: 1,
+                source: PaneId::new("first", "default", "w1:p1"),
+                path: source.display().to_string(),
+                destination: to,
+                name: None,
+            })
+            .await;
+
+        // Read past the lease the subscribe granted; what is being asserted is
+        // the one it did not.
+        let refusal = connection.transfer_result().await;
+        assert!(
+            matches!(&refusal, ServerMessage::Error { message, .. } if message.contains("control lease")),
+            "{refusal:?}"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}.copy", source.display())).exists(),
+            "nothing should have been written"
         );
         harness.stop().await;
     }

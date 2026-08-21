@@ -407,6 +407,29 @@ impl ClientCommands {
         self.send(ClientMessage::CancelDownload { request });
     }
 
+    /// Move a file from one target to another without it touching this device.
+    ///
+    /// The daemon holds both connections, so the bytes never come here. What
+    /// comes back is the destination's staged path, once the destination's own
+    /// digest matches the source's.
+    pub fn transfer_between(
+        &self,
+        source: PaneId,
+        path: String,
+        destination: PaneId,
+        name: Option<String>,
+    ) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::TransferBetween {
+            request,
+            source,
+            path,
+            destination,
+            name,
+        });
+        request
+    }
+
     /// Ask for a pairing code to show a person.
     pub fn request_pairing_code(&self) -> u64 {
         let request = self.next_request();

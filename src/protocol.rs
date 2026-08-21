@@ -236,6 +236,26 @@ pub enum ClientMessage {
     PullDownload { request: u64, chunks: u32 },
     #[serde(rename = "download.cancel")]
     CancelDownload { request: u64 },
+    /// Move a file from one target to another without it touching this device.
+    ///
+    /// The direction the desktop-bound design could not express. Only the
+    /// daemon holds live connections to both hosts, so only the daemon can move
+    /// a build artifact from a build host to a development host without routing
+    /// it through whatever laptop happens to be asking.
+    ///
+    /// Both panes are named because both are checked: this reads from one host
+    /// and writes to another, so it answers to the control lease on each. The
+    /// name is what the file will be called at the destination, defaulting to
+    /// what it is called at the source.
+    #[serde(rename = "transfer.between")]
+    TransferBetween {
+        request: u64,
+        source: PaneId,
+        path: String,
+        destination: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// Attention state is durable and lives with the daemon, so marking events
     /// read is a request rather than a local edit.
     #[serde(rename = "attention.mark_seen")]
@@ -586,6 +606,13 @@ mod tests {
             chunks: 4,
         });
         round_trip_client(ClientMessage::CancelDownload { request: 6 });
+        round_trip_client(ClientMessage::TransferBetween {
+            request: 7,
+            source: pane(),
+            path: "/srv/artifacts/build.tar.gz".to_owned(),
+            destination: PaneId::new("second", "default", "w1:p1"),
+            name: None,
+        });
         round_trip_client(ClientMessage::MarkAttentionSeen { pane: pane() });
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);

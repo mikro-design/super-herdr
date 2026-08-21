@@ -132,6 +132,14 @@ pub enum Effect {
         client: ClientId,
         request: u64,
     },
+    TransferBetween {
+        client: ClientId,
+        request: u64,
+        source: PaneId,
+        path: String,
+        destination: PaneId,
+        name: Option<String>,
+    },
     MarkAttentionSeen {
         pane: PaneId,
     },
@@ -547,6 +555,30 @@ impl Broker {
             }
             ClientMessage::CancelDownload { request } => {
                 effects.push(Effect::CancelDownload { client, request });
+            }
+            ClientMessage::TransferBetween {
+                request,
+                source,
+                path,
+                destination,
+                name,
+            } => {
+                // Both, because this reads from one host and writes to the
+                // other. Holding the lease on the destination is not permission
+                // to read somebody else's host, and holding it on the source is
+                // not permission to write to theirs.
+                if self.holds_control(client, &source, &mut effects)
+                    && self.holds_control(client, &destination, &mut effects)
+                {
+                    effects.push(Effect::TransferBetween {
+                        client,
+                        request,
+                        source,
+                        path,
+                        destination,
+                        name,
+                    });
+                }
             }
             ClientMessage::MarkAttentionSeen { pane } => {
                 effects.push(Effect::MarkAttentionSeen { pane });

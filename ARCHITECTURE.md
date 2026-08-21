@@ -623,6 +623,23 @@ daemon holds live connections to both—the direction the current desktop-bound
 design cannot express, and the one that removes the laptop from the middle of a
 build-host-to-development-host copy.
 
+Target to target is the composition of the other two, and needed almost nothing
+of its own. The host with the file describes and sends it; the host receiving it
+stages and hashes what it stored; the daemon holds both connections at once, so
+the reader is one host's SSH output and the writer is the other's SSH input and
+a single chunk is in this process at a time. Backpressure is end to end without
+anything arranging it, and no credit is needed because nothing is queued for
+anybody. Both digests are the hosts' own and the daemon compares them, which is
+the only role the middle has ever had here.
+
+Two rules change because the situation does. An interruption is discarded rather
+than kept: the file still exists where it started, so a second attempt costs a
+re-read rather than something nobody can reproduce — the opposite of a client's
+upload, where the bytes lived on a device that may be gone. And a move answers
+to the control lease on both panes, because holding one on the destination is
+not permission to read somebody else's host, and holding one on the source is
+not permission to write to theirs.
+
 Reading a file back off a target inverts two things and keeps everything else.
 The client names the path, where an upload never does; that is not a widening of
 what it may reach, because a client holding the pane's control lease can already
