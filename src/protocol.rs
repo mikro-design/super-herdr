@@ -16,9 +16,15 @@
 //!   material, a Herdr socket path, a `herdr` binary candidate, or any other
 //!   credential or transport detail, so a paired device cannot reach a host
 //!   except through the daemon's own routing.
-//! * Terminal payloads stay opaque. Frames and input are base64 byte strings
-//!   passed through untouched, preserving the rule that encoded ANSI reaches a
-//!   renderer without a lossy intermediate screen model.
+//! * Terminal payloads stay opaque on the frame path. Frames and input are
+//!   base64 byte strings passed through untouched, so encoded ANSI reaches a
+//!   renderer without a *double* parse: nothing here decodes it and re-encodes
+//!   it on the way, which is what would hand a renderer something degraded.
+//!   A client that cannot carry an emulator may ask for a rendered screen
+//!   instead (`PaneRepresentation::Screen`). That is one parse moved to the end
+//!   that can afford it, not a lossy middle, and it reaches the same fidelity
+//!   ceiling a client-side `vt100` would. The frame path is unchanged by it and
+//!   remains the primary one.
 //!
 //! Unknown fields are ignored rather than rejected: a newer daemon must be able
 //! to add a field without breaking an older client that negotiated the same
@@ -34,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::attention::AttentionEvent;
 use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
+use crate::screen::{Diff as ScreenDiff, Snapshot};
 use crate::state::{FederationState, TargetRuntimeState};
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 
@@ -48,6 +55,24 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// a third. This leaves room for both while keeping a peer from forcing
 /// unbounded buffering by never sending a newline.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// What a pane subscriber is sent for each frame.
+///
+/// Two representations of the same terminal, chosen per subscription rather
+/// than per daemon, because the right answer differs by client in the same
+/// federation: the TUI owns a parser and wants the bytes, a browser cannot
+/// carry one and wants the result. The daemon parses only for panes somebody is
+/// actually watching this way, which is the cost the TUI already pays per
+/// visible pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneRepresentation {
+    /// Encoded terminal output, rendered by a client that owns an emulator.
+    #[default]
+    Frames,
+    /// A rendered screen, for a client that cannot.
+    Screen,
+}
 
 /// Sent by a client. Requests that report an outcome carry a `request`
 /// identifier the daemon echoes, so a client can correlate a result without
@@ -71,6 +96,10 @@ pub enum ClientMessage {
         access: TerminalAccess,
         cols: u16,
         rows: u16,
+        /// What this subscriber wants to receive. Absent means `frames`, so a
+        /// client written before this existed keeps the behaviour it had.
+        #[serde(default)]
+        representation: PaneRepresentation,
     },
     #[serde(rename = "pane.unsubscribe")]
     UnsubscribePane { pane: PaneId },
@@ -231,6 +260,20 @@ pub enum ServerMessage {
         #[serde(with = "base64_bytes")]
         bytes: Arc<[u8]>,
     },
+    /// A rendered screen, whole. Sent to a `screen` subscriber for its first
+    /// update, and again whenever a diff cannot express the change — a resize
+    /// makes every row describe different cells, and a full repaint restarts
+    /// the emulator, so in both cases a snapshot is the only honest answer.
+    #[serde(rename = "pane.screen")]
+    PaneScreen { pane: PaneId, screen: Snapshot },
+    /// The rows of a rendered screen that changed.
+    ///
+    /// `follows` names the update it applies to, so a client that missed one
+    /// refuses to paint instead of holding a grid that is wrong forever and
+    /// silent about it. The recovery is to resubscribe, which yields a fresh
+    /// `PaneScreen`.
+    #[serde(rename = "pane.screen_diff")]
+    PaneScreenDiff { pane: PaneId, diff: ScreenDiff },
     #[serde(rename = "pane.closed")]
     PaneClosed { pane: PaneId },
     /// The access a pane subscription actually holds. A control lease that is
@@ -373,7 +416,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ServerMessage, decode, encode,
+        ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, PaneRepresentation, ServerMessage,
+        decode, encode,
     };
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{PaneId, TargetSession, WorkspaceId};
@@ -415,6 +459,14 @@ mod tests {
             access: TerminalAccess::Control,
             cols: 120,
             rows: 40,
+            representation: PaneRepresentation::Frames,
+        });
+        round_trip_client(ClientMessage::SubscribePane {
+            pane: pane(),
+            access: TerminalAccess::Observe,
+            cols: 120,
+            rows: 40,
+            representation: PaneRepresentation::Screen,
         });
         round_trip_client(ClientMessage::UnsubscribePane { pane: pane() });
         round_trip_client(ClientMessage::TakePaneControl { pane: pane() });

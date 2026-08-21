@@ -25,7 +25,8 @@ use crate::daemon::server::DaemonHandle;
 use crate::model::PaneId;
 use crate::operation::Operation;
 use crate::protocol::{
-    ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ServerMessage, decode, encode,
+    ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, PaneRepresentation, ServerMessage, decode,
+    encode,
 };
 use crate::state::FederationState;
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
@@ -209,12 +210,30 @@ impl ClientCommands {
         self.send(ClientMessage::SubscribeState);
     }
 
+    /// Subscribe for encoded frames, which is what a client with its own
+    /// emulator wants and what every caller here wants today.
     pub fn subscribe_pane(&self, pane: PaneId, access: TerminalAccess, cols: u16, rows: u16) {
+        self.subscribe_pane_as(pane, access, cols, rows, PaneRepresentation::Frames);
+    }
+
+    /// Subscribe naming the representation. Separate from `subscribe_pane`
+    /// rather than a fifth argument on it: the emulator-owning case is the
+    /// common one, and making every caller restate it would obscure the rare
+    /// client that genuinely cannot parse.
+    pub fn subscribe_pane_as(
+        &self,
+        pane: PaneId,
+        access: TerminalAccess,
+        cols: u16,
+        rows: u16,
+        representation: PaneRepresentation,
+    ) {
         self.send(ClientMessage::SubscribePane {
             pane,
             access,
             cols,
             rows,
+            representation,
         });
     }
 
