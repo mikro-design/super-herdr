@@ -25,7 +25,8 @@ use std::sync::Arc;
 use crate::attention::AttentionEvent;
 use crate::model::PaneId;
 use crate::operation::Operation;
-use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
+use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
+use crate::screen::{Diff as ScreenDiff, Snapshot};
 use crate::state::{FederationState, TargetConnectionState};
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 
@@ -137,6 +138,11 @@ struct PaneSubscription {
     requested: TerminalAccess,
     cols: u16,
     rows: u16,
+    representation: PaneRepresentation,
+    /// The rendered update this client is known to hold, for `screen`
+    /// subscribers. `None` means it holds nothing yet and must be sent a whole
+    /// screen before a diff can mean anything to it.
+    holds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,13 +171,85 @@ impl Client {
     }
 }
 
+/// One pane's rendered screen, kept only while somebody is watching it that
+/// way.
+///
+/// The emulator lives here rather than on `Route` because it is a rendering
+/// concern, not a routing one: a route exists as soon as anyone subscribes,
+/// while a parser should exist only for the panes actually being rendered.
+struct ScreenState {
+    parser: vt100::Parser,
+    /// The last screen anyone was told about. A diff is computed against this,
+    /// and its sequence is the one a diff says it follows.
+    last: Snapshot,
+}
+
+/// What one frame did to a rendered screen.
+struct Rendered {
+    screen: Snapshot,
+    /// Absent when a diff cannot express the change, which a resize guarantees.
+    diff: Option<ScreenDiff>,
+    /// False when the frame left the visible screen exactly as it was. Frames
+    /// that change nothing visible are common — a program writing a control
+    /// sequence, or output scrolled off the visible region — and sending an
+    /// empty diff for each would be traffic with nothing in it.
+    changed: bool,
+}
+
 pub struct Broker {
     server_version: String,
     features: Vec<String>,
     clients: BTreeMap<ClientId, Client>,
     routes: BTreeMap<PaneId, Route>,
+    screens: BTreeMap<PaneId, ScreenState>,
     state: FederationState,
     next_client: u64,
+}
+
+impl ScreenState {
+    fn new(width: u16, height: u16) -> Self {
+        // No scrollback: this renders the visible screen, and scrolling is
+        // routed through Herdr so the server owns the history a viewer sees.
+        let parser = vt100::Parser::new(height, width, 0);
+        let last = Snapshot::of(parser.screen(), 0);
+        Self { parser, last }
+    }
+
+    /// Feed one frame in and say what changed.
+    fn advance(&mut self, width: u16, height: u16, full: bool, bytes: &[u8]) -> Rendered {
+        let (rows, cols) = self.parser.screen().size();
+        // A full repaint restarts the program's idea of the screen, and a
+        // resize makes every cell describe something else. Both rebuild the
+        // emulator rather than feed it, which is the rule the TUI already
+        // follows for exactly the same reason.
+        if full || rows != height || cols != width {
+            self.parser = vt100::Parser::new(height, width, 0);
+        }
+        self.parser.process(bytes);
+
+        let candidate = Snapshot::of(self.parser.screen(), self.last.sequence + 1);
+        let unchanged = candidate.width == self.last.width
+            && candidate.height == self.last.height
+            && candidate.rows == self.last.rows
+            && candidate.cursor == self.last.cursor;
+        if unchanged {
+            // The sequence deliberately does not advance: a client that missed
+            // nothing should not be told it is behind.
+            return Rendered {
+                screen: self.last.clone(),
+                diff: None,
+                changed: false,
+            };
+        }
+
+        let diff = ScreenDiff::between(&self.last, &candidate);
+        self.last = candidate.clone();
+        Rendered {
+            screen: candidate,
+            diff,
+            changed: true,
+        }
+    }
 }
 
 impl Broker {
@@ -181,6 +259,7 @@ impl Broker {
             features,
             clients: BTreeMap::new(),
             routes: BTreeMap::new(),
+            screens: BTreeMap::new(),
             state: FederationState::default(),
             next_client: 0,
         }
@@ -289,7 +368,16 @@ impl Broker {
                 access,
                 cols,
                 rows,
-            } => self.subscribe_pane(client, pane, access, cols, rows, &mut effects),
+                representation,
+            } => self.subscribe_pane(
+                client,
+                pane,
+                access,
+                cols,
+                rows,
+                representation,
+                &mut effects,
+            ),
             ClientMessage::UnsubscribePane { pane } => {
                 if let Some(session) = self.clients.get_mut(&client)
                     && session.panes.remove(&pane).is_some()
@@ -474,11 +562,19 @@ impl Broker {
         let Some(route) = self.routes.get(pane) else {
             return Vec::new();
         };
-        route
-            .subscribers
-            .iter()
+
+        // One frame, two audiences. The choice is per subscriber rather than
+        // per daemon, so a TUI and a browser can watch the same pane at once
+        // and each gets the representation it can actually render.
+        let (screen_subscribers, frame_subscribers): (Vec<_>, Vec<_>) =
+            route.subscribers.iter().copied().partition(|client| {
+                self.representation_of(*client, pane) == PaneRepresentation::Screen
+            });
+
+        let mut effects: Vec<Effect> = frame_subscribers
+            .into_iter()
             .map(|client| Effect::Send {
-                client: *client,
+                client,
                 message: ServerMessage::PaneFrame {
                     pane: pane.clone(),
                     sequence,
@@ -490,7 +586,96 @@ impl Broker {
                     bytes: Arc::clone(&bytes),
                 },
             })
-            .collect()
+            .collect();
+
+        if screen_subscribers.is_empty() {
+            // Nobody is watching this pane as a screen, so nothing parses it.
+            // The parser is dropped rather than kept warm: a federation holds
+            // far more panes than anyone observes, and the cost should follow
+            // the watching.
+            self.screens.remove(pane);
+            return effects;
+        }
+
+        effects.extend(self.render_for(pane, width, height, full, &bytes, &screen_subscribers));
+        effects
+    }
+
+    fn representation_of(&self, client: ClientId, pane: &PaneId) -> PaneRepresentation {
+        self.clients
+            .get(&client)
+            .and_then(|session| session.panes.get(pane))
+            .map_or(PaneRepresentation::default(), |subscription| {
+                subscription.representation
+            })
+    }
+
+    /// Parse this frame into a screen and tell each screen subscriber what it
+    /// needs.
+    ///
+    /// A client that holds the update a diff follows gets the diff; anything
+    /// else gets a whole screen. "Anything else" is deliberately broad — a new
+    /// subscriber, a client that fell behind, a resize — because sending a diff
+    /// that cannot be applied is worse than sending more bytes than strictly
+    /// needed.
+    fn render_for(
+        &mut self,
+        pane: &PaneId,
+        width: u16,
+        height: u16,
+        full: bool,
+        bytes: &[u8],
+        subscribers: &[ClientId],
+    ) -> Vec<Effect> {
+        let rendered = self
+            .screens
+            .entry(pane.clone())
+            .or_insert_with(|| ScreenState::new(width, height))
+            .advance(width, height, full, bytes);
+
+        let mut effects = Vec::new();
+        for &client in subscribers {
+            let Some(subscription) = self
+                .clients
+                .get_mut(&client)
+                .and_then(|session| session.panes.get_mut(pane))
+            else {
+                continue;
+            };
+
+            // Up to date and nothing moved: say nothing rather than send an
+            // empty diff.
+            if !rendered.changed && subscription.holds == Some(rendered.screen.sequence) {
+                continue;
+            }
+
+            let message = match (&rendered.diff, subscription.holds) {
+                (Some(diff), Some(held)) if held == diff.follows => ServerMessage::PaneScreenDiff {
+                    pane: pane.clone(),
+                    diff: diff.clone(),
+                },
+                _ => ServerMessage::PaneScreen {
+                    pane: pane.clone(),
+                    screen: rendered.screen.clone(),
+                },
+            };
+            subscription.holds = Some(rendered.screen.sequence);
+            effects.push(Effect::Send { client, message });
+        }
+        effects
+    }
+
+    /// Drop the emulator for a pane nobody is watching as a screen any more.
+    fn release_screen_if_unwatched(&mut self, pane: &PaneId) {
+        let watched = self.routes.get(pane).is_some_and(|route| {
+            route
+                .subscribers
+                .iter()
+                .any(|client| self.representation_of(*client, pane) == PaneRepresentation::Screen)
+        });
+        if !watched {
+            self.screens.remove(pane);
+        }
     }
 
     /// The route's own stream ended. Subscribers keep their subscription
@@ -500,6 +685,7 @@ impl Broker {
         let Some(route) = self.routes.remove(pane) else {
             return Vec::new();
         };
+        self.screens.remove(pane);
         let mut effects = Vec::new();
         for client in route.subscribers {
             if let Some(session) = self.clients.get_mut(&client) {
@@ -589,6 +775,7 @@ impl Broker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn subscribe_pane(
         &mut self,
         client: ClientId,
@@ -596,6 +783,7 @@ impl Broker {
         access: TerminalAccess,
         cols: u16,
         rows: u16,
+        representation: PaneRepresentation,
         effects: &mut Vec<Effect>,
     ) {
         let Some(session) = self.clients.get_mut(&client) else {
@@ -607,6 +795,8 @@ impl Broker {
                 requested: access,
                 cols,
                 rows,
+                representation,
+                holds: None,
             },
         );
 
@@ -644,6 +834,27 @@ impl Broker {
                 access
             }
         };
+
+        // A screen subscriber that arrives mid-stream would otherwise see
+        // nothing until the pane next produced output, which for an idle pane
+        // is indistinguishable from a broken viewer.
+        if representation == PaneRepresentation::Screen
+            && let Some(state) = self.screens.get(&pane)
+        {
+            let screen = state.last.clone();
+            if let Some(session) = self.clients.get_mut(&client)
+                && let Some(subscription) = session.panes.get_mut(&pane)
+            {
+                subscription.holds = Some(screen.sequence);
+            }
+            effects.push(Effect::Send {
+                client,
+                message: ServerMessage::PaneScreen {
+                    pane: pane.clone(),
+                    screen,
+                },
+            });
+        }
 
         effects.push(Effect::Send {
             client,
@@ -752,14 +963,23 @@ impl Broker {
             return;
         };
         route.subscribers.remove(&client);
-        if route.subscribers.is_empty() {
+        let emptied = route.subscribers.is_empty();
+        let held_control = route.control == Some(client);
+        if emptied {
             self.routes.remove(pane);
+            self.screens.remove(pane);
             effects.push(Effect::CloseRoute { pane: pane.clone() });
             return;
         }
-        if route.control != Some(client) {
+        // The one leaving may have been the last watching this pane as a
+        // screen, and the emulator should go with them.
+        self.release_screen_if_unwatched(pane);
+        if !held_control {
             return;
         }
+        let Some(route) = self.routes.get_mut(pane) else {
+            return;
+        };
 
         // The control holder left. The lease is not handed to an observer that
         // never asked for it; the route drops back to observation and the
@@ -831,7 +1051,8 @@ mod tests {
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{PaneId, TargetSession};
     use crate::operation::Operation;
-    use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
+    use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
+    use crate::screen::Snapshot;
     use crate::state::{
         FederationState, NormalizedSnapshot, PaneState, TargetConnectionState, TargetRuntimeState,
         TargetUpdateMode,
@@ -916,6 +1137,21 @@ mod tests {
         }
     }
 
+    fn frame(broker: &mut Broker, resource: &str, bytes: &[u8]) -> Vec<Effect> {
+        broker.pane_frame(&pane(resource), 1, 80, 24, false, Arc::from(bytes.to_vec()))
+    }
+
+    fn rendered_row(broker: &Broker, resource: &str, row: usize) -> String {
+        row_text(&broker.screens[&pane(resource)].last, row)
+    }
+
+    fn row_text(screen: &Snapshot, row: usize) -> String {
+        screen.rows[row]
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect()
+    }
+
     fn messages_for(effects: &[Effect], client: ClientId) -> Vec<ServerMessage> {
         effects
             .iter()
@@ -937,6 +1173,27 @@ mod tests {
         cols: u16,
         rows: u16,
     ) -> Vec<Effect> {
+        subscribe_as(
+            broker,
+            client,
+            resource,
+            access,
+            cols,
+            rows,
+            PaneRepresentation::Frames,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn subscribe_as(
+        broker: &mut Broker,
+        client: ClientId,
+        resource: &str,
+        access: TerminalAccess,
+        cols: u16,
+        rows: u16,
+        representation: PaneRepresentation,
+    ) -> Vec<Effect> {
         broker.handle(
             client,
             ClientMessage::SubscribePane {
@@ -944,6 +1201,7 @@ mod tests {
                 access,
                 cols,
                 rows,
+                representation,
             },
         )
     }
@@ -1547,6 +1805,272 @@ mod tests {
 
         assert_eq!(messages_for(&effects, watching).len(), 1);
         assert!(messages_for(&effects, elsewhere).is_empty());
+    }
+
+    /// The whole point of the second representation: one pane, two clients,
+    /// each rendering what it is able to.
+    #[test]
+    fn one_frame_serves_an_emulator_client_and_a_screen_client_at_once() {
+        let mut broker = broker();
+        let tui = greet(&mut broker);
+        let browser = greet(&mut broker);
+        subscribe(&mut broker, tui, "w1:p1", TerminalAccess::Observe, 80, 24);
+        subscribe_as(
+            &mut broker,
+            browser,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        let effects = frame(&mut broker, "w1:p1", b"hello");
+
+        assert!(
+            matches!(
+                messages_for(&effects, tui).as_slice(),
+                [ServerMessage::PaneFrame { .. }]
+            ),
+            "the emulator client still receives untouched bytes"
+        );
+        let browser_messages = messages_for(&effects, browser);
+        let [ServerMessage::PaneScreen { screen, .. }] = browser_messages.as_slice() else {
+            panic!("expected one rendered screen, got {browser_messages:?}");
+        };
+        assert_eq!(row_text(screen, 0), "hello");
+    }
+
+    #[test]
+    fn a_screen_subscriber_is_sent_a_whole_screen_before_any_diff() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        let effects = frame(&mut broker, "w1:p1", b"hello");
+
+        assert!(
+            matches!(
+                messages_for(&effects, viewer).as_slice(),
+                [ServerMessage::PaneScreen { .. }]
+            ),
+            "a client holding nothing cannot apply a diff"
+        );
+    }
+
+    #[test]
+    fn a_later_frame_reaches_a_screen_subscriber_as_a_diff_naming_what_it_follows() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        let first = frame(&mut broker, "w1:p1", b"hello");
+        let held = match messages_for(&first, viewer).as_slice() {
+            [ServerMessage::PaneScreen { screen, .. }] => screen.sequence,
+            other => panic!("expected a whole screen, got {other:?}"),
+        };
+
+        let second = frame(&mut broker, "w1:p1", b"\r\nworld");
+        let messages = messages_for(&second, viewer);
+        let [ServerMessage::PaneScreenDiff { diff, .. }] = messages.as_slice() else {
+            panic!("expected a diff once the client holds a screen, got {messages:?}");
+        };
+        assert_eq!(
+            diff.follows, held,
+            "a diff must name the update it applies to"
+        );
+        assert!(
+            diff.rows.iter().any(|update| update.row == 1),
+            "the second line changed and the diff should say so: {:?}",
+            diff.rows
+        );
+    }
+
+    /// A terminal emits plenty that leaves the visible screen exactly as it
+    /// was. Sending an empty diff for each would be traffic carrying nothing.
+    #[test]
+    fn a_frame_that_changes_nothing_visible_is_not_sent_as_a_screen() {
+        let mut broker = broker();
+        let tui = greet(&mut broker);
+        let browser = greet(&mut broker);
+        subscribe(&mut broker, tui, "w1:p1", TerminalAccess::Observe, 80, 24);
+        subscribe_as(
+            &mut broker,
+            browser,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"hello");
+
+        // Setting attributes paints no cell and moves no cursor.
+        let effects = frame(&mut broker, "w1:p1", b"\x1b[0m");
+
+        assert!(
+            messages_for(&effects, browser).is_empty(),
+            "nothing visible changed, so the screen client hears nothing"
+        );
+        assert_eq!(
+            messages_for(&effects, tui).len(),
+            1,
+            "the frame itself is still delivered untouched to an emulator client"
+        );
+    }
+
+    #[test]
+    fn a_resize_sends_a_whole_screen_because_a_diff_cannot_express_it() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"hello");
+
+        let effects =
+            broker.pane_frame(&pane("w1:p1"), 9, 100, 30, false, Arc::from(b"!".to_vec()));
+
+        let messages = messages_for(&effects, viewer);
+        let [ServerMessage::PaneScreen { screen, .. }] = messages.as_slice() else {
+            panic!("a resized screen cannot arrive as a diff, got {messages:?}");
+        };
+        assert_eq!((screen.width, screen.height), (100, 30));
+    }
+
+    /// A full repaint restarts the program's idea of the screen, so the
+    /// emulator is rebuilt rather than fed. The two payloads differ in length
+    /// deliberately: an emulator that was appended to would leave the tail of
+    /// the old line visible past the end of the new one.
+    #[test]
+    fn a_full_frame_restarts_the_emulator_rather_than_writing_over_it() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"a long stale line");
+
+        let effects =
+            broker.pane_frame(&pane("w1:p1"), 9, 80, 24, true, Arc::from(b"new".to_vec()));
+
+        assert_eq!(
+            rendered_row(&broker, "w1:p1", 0),
+            "new",
+            "a full repaint must not leave the previous line's tail behind"
+        );
+        assert!(
+            !messages_for(&effects, viewer).is_empty(),
+            "the viewer is told about the repaint"
+        );
+    }
+
+    #[test]
+    fn nothing_is_parsed_for_a_pane_watched_only_as_frames() {
+        let mut broker = broker();
+        let tui = greet(&mut broker);
+        subscribe(&mut broker, tui, "w1:p1", TerminalAccess::Observe, 80, 24);
+
+        frame(&mut broker, "w1:p1", b"hello");
+
+        assert!(
+            broker.screens.is_empty(),
+            "a pane nobody renders should cost no emulator"
+        );
+    }
+
+    #[test]
+    fn the_emulator_is_dropped_when_the_last_screen_subscriber_leaves() {
+        let mut broker = broker();
+        let tui = greet(&mut broker);
+        let browser = greet(&mut broker);
+        subscribe(&mut broker, tui, "w1:p1", TerminalAccess::Observe, 80, 24);
+        subscribe_as(
+            &mut broker,
+            browser,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"hello");
+        assert!(broker.screens.contains_key(&pane("w1:p1")));
+
+        broker.handle(
+            browser,
+            ClientMessage::UnsubscribePane {
+                pane: pane("w1:p1"),
+            },
+        );
+
+        assert!(
+            broker.screens.is_empty(),
+            "the route outlives the viewer, but the emulator should not"
+        );
+    }
+
+    /// An idle pane produces no output, so a viewer that had to wait for the
+    /// next frame would be indistinguishable from a broken one.
+    #[test]
+    fn a_screen_subscriber_arriving_mid_stream_is_sent_the_screen_as_it_stands() {
+        let mut broker = broker();
+        let first = greet(&mut broker);
+        let second = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            first,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"already here");
+
+        let effects = subscribe_as(
+            &mut broker,
+            second,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        let messages = messages_for(&effects, second);
+        let Some(ServerMessage::PaneScreen { screen, .. }) = messages.first() else {
+            panic!("expected the current screen on subscribing, got {messages:?}");
+        };
+        assert_eq!(row_text(screen, 0), "already here");
     }
 
     #[test]

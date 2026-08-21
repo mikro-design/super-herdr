@@ -2214,7 +2214,9 @@ mod tests {
     use super::{DaemonOptions, MAX_RETAINED_TRANSFERS, invalidated_routes, serve, serve_until};
     use crate::config::{Config, Target};
     use crate::model::PaneId;
-    use crate::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, decode, encode};
+    use crate::protocol::{
+        ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage, decode, encode,
+    };
     use crate::terminal::TerminalAccess;
 
     /// A federation with no targets exercises the whole I/O path without
@@ -2636,6 +2638,7 @@ mod tests {
                 access: TerminalAccess::Control,
                 cols: 80,
                 rows: 24,
+                representation: PaneRepresentation::Frames,
             })
             .await;
         pane
@@ -2773,6 +2776,7 @@ mod tests {
                 access: TerminalAccess::Control,
                 cols: 80,
                 rows: 24,
+                representation: PaneRepresentation::Frames,
             })
             .await;
         connection

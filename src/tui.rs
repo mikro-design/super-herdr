@@ -4277,6 +4277,10 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                 };
             }
         }
+        // The TUI owns a `vt100` parser and subscribes for frames, so the daemon
+        // never renders on its behalf. Ignored rather than logged: arriving here
+        // would mean this client asked for screens, and it has no code that does.
+        ServerMessage::PaneScreen { .. } | ServerMessage::PaneScreenDiff { .. } => {}
         ServerMessage::PaneClosed { pane } => {
             app.routes.remove(&pane);
             // Wait before asking again, so a pane that cannot be opened does not

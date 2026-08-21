@@ -274,6 +274,9 @@ async fn relay(
             access: super_herdr::terminal::TerminalAccess::Control,
             cols: 80,
             rows: 24,
+            // This harness drives an upload, not a viewer; it wants the lease,
+            // not a rendered screen.
+            representation: super_herdr::protocol::PaneRepresentation::Frames,
         })?)
         .await?;
 
