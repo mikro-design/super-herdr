@@ -73,11 +73,12 @@ Work is ordered by dependency and product risk.
    daemon relays a transfer as it arrives rather than holding it, with
    backpressure reaching the sending client, the trailer checked against the
    bytes actually relayed, and a refused or abandoned transfer unstaged on the
-   host. Content is arbitrary, the caller may name the file, and the ceiling is
-   `transfers.max_bytes` rather than the clipboard's. What remains is
-   resumability across a reconnect, and the two directions that are not
-   client-to-target — target-to-client, and target-to-target without the device
-   in the middle.
+   host. Content is arbitrary, the caller may name the file, the ceiling is
+   `transfers.max_bytes` rather than the clipboard's, and a transfer survives a
+   reconnect: an interruption keeps what arrived, a sender returns with the
+   token it was issued, and the offset comes from the host's own count. What
+   remains is the two directions that are not client-to-target —
+   target-to-client, and target-to-target without the device in the middle.
 3. Add read-only pane observation to the browser client. Navigation and the
    attention feed are served; rendering a terminal needs a VT implementation in
    the page, which means vendoring one — the first third-party code the client

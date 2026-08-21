@@ -142,6 +142,26 @@ pub enum ClientMessage {
         name: Option<String>,
         length: u64,
     },
+    /// Continue a transfer that stopped without finishing.
+    ///
+    /// The token was issued when the transfer began, and is the only thing that
+    /// names what the host already holds. It is not authority on its own: the
+    /// pane's control lease is checked exactly as it is for a new transfer, and
+    /// the declared length must be the one the transfer started with — a resume
+    /// that declares a different length is a different file wearing this one's
+    /// token.
+    ///
+    /// The daemon answers with `upload.accepted`, whose `staged` is the offset
+    /// the next byte belongs at. It comes from the host's own count rather than
+    /// from anything the daemon remembered, because an attempt that died
+    /// mid-chunk left a length nobody predicted.
+    #[serde(rename = "upload.resume")]
+    ResumeUpload {
+        request: u64,
+        transfer: String,
+        pane: PaneId,
+        length: u64,
+    },
     #[serde(rename = "upload.chunk")]
     UploadChunk {
         request: u64,
@@ -234,6 +254,31 @@ pub enum ServerMessage {
         request: u64,
         code: String,
         expires_in_seconds: u64,
+    },
+    /// A transfer may proceed, and this is where to send from.
+    ///
+    /// `staged` is zero for a transfer that is starting, and the host's own
+    /// count of what it already holds for one that is resuming. The token is
+    /// what a sender needs to come back after a dropped connection, and is
+    /// worth keeping for as long as the sender intends to finish.
+    #[serde(rename = "upload.accepted")]
+    UploadAccepted {
+        request: u64,
+        transfer: String,
+        staged: u64,
+    },
+    /// A transfer stopped without finishing, and the host is still holding what
+    /// arrived.
+    ///
+    /// Sent where there is anybody left to tell — the usual reason to stop is
+    /// that there is not. It says nothing about the file being usable: nothing
+    /// is verified and no path is named, because a path is what a client would
+    /// paste into a pane.
+    #[serde(rename = "upload.interrupted")]
+    UploadInterrupted {
+        request: u64,
+        transfer: String,
+        staged: u64,
     },
     /// A transfer that arrived intact and verified on the host. The path is
     /// the daemon's, derived from a private staging directory; nothing a client

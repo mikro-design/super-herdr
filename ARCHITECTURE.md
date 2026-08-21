@@ -560,6 +560,39 @@ this exists to remove. The cost is that a connection moving a large file is not
 reading its own other messages meanwhile — a consequence of one ordered stream
 per connection, paid by the transfer's own client.
 
+One transfer may take more than one attempt, and that is the single exception to
+"a refusal leaves nothing behind". A connection that drops mid-transfer is not a
+refusal: nobody decided anything, and discarding a gigabyte because a laptop
+closed is a cost with nothing on the other side of it. So an interruption keeps
+what arrived, and a sender that comes back with the token it was issued
+continues from there.
+
+The distinction that makes this safe is that an interruption is the *absence* of
+a decision. A withdrawal is discarded, because the sender asked. A sender that
+attests to a transfer it did not deliver is refused and discarded, because it
+said it was finished and it was not. Only a stream that stops without saying
+anything is kept — and what is kept is inert: no path is reported and nothing is
+injected into a pane until a digest verifies, so a partial file is not a
+verified-looking artifact reachable by another route. It is bounded by a clock
+and by a count, because a clock alone bounds how long one sender may occupy a
+host while a count is what bounds how many of them may at once.
+
+Where the next byte belongs is asked of the host rather than remembered. An
+attempt that died mid-chunk left a length nobody predicted, and a daemon that
+resumed from its own bookkeeping would corrupt a file silently. The token names
+the transfer; the file decides the offset. A resume answers to the same control
+lease a new transfer does, so returning with a token is not on its own authority
+to write to a host.
+
+Verification changes shape once a transfer can be assembled from several
+attempts. The digest a sender attests to covers the whole content, and it is
+compared against the digest the host computed over the file it stored — the
+middle computes nothing. That is stronger than the per-attempt comparison it
+replaces, and it is the only comparison that can span attempts at all. It also
+means a file that changed between attempts fails rather than resuming into a
+mixture of two versions: the earlier bytes came from an earlier read, and the
+attestation covers what the source holds now.
+
 Refusing early is free and refusing late is not, which decides where each check
 lives. A length above the ceiling, and a pane whose target is not configured,
 are both settled before a byte moves. The trailer cannot be: it attests to bytes

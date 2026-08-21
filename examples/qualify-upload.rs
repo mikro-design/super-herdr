@@ -68,15 +68,25 @@ async fn main() -> Result<()> {
     );
 
     let streamed = png(3 * 1024 * 1024);
-    let sent = clipboard::upload_stream(
+    let sent = match clipboard::upload_stream(
         &target,
         &transport,
-        PNG,
-        Some("qualification-streamed.png"),
+        clipboard::TransferPlan {
+            media: PNG,
+            staging: clipboard::Staging::Fresh {
+                name: Some("qualification-streamed.png"),
+            },
+            length: streamed.len() as u64,
+        },
         streamed.as_slice(),
-        streamed.len() as u64,
     )
-    .await?;
+    .await?
+    {
+        clipboard::Transferred::Complete(uploaded) => uploaded,
+        clipboard::Transferred::Interrupted { staged, .. } => {
+            anyhow::bail!("the streamed upload stopped after {staged} bytes")
+        }
+    };
     let stored = remote(
         &destination,
         &transport,
@@ -88,23 +98,66 @@ async fn main() -> Result<()> {
         stored == sha256(&streamed)
     );
 
-    // A source shorter than its declared length must be refused, and the
-    // refusal must take the staged payload with it.
-    let short = png(1024);
-    let before = remote(
-        &destination,
+    // A source that stops short keeps what arrived, and a second attempt
+    // continues from wherever the host actually got to. Both halves are
+    // qualified here because neither is provable without a real host: the
+    // offset comes from the far side's own count, and the digest that verifies
+    // the result spans two SSH connections.
+    let whole = png(2 * 1024 * 1024);
+    let staged_count = "ls -d ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/super-herdr-clipboard.* \
+                        2>/dev/null | wc -l";
+    let before = remote(&destination, &transport, staged_count)?;
+    let interrupted = clipboard::upload_stream(
+        &target,
         &transport,
-        "ls -d ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/super-herdr-clipboard.* 2>/dev/null | wc -l",
-    )?;
-    let error = clipboard::upload_stream(&target, &transport, PNG, None, short.as_slice(), 8192)
+        clipboard::TransferPlan {
+            media: PNG,
+            staging: clipboard::Staging::Fresh {
+                name: Some("qualification-resumed.png"),
+            },
+            length: whole.len() as u64,
+        },
+        &whole[..700_000],
+    )
+    .await?;
+    let clipboard::Transferred::Interrupted { path, staged } = interrupted else {
+        anyhow::bail!("a source that stopped short must not report a finished transfer");
+    };
+    println!(
+        "interrupted: {staged} of {} bytes staged at {path}",
+        whole.len()
+    );
+
+    let offset = clipboard::staged_bytes(&target, &transport, &path)
         .await
-        .expect_err("a short source must be refused");
-    let after = remote(
-        &destination,
+        .context("the host could not say how much it holds")?;
+    println!("  host reports {offset} bytes staged");
+    let resumed = clipboard::upload_stream(
+        &target,
         &transport,
-        "ls -d ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/super-herdr-clipboard.* 2>/dev/null | wc -l",
-    )?;
-    println!("refusal: {error}");
+        clipboard::TransferPlan {
+            media: PNG,
+            staging: clipboard::Staging::Resume {
+                path: &path,
+                staged: offset,
+            },
+            length: whole.len() as u64,
+        },
+        &whole[offset as usize..],
+    )
+    .await?;
+    let clipboard::Transferred::Complete(finished) = resumed else {
+        anyhow::bail!("the resumed attempt did not finish the transfer");
+    };
+    println!(
+        "resumed: {} bytes -> {}, digest matches source: {}",
+        finished.bytes,
+        finished.path,
+        finished.digest == sha256(&whole)
+    );
+
+    clipboard::discard_upload(&target, &transport, &finished.path).await;
+    let after = remote(&destination, &transport, staged_count)?;
     println!("  staged directories before {before}, after {after} (equal means nothing was left)");
 
     match (std::env::args().nth(2), std::env::args().nth(3)) {

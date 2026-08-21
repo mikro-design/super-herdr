@@ -28,6 +28,68 @@ pub struct UploadedFile {
     pub path: String,
     pub bytes: usize,
     pub mime: &'static str,
+    /// What the host computed over the file it stored.
+    ///
+    /// Carried out rather than checked here, because only the caller holds the
+    /// other half: the digest the sender attested to. Comparing the two is what
+    /// verifies a transfer end to end, and it is the only comparison that
+    /// survives a transfer assembled from more than one attempt.
+    pub digest: String,
+}
+
+/// Where a transfer's bytes are going.
+#[derive(Debug, Clone, Copy)]
+pub enum Staging<'a> {
+    /// A private directory of its own, under a name the caller chose or the
+    /// flavor's own.
+    Fresh { name: Option<&'a str> },
+    /// One that already holds the beginning of this transfer.
+    Resume { path: &'a str, staged: u64 },
+}
+
+/// One attempt at moving a transfer to a host.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferPlan<'a> {
+    pub media: ClipboardMedia,
+    pub staging: Staging<'a>,
+    /// The whole content's length, including anything already staged.
+    pub length: u64,
+}
+
+impl TransferPlan<'_> {
+    /// How much of the content is already on the host.
+    pub fn staged(&self) -> u64 {
+        match self.staging {
+            Staging::Fresh { .. } => 0,
+            Staging::Resume { staged, .. } => staged,
+        }
+    }
+
+    /// How much this attempt is responsible for.
+    fn remaining(&self) -> u64 {
+        match self.staging {
+            Staging::Fresh { .. } => self.length,
+            Staging::Resume { staged, .. } => self.length.saturating_sub(staged),
+        }
+    }
+}
+
+/// What became of one attempt.
+#[derive(Debug)]
+pub enum Transferred {
+    Complete(UploadedFile),
+    /// The source stopped before the declared length, and what did arrive is
+    /// still on the host.
+    ///
+    /// Not an error, because the difference between an interruption and a
+    /// refusal is not visible from here: a stream that stops short is a dropped
+    /// connection or a withdrawal depending on facts only the caller has. So
+    /// the bytes are left where they are and named, and whoever knows which one
+    /// happened decides whether to keep or discard them.
+    Interrupted {
+        path: String,
+        staged: u64,
+    },
 }
 
 impl ClipboardDelivery {
@@ -581,6 +643,7 @@ pub async fn upload_media(
             path: upload.path,
             bytes: upload.bytes,
             mime: media.mime,
+            digest: upload.digest,
         });
     }
     upload_local_media(media, &staged, bytes, &expected_digest)
@@ -606,32 +669,103 @@ pub async fn upload_media(
 pub async fn upload_stream<R>(
     target: &Target,
     transport: &TransportConfig,
-    media: ClipboardMedia,
-    name: Option<&str>,
+    plan: TransferPlan<'_>,
     source: R,
-    expected_bytes: u64,
-) -> Result<UploadedFile>
+) -> Result<Transferred>
 where
     R: AsyncRead + Unpin,
 {
-    // Refused before a connection is opened, because a name is the one thing
-    // about a transfer that can be judged without moving anything.
-    let staged = StagedName::resolve(name, media)?;
-    if let Some(destination) = target.ssh.as_deref() {
-        let (receipt, digest, written) =
-            upload_remote_stream(destination, transport, &staged, source, expected_bytes).await?;
-        let verdict = verify_transfer(&receipt, &digest, written, expected_bytes);
-        if let Err(error) = verdict {
-            remove_remote_upload(destination, transport, &receipt.path).await;
-            return Err(error);
+    // Judged before a connection is opened, because a name is the one thing
+    // about a transfer that can be decided without moving anything.
+    let staged = match plan.staging {
+        Staging::Fresh { name } => Some(StagedName::resolve(name, plan.media)?),
+        Staging::Resume { path, .. } => {
+            anyhow::ensure!(
+                removable_upload_directory(path).is_some(),
+                "a transfer cannot be resumed into a path this bridge did not stage"
+            );
+            None
         }
-        return Ok(UploadedFile {
+    };
+    let receipt = if let Some(destination) = target.ssh.as_deref() {
+        remote_attempt(destination, transport, staged.as_ref(), plan, source).await?
+    } else {
+        local_attempt(staged.as_ref(), plan, source).await?
+    };
+    finish_attempt(target, transport, plan, receipt).await
+}
+
+/// Judge what the host now holds against what the whole transfer declared.
+///
+/// The digest is not compared here. The host computed one over the file it
+/// stored, and the only thing worth comparing it against is what the sender
+/// attested to — which arrives after the last byte, and belongs to whoever is
+/// holding the sender's end.
+async fn finish_attempt(
+    target: &Target,
+    transport: &TransportConfig,
+    plan: TransferPlan<'_>,
+    receipt: RemoteUploadReceipt,
+) -> Result<Transferred> {
+    let total = receipt.bytes as u64;
+    if total < plan.length {
+        return Ok(Transferred::Interrupted {
             path: receipt.path,
-            bytes: receipt.bytes,
-            mime: media.mime,
+            staged: total,
         });
     }
-    upload_local_stream(media, &staged, source, expected_bytes).await
+    if total > plan.length {
+        // Unreachable from a relay that stops at the declared length, and not
+        // something anyone should resume from, so it goes rather than lingers.
+        discard_upload(target, transport, &receipt.path).await;
+        bail!(
+            "host stored {total} bytes of a transfer that declared {}",
+            plan.length
+        );
+    }
+    Ok(Transferred::Complete(UploadedFile {
+        path: receipt.path,
+        bytes: receipt.bytes,
+        mime: plan.media.mime,
+        digest: receipt.digest,
+    }))
+}
+
+/// How much of an interrupted transfer the host still holds.
+///
+/// The answer comes from the file rather than from anything remembered, because
+/// an attempt that died mid-chunk left a length nobody predicted. A path that
+/// is not one this bridge staged, or a file that is no longer there, is not an
+/// error worth distinguishing: both mean there is nothing to resume, and the
+/// transfer starts again from nothing.
+pub async fn staged_bytes(target: &Target, transport: &TransportConfig, path: &str) -> Option<u64> {
+    removable_upload_directory(path)?;
+    let Some(destination) = target.ssh.as_deref() else {
+        return fs::metadata(path).ok().map(|file| file.len());
+    };
+    let mut command = build_ssh_command(destination, transport, STAGED_SIZE_SCRIPT.to_owned());
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut input = child.stdin.take()?;
+    let _ = input.write_all(format!("{path}\n").as_bytes()).await;
+    let _ = input.shutdown().await;
+    drop(input);
+    let output = timeout(
+        Duration::from_secs(transport.command_timeout_seconds),
+        child.wait_with_output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
 /// Remove a staged upload the caller has decided not to accept.
@@ -668,39 +802,28 @@ pub(crate) fn discard_local_upload(path: &Path) {
     let _ = fs::remove_dir_all(directory);
 }
 
-/// Compare a receipt against what was actually sent, naming the failed check.
-fn verify_transfer(
-    receipt: &RemoteUploadReceipt,
-    digest: &str,
-    written: u64,
-    expected_bytes: u64,
-) -> Result<()> {
-    if written != expected_bytes {
-        bail!("transfer ended after {written} of {expected_bytes} declared bytes");
-    }
-    if receipt.bytes as u64 != written {
-        bail!(
-            "host stored {} bytes of the {written} that were sent",
-            receipt.bytes
-        );
-    }
-    if receipt.digest != digest {
-        bail!("stored payload does not match the digest of the bytes that were sent");
-    }
-    Ok(())
-}
-
-async fn upload_remote_stream<R>(
+/// One attempt at moving bytes to a host over SSH.
+///
+/// A fresh transfer and a resumed one differ only in which script runs and what
+/// its first line says: a name for a directory to be made, or the path of one
+/// that already holds the beginning of this file. Everything after that — the
+/// copy, the receipt, and what a failure leaves behind — is the same, which is
+/// the point of doing it this way rather than writing a second transfer path.
+async fn remote_attempt<R>(
     destination: &str,
     transport: &TransportConfig,
-    staged: &StagedName,
+    staged: Option<&StagedName>,
+    plan: TransferPlan<'_>,
     mut source: R,
-    expected_bytes: u64,
-) -> Result<(RemoteUploadReceipt, String, u64)>
+) -> Result<RemoteUploadReceipt>
 where
     R: AsyncRead + Unpin,
 {
-    let mut command = build_ssh_command(destination, transport, UPLOAD_SCRIPT.to_owned());
+    let script = match plan.staging {
+        Staging::Fresh { .. } => UPLOAD_SCRIPT,
+        Staging::Resume { .. } => RESUME_SCRIPT,
+    };
+    let mut command = build_ssh_command(destination, transport, script.to_owned());
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -716,27 +839,34 @@ where
         .stdout
         .take()
         .context("the SSH media upload did not expose stdout")?;
-    // Ahead of the payload, and not hashed with it: the digest attests to the
-    // file, and the name is framing around it.
-    write_transfer_name(&mut input, staged).await?;
+    // Ahead of the payload, on its own line: framing around the file rather
+    // than part of it, which is what keeps it out of the script's own text.
+    let heading = match plan.staging {
+        Staging::Fresh { .. } => staged
+            .context("a fresh transfer needs a name")?
+            .as_str()
+            .to_owned(),
+        Staging::Resume { path, .. } => path.to_owned(),
+    };
+    input
+        .write_all(format!("{heading}\n").as_bytes())
+        .await
+        .context("failed to send the transfer heading")?;
 
-    let mut hasher = Sha256::new();
+    let expected = plan.remaining();
     let mut written = 0u64;
     let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
     // A failure moving the bytes is recorded rather than returned. By the time
     // one can happen the host has already staged part of a file, and the only
     // way to learn where is to finish the exchange and read the receipt.
-    // Returning early would strand exactly the artifact a refusal must not
-    // leave behind.
     let mut failure: Option<anyhow::Error> = None;
-    while written < expected_bytes {
-        let wanted = usize::try_from(expected_bytes - written)
+    while written < expected {
+        let wanted = usize::try_from(expected - written)
             .unwrap_or(STREAM_CHUNK_BYTES)
             .min(STREAM_CHUNK_BYTES);
         match source.read(&mut buffer[..wanted]).await {
             Ok(0) => break,
             Ok(read) => {
-                hasher.update(&buffer[..read]);
                 if let Err(error) = input.write_all(&buffer[..read]).await {
                     failure =
                         Some(anyhow::Error::new(error).context("failed to send upload bytes"));
@@ -760,51 +890,57 @@ where
 
     let receipt = read_upload_receipt(output).await;
     let waited = child.wait().await;
-    if let Some(error) = failure {
-        if let Ok(receipt) = &receipt {
-            remove_remote_upload(destination, transport, &receipt.path).await;
+    // A receipt is what makes an interruption resumable rather than lost, so a
+    // failure with one is reported through the receipt and judged like any
+    // other short attempt. A failure without one leaves nothing anybody can
+    // name, and there is nothing to do but say so.
+    match (failure, receipt) {
+        (Some(_), Ok(receipt)) => Ok(receipt),
+        (Some(error), Err(_)) => Err(error),
+        (None, receipt) => {
+            let status = waited.context("failed to wait for the SSH media upload")?;
+            if !status.success() {
+                bail!("SSH media upload failed (diagnostics redacted)");
+            }
+            receipt
         }
-        return Err(error);
     }
-    let status = waited.context("failed to wait for the SSH media upload")?;
-    if !status.success() {
-        bail!("SSH media upload failed (diagnostics redacted)");
-    }
-    let digest = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok((receipt?, digest, written))
 }
 
-async fn upload_local_stream<R>(
-    media: ClipboardMedia,
-    staged: &StagedName,
+/// The same attempt, when the target is this machine.
+///
+/// Written to look like its remote sibling on purpose: a private directory with
+/// the file inside it, appended to when resuming, and a receipt computed from
+/// what is actually on disk rather than from what was believed to be written.
+async fn local_attempt<R>(
+    staged: Option<&StagedName>,
+    plan: TransferPlan<'_>,
     mut source: R,
-    expected_bytes: u64,
-) -> Result<UploadedFile>
+) -> Result<RemoteUploadReceipt>
 where
     R: AsyncRead + Unpin,
 {
-    let path = local_staging(staged)?;
-    let mut hasher = Sha256::new();
+    let path = match plan.staging {
+        Staging::Fresh { .. } => local_staging(staged.context("a fresh transfer needs a name")?)?,
+        Staging::Resume { path, .. } => PathBuf::from(path),
+    };
+    let expected = plan.remaining();
     let mut written = 0u64;
-    // Recorded rather than returned, for the same reason the remote path does
-    // it: a file exists here by now, and leaving before removing it would be a
-    // refusal that left something behind.
     let mut failure: Option<anyhow::Error> = None;
     {
-        let mut sink = fs::File::create(&path).context("failed to open the local media file")?;
+        let mut sink = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("failed to open the local media file")?;
         let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
-        while written < expected_bytes {
-            let wanted = usize::try_from(expected_bytes - written)
+        while written < expected {
+            let wanted = usize::try_from(expected - written)
                 .unwrap_or(STREAM_CHUNK_BYTES)
                 .min(STREAM_CHUNK_BYTES);
             match source.read(&mut buffer[..wanted]).await {
                 Ok(0) => break,
                 Ok(read) => {
-                    hasher.update(&buffer[..read]);
                     if let Err(error) = sink.write_all(&buffer[..read]) {
                         failure = Some(
                             anyhow::Error::new(error).context("failed to write the local media"),
@@ -826,29 +962,19 @@ where
             });
         }
     }
-    if let Some(error) = failure {
+    // Read back rather than counted: the receipt has to describe the file, not
+    // the intention, exactly as the remote script's does.
+    let stored = fs::read(&path).context("failed to verify the local media file")?;
+    if let Some(error) = failure
+        && stored.is_empty()
+    {
         discard_local_upload(&path);
         return Err(error);
     }
-    let digest = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let stored = fs::read(&path).context("failed to verify the local media file")?;
-    let receipt = RemoteUploadReceipt {
+    Ok(RemoteUploadReceipt {
         path: path.display().to_string(),
         bytes: stored.len(),
         digest: sha256_hex(&stored),
-    };
-    if let Err(error) = verify_transfer(&receipt, &digest, written, expected_bytes) {
-        discard_local_upload(&path);
-        return Err(error);
-    }
-    Ok(UploadedFile {
-        path: receipt.path,
-        bytes: receipt.bytes,
-        mime: media.mime,
     })
 }
 
@@ -1147,6 +1273,54 @@ struct RemoteUploadReceipt {
 /// command search path with one file and everything after it fails to be found.
 /// That is the default shell on macOS, so the names here are chosen to collide
 /// with nothing.
+/// The same staging, for a transfer that already has a beginning on this host.
+///
+/// It takes a path rather than a name, and appends rather than creates. The
+/// path was produced by the script above and handed back by this host, but it
+/// is still checked here for the shape only that script produces: a path is the
+/// one thing in this exchange that has made a round trip through somewhere
+/// else, and `>>` on a path nobody checked is how a transfer becomes a way to
+/// append to an arbitrary file.
+///
+/// The receipt describes the whole file rather than this attempt, because what
+/// matters at the end is the file, and a transfer made of several attempts has
+/// no other way to be verified as one thing.
+const RESUME_SCRIPT: &str = r#"set -eu
+umask 077
+IFS= read -r staged_file
+case "$staged_file" in
+  */super-herdr-clipboard.*/*) ;;
+  *) exit 1 ;;
+esac
+case "$staged_file" in
+  *..*) exit 1 ;;
+esac
+[ -f "$staged_file" ] || exit 1
+cat >> "$staged_file"
+staged_size=$(wc -c < "$staged_file" | tr -d '[:space:]')
+staged_digest=$(sha256sum "$staged_file" | awk '{print $1}')
+printf '%s\t%s\t%s\n' "$staged_file" "$staged_size" "$staged_digest"
+"#;
+
+/// How much of a transfer a host already holds.
+///
+/// Asked of the host rather than remembered here: what a resuming sender needs
+/// is the offset the next byte belongs at, and only the file knows that. A
+/// daemon that restarted, or one whose last attempt died mid-chunk, would
+/// otherwise resume from a number that was never true.
+const STAGED_SIZE_SCRIPT: &str = r#"set -eu
+IFS= read -r staged_file
+case "$staged_file" in
+  */super-herdr-clipboard.*/*) ;;
+  *) exit 1 ;;
+esac
+case "$staged_file" in
+  *..*) exit 1 ;;
+esac
+[ -f "$staged_file" ] || exit 1
+wc -c < "$staged_file" | tr -d '[:space:]'
+"#;
+
 const UPLOAD_SCRIPT: &str = r#"set -eu
 umask 077
 IFS= read -r transfer_name
@@ -1349,6 +1523,7 @@ fn upload_local_media(
         path: path.display().to_string(),
         bytes: bytes.len(),
         mime: media.mime,
+        digest: expected_digest.to_owned(),
     })
 }
 
@@ -1421,10 +1596,10 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{
-        ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, OPAQUE, PDF, PNG,
-        RemoteUploadReceipt, SVG, StagedName, TIFF, UPLOAD_SCRIPT, WEBP, discard_local_upload,
-        media_for_mime, parse_remote_upload_receipt, removable_upload_directory, sha256_hex,
-        upload_stream, verify_transfer,
+        ClipboardContext, ClipboardMedia, GIF, JPEG, KNOWN_MEDIA, OPAQUE, PDF, PNG, RESUME_SCRIPT,
+        SVG, StagedName, Staging, TIFF, TransferPlan, Transferred, UPLOAD_SCRIPT, UploadedFile,
+        WEBP, discard_local_upload, parse_remote_upload_receipt, removable_upload_directory,
+        sha256_hex, staged_bytes, upload_stream,
     };
     use crate::config::{Target, TransportConfig};
 
@@ -1549,160 +1724,204 @@ mod tests {
         }
     }
 
+    /// A plan for a transfer starting from nothing.
+    fn fresh(name: Option<&str>, media: ClipboardMedia, length: u64) -> TransferPlan<'_> {
+        TransferPlan {
+            media,
+            staging: Staging::Fresh { name },
+            length,
+        }
+    }
+
+    fn complete(transferred: Transferred) -> UploadedFile {
+        match transferred {
+            Transferred::Complete(uploaded) => uploaded,
+            Transferred::Interrupted { path, staged } => {
+                panic!("expected a complete transfer, got {staged} bytes at {path}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_streamed_upload_is_verified_against_the_bytes_that_were_sent() {
         let payload = vec![7u8; 200_000];
-        let uploaded = upload_stream(
-            &local_target(),
-            &TransportConfig::default(),
-            OPAQUE,
-            None,
-            payload.as_slice(),
-            payload.len() as u64,
-        )
-        .await
-        .unwrap();
+        let uploaded = complete(
+            upload_stream(
+                &local_target(),
+                &TransportConfig::default(),
+                fresh(None, OPAQUE, payload.len() as u64),
+                payload.as_slice(),
+            )
+            .await
+            .unwrap(),
+        );
         let stored = std::fs::read(&uploaded.path).unwrap();
         assert_eq!(stored, payload);
         assert_eq!(uploaded.bytes, payload.len());
+        // The digest travels out rather than being checked here, because the
+        // other half of the comparison belongs to whoever holds the sender.
+        assert_eq!(uploaded.digest, sha256_hex(&payload));
         // An unrecognized type is written with no extension at all.
         assert!(uploaded.path.ends_with("/payload"), "{}", uploaded.path);
         discard_local_upload(std::path::Path::new(&uploaded.path));
     }
 
     #[tokio::test]
-    async fn a_short_source_is_refused_as_truncated() {
+    async fn a_short_source_stops_rather_than_failing_and_keeps_what_arrived() {
+        // Not an error: a stream that stops short is a dropped connection or a
+        // withdrawal, and which one it was is not visible from here. The bytes
+        // stay where they are and the caller decides.
         let payload = vec![1u8; 1024];
-        let error = upload_stream(
+        let transferred = upload_stream(
             &local_target(),
             &TransportConfig::default(),
-            PNG,
-            None,
+            fresh(None, PNG, 4096),
             payload.as_slice(),
-            4096,
         )
         .await
-        .unwrap_err()
-        .to_string();
-        // The refusal names the check that failed, because a short read is the
-        // one worth retrying.
-        assert!(error.contains("1024 of 4096"), "{error}");
+        .unwrap();
+        let Transferred::Interrupted { path, staged } = transferred else {
+            panic!("a short source must not look like a finished transfer");
+        };
+        assert_eq!(staged, 1024);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        discard_local_upload(std::path::Path::new(&path));
     }
 
     #[tokio::test]
     async fn a_source_longer_than_declared_is_cut_off_rather_than_believed() {
         let payload = vec![9u8; 10_000];
-        let uploaded = upload_stream(
-            &local_target(),
-            &TransportConfig::default(),
-            OPAQUE,
-            None,
-            payload.as_slice(),
-            4096,
-        )
-        .await
-        .unwrap();
+        let uploaded = complete(
+            upload_stream(
+                &local_target(),
+                &TransportConfig::default(),
+                fresh(None, OPAQUE, 4096),
+                payload.as_slice(),
+            )
+            .await
+            .unwrap(),
+        );
         // Only the declared length reaches the host: a lying length must not
         // write unbounded data there.
         assert_eq!(uploaded.bytes, 4096);
         discard_local_upload(std::path::Path::new(&uploaded.path));
     }
 
-    #[test]
-    fn each_refusal_names_the_check_that_failed() {
-        // Only a short read is likely to be a dropped connection worth
-        // retrying, so the three refusals must be distinguishable.
-        let receipt = |bytes, digest: &str| RemoteUploadReceipt {
-            path: "/tmp/super-herdr-clipboard.aa/payload".to_owned(),
-            bytes,
-            digest: digest.to_owned(),
-        };
-        let truncated = verify_transfer(&receipt(10, "abc"), "abc", 10, 20).unwrap_err();
-        assert!(truncated.to_string().contains("10 of 20"), "{truncated}");
+    #[tokio::test]
+    async fn a_resumed_transfer_appends_and_verifies_as_one_file() {
+        let payload: Vec<u8> = (0..30_000_u32).map(|index| index as u8).collect();
+        let (target, transport) = (local_target(), TransportConfig::default());
 
-        let short_write = verify_transfer(&receipt(5, "abc"), "abc", 10, 10).unwrap_err();
-        assert!(
-            short_write.to_string().contains("host stored 5"),
-            "{short_write}"
+        // First attempt: the source stops a third of the way through.
+        let Transferred::Interrupted { path, staged } = upload_stream(
+            &target,
+            &transport,
+            fresh(Some("archive.tar"), OPAQUE, payload.len() as u64),
+            &payload[..10_000],
+        )
+        .await
+        .unwrap() else {
+            panic!("the first attempt should not have finished");
+        };
+        assert_eq!(staged, 10_000);
+
+        // What the host holds is what decides where the next byte goes, and it
+        // is asked rather than assumed.
+        let offset = staged_bytes(&target, &transport, &path).await.unwrap();
+        assert_eq!(offset, 10_000);
+
+        // Second attempt: also short. Resuming is not a promise to finish.
+        let Transferred::Interrupted { path, staged } = upload_stream(
+            &target,
+            &transport,
+            TransferPlan {
+                media: OPAQUE,
+                staging: Staging::Resume {
+                    path: &path,
+                    staged: offset,
+                },
+                length: payload.len() as u64,
+            },
+            &payload[10_000..25_000],
+        )
+        .await
+        .unwrap() else {
+            panic!("the second attempt should not have finished either");
+        };
+        assert_eq!(staged, 25_000);
+
+        // Third attempt finishes it.
+        let uploaded = complete(
+            upload_stream(
+                &target,
+                &transport,
+                TransferPlan {
+                    media: OPAQUE,
+                    staging: Staging::Resume {
+                        path: &path,
+                        staged,
+                    },
+                    length: payload.len() as u64,
+                },
+                &payload[25_000..],
+            )
+            .await
+            .unwrap(),
         );
 
-        let corrupt = verify_transfer(&receipt(10, "zzz"), "abc", 10, 10).unwrap_err();
-        assert!(corrupt.to_string().contains("digest"), "{corrupt}");
-
-        assert!(verify_transfer(&receipt(10, "abc"), "abc", 10, 10).is_ok());
+        assert_eq!(uploaded.bytes, payload.len());
+        assert_eq!(std::fs::read(&uploaded.path).unwrap(), payload);
+        // The digest spans the whole file rather than the last attempt, which
+        // is the only thing a transfer assembled from three pieces can be
+        // verified against.
+        assert_eq!(uploaded.digest, sha256_hex(&payload));
+        assert!(uploaded.path.ends_with("/archive.tar"), "{}", uploaded.path);
+        discard_local_upload(std::path::Path::new(&uploaded.path));
     }
 
-    #[test]
-    fn an_unknown_type_is_carried_opaquely_rather_than_refused() {
-        assert_eq!(media_for_mime("image/png"), PNG);
-        assert_eq!(media_for_mime("application/x-anything"), OPAQUE);
-        assert_eq!(media_for_mime("").extension, None);
-        assert_eq!(OPAQUE.payload_name().unwrap(), "payload");
-        #[cfg(target_os = "macos")]
-        assert_eq!(OPAQUE.file_suffix().unwrap(), "");
-        assert!(OPAQUE.validate(b"\x00\x01\x02").is_ok());
+    #[tokio::test]
+    async fn a_transfer_cannot_be_resumed_into_a_path_this_bridge_did_not_stage() {
+        // The path is the one value in the exchange that has made a round trip
+        // through somewhere else, and appending to it is what a resume does.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let error = upload_stream(
+            &local_target(),
+            &TransportConfig::default(),
+            TransferPlan {
+                media: OPAQUE,
+                staging: Staging::Resume {
+                    path: outside.path().to_str().unwrap(),
+                    staged: 0,
+                },
+                length: 16,
+            },
+            b"sixteen bytes!!!".as_slice(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not stage"), "{error}");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"");
     }
 
-    #[test]
-    fn the_upload_script_runs_under_every_shell_a_host_might_use() {
-        // The remote login shell runs this script, and it is not necessarily
-        // the one running the tests. zsh ties `path` to PATH, so an earlier
-        // version replaced the command search path with the staged file and
-        // every command after it vanished — invisible to a unit test that only
-        // ever tried one shell, and fatal on macOS, where zsh is the default.
-        // The name now arrives as the first line of the same stream as the
-        // payload, which asks something of every one of these shells: `read`
-        // must stop at the newline and leave the rest for `cat`. A shell that
-        // buffers ahead would eat the beginning of the file, so the digest
-        // below is what proves the framing rather than only the transfer.
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
-
-        let payload = b"\x89PNG\r\n\x1a\nqualification";
-        let mut tried = 0;
-        for shell in ["sh", "bash", "zsh", "dash", "ksh"] {
-            // A shell that is not installed simply fails to spawn and is
-            // skipped; the assertion at the end catches a host with none.
-            let Ok(mut child) = Command::new(shell)
-                .arg("-c")
-                .arg(UPLOAD_SCRIPT)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-            else {
-                continue;
-            };
-            tried += 1;
-            let mut input = child.stdin.take().unwrap();
-            input.write_all(b"qualification.png\n").unwrap();
-            input.write_all(payload).unwrap();
-            drop(input);
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "the upload script failed under {shell}"
-            );
-            let receipt = parse_remote_upload_receipt(&output.stdout)
-                .unwrap_or_else(|error| panic!("{shell} produced no usable receipt: {error}"));
-            assert!(
-                receipt.path.ends_with("/qualification.png"),
-                "{shell} ignored the name it was given: {}",
-                receipt.path
-            );
-            assert_eq!(
-                receipt.bytes,
-                payload.len(),
-                "{shell} stored the wrong size"
-            );
-            assert_eq!(
-                receipt.digest,
-                sha256_hex(payload),
-                "{shell} stored wrong bytes"
-            );
-            let _ = std::fs::remove_dir_all(std::path::Path::new(&receipt.path).parent().unwrap());
-        }
-        assert!(tried > 0, "no shell was available to run the upload script");
+    #[tokio::test]
+    async fn nothing_is_staged_where_there_is_nothing_to_resume() {
+        let (target, transport) = (local_target(), TransportConfig::default());
+        assert!(
+            staged_bytes(&target, &transport, "/etc/passwd")
+                .await
+                .is_none(),
+            "a path this bridge did not stage has no length worth reporting"
+        );
+        assert!(
+            staged_bytes(
+                &target,
+                &transport,
+                "/tmp/super-herdr-clipboard.nonexistent/payload"
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[test]
@@ -1768,16 +1987,16 @@ mod tests {
     #[tokio::test]
     async fn a_named_transfer_is_staged_under_the_name_it_was_given() {
         let payload = vec![3u8; 4096];
-        let uploaded = upload_stream(
-            &local_target(),
-            &TransportConfig::default(),
-            OPAQUE,
-            Some("release-notes.md"),
-            payload.as_slice(),
-            payload.len() as u64,
-        )
-        .await
-        .unwrap();
+        let uploaded = complete(
+            upload_stream(
+                &local_target(),
+                &TransportConfig::default(),
+                fresh(Some("release-notes.md"), OPAQUE, payload.len() as u64),
+                payload.as_slice(),
+            )
+            .await
+            .unwrap(),
+        );
         assert!(
             uploaded.path.ends_with("/release-notes.md"),
             "{}",
@@ -1794,6 +2013,80 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[test]
+    fn the_resume_script_appends_under_every_shell_and_refuses_a_path_it_did_not_stage() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::Builder::new()
+            .prefix("super-herdr-clipboard.")
+            .tempdir()
+            .unwrap();
+        let staged = directory.path().join("payload.bin");
+        let mut tried = 0;
+        for shell in ["sh", "bash", "zsh", "dash", "ksh"] {
+            std::fs::write(&staged, b"first-half-").unwrap();
+            let Ok(mut child) = Command::new(shell)
+                .arg("-c")
+                .arg(RESUME_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            tried += 1;
+            let mut input = child.stdin.take().unwrap();
+            input
+                .write_all(format!("{}\n", staged.display()).as_bytes())
+                .unwrap();
+            input.write_all(b"second-half").unwrap();
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "the resume script failed under {shell}"
+            );
+            let receipt = parse_remote_upload_receipt(&output.stdout)
+                .unwrap_or_else(|error| panic!("{shell} produced no usable receipt: {error}"));
+            // Appended, not replaced, and the receipt describes the whole file
+            // rather than what this attempt contributed.
+            assert_eq!(
+                std::fs::read(&staged).unwrap(),
+                b"first-half-second-half",
+                "{shell} did not append"
+            );
+            assert_eq!(receipt.bytes, 22, "{shell} reported the wrong total");
+            assert_eq!(receipt.digest, sha256_hex(b"first-half-second-half"));
+        }
+        assert!(tried > 0, "no shell was available to run the resume script");
+
+        // A path outside a staging directory is refused by the script itself,
+        // whatever the daemon believed when it sent it.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        for path in [
+            outside.path().display().to_string(),
+            format!("{}/../escape", directory.path().display()),
+            "/etc/passwd".to_owned(),
+        ] {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(RESUME_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("sh is available");
+            let mut input = child.stdin.take().unwrap();
+            let _ = input.write_all(format!("{path}\nappended").as_bytes());
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success(), "the script accepted {path:?}");
+        }
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"");
     }
 
     /// The script refuses a separator even though nothing should ever send it

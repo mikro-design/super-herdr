@@ -294,6 +294,43 @@ impl ClientCommands {
         self.offer_upload(pane, mime, Some(name), bytes)
     }
 
+    /// Continue a transfer that stopped, under the token it was given.
+    ///
+    /// Chunks do not follow immediately: the daemon answers with
+    /// `upload.accepted`, and its `staged` is the offset the next byte belongs
+    /// at. It comes from the host rather than from anything either side
+    /// remembered, so a caller sends from there rather than from where it
+    /// believes it stopped.
+    pub fn resume_upload(&self, pane: PaneId, transfer: String, length: u64) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::ResumeUpload {
+            request,
+            transfer,
+            pane,
+            length,
+        });
+        request
+    }
+
+    /// Send part of a transfer that is already under way.
+    ///
+    /// Separate from the one-shot helpers because a resumed transfer's bytes
+    /// are decided by an answer that has not arrived yet.
+    pub fn send_upload_chunk(&self, request: u64, bytes: Vec<u8>) {
+        self.send(ClientMessage::UploadChunk { request, bytes });
+    }
+
+    /// Attest to the whole content, including anything an earlier attempt
+    /// delivered. The digest spans the file, not the attempt: it is compared
+    /// against what the host computed over what it stored.
+    pub fn finish_upload(&self, request: u64, digest: String) {
+        self.send(ClientMessage::FinishUpload { request, digest });
+    }
+
+    pub fn cancel_upload(&self, request: u64) {
+        self.send(ClientMessage::CancelUpload { request });
+    }
+
     fn offer_upload(&self, pane: PaneId, mime: String, name: Option<String>, bytes: &[u8]) -> u64 {
         use sha2::{Digest, Sha256};
 

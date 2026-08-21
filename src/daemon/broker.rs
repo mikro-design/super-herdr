@@ -95,6 +95,13 @@ pub enum Effect {
         name: Option<String>,
         length: u64,
     },
+    ResumeUpload {
+        client: ClientId,
+        request: u64,
+        transfer: String,
+        pane: PaneId,
+        length: u64,
+    },
     UploadChunk {
         client: ClientId,
         request: u64,
@@ -374,6 +381,24 @@ impl Broker {
                         pane,
                         mime,
                         name,
+                        length,
+                    });
+                }
+            }
+            ClientMessage::ResumeUpload {
+                request,
+                transfer,
+                pane,
+                length,
+            } => {
+                // A token is not authority. Resuming writes to a host exactly
+                // as beginning does, so it answers to the same lease.
+                if self.holds_control(client, &pane, &mut effects) {
+                    effects.push(Effect::ResumeUpload {
+                        client,
+                        request,
+                        transfer,
+                        pane,
                         length,
                     });
                 }

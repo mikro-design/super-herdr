@@ -4323,6 +4323,11 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                 app.message = Some(format!("Herdr action failed: {message}"));
             }
         }
+        // The frontend uploads what a clipboard held, in one attempt, over a
+        // socket it shares a machine with. It has nothing to resume from and
+        // nowhere to keep a token, so it notes neither — a client that outlives
+        // its connection is the one these are for.
+        ServerMessage::UploadAccepted { .. } | ServerMessage::UploadInterrupted { .. } => {}
         ServerMessage::UploadComplete {
             request,
             path,

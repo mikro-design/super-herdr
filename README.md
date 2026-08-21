@@ -25,6 +25,11 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Verified transfer of arbitrary content to a target through the daemon, relayed
   as it arrives rather than held, under a name the caller chooses, bounded by
   `transfers.max_bytes` and unstaged on the host if any check fails.
+- Transfers that survive a lost connection: an interrupted one keeps what
+  reached the host, a sender returns with the token it was issued, and the
+  offset it continues from is the host's own count rather than anyone's
+  bookkeeping. What is kept is bounded by a ten-minute clock and by a limit on
+  how many unfinished transfers a host may hold at once.
 - Event-driven updates when a documented Herdr socket is configured, with polling
   fallback.
 - Atomic persistence and restoration of the last explicitly selected qualified
