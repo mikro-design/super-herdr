@@ -120,6 +120,14 @@ also why devices that simply worked before will ask for a code after upgrading.
 A daemon reached over an SSH forward of its Unix socket, or bound to loopback
 with nothing in front of it, was never exposed.
 
+Upgrade from 0.7.1 as well if any target relies on session discovery for its
+Herdr API socket — a target with `discover_sessions` and no `socket` line.
+0.7.0 and 0.7.1 decided whether an atomic paste was possible by reading the
+configuration file rather than what discovery resolved, so those targets were
+told they had no socket and a multiline paste into a pane without bracketed
+paste was refused. 0.7.2 asks the resolved sessions, which is where a
+discovered socket actually is.
+
 ### Package managers
 
 ```sh
@@ -128,7 +136,7 @@ brew install mikro-design/tap/super-herdr
 
 # Debian and Ubuntu. The version is part of the asset name, so there is no
 # stable "latest" URL; set these to a published release and your architecture.
-version=0.7.1
+version=0.7.2
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -152,7 +160,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.7.1
+tag=v0.7.2
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -206,8 +214,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.7.1`
-must be tagged `v0.7.1`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.7.2`
+must be tagged `v0.7.2`.
 
 ### macOS
 
