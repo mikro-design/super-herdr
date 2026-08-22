@@ -11,8 +11,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use qrcode::{EcLevel, QrCode};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -796,6 +797,7 @@ struct App {
     target_test_sender: Option<mpsc::UnboundedSender<TargetTestEvent>>,
     next_target_test_request: u64,
     agent_navigator: Option<AgentNavigator>,
+    pairing: Option<PairingOffer>,
     attention: AttentionIndex,
     attention_center: Option<AttentionCenter>,
     notification_queue: NotificationQueue,
@@ -844,6 +846,7 @@ impl Default for App {
             target_test_sender: None,
             next_target_test_request: 1,
             agent_navigator: None,
+            pairing: None,
             attention: AttentionIndex::default(),
             attention_center: None,
             notification_queue: NotificationQueue::default(),
@@ -1264,6 +1267,7 @@ async fn handle_decoded_input(
             if app.mode != InputMode::Terminal
                 || app.target_manager.is_some()
                 || app.agent_navigator.is_some()
+                || app.pairing.is_some()
                 || app.attention_center.is_some()
                 || app.command_palette.is_some()
                 || app.context_menu.is_some()
@@ -1318,6 +1322,7 @@ async fn handle_mouse(
     }
     if app.mode != InputMode::Terminal
         || app.agent_navigator.is_some()
+        || app.pairing.is_some()
         || app.attention_center.is_some()
         || app.command_palette.is_some()
         || app.text_prompt.is_some()
@@ -2010,6 +2015,15 @@ async fn handle_input(
     }
     if app.target_manager.is_some() {
         return handle_target_manager_input(key, transport_config, app);
+    }
+    if app.pairing.is_some() {
+        // A live pairing code is on screen; any key takes it down. There is
+        // nothing to navigate, and leaving a credential up because a keystroke
+        // was not one of a handful this screen recognised would be the wrong
+        // default for the one overlay that displays one.
+        let _ = key;
+        app.pairing = None;
+        return Ok(false);
     }
     if app.agent_navigator.is_some() {
         return handle_agent_navigator_input(key, state, app);
@@ -4382,12 +4396,18 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         ServerMessage::PairingCode {
             code,
             expires_in_seconds,
+            url,
             ..
         } => {
             let minutes = expires_in_seconds / 60;
             app.message = Some(format!(
-                "pairing code {code} — enter it in the browser client within {minutes} minutes"
+                "pairing code {code} — expires in {minutes} minutes; any key closes the screen"
             ));
+            app.pairing = Some(PairingOffer {
+                code,
+                url,
+                expires_in_seconds,
+            });
         }
         ServerMessage::Error { request, message } => {
             // A refusal ends whatever asked for it, so a failed transfer does
@@ -4487,7 +4507,9 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
     }
     render_tabs(frame, state, app, tab_area);
     render_terminal_surfaces(frame, state, app, terminal_area);
-    if let Some(manager) = app.target_manager.as_ref() {
+    if let Some(offer) = app.pairing.as_ref() {
+        render_pairing(frame, offer);
+    } else if let Some(manager) = app.target_manager.as_ref() {
         render_target_manager(frame, manager);
     } else if let Some(navigator) = app.agent_navigator.as_ref() {
         render_agent_navigator(frame, state, navigator);
@@ -5078,6 +5100,161 @@ fn centered_popup(area: Rect, maximum_width: u16, maximum_height: u16) -> Rect {
         width,
         height,
     )
+}
+
+/// A pairing code the daemon has just issued, and where to take it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingOffer {
+    code: String,
+    /// Absent unless the daemon was told its public address. Nothing derives
+    /// one: the daemon binds loopback, and what a phone must reach is usually a
+    /// different host, port and scheme.
+    url: Option<String>,
+    expires_in_seconds: u64,
+}
+
+impl PairingOffer {
+    /// What a scanner should be sent to.
+    ///
+    /// The code rides in the fragment rather than a query parameter, so it is
+    /// never sent to the server: it stays out of request lines, out of access
+    /// logs, and out of any reverse proxy in front. `None` when there is no
+    /// address to send anyone to.
+    fn scan_target(&self) -> Option<String> {
+        let url = self.url.as_ref()?.trim_end_matches('#');
+        Some(format!("{url}#{}", self.code))
+    }
+}
+
+/// One QR, drawn two module rows to a text row.
+///
+/// Half blocks rather than two spaces per module: a terminal cell is about
+/// twice as tall as it is wide, so stacking two modules in one cell keeps them
+/// square, and a square module is what a scanner is looking for.
+///
+/// `None` when it will not fit. That refusal is the point of this returning an
+/// option at all — a clipped QR is still a rectangle of black squares, and the
+/// person holding the phone cannot tell a truncated code from a bad angle or
+/// poor light. Text they can read; half a QR they can only fail at.
+fn qr_rows(payload: &str, available: Rect) -> Option<Vec<String>> {
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M).ok()?;
+    let width = code.width();
+    // Four modules of quiet zone on every side, which the specification
+    // requires and scanners genuinely rely on against a busy terminal.
+    let quiet = 4usize;
+    let span = width + quiet * 2;
+    let needed_columns = u16::try_from(span).ok()?;
+    let needed_rows = u16::try_from(span.div_ceil(2)).ok()?;
+    if needed_columns > available.width || needed_rows > available.height {
+        return None;
+    }
+
+    let dark = code.to_colors();
+    let is_dark = |x: usize, y: usize| -> bool {
+        if x < quiet || y < quiet || x >= quiet + width || y >= quiet + width {
+            return false;
+        }
+        dark[(y - quiet) * width + (x - quiet)] == qrcode::Color::Dark
+    };
+
+    let mut rows = Vec::with_capacity(span.div_ceil(2));
+    for pair in (0..span).step_by(2) {
+        let mut row = String::with_capacity(span);
+        for x in 0..span {
+            let upper = is_dark(x, pair);
+            let lower = pair + 1 < span && is_dark(x, pair + 1);
+            // Dark modules are drawn as the terminal's foreground, so this
+            // inverts: a block character is a light module.
+            row.push(match (upper, lower) {
+                (true, true) => ' ',
+                (true, false) => '\u{2584}',
+                (false, true) => '\u{2580}',
+                (false, false) => '\u{2588}',
+            });
+        }
+        rows.push(row);
+    }
+    Some(rows)
+}
+
+fn render_pairing(frame: &mut Frame, offer: &PairingOffer) {
+    let area = centered_popup(frame.area(), 60, 34);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" pair a device ", Style::default().bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let minutes = offer.expires_in_seconds / 60;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // A QR is drawn on a white field with dark modules, whatever the terminal's
+    // own colours are. A scanner needs the contrast to be this way round, and a
+    // dark-themed terminal would otherwise invert it.
+    let paper = Style::default().fg(Color::Black).bg(Color::White);
+    match offer.scan_target() {
+        Some(target) => match qr_rows(&target, inner) {
+            Some(rows) => {
+                for row in rows {
+                    lines.push(Line::styled(row, paper));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("code {}", offer.code),
+                    Style::default().bold(),
+                ));
+                lines.push(Line::styled(
+                    format!("expires in {minutes} min · any key closes"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            None => {
+                // Too small to draw honestly, so it is not drawn at all.
+                lines.push(Line::styled(
+                    "terminal too small for a scannable code",
+                    Style::default().fg(Color::Yellow),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(target, Style::default().fg(Color::Blue)));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("code {}", offer.code),
+                    Style::default().bold(),
+                ));
+                lines.push(Line::styled(
+                    format!("expires in {minutes} min · any key closes"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        },
+        None => {
+            lines.push(Line::styled(
+                format!("code {}", offer.code),
+                Style::default().bold(),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "enter it in the browser client",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::raw(""));
+            // Said plainly, because the absence of a QR looks like a missing
+            // feature rather than a daemon that was never told where it is.
+            lines.push(Line::styled(
+                "no scannable address: start the daemon with --web-url",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::styled(
+                format!("expires in {minutes} min · any key closes"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
 fn render_agent_navigator(frame: &mut Frame, state: &FederationState, navigator: &AgentNavigator) {
@@ -6202,6 +6379,93 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// A QR that will not fit is not drawn at all.
+    ///
+    /// This is the whole reason `qr_rows` returns an option. A clipped code is
+    /// still a rectangle of squares, and the person holding the phone cannot
+    /// tell a truncated code from a bad angle or poor light — they only know it
+    /// does not work. Text in the same space is legible.
+    #[test]
+    fn a_code_that_would_be_clipped_is_refused_rather_than_drawn() {
+        let target = "https://onio-ws01.tail15b0b2.ts.net:8790#ABCD-2345";
+        let roomy = super::qr_rows(target, super::Rect::new(0, 0, 80, 40))
+            .expect("80x40 has room for this payload");
+
+        // Square once the two-modules-per-cell packing is undone. The span is
+        // odd for most versions, so the final row carries one module rather
+        // than two — hence the ceiling rather than a doubling.
+        let span = roomy[0].chars().count();
+        assert_eq!(roomy.len(), span.div_ceil(2));
+        for narrow in [
+            super::Rect::new(0, 0, 20, 40),
+            super::Rect::new(0, 0, 80, 6),
+            super::Rect::new(0, 0, 1, 1),
+        ] {
+            assert!(
+                super::qr_rows(target, narrow).is_none(),
+                "a code was drawn into {narrow:?}, where it cannot be scanned"
+            );
+        }
+    }
+
+    /// Dark modules must render dark against a light field. Inverting them
+    /// produces a code that some scanners accept and others silently do not,
+    /// which is the worst failure available here: it looks like it works.
+    #[test]
+    fn the_quiet_zone_is_light_and_the_finder_pattern_is_not() {
+        let rows = super::qr_rows(
+            "https://example.test:8790#ABCD-2345",
+            super::Rect::new(0, 0, 80, 40),
+        )
+        .expect("room for this payload");
+
+        // Four modules of quiet zone is two rows of full blocks, top and bottom.
+        assert!(
+            rows[0].chars().all(|cell| cell == '\u{2588}'),
+            "the quiet zone is not light: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[rows.len() - 1].chars().all(|cell| cell == '\u{2588}'),
+            "the trailing quiet zone is not light"
+        );
+
+        // The top-left finder centre sits four modules in past the quiet zone.
+        let finder = &rows[3];
+        assert!(
+            finder.chars().any(|cell| cell != '\u{2588}'),
+            "the finder pattern rendered as empty space: {finder:?}"
+        );
+    }
+
+    #[test]
+    fn a_scan_target_carries_the_code_in_the_fragment() {
+        let offer = super::PairingOffer {
+            code: "ABCD-2345".to_owned(),
+            url: Some("https://host.tail0.ts.net:8790".to_owned()),
+            expires_in_seconds: 300,
+        };
+
+        assert_eq!(
+            offer.scan_target().as_deref(),
+            Some("https://host.tail0.ts.net:8790#ABCD-2345"),
+            "the code must ride in the fragment, never in a query"
+        );
+    }
+
+    /// A daemon that was never told its public address offers nothing to scan,
+    /// rather than a QR pointing at the loopback it happens to have bound.
+    #[test]
+    fn without_a_configured_address_there_is_nothing_to_scan() {
+        let offer = super::PairingOffer {
+            code: "ABCD-2345".to_owned(),
+            url: None,
+            expires_in_seconds: 300,
+        };
+
+        assert!(offer.scan_target().is_none());
+    }
 
     /// A target whose socket comes from discovery can still take an atomic
     /// paste.
