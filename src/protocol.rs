@@ -108,9 +108,17 @@ pub enum ClientMessage {
     /// the socket, but a rendered update is queued for a client that may be
     /// draining it far more slowly than a pane produces it.
     ///
-    /// The sequence is checked against what was actually sent rather than
-    /// believed, so acknowledging an update twice, or one that was never sent,
-    /// buys a client nothing. It reports progress; it does not grant anything.
+    /// One acknowledgement settles the update it names and every earlier one
+    /// still outstanding, so a viewer that painted several and reports only the
+    /// newest is understood to have painted all of them, and a viewer that
+    /// failed to report one is repaired by the next rather than penalised for
+    /// ever.
+    ///
+    /// The sequence must name an update this subscription was actually sent.
+    /// Acknowledging one twice, or one that was never sent, settles nothing —
+    /// which matters because a viewer at its limit is skipped, so the updates
+    /// it missed were never outstanding and cannot be cleared by naming them.
+    /// It reports progress; it does not grant anything.
     #[serde(rename = "pane.screen_ack")]
     AckPaneScreen { pane: PaneId, sequence: u64 },
     #[serde(rename = "pane.unsubscribe")]

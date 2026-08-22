@@ -524,12 +524,22 @@ viewer on a slow link watching a busy pane would accumulate one message per
 frame in the daemon's memory.
 
 So the depth is bounded here. A screen subscriber may hold a small number of
-updates, the daemon decides how many, and a viewer acknowledges each update once
-it has painted it. An acknowledgement is checked against what that subscription
-was actually sent: acknowledging twice, or acknowledging something never sent,
-changes nothing. It reports progress rather than granting anything, for the same
-reason a resume token is not authority and a download's credit is a request
-rather than an instruction.
+updates, the daemon decides how many, and a viewer acknowledges an update once
+it has painted it. What is held is the sequences themselves rather than a count
+of them, so one acknowledgement settles the update it names and every earlier
+one still outstanding: a viewer that paints four and reports only the newest is
+telling the truth about all four, and a viewer that drops an acknowledgement is
+repaired by the next rather than losing a slot for ever. Counting would have
+made both permanent, and would have made the protocol depend on a client
+acknowledging exactly once per update without anywhere saying so.
+
+An acknowledgement must name an update that subscription was actually sent.
+That is membership in the outstanding queue, not merely a sequence below the
+newest one: the queue has gaps, because a viewer at its limit is skipped and
+what it missed was never outstanding, and without membership a client could
+clear those gaps by naming updates it never received. It reports progress rather
+than granting anything, for the same reason a resume token is not authority and
+a download's credit is a request rather than an instruction.
 
 What a viewer that fell behind is sent when it catches up is the screen as it
 stands, not the backlog it missed — which is both fewer bytes and the thing it

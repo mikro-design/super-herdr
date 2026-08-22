@@ -19,7 +19,7 @@
 //! so an observer on a phone cannot reshape a pane someone is working in, and
 //! the route is resized when the lease moves to a client of a different size.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::attention::AttentionEvent;
@@ -166,14 +166,18 @@ struct PaneSubscription {
     /// sent nothing yet and must receive a whole screen before a diff can mean
     /// anything to it.
     sent: Option<u64>,
-    /// The last update this client said it painted.
-    acked: Option<u64>,
-    /// Updates sent and not yet acknowledged.
+    /// The sequences sent to this client and not yet acknowledged, oldest
+    /// first, at most `MAX_OUTSTANDING_SCREEN_UPDATES` of them.
     ///
-    /// Counted rather than derived from the sequences, because a whole screen
-    /// sent to a client that fell behind advances the sequence by more than one
-    /// while being a single update.
-    outstanding: u32,
+    /// The sequences themselves rather than a count of them, so that one
+    /// acknowledgement can settle every update at or below it. A viewer that
+    /// paints four and reports only the newest is then telling the truth about
+    /// all four, and a client that never acknowledges an update it painted
+    /// costs itself nothing beyond that update — the next acknowledgement
+    /// repairs it. Counting would have made both of those permanent, and would
+    /// have made the protocol depend on a client acknowledging exactly once per
+    /// update without anywhere saying so.
+    outstanding: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +214,7 @@ impl Client {
 /// slow link watching a busy pane would accumulate without limit in this
 /// process. The daemon chooses the depth; an acknowledgement reports progress
 /// against what was actually sent and cannot ask for more than this.
-const MAX_OUTSTANDING_SCREEN_UPDATES: u32 = 4;
+const MAX_OUTSTANDING_SCREEN_UPDATES: usize = 4;
 
 /// One pane's rendered screen, kept only while somebody is watching it that
 /// way.
@@ -748,13 +752,13 @@ impl Broker {
             // update is not queued behind the others and not remembered: when
             // it catches up it is sent the screen as it stands then, which is
             // what it wants and is bounded however far behind it fell.
-            if subscription.outstanding >= MAX_OUTSTANDING_SCREEN_UPDATES {
+            if subscription.outstanding.len() >= MAX_OUTSTANDING_SCREEN_UPDATES {
                 continue;
             }
 
             let message = Self::update_for(subscription, pane, &rendered);
             subscription.sent = Some(rendered.screen.sequence);
-            subscription.outstanding += 1;
+            subscription.outstanding.push_back(rendered.screen.sequence);
             effects.push(Effect::Send { client, message });
         }
         effects
@@ -803,13 +807,27 @@ impl Broker {
         else {
             return;
         };
-        if subscription.sent.is_none_or(|sent| sequence > sent)
-            || subscription.acked.is_some_and(|acked| sequence <= acked)
-        {
+        // The sequence must be one this subscription is actually waiting on,
+        // not merely one below the newest thing sent. The queue has gaps in it
+        // — a viewer at its limit is skipped, so the updates it missed are
+        // never in here — and settling everything below an arbitrary number
+        // would let a client clear those gaps by naming an update that was
+        // never sent to it. Membership is what makes "checked against what was
+        // actually sent" a promise rather than a description of the common
+        // case; it also makes acknowledging twice a no-op, since the second
+        // acknowledgement names something no longer held.
+        if !subscription.outstanding.contains(&sequence) {
             return;
         }
-        subscription.acked = Some(sequence);
-        subscription.outstanding = subscription.outstanding.saturating_sub(1);
+        // Painting is in order, so an acknowledgement settles everything the
+        // client was sent before this one as well.
+        while subscription
+            .outstanding
+            .front()
+            .is_some_and(|held| *held <= sequence)
+        {
+            subscription.outstanding.pop_front();
+        }
 
         // Caught up enough to be sent something, and behind what the pane now
         // shows. A pane that has gone quiet produces no further frame, so
@@ -819,7 +837,7 @@ impl Broker {
             return;
         };
         if subscription.sent == Some(state.last.sequence)
-            || subscription.outstanding >= MAX_OUTSTANDING_SCREEN_UPDATES
+            || subscription.outstanding.len() >= MAX_OUTSTANDING_SCREEN_UPDATES
         {
             return;
         }
@@ -830,7 +848,7 @@ impl Broker {
         };
         let message = Self::update_for(subscription, pane, &rendered);
         subscription.sent = Some(state.last.sequence);
-        subscription.outstanding += 1;
+        subscription.outstanding.push_back(state.last.sequence);
         effects.push(Effect::Send { client, message });
     }
 
@@ -966,8 +984,7 @@ impl Broker {
                 rows,
                 representation,
                 sent: None,
-                acked: None,
-                outstanding: 0,
+                outstanding: VecDeque::new(),
             },
         );
 
@@ -1017,7 +1034,7 @@ impl Broker {
                 && let Some(subscription) = session.panes.get_mut(&pane)
             {
                 subscription.sent = Some(screen.sequence);
-                subscription.outstanding += 1;
+                subscription.outstanding.push_back(screen.sequence);
             }
             effects.push(Effect::Send {
                 client,
@@ -1219,6 +1236,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use std::collections::VecDeque;
+
     use super::{
         Broker, ClientId, Effect, MAX_OUTSTANDING_SCREEN_UPDATES, PaneSubscription, Rendered,
     };
@@ -1320,6 +1339,29 @@ mod tests {
         row_text(&broker.screens[&pane(resource)].last, row)
     }
 
+    fn sequence_of(message: &ServerMessage) -> u64 {
+        match message {
+            ServerMessage::PaneScreen { screen, .. } => screen.sequence,
+            ServerMessage::PaneScreenDiff { diff, .. } => diff.sequence,
+            other => panic!("not a rendered update: {other:?}"),
+        }
+    }
+
+    fn outstanding_sequences(broker: &Broker, client: ClientId, resource: &str) -> Vec<u64> {
+        broker.clients[&client].panes[&pane(resource)]
+            .outstanding
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn newest_outstanding(broker: &Broker, client: ClientId, resource: &str) -> u64 {
+        *broker.clients[&client].panes[&pane(resource)]
+            .outstanding
+            .back()
+            .expect("the subscription was sent nothing")
+    }
+
     fn ack(broker: &mut Broker, client: ClientId, resource: &str, sequence: u64) -> Vec<Effect> {
         broker.handle(
             client,
@@ -1330,14 +1372,19 @@ mod tests {
         )
     }
 
-    /// The first update this subscription was sent, which is what a viewer
-    /// painting in order acknowledges first.
+    /// The oldest update this subscription is still waiting to hear about,
+    /// which is what a viewer painting in order acknowledges first.
     fn first_sequence(broker: &Broker, client: ClientId, resource: &str) -> u64 {
-        let subscription = &broker.clients[&client].panes[&pane(resource)];
-        subscription
-            .sent
+        *broker.clients[&client].panes[&pane(resource)]
+            .outstanding
+            .front()
             .expect("the subscription was sent nothing")
-            - u64::from(MAX_OUTSTANDING_SCREEN_UPDATES - 1)
+    }
+
+    fn outstanding(broker: &Broker, client: ClientId, resource: &str) -> usize {
+        broker.clients[&client].panes[&pane(resource)]
+            .outstanding
+            .len()
     }
 
     fn row_text(screen: &Snapshot, row: usize) -> String {
@@ -2213,7 +2260,7 @@ mod tests {
         }
 
         assert_eq!(
-            sent, MAX_OUTSTANDING_SCREEN_UPDATES as usize,
+            sent, MAX_OUTSTANDING_SCREEN_UPDATES,
             "twenty frames reached a viewer that acknowledged none of them"
         );
     }
@@ -2336,8 +2383,7 @@ mod tests {
             rows: 24,
             representation: PaneRepresentation::Screen,
             sent,
-            acked: None,
-            outstanding: 0,
+            outstanding: VecDeque::new(),
         };
         let mut parser = vt100::Parser::new(4, 20, 0);
         parser.process(b"before");
@@ -2366,6 +2412,146 @@ mod tests {
                 "a subscriber holding {held:?} was sent a diff it cannot apply"
             );
         }
+    }
+
+    /// The case whose answer is not in question, written first so that a wrong
+    /// harness shows up here rather than as a finding three tests later: a
+    /// viewer that acknowledges everything it is sent falls behind by nothing.
+    #[test]
+    fn a_viewer_that_acknowledges_everything_holds_nothing_outstanding() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        for index in 0..20 {
+            let effects = frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+            for message in messages_for(&effects, viewer) {
+                ack(&mut broker, viewer, "w1:p1", sequence_of(&message));
+            }
+        }
+
+        assert_eq!(
+            outstanding(&broker, viewer, "w1:p1"),
+            0,
+            "a viewer keeping up should be waiting on nothing"
+        );
+    }
+
+    /// The reason the queue holds sequences rather than a count. A viewer that
+    /// paints four and reports only the newest is telling the truth about all
+    /// four, and counting would have called it three behind for ever.
+    #[test]
+    fn acknowledging_the_newest_settles_everything_below_it() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        for index in 0..20 {
+            frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+        }
+        assert_eq!(
+            outstanding(&broker, viewer, "w1:p1"),
+            MAX_OUTSTANDING_SCREEN_UPDATES
+        );
+
+        let newest = newest_outstanding(&broker, viewer, "w1:p1");
+        let effects = ack(&mut broker, viewer, "w1:p1", newest);
+
+        // One acknowledgement settled all four, so the catch-up update is the
+        // only thing now outstanding.
+        assert_eq!(
+            outstanding(&broker, viewer, "w1:p1"),
+            1,
+            "acknowledging the newest of four left updates outstanding"
+        );
+        assert!(!messages_for(&effects, viewer).is_empty());
+    }
+
+    /// A dropped acknowledgement costs that update and nothing more: the next
+    /// one settles it. Counting made a missed acknowledgement permanent, which
+    /// is a thing a client could trip over without ever being told the rule.
+    #[test]
+    fn a_missed_acknowledgement_is_repaired_by_the_next_one() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        for index in 0..20 {
+            frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+        }
+
+        let held: Vec<u64> = outstanding_sequences(&broker, viewer, "w1:p1");
+        // Skip the first entirely, as a viewer that dropped one would.
+        ack(&mut broker, viewer, "w1:p1", held[1]);
+
+        assert_eq!(
+            outstanding(&broker, viewer, "w1:p1"),
+            MAX_OUTSTANDING_SCREEN_UPDATES - 2 + 1,
+            "the skipped update was not settled by the one after it"
+        );
+    }
+
+    /// An acknowledgement names an update this subscription was sent. The queue
+    /// has gaps — a viewer at its limit is skipped, so what it missed was never
+    /// in it — and without membership a client could clear those gaps by naming
+    /// an update it never received.
+    #[test]
+    fn an_update_that_was_never_sent_settles_nothing() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        for index in 0..20 {
+            frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+        }
+        // Settle one, so the catch-up update leaves a gap behind it.
+        let first = first_sequence(&broker, viewer, "w1:p1");
+        ack(&mut broker, viewer, "w1:p1", first);
+
+        let held = outstanding_sequences(&broker, viewer, "w1:p1");
+        let never_sent = held[held.len() - 1] - 1;
+        assert!(!held.contains(&never_sent), "the fixture needs a real gap");
+
+        let effects = ack(&mut broker, viewer, "w1:p1", never_sent);
+
+        assert_eq!(
+            outstanding_sequences(&broker, viewer, "w1:p1"),
+            held,
+            "a sequence that was never sent settled updates that were"
+        );
+        assert!(
+            messages_for(&effects, viewer).is_empty(),
+            "an update that was never sent bought a slot"
+        );
     }
 
     /// The bound belongs to the rendered path alone: a frame subscriber is
