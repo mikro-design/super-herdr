@@ -177,6 +177,19 @@ struct PaneSubscription {
     /// repairs it. Counting would have made both of those permanent, and would
     /// have made the protocol depend on a client acknowledging exactly once per
     /// update without anywhere saying so.
+    ///
+    /// These sequences mean something only within one [`ScreenState`]. A pane's
+    /// emulator is dropped when nobody is watching it as a screen and rebuilt
+    /// at sequence zero for the next viewer, so the numbers here can be higher
+    /// than anything the pane will issue again. What keeps that harmless is
+    /// that `subscribe_pane` replaces the whole `PaneSubscription`, queue
+    /// included, so no queue outlives the sequence space that filled it.
+    ///
+    /// Anything that changes subscribing to update a subscription in place —
+    /// keeping `sent` across a resize to spare a viewer a whole screen would be
+    /// a reasonable reason to try — has to clear this queue as well. A stale
+    /// queue against a restarted sequence space never drains: it is full, so
+    /// nothing new is sent, and no acknowledgement names anything in it.
     outstanding: VecDeque<u64>,
 }
 
