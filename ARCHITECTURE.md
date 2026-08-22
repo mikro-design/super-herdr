@@ -490,6 +490,55 @@ text, exactly as the desktop path already guarantees. Because a single-machine
 install should not require operating a service, the TUI retains an in-process
 mode that runs the daemon's responsibilities inside the frontend process.
 
+### Two representations of a pane
+
+A pane subscription names what it wants. `frames` is the default and carries
+encoded ANSI untouched, which is what a client owning a VT parser wants and what
+the TUI uses. `screen` carries a rendered screen instead, for a client that
+cannot carry an emulator: vendoring one into the browser page would mean a
+megabyte of third-party JavaScript inside a signed binary, in the component most
+exposed to a network, shipping input handling to a viewer that is deliberately
+read-only.
+
+This does not weaken the rule that encoded ANSI reaches a renderer without a
+lossy intermediate model. That rule forbids a *double* parse — a middle that
+decodes and re-encodes and hands a renderer something degraded. A rendered
+screen is one parse moved to whichever end can afford it, delivered directly,
+and it reaches the same ceiling a client-side `vt100` would, because the TUI
+already reduces to a `vt100` screen. Both representations are served from a
+single parse of a single frame, so a TUI and a browser can watch one pane at
+once. The emulator is created with the first screen subscriber and dropped with
+the last, so a pane nobody renders costs nothing.
+
+A full repaint or a resize rebuilds the emulator rather than feeding it, which
+is the rule the TUI already follows. A frame that leaves the visible screen
+unchanged sends nothing and does not advance the sequence: a client that missed
+nothing should not be told that it is behind.
+
+### Backpressure on rendered updates
+
+A frame subscriber needs no flow control, because the socket provides it — a
+client that stops draining stops the daemon reading. A rendered update is queued
+into an unbounded outbox instead, so nothing in the transport pushes back, and a
+viewer on a slow link watching a busy pane would accumulate one message per
+frame in the daemon's memory.
+
+So the depth is bounded here. A screen subscriber may hold a small number of
+updates, the daemon decides how many, and a viewer acknowledges each update once
+it has painted it. An acknowledgement is checked against what that subscription
+was actually sent: acknowledging twice, or acknowledging something never sent,
+changes nothing. It reports progress rather than granting anything, for the same
+reason a resume token is not authority and a download's credit is a request
+rather than an instruction.
+
+What a viewer that fell behind is sent when it catches up is the screen as it
+stands, not the backlog it missed — which is both fewer bytes and the thing it
+actually wants. Frames cannot do this, because every byte matters to a parser
+consuming them statefully. A snapshot can, because it is self-contained and
+carries the sequence that tells a client what it skipped. That asymmetry is the
+argument for the second representation, and it bounds the cost of a viewer
+however far behind it falls.
+
 ## File bridge
 
 Moving a file between the machine a person is holding, the daemon host, and the

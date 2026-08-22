@@ -380,6 +380,16 @@ function paint() {
   }
 }
 
+// Sent only after the update is on the screen, because that is what it claims.
+// The daemon holds a small number of updates for this viewer and sends no more
+// until they are painted, so a phone on a slow link falls behind rather than
+// filling the daemon with a pane's history — and what it is sent when it
+// catches up is the screen as it stands, not the backlog it missed.
+function acknowledge() {
+  if (!watching || !screen) return;
+  send({ type: 'pane.screen_ack', pane: watching, sequence: screen.sequence });
+}
+
 function observe(pane, label) {
   if (watching && !sameId(pane, watching)) send({ type: 'pane.unsubscribe', pane: watching });
   watching = pane;
@@ -496,6 +506,7 @@ function apply(message) {
       el('screen-note').textContent = '';
       refit();
       paint();
+      acknowledge();
       break;
     case 'pane.screen_diff': {
       if (!sameId(message.pane, watching)) break;
@@ -508,6 +519,7 @@ function apply(message) {
       screen.cursor = diff.cursor;
       screen.sequence = diff.sequence;
       paint();
+      acknowledge();
       break;
     }
     case 'pane.lease':
