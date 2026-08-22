@@ -590,10 +590,18 @@ function codeFromFragment() {
   } catch (_) {
     return '';
   }
-  // Shaped like a code or ignored. A fragment is attacker-supplied in the sense
-  // that anything can link here, and this value is about to be typed into a
-  // form field.
-  return /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$/.test(decoded) ? decoded.toUpperCase() : '';
+  // Bounded, not shaped. Anything can link to this page, so the fragment is
+  // attacker-supplied and this value goes straight into a form field — a length
+  // and character bound is what that needs.
+  //
+  // It deliberately does not encode what a code looks like. The daemon defines
+  // that, in one place, and already accepts a code however it was typed:
+  // `normalize_code` treats case and separators as presentation. A pattern here
+  // would be a second definition with nothing holding the two together, and the
+  // day they disagreed every scan would quietly degrade to typing with no error
+  // anywhere and a person debugging it from a phone. Whether a code is right is
+  // the daemon's to answer, and it answers in constant time.
+  return /^[A-Za-z0-9-]{1,32}$/.test(decoded) ? decoded.toUpperCase() : '';
 }
 
 // A guess the person can correct, so a device that pairs by scanning still ends
