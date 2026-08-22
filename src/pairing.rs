@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 /// A pairing code is read off one screen and typed into another, so it avoids
@@ -74,6 +74,44 @@ pub fn fingerprint(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hex(&hasher.finalize())
+}
+
+/// Check a URL a pairing code can be offered at, and hand back its base.
+///
+/// Refused at the flag rather than at the screen, because everything after this
+/// point produces something that looks right. A QR of an unreachable address
+/// scans perfectly and fails at the far end, where the person holding the phone
+/// cannot tell a wrong address from a bad camera, poor light, or a daemon that
+/// is not running. A refusal here names the problem while somebody is still
+/// looking at a terminal.
+///
+/// What is checked is what this can know: a scheme it makes sense to open, a
+/// host that is not empty, and no fragment — the code becomes the fragment, and
+/// one already there would be silently replaced. Whether the host resolves and
+/// whether a certificate validates are not knowable from here and are not
+/// pretended at.
+pub fn pairing_url(url: &str) -> Result<String> {
+    let trimmed = url.trim();
+    let (scheme, rest) = trimmed
+        .split_once("://")
+        .context("a pairing URL needs a scheme, as in https://host.example:8790")?;
+    if !matches!(scheme, "http" | "https") {
+        bail!("a pairing URL must be http or https; {scheme:?} is neither");
+    }
+    if scheme == "http" && !rest.starts_with("127.0.0.1") && !rest.starts_with("localhost") {
+        // A token authenticates a device and encrypts nothing, which is why the
+        // listener refuses a public address. Offering one over plain HTTP would
+        // put the pairing code itself on the wire.
+        bail!("a pairing URL over http would carry the code in clear; use https");
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        bail!("a pairing URL needs a host");
+    }
+    if trimmed.contains('#') {
+        bail!("a pairing URL cannot carry a fragment; the code is the fragment");
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
 }
 
 /// Compare without revealing where two values first differ.
@@ -172,6 +210,45 @@ mod tests {
         CODE_ALPHABET, CODE_LIFETIME, PendingPairing, fingerprint, matches, normalize_code,
         pairing_code, token,
     };
+
+    #[test]
+    fn a_pairing_url_is_refused_while_somebody_is_still_looking_at_a_terminal() {
+        // The whole point of checking here: everything downstream of this
+        // produces something that looks right. A QR of an unreachable address
+        // scans perfectly and fails where nobody can diagnose it.
+        for url in [
+            "https://onio-ws01.tail15b0b2.ts.net:8790",
+            "https://host.example",
+            // Loopback over http is the one plain case that is not on a wire.
+            "http://127.0.0.1:8790",
+            "http://localhost:8790",
+        ] {
+            assert!(super::pairing_url(url).is_ok(), "{url} should be accepted");
+        }
+
+        for (url, expected) in [
+            ("host.example:8790", "scheme"),
+            ("ftp://host.example", "http or https"),
+            // A token authenticates and encrypts nothing, so plain http off
+            // this machine would put the code itself on the wire.
+            ("http://host.example:8790", "clear"),
+            ("https://", "host"),
+            // The code becomes the fragment; one already there would vanish.
+            ("https://host.example/#already", "fragment"),
+        ] {
+            let error = super::pairing_url(url)
+                .expect_err(&format!("{url} should be refused"))
+                .to_string();
+            assert!(error.contains(expected), "{url}: {error}");
+        }
+
+        // A trailing slash would otherwise become a double slash before the
+        // fragment.
+        assert_eq!(
+            super::pairing_url("https://host.example:8790/").unwrap(),
+            "https://host.example:8790"
+        );
+    }
 
     #[test]
     fn a_token_is_unpredictable_and_stored_only_as_a_digest() {

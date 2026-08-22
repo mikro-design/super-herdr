@@ -72,6 +72,16 @@ pub struct DaemonOptions {
     pub web_port: Option<u16>,
     /// Where the browser client listens. `None` is loopback.
     pub web_address: Option<std::net::IpAddr>,
+    /// The address a device outside this machine reaches the browser client on.
+    ///
+    /// It cannot be derived from the bind, and a daemon that tried would be
+    /// confidently wrong: this process binds loopback, while a phone needs
+    /// whatever host, port and scheme the proxy in front of it terminates —
+    /// `https://host.tailnet.ts.net:8790` against a `127.0.0.1:8795` listener.
+    /// Deriving one from the other produces a perfectly valid QR of an
+    /// unreachable address, which is worse than no QR at all, so it is told
+    /// rather than guessed and `None` means a client shows the code alone.
+    pub web_url: Option<String>,
 }
 
 impl DaemonOptions {
@@ -94,6 +104,7 @@ impl DaemonOptions {
             refresh_interval: CONFIG_REFRESH_INTERVAL,
             web_port: None,
             web_address: None,
+            web_url: None,
         })
     }
 }
@@ -677,6 +688,9 @@ struct Daemon {
     /// pipe nobody is emptying.
     downloads: BTreeMap<(ClientId, u64), Download>,
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
+    /// Where a device outside this machine reaches the browser client, when
+    /// somebody told the daemon. Never derived: see `DaemonOptions::web_url`.
+    web_url: Option<String>,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
     downgraded: Vec<PaneId>,
@@ -882,6 +896,7 @@ async fn run(
     let attention_cursor = attention.events().next_back().map(|event| event.id);
     let mut daemon = Daemon {
         broker: Broker::new(env!("CARGO_PKG_VERSION"), vec!["terminal".to_owned()]),
+        web_url: options.web_url.clone(),
         outboxes: BTreeMap::new(),
         routes: BTreeMap::new(),
         targets: target_map(&active),
@@ -1754,6 +1769,7 @@ impl Daemon {
                     request,
                     code,
                     expires_in_seconds,
+                    url: self.web_url.clone(),
                 }
             }
             Err(error) => ServerMessage::Error {
@@ -2634,6 +2650,7 @@ mod tests {
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             };
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let server = tokio::spawn(serve_until(config, None, options, async move {
@@ -2884,6 +2901,7 @@ mod tests {
                 refresh_interval: Duration::from_millis(50),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             },
         ));
 
@@ -3156,6 +3174,7 @@ mod tests {
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             },
         ));
 
@@ -3496,6 +3515,70 @@ mod tests {
         // documents, and the test cleans up after it rather than pretending it
         // does not exist.
         discard_staged(&last);
+    }
+
+    /// What the daemon was told is what a client is offered, and nothing is
+    /// invented when it was told nothing.
+    ///
+    /// The whole point of the flag: a URL cannot be derived from the loopback
+    /// address this process binds, so it either arrives from configuration or
+    /// it is absent. A daemon that filled the gap with its own bind would hand
+    /// a client a perfectly valid QR of somewhere no phone can reach.
+    #[tokio::test]
+    async fn a_pairing_code_carries_the_url_the_daemon_was_told_and_no_other() {
+        for told in [Some("https://host.example:8790".to_owned()), None] {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+            let socket = directory.path().join("daemon.sock");
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(serve_until(
+                empty_config(),
+                None,
+                DaemonOptions {
+                    socket: socket.clone(),
+                    attention_state: Some(directory.path().join("attention.json")),
+                    refresh_interval: Duration::from_secs(3600),
+                    web_port: None,
+                    web_address: None,
+                    web_url: told.clone(),
+                },
+                async move {
+                    let _ = stopped.await;
+                },
+            ));
+
+            let mut connection = None;
+            for _ in 0..200 {
+                if let Ok(stream) = UnixStream::connect(&socket).await {
+                    connection = Some(Connection {
+                        reader: BufReader::new(stream),
+                    });
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut connection = connection.expect("the daemon accepts a connection");
+            connection.hello().await;
+            connection
+                .send(ClientMessage::RequestPairingCode { request: 1 })
+                .await;
+
+            let issued = loop {
+                match connection.receive().await.expect("the daemon answers") {
+                    message @ (ServerMessage::PairingCode { .. } | ServerMessage::Error { .. }) => {
+                        break message;
+                    }
+                    _ => continue,
+                }
+            };
+            let ServerMessage::PairingCode { code, url, .. } = &issued else {
+                panic!("no pairing code was issued: {issued:?}");
+            };
+            assert!(!code.is_empty(), "a code is issued either way");
+            assert_eq!(url, &told, "the daemon offered a URL it was not given");
+
+            let _ = stop.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+        }
     }
 
     /// A caller's name reaches the host, and a bad one never leaves the daemon.
@@ -4011,6 +4094,7 @@ mod tests {
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             },
             async move {
                 let _ = stopped.await;
@@ -4087,6 +4171,7 @@ mod tests {
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             },
             async move {
                 let _ = stopped.await;
@@ -4125,6 +4210,7 @@ mod tests {
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
             web_address: None,
+            web_url: None,
         };
         let error = serve(empty_config(), None, options)
             .await
@@ -4150,6 +4236,7 @@ mod tests {
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             },
         ));
 

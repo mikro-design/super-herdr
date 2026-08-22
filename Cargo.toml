@@ -32,6 +32,14 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+# Rendering a pairing code as a QR. Taken rather than written because the parts
+# that are easy to get subtly wrong — Reed-Solomon and mask selection — fail by
+# producing a code that scans on one phone and not another, which looks like
+# working software to whoever holds the phone that works. Zero transitive
+# dependencies, with defaults or without; `default-features = false` drops the
+# image, svg and pic renderers, which are the only things here that would ever
+# grow a tree.
+qrcode = { version = "0.14.1", default-features = false }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

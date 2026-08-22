@@ -366,6 +366,25 @@ pub enum ServerMessage {
         request: u64,
         code: String,
         expires_in_seconds: u64,
+        /// Where a device outside the daemon's machine reaches the browser
+        /// client, when somebody told the daemon. Absent means nobody did, and
+        /// a client shows the code to be typed.
+        ///
+        /// It is never derived from what the daemon bound. Behind a proxy that
+        /// terminates TLS the host, port and scheme a phone needs are all
+        /// different from the loopback address this process listens on, and a
+        /// guess would produce a perfectly valid QR of somewhere unreachable —
+        /// which fails where the person holding the phone cannot tell a wrong
+        /// address from a bad camera.
+        ///
+        /// A client joins this to the code as `{url}#{code}`. The fragment is
+        /// deliberate: it is never sent to a server, so the code stays out of
+        /// request lines, out of the daemon's own path, and out of any proxy in
+        /// front of it. The daemon refuses a URL that already carries one,
+        /// because the code replacing it would fail like a bad code rather than
+        /// like a bad URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
     /// A transfer may proceed, and this is where to send from.
     ///
@@ -693,6 +712,14 @@ mod tests {
             request: 9,
             code: "ABCD-2345".to_owned(),
             expires_in_seconds: 300,
+            url: Some("https://host.example:8790".to_owned()),
+        });
+        round_trip_server(ServerMessage::PairingCode {
+            request: 8,
+            code: "ABCD-EFGH".to_owned(),
+            expires_in_seconds: 120,
+            // What a daemon nobody told sends: a code to be typed.
+            url: None,
         });
         round_trip_server(ServerMessage::Error {
             request: Some(7),
