@@ -469,7 +469,10 @@ mod tests {
     use super::Client;
     use crate::config::{Config, Target};
     use crate::daemon::server::{DaemonHandle, DaemonOptions, spawn_in_process};
+    use crate::model::PaneId;
     use crate::model::TargetSession;
+    use crate::protocol::ServerMessage;
+    use crate::terminal::TerminalAccess;
 
     fn target_named(name: &str) -> Target {
         Target {
@@ -542,6 +545,57 @@ mod tests {
             !directory.path().join("unused.sock").exists(),
             "an in-process daemon binds nothing"
         );
+    }
+
+    /// A clipboard image reaches a local target through a daemon this process
+    /// is hosting.
+    ///
+    /// The path a single-machine install actually takes, and the one nothing
+    /// covered: every other transfer test drives a daemon over a socket, while
+    /// a frontend hosting its own daemon speaks through a 64 KiB in-memory pipe
+    /// and sends 512 KiB chunks into it.
+    #[tokio::test]
+    async fn a_clipboard_upload_crosses_an_in_process_daemon() {
+        let (daemon, directory) = daemon_with(vec![Target {
+            name: "first".to_owned(),
+            // The sink is this machine, which is what "native" means here.
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+        }]);
+        let _ = directory;
+
+        let (client, mut events) = Client::attach(&daemon, "test").await.expect("attaches");
+        let commands = client.commands();
+        let pane = PaneId::new("first", "default", "w1:p1");
+        commands.subscribe_pane(pane.clone(), TerminalAccess::Control, 80, 24);
+
+        // Bigger than one chunk and bigger than the pipe between the two.
+        let mut payload = b"\x89PNG\r\n\x1a\n".to_vec();
+        payload.extend((0..900_000_u32).map(|index| index as u8));
+        commands.upload_media(pane, "image/png".to_owned(), &payload);
+
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match events.recv().await {
+                    Some(ServerMessage::UploadComplete { path, bytes, .. }) => {
+                        return Some((path, bytes));
+                    }
+                    Some(ServerMessage::Error { message, .. }) => panic!("{message}"),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("an in-process upload finishes rather than wedging");
+
+        let (path, bytes) = result.expect("the daemon answers");
+        assert_eq!(bytes as usize, payload.len());
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        crate::clipboard::discard_local_upload(std::path::Path::new(&path));
     }
 
     #[tokio::test]

@@ -663,12 +663,27 @@ struct PendingOperation {
     clipboard_feedback: Option<String>,
 }
 
+/// Targets by the qualified key they are addressed with, after discovery.
+fn resolved_targets(config: &Config) -> BTreeMap<TargetSession, Target> {
+    config
+        .targets
+        .iter()
+        .map(|target| (crate::state::target_key(target), target.clone()))
+        .collect()
+}
+
 /// Whether a target can take an atomic paste, which needs a documented Herdr
 /// API socket rather than a terminal stream.
-fn atomic_paste_available(configured: &[Target], key: &TargetSession) -> bool {
-    configured
-        .iter()
-        .any(|target| target.name == key.target && target.socket.is_some())
+///
+/// Asked of the resolved targets rather than the configured ones, because those
+/// are different things whenever discovery is doing its job: a target with
+/// `discover_sessions` and no `socket` line has no socket in the file and a
+/// perfectly good one at runtime. Asking the file returns no for a target that
+/// can, which is a paste refused for a reason that is not true.
+fn atomic_paste_available(resolved: &BTreeMap<TargetSession, Target>, key: &TargetSession) -> bool {
+    resolved
+        .get(key)
+        .is_some_and(|target| target.socket.is_some())
 }
 
 /// What the frontend needs to remember while the daemon moves a payload. The
@@ -770,6 +785,12 @@ struct App {
     clipboard_feedback: Option<ClipboardFeedback>,
     config_path: Option<PathBuf>,
     configured_targets: Vec<Target>,
+    /// Targets as they resolved, which is not what the file says. A session
+    /// discovered at runtime carries the socket the host reported, and a target
+    /// that relies on discovery has none in the file at all — so a question
+    /// about what a target can do has to be asked of this rather than of the
+    /// configuration the frontend happens to hold.
+    resolved_targets: BTreeMap<TargetSession, Target>,
     configuration_dirty: bool,
     target_manager: Option<TargetManager>,
     target_test_sender: Option<mpsc::UnboundedSender<TargetTestEvent>>,
@@ -817,6 +838,7 @@ impl Default for App {
             clipboard_feedback: None,
             config_path: None,
             configured_targets: Vec::new(),
+            resolved_targets: BTreeMap::new(),
             configuration_dirty: false,
             target_manager: None,
             target_test_sender: None,
@@ -890,6 +912,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         notification_sender: Some(notification_sender),
         config_path: Some(config_path.clone()),
         configured_targets,
+        resolved_targets: resolved_targets(&active_config),
         target_test_sender: Some(target_test_sender),
         client: Some(client.commands()),
         ..App::default()
@@ -966,6 +989,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                             app.notification_error_reported = false;
                         }
                         app.configured_targets = configured.targets.clone();
+                        app.resolved_targets = resolved_targets(&expanded);
                         // Supervisors belong to the daemon, which refreshes them
                         // from the same file on its own schedule. What the
                         // frontend still needs from a reload is the local
@@ -3731,7 +3755,7 @@ async fn paste_text_into_selected(
     // in one piece, and only the daemon has a route there. Which targets can do
     // that is the daemon's knowledge too, so it is asked rather than guessed at
     // from configuration this frontend happens to hold.
-    if atomic_paste_available(&app.configured_targets, &key) {
+    if atomic_paste_available(&app.resolved_targets, &key) {
         let Some(client) = app.client.clone() else {
             app.message = Some("paste routing is unavailable; paste not sent".to_owned());
             return Ok(());
@@ -6178,6 +6202,56 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// A target whose socket comes from discovery can still take an atomic
+    /// paste.
+    ///
+    /// The regression this is here for: the check used to read the file rather
+    /// than what discovery resolved, so a target configured with
+    /// `discover_sessions` and no `socket` line was told it could not do the
+    /// one thing it could do — and a multiline paste into a pane without
+    /// bracketed paste was refused with a reason that was not true.
+    #[test]
+    fn a_discovered_socket_is_enough_for_an_atomic_paste() {
+        let configured = Target {
+            name: "ws01".to_owned(),
+            ssh: None,
+            discover_sessions: true,
+            session: Some("rv32sim".to_owned()),
+            // What the file says: nothing. The host reports it at runtime.
+            socket: None,
+            herdr_bins: vec!["herdr".to_owned()],
+        };
+        let key = TargetSession::new("ws01", "rv32sim");
+
+        // Before discovery has answered there is genuinely nothing to use.
+        let unresolved = super::resolved_targets(&Config {
+            transport: Default::default(),
+            notifications: Default::default(),
+            transfers: Default::default(),
+            targets: vec![configured.clone()],
+            devices: Vec::new(),
+        });
+        assert!(!super::atomic_paste_available(&unresolved, &key));
+
+        // After it has, the socket exists and the paste is available.
+        let discovered = Target {
+            discover_sessions: false,
+            socket: Some("/home/veba/.config/herdr/sessions/rv32sim/herdr.sock".to_owned()),
+            ..configured
+        };
+        let resolved = super::resolved_targets(&Config {
+            transport: Default::default(),
+            notifications: Default::default(),
+            transfers: Default::default(),
+            targets: vec![discovered],
+            devices: Vec::new(),
+        });
+        assert!(
+            super::atomic_paste_available(&resolved, &key),
+            "a discovered socket must count; reading the file instead is what broke this"
+        );
+    }
 
     use ratatui::style::Modifier;
     use serde_json::json;
