@@ -595,6 +595,7 @@ mod tests {
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
                 web_address: None,
+                web_url: None,
             },
         );
         // Port zero so tests never collide with a daemon somebody is running.

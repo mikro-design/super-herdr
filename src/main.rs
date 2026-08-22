@@ -76,6 +76,15 @@ enum Commands {
         /// not encrypt.
         #[arg(long, value_name = "ADDRESS", requires = "web")]
         web_address: Option<std::net::IpAddr>,
+        /// Where a device outside this machine reaches the browser client, so
+        /// a pairing code can be offered as something scannable. This cannot
+        /// be worked out from the address above: behind a proxy that
+        /// terminates TLS, such as `tailscale serve`, the host, port and
+        /// scheme a phone needs are all different from what this process
+        /// binds. Without it a pairing code is shown to be typed, which is
+        /// what happens today.
+        #[arg(long, value_name = "URL", requires = "web")]
+        web_url: Option<String>,
     },
     /// Inspect clipboard copy and paste capabilities without reading clipboard contents.
     Clipboard {
@@ -362,6 +371,7 @@ async fn run() -> Result<ExitCode> {
             socket,
             web,
             web_address,
+            web_url,
         } => {
             let mut options = DaemonOptions::discover()?;
             if let Some(socket) = socket {
@@ -369,6 +379,9 @@ async fn run() -> Result<ExitCode> {
             }
             options.web_port = web;
             options.web_address = web_address;
+            options.web_url = web_url
+                .map(|url| super_herdr::pairing::pairing_url(&url))
+                .transpose()?;
             // The daemon announces itself once it is actually listening; a
             // line printed here would be a claim rather than a report.
             serve(config, Some(path), options).await?;

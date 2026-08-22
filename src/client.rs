@@ -501,6 +501,7 @@ mod tests {
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
             web_address: None,
+            web_url: None,
         };
         (spawn_in_process(config, None, options), directory)
     }

@@ -218,6 +218,7 @@ async fn relay(
             refresh_interval: std::time::Duration::from_secs(3600),
             web_port: None,
             web_address: None,
+            web_url: None,
         },
     );
 
