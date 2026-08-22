@@ -162,10 +162,18 @@ struct PaneSubscription {
     cols: u16,
     rows: u16,
     representation: PaneRepresentation,
-    /// The rendered update this client is known to hold, for `screen`
-    /// subscribers. `None` means it holds nothing yet and must be sent a whole
-    /// screen before a diff can mean anything to it.
-    holds: Option<u64>,
+    /// The rendered update last sent to this client. `None` means it has been
+    /// sent nothing yet and must receive a whole screen before a diff can mean
+    /// anything to it.
+    sent: Option<u64>,
+    /// The last update this client said it painted.
+    acked: Option<u64>,
+    /// Updates sent and not yet acknowledged.
+    ///
+    /// Counted rather than derived from the sequences, because a whole screen
+    /// sent to a client that fell behind advances the sequence by more than one
+    /// while being a single update.
+    outstanding: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +201,16 @@ impl Client {
         }
     }
 }
+
+/// How many rendered updates one screen subscriber may have outstanding.
+///
+/// A frame subscriber needs no such number: the socket stops the daemon reading
+/// when a client stops draining. A rendered update is queued into an unbounded
+/// outbox instead, so nothing in the transport pushes back and a viewer on a
+/// slow link watching a busy pane would accumulate without limit in this
+/// process. The daemon chooses the depth; an acknowledgement reports progress
+/// against what was actually sent and cannot ask for more than this.
+const MAX_OUTSTANDING_SCREEN_UPDATES: u32 = 4;
 
 /// One pane's rendered screen, kept only while somebody is watching it that
 /// way.
@@ -401,6 +419,9 @@ impl Broker {
                 representation,
                 &mut effects,
             ),
+            ClientMessage::AckPaneScreen { pane, sequence } => {
+                self.ack_pane_screen(client, &pane, sequence, &mut effects);
+            }
             ClientMessage::UnsubscribePane { pane } => {
                 if let Some(session) = self.clients.get_mut(&client)
                     && session.panes.remove(&pane).is_some()
@@ -719,24 +740,98 @@ impl Broker {
 
             // Up to date and nothing moved: say nothing rather than send an
             // empty diff.
-            if !rendered.changed && subscription.holds == Some(rendered.screen.sequence) {
+            if !rendered.changed && subscription.sent == Some(rendered.screen.sequence) {
                 continue;
             }
 
-            let message = match (&rendered.diff, subscription.holds) {
-                (Some(diff), Some(held)) if held == diff.follows => ServerMessage::PaneScreenDiff {
-                    pane: pane.clone(),
-                    diff: diff.clone(),
-                },
-                _ => ServerMessage::PaneScreen {
-                    pane: pane.clone(),
-                    screen: rendered.screen.clone(),
-                },
-            };
-            subscription.holds = Some(rendered.screen.sequence);
+            // Already holding as much as this viewer has agreed to carry. The
+            // update is not queued behind the others and not remembered: when
+            // it catches up it is sent the screen as it stands then, which is
+            // what it wants and is bounded however far behind it fell.
+            if subscription.outstanding >= MAX_OUTSTANDING_SCREEN_UPDATES {
+                continue;
+            }
+
+            let message = Self::update_for(subscription, pane, &rendered);
+            subscription.sent = Some(rendered.screen.sequence);
+            subscription.outstanding += 1;
             effects.push(Effect::Send { client, message });
         }
         effects
+    }
+
+    /// What one subscriber needs in order to hold `rendered`.
+    ///
+    /// A diff is only applicable to the exact update it follows, and the only
+    /// client that holds that update is one that was sent it. Anything else —
+    /// a new subscriber, a resize, or a viewer that was skipped while it was at
+    /// its limit — is sent the whole screen.
+    fn update_for(
+        subscription: &PaneSubscription,
+        pane: &PaneId,
+        rendered: &Rendered,
+    ) -> ServerMessage {
+        match (&rendered.diff, subscription.sent) {
+            (Some(diff), Some(sent)) if sent == diff.follows => ServerMessage::PaneScreenDiff {
+                pane: pane.clone(),
+                diff: diff.clone(),
+            },
+            _ => ServerMessage::PaneScreen {
+                pane: pane.clone(),
+                screen: rendered.screen.clone(),
+            },
+        }
+    }
+
+    /// A client painted an update, so it may be sent another.
+    ///
+    /// The sequence is checked against what this subscription was actually
+    /// sent: acknowledging the same update twice, or one never sent, changes
+    /// nothing. Progress is reported here, not granted — the depth stays the
+    /// daemon's.
+    fn ack_pane_screen(
+        &mut self,
+        client: ClientId,
+        pane: &PaneId,
+        sequence: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(subscription) = self
+            .clients
+            .get_mut(&client)
+            .and_then(|session| session.panes.get_mut(pane))
+        else {
+            return;
+        };
+        if subscription.sent.is_none_or(|sent| sequence > sent)
+            || subscription.acked.is_some_and(|acked| sequence <= acked)
+        {
+            return;
+        }
+        subscription.acked = Some(sequence);
+        subscription.outstanding = subscription.outstanding.saturating_sub(1);
+
+        // Caught up enough to be sent something, and behind what the pane now
+        // shows. A pane that has gone quiet produces no further frame, so
+        // waiting for one would leave this viewer holding a screen it can see
+        // is stale and cannot ask to replace.
+        let Some(state) = self.screens.get(pane) else {
+            return;
+        };
+        if subscription.sent == Some(state.last.sequence)
+            || subscription.outstanding >= MAX_OUTSTANDING_SCREEN_UPDATES
+        {
+            return;
+        }
+        let rendered = Rendered {
+            screen: state.last.clone(),
+            diff: None,
+            changed: true,
+        };
+        let message = Self::update_for(subscription, pane, &rendered);
+        subscription.sent = Some(state.last.sequence);
+        subscription.outstanding += 1;
+        effects.push(Effect::Send { client, message });
     }
 
     /// Drop the emulator for a pane nobody is watching as a screen any more.
@@ -870,7 +965,9 @@ impl Broker {
                 cols,
                 rows,
                 representation,
-                holds: None,
+                sent: None,
+                acked: None,
+                outstanding: 0,
             },
         );
 
@@ -919,7 +1016,8 @@ impl Broker {
             if let Some(session) = self.clients.get_mut(&client)
                 && let Some(subscription) = session.panes.get_mut(&pane)
             {
-                subscription.holds = Some(screen.sequence);
+                subscription.sent = Some(screen.sequence);
+                subscription.outstanding += 1;
             }
             effects.push(Effect::Send {
                 client,
@@ -1121,11 +1219,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use super::{Broker, ClientId, Effect};
+    use super::{
+        Broker, ClientId, Effect, MAX_OUTSTANDING_SCREEN_UPDATES, PaneSubscription, Rendered,
+    };
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{PaneId, TargetSession};
     use crate::operation::Operation;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
+    use crate::screen::Diff as ScreenDiff;
     use crate::screen::Snapshot;
     use crate::state::{
         FederationState, NormalizedSnapshot, PaneState, TargetConnectionState, TargetRuntimeState,
@@ -1217,6 +1318,26 @@ mod tests {
 
     fn rendered_row(broker: &Broker, resource: &str, row: usize) -> String {
         row_text(&broker.screens[&pane(resource)].last, row)
+    }
+
+    fn ack(broker: &mut Broker, client: ClientId, resource: &str, sequence: u64) -> Vec<Effect> {
+        broker.handle(
+            client,
+            ClientMessage::AckPaneScreen {
+                pane: pane(resource),
+                sequence,
+            },
+        )
+    }
+
+    /// The first update this subscription was sent, which is what a viewer
+    /// painting in order acknowledges first.
+    fn first_sequence(broker: &Broker, client: ClientId, resource: &str) -> u64 {
+        let subscription = &broker.clients[&client].panes[&pane(resource)];
+        subscription
+            .sent
+            .expect("the subscription was sent nothing")
+            - u64::from(MAX_OUTSTANDING_SCREEN_UPDATES - 1)
     }
 
     fn row_text(screen: &Snapshot, row: usize) -> String {
@@ -2065,6 +2186,203 @@ mod tests {
             !messages_for(&effects, viewer).is_empty(),
             "the viewer is told about the repaint"
         );
+    }
+
+    /// The reason this bound exists: a rendered update is queued into an
+    /// unbounded outbox, so a viewer that stops draining would otherwise
+    /// accumulate one message per frame in this process for as long as the pane
+    /// keeps producing output.
+    #[test]
+    fn a_viewer_that_stops_painting_stops_being_queued_for() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        let mut sent = 0;
+        for index in 0..20 {
+            let effects = frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+            sent += messages_for(&effects, viewer).len();
+        }
+
+        assert_eq!(
+            sent, MAX_OUTSTANDING_SCREEN_UPDATES as usize,
+            "twenty frames reached a viewer that acknowledged none of them"
+        );
+    }
+
+    #[test]
+    fn acknowledging_an_update_lets_the_next_one_through() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        for index in 0..20 {
+            frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+        }
+
+        let held = first_sequence(&broker, viewer, "w1:p1");
+        let effects = ack(&mut broker, viewer, "w1:p1", held);
+
+        assert!(
+            !messages_for(&effects, viewer).is_empty(),
+            "a viewer that caught up was sent nothing"
+        );
+    }
+
+    /// What a viewer that fell behind wants is the screen as it stands, not the
+    /// history of how it got there. Frames cannot do this; a snapshot can,
+    /// because it is self-contained.
+    #[test]
+    fn a_viewer_that_catches_up_is_sent_the_screen_as_it_stands() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        for index in 0..20 {
+            frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+        }
+
+        let held = first_sequence(&broker, viewer, "w1:p1");
+        let effects = ack(&mut broker, viewer, "w1:p1", held);
+
+        let messages = messages_for(&effects, viewer);
+        let [ServerMessage::PaneScreen { screen, .. }] = messages.as_slice() else {
+            panic!("expected the current screen, not a backlog: {messages:?}");
+        };
+        assert_eq!(
+            screen.sequence,
+            broker.screens[&pane("w1:p1")].last.sequence,
+            "the viewer was sent something other than the newest screen"
+        );
+        assert_eq!(
+            row_text(screen, 19),
+            "line 19",
+            "the screen sent was not the one the pane is showing"
+        );
+    }
+
+    /// An acknowledgement reports progress. It does not grant anything, so a
+    /// client cannot talk its way into more of this process's memory.
+    #[test]
+    fn an_acknowledgement_is_checked_against_what_was_actually_sent() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        for index in 0..20 {
+            frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+        }
+
+        // Never sent, so it buys nothing.
+        assert!(
+            messages_for(&ack(&mut broker, viewer, "w1:p1", 9_999), viewer).is_empty(),
+            "a sequence that was never sent was accepted"
+        );
+
+        // The same update, over and over, is still one update painted.
+        let held = first_sequence(&broker, viewer, "w1:p1");
+        ack(&mut broker, viewer, "w1:p1", held);
+        let mut extra = 0;
+        for _ in 0..10 {
+            extra += messages_for(&ack(&mut broker, viewer, "w1:p1", held), viewer).len();
+        }
+        assert_eq!(
+            extra, 0,
+            "repeating one acknowledgement bought more updates"
+        );
+    }
+
+    /// A diff is only applicable to the exact update it follows, and in a
+    /// working broker every screen subscriber holds that update by the time the
+    /// next frame arrives — so nothing driving the daemon can produce a
+    /// mismatch, and the rule that decides it would go untested.
+    ///
+    /// It is tested here directly instead. The alternative is a check that
+    /// cannot fail, which is a check nobody has evidence for.
+    #[test]
+    fn a_diff_is_refused_for_a_subscriber_holding_a_different_update() {
+        let subscription = |sent| PaneSubscription {
+            requested: TerminalAccess::Observe,
+            cols: 80,
+            rows: 24,
+            representation: PaneRepresentation::Screen,
+            sent,
+            acked: None,
+            outstanding: 0,
+        };
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"before");
+        let previous = Snapshot::of(parser.screen(), 7);
+        parser.process(b"\r\nafter");
+        let current = Snapshot::of(parser.screen(), 8);
+        let rendered = Rendered {
+            diff: ScreenDiff::between(&previous, &current),
+            screen: current,
+            changed: true,
+        };
+
+        assert!(
+            matches!(
+                Broker::update_for(&subscription(Some(7)), &pane("w1:p1"), &rendered),
+                ServerMessage::PaneScreenDiff { .. }
+            ),
+            "a subscriber holding update 7 can apply a diff that follows 7"
+        );
+        for held in [None, Some(6), Some(8)] {
+            assert!(
+                matches!(
+                    Broker::update_for(&subscription(held), &pane("w1:p1"), &rendered),
+                    ServerMessage::PaneScreen { .. }
+                ),
+                "a subscriber holding {held:?} was sent a diff it cannot apply"
+            );
+        }
+    }
+
+    /// The bound belongs to the rendered path alone: a frame subscriber is
+    /// already stopped by the socket it is not draining.
+    #[test]
+    fn a_frame_subscriber_is_not_bounded_by_the_screen_limit() {
+        let mut broker = broker();
+        let tui = greet(&mut broker);
+        subscribe(&mut broker, tui, "w1:p1", TerminalAccess::Observe, 80, 24);
+
+        let mut sent = 0;
+        for index in 0..20 {
+            let effects = frame(&mut broker, "w1:p1", format!("line {index}\r\n").as_bytes());
+            sent += messages_for(&effects, tui).len();
+        }
+
+        assert_eq!(sent, 20, "frames were withheld from an emulator client");
     }
 
     #[test]

@@ -101,6 +101,18 @@ pub enum ClientMessage {
         #[serde(default)]
         representation: PaneRepresentation,
     },
+    /// Confirm that a rendered update has been painted.
+    ///
+    /// Only `screen` subscribers send this, and it is the only signal the
+    /// daemon has that a viewer is keeping up: a frame subscriber is bounded by
+    /// the socket, but a rendered update is queued for a client that may be
+    /// draining it far more slowly than a pane produces it.
+    ///
+    /// The sequence is checked against what was actually sent rather than
+    /// believed, so acknowledging an update twice, or one that was never sent,
+    /// buys a client nothing. It reports progress; it does not grant anything.
+    #[serde(rename = "pane.screen_ack")]
+    AckPaneScreen { pane: PaneId, sequence: u64 },
     #[serde(rename = "pane.unsubscribe")]
     UnsubscribePane { pane: PaneId },
     /// Take the control lease for a pane another client holds. Control is never
@@ -545,6 +557,10 @@ mod tests {
             cols: 120,
             rows: 40,
             representation: PaneRepresentation::Screen,
+        });
+        round_trip_client(ClientMessage::AckPaneScreen {
+            pane: pane(),
+            sequence: 12,
         });
         round_trip_client(ClientMessage::UnsubscribePane { pane: pane() });
         round_trip_client(ClientMessage::TakePaneControl { pane: pane() });
