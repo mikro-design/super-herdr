@@ -574,9 +574,43 @@ window.addEventListener('resize', () => {
   paint();
 });
 
+// A scanned pairing code arrives in the fragment, never in a query string. A
+// fragment is not sent to the server, so the code stays out of request lines,
+// out of any access log, and out of a reverse proxy that would otherwise see
+// every pairing attempt in clear. It is stripped from the address before
+// anything else runs, so a bookmark, a shared link or the back button cannot
+// carry a live credential.
+function codeFromFragment() {
+  const raw = (location.hash || '').replace(/^#/, '');
+  if (!raw) return '';
+  history.replaceState(null, '', location.pathname + location.search);
+  let decoded = '';
+  try {
+    decoded = decodeURIComponent(raw).trim();
+  } catch (_) {
+    return '';
+  }
+  // Shaped like a code or ignored. A fragment is attacker-supplied in the sense
+  // that anything can link here, and this value is about to be typed into a
+  // form field.
+  return /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$/.test(decoded) ? decoded.toUpperCase() : '';
+}
+
+// A guess the person can correct, so a device that pairs by scanning still ends
+// up with a name worth seeing in `device list` rather than an empty one.
+function suggestedName() {
+  const agent = navigator.userAgent || '';
+  if (/iPad|Tablet/i.test(agent)) return 'iPad';
+  if (/Android|iPhone|Mobile/i.test(agent)) return 'phone';
+  return 'browser';
+}
+
 // The version of the daemon, not of this page: the page ships inside that
 // binary, so a stale daemon is otherwise invisible from here.
 async function start() {
+  // Read first, and unconditionally, so the address is cleaned even when the
+  // device turns out to be paired already.
+  const scanned = codeFromFragment();
   let session_state = { paired: true, version: '' };
   try {
     session_state = await (await fetch('/session')).json();
@@ -587,6 +621,15 @@ async function start() {
   el('version').textContent = session_state.version ? `daemon ${session_state.version}` : '';
   if (!session_state.paired) {
     el('pairing').hidden = false;
+    if (scanned) {
+      // The code is the part worth not retyping on a phone. The name is left
+      // for a person, because a device nobody named is one nobody can revoke
+      // with any confidence later.
+      el('code').value = scanned;
+      el('name').value = el('name').value || suggestedName();
+      el('name').focus();
+      el('name').select();
+    }
     return;
   }
   document.querySelector('main').hidden = false;
