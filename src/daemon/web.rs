@@ -484,12 +484,22 @@ async fn stream_events(
     let mut daemon_reader = BufReader::new(daemon_reader);
     let mut line = Vec::new();
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Keepalive means "nothing written for an interval", not "an interval
+    // elapsed". Bursting the ticks missed during a busy stretch would cancel a
+    // read that is making progress, repeatedly, at exactly the moment there is
+    // traffic to interrupt.
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes immediately, and a comment before the first real
     // event is noise rather than reassurance.
     keepalive.tick().await;
     loop {
-        line.clear();
-        let mut limited = (&mut daemon_reader).take(MAX_MESSAGE_BYTES as u64);
+        // What is left of the cap for *this* line. A keepalive can cancel the
+        // read partway through a message, and the bytes already in `line` still
+        // count — rebuilding the whole budget every pass would let an oversized
+        // message through as two under-budget pieces, which is the size guard
+        // quietly ceasing to bound anything.
+        let remaining = MAX_MESSAGE_BYTES.saturating_sub(line.len());
+        let mut limited = (&mut daemon_reader).take(remaining as u64);
         let read = tokio::select! {
             read = limited.read_until(b'\n', &mut line) => read,
             _ = keepalive.tick() => {
@@ -497,6 +507,11 @@ async fn stream_events(
                 // only thing standing between an idle federation and a proxy
                 // that reaps silent connections. Without it a viewer watching a
                 // quiet pane is disconnected on somebody else's timer.
+                //
+                // `line` is deliberately untouched. `read_until` appends
+                // whatever it read before being cancelled, so clearing here
+                // would drop the front of a message and hand the browser its
+                // tail as though it were whole.
                 if writer.write_all(b": keepalive\n\n").await.is_err() {
                     break;
                 }
@@ -504,6 +519,8 @@ async fn stream_events(
             }
         };
         match read {
+            // Zero means the attachment ended, or that this line has used the
+            // whole message budget without terminating. Both end the stream.
             Ok(0) | Err(_) => break,
             Ok(_) if line.last() != Some(&b'\n') => break,
             Ok(_) => {}
@@ -516,6 +533,11 @@ async fn stream_events(
         {
             break;
         }
+        // Said something real, so the next comment is a full interval away.
+        keepalive.reset();
+        // Cleared here rather than at the top of the loop: only a line that has
+        // been delivered whole is finished with.
+        line.clear();
     }
 
     if let Ok(mut open) = sessions.open.lock() {
@@ -773,6 +795,147 @@ mod tests {
         .expect("a silent stream was never heard from again");
 
         assert_eq!(comment.trim_end(), ": keepalive");
+        task.abort();
+    }
+
+    /// A keepalive that fires mid-message must not eat the part already read.
+    ///
+    /// `read_until` is cancel-safe only in the sense that partially read bytes
+    /// are *appended to the buffer* — cancelling it and then clearing the buffer
+    /// throws away the front of a message, and the tail that arrives next looks
+    /// like a whole one. The browser is then handed half a JSON object, which
+    /// is the same failure this stream was fixed to stop having: silently wrong
+    /// rather than visibly broken.
+    #[tokio::test]
+    async fn a_keepalive_between_halves_of_a_message_does_not_eat_it() {
+        use tokio::io::AsyncReadExt as _;
+        // An attachment this test writes to by hand, so a message can be split
+        // across a keepalive on purpose.
+        let (mut far, near) = tokio::io::duplex(64 * 1024);
+        let near = Arc::new(Mutex::new(Some(near)));
+        let attach: super::Attach = Arc::new(move || {
+            near.lock()
+                .ok()
+                .and_then(|mut held| held.take())
+                .ok_or_else(|| anyhow::anyhow!("attached twice"))
+        });
+        let listener = super::bind(loopback(0)).await.expect("binds loopback");
+        let port = listener.local_addr().expect("a bound address").port();
+        let devices = Arc::new(TestDevices::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices));
+
+        let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
+        stream
+            .write_all(b"GET /events?session=split HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .expect("writes");
+        // The daemon side receives the client's hello first.
+        let mut greeting = vec![0u8; 256];
+        let _ = far.read(&mut greeting).await.expect("reads the hello");
+
+        let message =
+            br#"{"type":"pane.closed","pane":{"target":"t","session":"s","resource":"w1:p1"}}"#;
+        let (head, tail) = message.split_at(20);
+        far.write_all(head).await.expect("writes the first half");
+        // Past a keepalive, so the read of this line is cancelled mid-message.
+        tokio::time::sleep(super::KEEPALIVE_INTERVAL * 3).await;
+        far.write_all(tail).await.expect("writes the rest");
+        far.write_all(b"\n").await.expect("ends the line");
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.expect("reads");
+                if line.starts_with("data: ") {
+                    return line.clone();
+                }
+            }
+        })
+        .await
+        .expect("the split message never arrived at all");
+
+        assert!(
+            event.contains("pane.closed") && event.contains("w1:p1"),
+            "the browser was handed a fragment, not a message: {event:?}"
+        );
+        task.abort();
+    }
+
+    /// The message cap must bound a message, not a read.
+    ///
+    /// A keepalive can cancel a read partway, and if the budget is rebuilt each
+    /// time round the loop an oversized message arrives as several under-budget
+    /// pieces and every one is forwarded. The guard then looks present and
+    /// bounds nothing — the browser is handed a message larger than the
+    /// protocol permits, in a component that is deliberately the strict one.
+    #[tokio::test]
+    async fn a_keepalive_does_not_refill_the_message_budget() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut far, near) = tokio::io::duplex(1024 * 1024);
+        let near = Arc::new(Mutex::new(Some(near)));
+        let attach: super::Attach = Arc::new(move || {
+            near.lock()
+                .ok()
+                .and_then(|mut held| held.take())
+                .ok_or_else(|| anyhow::anyhow!("attached twice"))
+        });
+        let listener = super::bind(loopback(0)).await.expect("binds loopback");
+        let port = listener.local_addr().expect("a bound address").port();
+        let devices = Arc::new(TestDevices::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices));
+
+        let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
+        stream
+            .write_all(b"GET /events?session=huge HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .expect("writes");
+        let mut greeting = vec![0u8; 256];
+        let _ = far.read(&mut greeting).await.expect("reads the hello");
+
+        // Three quarters of the cap, then a pause past a keepalive, then enough
+        // to take the whole line over it. No newline until the very end, so
+        // this is one message by the protocol's reckoning.
+        let writing = tokio::spawn(async move {
+            let chunk = vec![b'x'; crate::protocol::MAX_MESSAGE_BYTES / 4];
+            for _ in 0..3 {
+                if far.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(super::KEEPALIVE_INTERVAL * 3).await;
+            for _ in 0..2 {
+                if far.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = far.write_all(b"\n").await;
+        });
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => return None,
+                    Ok(_) if line.starts_with("data: ") => return Some(line.len()),
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .expect("the stream neither delivered nor ended");
+
+        assert!(
+            outcome.is_none(),
+            "a message of {outcome:?} bytes was forwarded past the {}-byte cap",
+            crate::protocol::MAX_MESSAGE_BYTES
+        );
+        writing.abort();
         task.abort();
     }
 
