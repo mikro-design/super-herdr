@@ -399,7 +399,13 @@ function observe(pane, label) {
   el('viewing').textContent = label || `${pane.target}/${pane.session}/${pane.resource}`;
   el('screen-note').textContent = 'waiting for output…';
   el('screen').innerHTML = '';
-  // `screen` rather than `frames`: this page has no emulator and wants none.
+  subscribeScreen(pane);
+}
+
+// `screen` rather than `frames`: this page has no emulator and wants none.
+// One definition, because three callers ask for the same thing — opening a
+// pane, recovering from a gap, and recovering from a dropped connection.
+function subscribeScreen(pane) {
   send({
     type: 'pane.subscribe',
     pane,
@@ -427,14 +433,7 @@ function resync() {
   el('screen-note').textContent = 'missed an update — resyncing';
   send({ type: 'pane.unsubscribe', pane });
   screen = null;
-  send({
-    type: 'pane.subscribe',
-    pane,
-    access: 'observe',
-    cols: 80,
-    rows: 24,
-    representation: 'screen',
-  });
+  subscribeScreen(pane);
 }
 
 function renderPanes() {
@@ -481,6 +480,16 @@ function apply(message) {
   switch (message.type) {
     case 'server.hello':
       send({ type: 'state.subscribe' });
+      // A reconnect is a new client to the daemon, which knows nothing about
+      // what this page was watching — so what was being watched is asked for
+      // again here. Without this the last screen stays painted and the link
+      // says "live" while nothing arrives ever again, which is worse than a
+      // viewer that visibly breaks.
+      if (watching) {
+        screen = null;
+        cell = null;
+        subscribeScreen(watching);
+      }
       break;
     case 'state.full':
       targets.clear();
@@ -555,9 +564,12 @@ function connect() {
       // rendering the ones it does.
     }
   };
-  // EventSource reconnects on its own; the daemon treats each reconnect as a
-  // new client and resends the state and the history, so nothing here has to
-  // remember where it was.
+  // EventSource reconnects on its own, and the daemon treats each reconnect as
+  // a new client: federation state and attention history are resent unasked.
+  // Pane observation is not — a subscription belongs to the connection that
+  // made it — so `server.hello` asks for it again. This comment used to say
+  // nothing here had to remember where it was; that stopped being true the day
+  // this page started watching panes.
   stream.onerror = () => {
     el('link').textContent = 'reconnecting…';
     el('link').className = 'down';

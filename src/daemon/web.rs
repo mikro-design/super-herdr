@@ -25,6 +25,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -61,6 +62,22 @@ const FORWARDING_HEADERS: &[&str] = &[
 ];
 
 pub const DEFAULT_WEB_PORT: u16 = 8790;
+
+/// How often a silent event stream says something anyway.
+///
+/// An idle federation writes nothing, and a connection that writes nothing is
+/// what every idle timeout between here and a browser is looking for — nginx
+/// and most load balancers default to a minute, and corporate proxies are
+/// frequently harsher. Twenty seconds sits under the shortest of those with
+/// room to spare, and costs one comment line per viewer per twenty seconds.
+#[cfg(not(test))]
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Short enough that the test asserting a silent stream speaks costs nothing.
+/// What it exercises is the mechanism; the interval above is a judgement about
+/// other people's timeouts and is not something a test can check.
+#[cfg(test)]
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a paired device's cookie lasts before the browser drops it. The
 /// token itself does not expire — revoking is what ends it — but a browser that
@@ -466,12 +483,26 @@ async fn stream_events(
 
     let mut daemon_reader = BufReader::new(daemon_reader);
     let mut line = Vec::new();
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // The first tick completes immediately, and a comment before the first real
+    // event is noise rather than reassurance.
+    keepalive.tick().await;
     loop {
         line.clear();
-        let read = (&mut daemon_reader)
-            .take(MAX_MESSAGE_BYTES as u64)
-            .read_until(b'\n', &mut line)
-            .await;
+        let mut limited = (&mut daemon_reader).take(MAX_MESSAGE_BYTES as u64);
+        let read = tokio::select! {
+            read = limited.read_until(b'\n', &mut line) => read,
+            _ = keepalive.tick() => {
+                // A comment line: valid SSE that every client ignores, and the
+                // only thing standing between an idle federation and a proxy
+                // that reaps silent connections. Without it a viewer watching a
+                // quiet pane is disconnected on somebody else's timer.
+                if writer.write_all(b": keepalive\n\n").await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
         match read {
             Ok(0) | Err(_) => break,
             Ok(_) if line.last() != Some(&b'\n') => break,
@@ -710,6 +741,38 @@ mod tests {
         // The browser is handed protocol messages, not a translation of them.
         assert!(greeting.contains("server.hello"), "{greeting}");
         assert!(greeting.contains("\"protocol\":1"), "{greeting}");
+        task.abort();
+    }
+
+    /// An idle federation writes nothing, and a connection that writes nothing
+    /// is what an idle timeout is looking for. The comment is the only thing
+    /// keeping a viewer of a quiet pane connected through a proxy.
+    #[tokio::test]
+    async fn a_silent_stream_still_says_something() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
+        stream
+            .write_all(b"GET /events?session=quiet HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .expect("writes");
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        // Long enough to cover the interval and the greeting ahead of it, and
+        // short enough that a regression fails rather than hangs the suite.
+        let comment = tokio::time::timeout(super::KEEPALIVE_INTERVAL * 2, async {
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.expect("reads");
+                if line.starts_with(':') {
+                    return line.clone();
+                }
+            }
+        })
+        .await
+        .expect("a silent stream was never heard from again");
+
+        assert_eq!(comment.trim_end(), ": keepalive");
         task.abort();
     }
 
