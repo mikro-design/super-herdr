@@ -22,6 +22,10 @@ It never takes over, stops, starts, or restarts a Herdr session.
   selected remote pane.
 - Verified clipboard file upload to the selected host with path-only injection,
   for PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG.
+- Copying a file in a file manager and pasting it into a pane. A clipboard holds
+  a reference rather than bytes for a copied file, so the reference is followed
+  and the file read from local disk, sent under its own name, and the verified
+  remote path pasted into the pane — the same path an image takes.
 - Verified transfer of arbitrary content to a target through the daemon, relayed
   as it arrives rather than held, under a name the caller chooses, bounded by
   `transfers.max_bytes` and unstaged on the host if any check fails.
@@ -800,9 +804,9 @@ cargo clippy -j 4 --target x86_64-apple-darwin --all-targets -- -D warnings
   cross-session transfer; `workspace.move` only reorders workspaces inside one
   session. Recreation is the supported substitute and restarts every process.
   A live cross-session move needs a Herdr-side transfer of the panes themselves.
-- File-list clipboard upload is not implemented: the bridge accepts one file at
-  a time from the clipboard's own data, not a list of file references copied in
-  a file manager.
+- Copying several files at once sends only the first. What a second should be
+  called on the far side, and what should happen when the third fails, are
+  questions without an obvious answer yet.
 - WebP and SVG have no classic macOS pasteboard class, so on macOS they report as
   unsupported rather than being requested under a code that cannot exist.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are

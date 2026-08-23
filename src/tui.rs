@@ -3838,27 +3838,67 @@ async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result
     }
     // Reading the clipboard is a desktop-session capability and stays here.
     // Moving the bytes needs a route to the host, so that half is the daemon's.
-    let (media, payload) = match clipboard::read_offered_media(MAX_CLIPBOARD_MEDIA_BYTES).await {
-        Ok(offered) => offered,
-        Err(error) => {
-            app.message = Some(format!("clipboard media unavailable: {error}"));
-            return Ok(());
-        }
+    let offered = match clipboard::read_offered_media(MAX_CLIPBOARD_MEDIA_BYTES).await {
+        Ok((media, payload)) => Some((media.mime.to_owned(), None, payload)),
+        // A clipboard holding no flavour this understands may still be pointing
+        // at a file. Copying one in a file manager puts a reference rather than
+        // bytes, which is what every attempt to copy a file ran into.
+        Err(media_error) => match clipboard::offered_file().await {
+            Some(path) => match read_local_file(&path) {
+                Ok((name, payload)) => {
+                    Some(("application/octet-stream".to_owned(), Some(name), payload))
+                }
+                Err(error) => {
+                    app.message = Some(format!("{}: {error}", path.display()));
+                    return Ok(());
+                }
+            },
+            None => {
+                app.message = Some(format!("clipboard media unavailable: {media_error}"));
+                return Ok(());
+            }
+        },
+    };
+    let Some((mime, name, payload)) = offered else {
+        return Ok(());
     };
     let Some(client) = app.client.clone() else {
         app.message = Some("clipboard upload routing is unavailable".to_owned());
         return Ok(());
     };
     let bytes = payload.len();
-    let request = client.upload_media(selected, media.mime.to_owned(), &payload);
-    app.pending_uploads.insert(
-        request,
-        PendingUpload {
-            mime: media.mime.to_owned(),
-        },
-    );
-    app.message = Some(format!("uploading {} {bytes} bytes…", media.mime));
+    let described = name.clone().unwrap_or_else(|| mime.clone());
+    let request = match name {
+        Some(name) => client.upload_file(selected, name, mime.clone(), &payload),
+        None => client.upload_media(selected, mime.clone(), &payload),
+    };
+    app.pending_uploads.insert(request, PendingUpload { mime });
+    app.message = Some(format!("uploading {described} {bytes} bytes…"));
     Ok(())
+}
+
+/// Read a file the clipboard pointed at, bounded like a clipboard payload.
+///
+/// The bound is this process's rather than the daemon's: the client API takes a
+/// payload whole, so a file larger than this would be read into memory here
+/// before any of it moved. The daemon's own ceiling is separate and larger, and
+/// streaming from disk is what would close the gap.
+fn read_local_file(path: &std::path::Path) -> Result<(String, Vec<u8>)> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("that file has no name this can carry")?
+        .to_owned();
+    let metadata = std::fs::metadata(path).context("cannot be read")?;
+    anyhow::ensure!(metadata.is_file(), "is not a regular file");
+    anyhow::ensure!(
+        metadata.len() as usize <= MAX_CLIPBOARD_MEDIA_BYTES,
+        "is {} bytes; the limit for a copied file is {} MiB",
+        metadata.len(),
+        MAX_CLIPBOARD_MEDIA_BYTES / (1024 * 1024)
+    );
+    let payload = std::fs::read(path).context("cannot be read")?;
+    Ok((name, payload))
 }
 
 fn terminal_paste_payload(text: &[u8], bracketed: bool) -> Result<Vec<u8>> {
