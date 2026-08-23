@@ -141,7 +141,11 @@ const session = (crypto.randomUUID && crypto.randomUUID() || String(Math.random(
 // The daemon's own vocabulary, mirrored here. Nothing is derived locally: the
 // federation and the attention history are what the daemon last said they were.
 const targets = new Map();
-let history = [];
+// Named for what it holds, and not `history`: a top-level `let history` shadows
+// `window.history` for the whole script, and the code that clears a scanned
+// pairing code out of the address bar calls `history.replaceState`. That threw,
+// and it threw before the page had rendered anything.
+let attention = [];
 
 const el = id => document.getElementById(id);
 const text = value => String(value == null ? '' : value);
@@ -202,7 +206,7 @@ function renderWaiting() {
 function renderHistory() {
   const list = el('history');
   list.innerHTML = '';
-  const recent = history.slice(-40).reverse();
+  const recent = attention.slice(-40).reverse();
   if (!recent.length) {
     list.innerHTML = '<li class="empty">no transitions yet</li>';
     return;
@@ -547,11 +551,13 @@ function apply(message) {
       if (sameId(message.pane, watching)) stopWatching('the pane closed');
       break;
     case 'attention.history':
-      history = message.events;
+      attention = message.events;
       renderHistory();
       break;
     case 'attention.event':
-      history = history.filter(held => held.id !== message.event.id).concat(message.event);
+      attention = attention
+        .filter(held => held.id !== message.event.id)
+        .concat(message.event);
       renderHistory();
       break;
   }
