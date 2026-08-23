@@ -412,6 +412,32 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAXIMUM_REPORTED_TYPES: usize = 12;
 const MAXIMUM_TYPE_NAME_CHARS: usize = 80;
 
+/// How many times the pasteboard has been written to, if the platform counts.
+///
+/// macOS keeps a change count that moves on every copy whatever was copied, so
+/// comparing it across a wait answers the question the file probe cannot:
+/// whether a copy happened at all. Without it, "no file was found" and "you
+/// never copied anything" are the same sentence.
+#[cfg(target_os = "macos")]
+async fn clipboard_generation() -> Option<u64> {
+    let spec = CommandSpec::new(
+        "osascript",
+        &[
+            "-e",
+            "use framework \"Foundation\"",
+            "-e",
+            "return (current application's NSPasteboard's generalPasteboard()'s changeCount()) as text",
+        ],
+    );
+    read_reference_output(&spec).await.ok()?.trim().parse().ok()
+}
+
+/// Nothing else counts copies, so nothing else can answer the question.
+#[cfg(not(target_os = "macos"))]
+async fn clipboard_generation() -> Option<u64> {
+    None
+}
+
 /// How often a waiting check looks again, and the longest it will be asked to.
 const PROBE_INTERVAL: Duration = Duration::from_millis(400);
 pub const MAXIMUM_PROBE_WAIT: Duration = Duration::from_secs(300);
@@ -476,9 +502,20 @@ pub async fn diagnostic_lines(wait: Option<Duration>) -> Vec<String> {
     // silently does nothing.
     // Waiting is only ever worth it on a desktop; nothing will arrive on a
     // clipboard this process cannot reach however long it watches.
-    let probe = match wait {
-        Some(wait) if context == ClipboardContext::Desktop => await_offered_files(wait).await,
-        _ => probe_offered_files().await,
+    let waiting = wait.filter(|_| context == ClipboardContext::Desktop);
+    let before = match waiting {
+        Some(_) => clipboard_generation().await,
+        None => None,
+    };
+    let probe = match waiting {
+        Some(wait) => await_offered_files(wait).await,
+        None => probe_offered_files().await,
+    };
+    let copies = match before {
+        Some(before) => clipboard_generation()
+            .await
+            .map(|after| after.saturating_sub(before)),
+        None => None,
     };
     let referenced = match probe.paths.as_slice() {
         [] if context == ClipboardContext::Desktop => {
@@ -507,6 +544,16 @@ pub async fn diagnostic_lines(wait: Option<Duration>) -> Vec<String> {
             [] => "file readers: none available on this desktop".to_owned(),
             attempts => format!("file readers: {}", attempts.join("; ")),
         });
+        // The two failures that look identical from here are "you copied a file
+        // and this could not read it" and "you never copied anything". A
+        // platform that counts copies can tell them apart outright.
+        if let Some(copies) = copies {
+            lines.push(match copies {
+                0 => "nothing was copied while this waited: the clipboard was never written to, so what it holds is whatever was there before".to_owned(),
+                1 => "one copy happened while this waited, and it was not a file".to_owned(),
+                copies => format!("{copies} copies happened while this waited, and the last was not a file"),
+            });
+        }
     }
     lines.extend([
         format!(
@@ -669,23 +716,30 @@ async fn probe_offered_files() -> FileProbe {
 /// that behave like the real ones without needing a desktop to run on.
 async fn probe_readers(readers: Vec<(&'static str, CommandSpec)>) -> FileProbe {
     let mut attempts = Vec::new();
-    // Readers are tried in order rather than chosen, because a reader that
-    // finds nothing and a reader that is not usable here look the same from
-    // the outside. The first one that names a file answers; the rest are a
-    // fallback for the desktops where it does not.
+    // A reader that fails hands over to the next one; a reader that *answers*
+    // ends the walk, empty-handed or not. "Nothing is on the clipboard" is an
+    // answer, and asking the fallback to disagree with it is how a clipboard
+    // holding plain text ends up being described as holding a file.
     for (label, spec) in readers {
-        match read_reference_output(&spec).await {
-            Err(complaint) => attempts.push(format!("{label}: {complaint}")),
-            Ok(text) => {
-                let paths = local_file_references(&text);
-                if paths.is_empty() {
-                    attempts.push(format!("{label}: answered, naming no local file"));
-                    continue;
-                }
-                attempts.push(format!("{label}: named {} file(s)", paths.len()));
-                return FileProbe { paths, attempts };
-            }
-        }
+        let Ok(text) = read_reference_output(&spec).await.inspect_err(|complaint| {
+            attempts.push(format!("{label}: {complaint}"));
+        }) else {
+            continue;
+        };
+        let named = local_file_references(&text);
+        // Named and present are different claims. `the clipboard as «class
+        // furl»` will coerce arbitrary copied text into a file reference, so a
+        // path that is not on this disk is the reader inventing one rather than
+        // reporting one — and a file that is not there cannot be copied anyway.
+        let paths: Vec<PathBuf> = named
+            .into_iter()
+            .filter(|path| fs::metadata(path).is_ok())
+            .collect();
+        attempts.push(match paths.len() {
+            0 => format!("{label}: answered, naming no file on this disk"),
+            count => format!("{label}: named {count} file(s)"),
+        });
+        return FileProbe { paths, attempts };
     }
     FileProbe {
         paths: Vec::new(),
@@ -2547,41 +2601,87 @@ mod tests {
     }
 
     /// The fallback exists because the first reader is not always the one that
-    /// works, and the account has to say which answered — otherwise a desktop
-    /// where only the fallback works looks identical to one where both do.
+    /// works. It is reached only when a reader *fails* — a reader that answers
+    /// has answered, and asking the next one to disagree is how a clipboard
+    /// holding text ends up described as holding a file.
     #[tokio::test]
-    async fn readers_are_tried_in_turn_and_each_answer_is_accounted_for() {
+    async fn a_reader_that_answers_ends_the_walk_and_a_reader_that_fails_does_not() {
         use super::{CommandSpec, probe_readers};
-        use std::path::PathBuf;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.c");
+        let second = directory.path().join("b.c");
+        std::fs::write(&first, b"int main(void) { return 0; }").unwrap();
+        std::fs::write(&second, b"int other(void) { return 1; }").unwrap();
 
         let broken = || CommandSpec::new("sh", &["-c", "echo nope >&2; exit 1"]);
-        let empty = || CommandSpec::new("sh", &["-c", "printf ''"]);
-        let naming =
-            || CommandSpec::new("sh", &["-c", "printf 'file:///tmp/a.c\nfile:///tmp/b.c\n'"]);
+        let naming = |paths: &[&std::path::Path]| {
+            let listing = paths
+                .iter()
+                .map(|path| format!("file://{}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            CommandSpec::new(
+                "sh",
+                &[
+                    "-c",
+                    Box::leak(format!("printf '{listing}\n'").into_boxed_str()),
+                ],
+            )
+        };
 
-        let probe = probe_readers(vec![("first", broken()), ("second", naming())]).await;
-        assert_eq!(
-            probe.paths,
-            vec![PathBuf::from("/tmp/a.c"), PathBuf::from("/tmp/b.c")]
-        );
+        // A failure hands over; the one that answers is the one reported.
+        let probe = probe_readers(vec![
+            ("first", broken()),
+            ("second", naming(&[&first, &second])),
+        ])
+        .await;
+        assert_eq!(probe.paths, vec![first.clone(), second.clone()]);
         assert!(probe.attempts[0].starts_with("first: failed (exit 1)"));
         assert_eq!(probe.attempts[1], "second: named 2 file(s)");
 
-        // A reader that answers stops the walk, so a working fallback is not
-        // asked and cannot overwrite what the first one found.
-        let probe = probe_readers(vec![("first", naming()), ("second", naming())]).await;
-        assert_eq!(probe.attempts, vec!["first: named 2 file(s)".to_owned()]);
+        // An answer ends the walk, so a second reader cannot overwrite it.
+        let probe = probe_readers(vec![
+            ("first", naming(&[&first])),
+            ("second", naming(&[&second])),
+        ])
+        .await;
+        assert_eq!(probe.paths, vec![first.clone()]);
+        assert_eq!(probe.attempts, vec!["first: named 1 file(s)".to_owned()]);
 
-        // Everything answering nothing is the report that says the clipboard
-        // holds no file, as opposed to the one that says nothing could look.
-        let probe = probe_readers(vec![("first", empty()), ("second", empty())]).await;
+        // Including when the answer is "nothing". This is the case that matters:
+        // `the clipboard as «class furl»` coerces copied *text* into a file
+        // reference, so a fallback consulted after a real answer of "no file"
+        // would invent one.
+        let empty = || CommandSpec::new("sh", &["-c", "printf ''"]);
+        let probe = probe_readers(vec![("first", empty()), ("second", naming(&[&first]))]).await;
         assert!(probe.paths.is_empty());
         assert_eq!(
             probe.attempts,
-            vec![
-                "first: answered, naming no local file".to_owned(),
-                "second: answered, naming no local file".to_owned()
-            ]
+            vec!["first: answered, naming no file on this disk".to_owned()]
+        );
+    }
+
+    /// Named and present are different claims, and only one of them can be
+    /// copied. A path that is not on this disk is a reader inventing a file
+    /// rather than reporting one.
+    #[tokio::test]
+    async fn a_path_that_is_not_on_this_disk_is_not_a_copied_file() {
+        use super::{CommandSpec, probe_readers};
+
+        // What the macOS coercion actually produced from copied text: a
+        // plausible absolute path naming nothing.
+        let invented = CommandSpec::new(
+            "sh",
+            &["-c", "printf '/super-herdr clipboard check --wait 20\n'"],
+        );
+
+        let probe = probe_readers(vec![("coercion", invented)]).await;
+
+        assert!(probe.paths.is_empty());
+        assert_eq!(
+            probe.attempts,
+            vec!["coercion: answered, naming no file on this disk".to_owned()]
         );
     }
 
