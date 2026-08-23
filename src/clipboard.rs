@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -412,7 +412,27 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAXIMUM_REPORTED_TYPES: usize = 12;
 const MAXIMUM_TYPE_NAME_CHARS: usize = 80;
 
-pub async fn diagnostic_lines() -> Vec<String> {
+/// How often a waiting check looks again, and the longest it will be asked to.
+const PROBE_INTERVAL: Duration = Duration::from_millis(400);
+pub const MAXIMUM_PROBE_WAIT: Duration = Duration::from_secs(300);
+
+/// Watch the clipboard until it names a file, or until the wait runs out.
+///
+/// Copying a file and then running a command is only one order; the other is
+/// running the command and then copying, and it is the order that works when
+/// getting the command into the terminal is what overwrote the clipboard.
+async fn await_offered_files(wait: Duration) -> FileProbe {
+    let deadline = Instant::now() + wait;
+    loop {
+        let probe = probe_offered_files().await;
+        if !probe.paths.is_empty() || Instant::now() >= deadline {
+            return probe;
+        }
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+}
+
+pub async fn diagnostic_lines(wait: Option<Duration>) -> Vec<String> {
     let context = clipboard_context();
     let writer = native_writer();
     let reader = native_reader();
@@ -454,9 +474,15 @@ pub async fn diagnostic_lines() -> Vec<String> {
     // file manager is a reference rather than bytes, and whether this can
     // follow it is the difference between a copy that works and one that
     // silently does nothing.
-    let referenced = match offered_files().await.as_slice() {
+    // Waiting is only ever worth it on a desktop; nothing will arrive on a
+    // clipboard this process cannot reach however long it watches.
+    let probe = match wait {
+        Some(wait) if context == ClipboardContext::Desktop => await_offered_files(wait).await,
+        _ => probe_offered_files().await,
+    };
+    let referenced = match probe.paths.as_slice() {
         [] if context == ClipboardContext::Desktop => {
-            "none (copy a file in a file manager to test)".to_owned()
+            "none (copy a file in a file manager, then run this with --wait 20)".to_owned()
         }
         [] => "unavailable to an SSH/nested process".to_owned(),
         paths => paths
@@ -466,13 +492,23 @@ pub async fn diagnostic_lines() -> Vec<String> {
             .join(", "),
     };
 
-    vec![
+    let mut lines = vec![
         format!("context: {}", context.label()),
         format!("copy: {copy_method} ({copy_acknowledgement})"),
         format!("paste action: {paste_method}"),
         format!("media paste action: {media_method}"),
         format!("clipboard offers: {offered}"),
         format!("copied file: {referenced}"),
+    ];
+    // Only when nothing was found, because that is the only time the reader's
+    // own account tells anybody anything they cannot already see.
+    if probe.paths.is_empty() && context == ClipboardContext::Desktop {
+        lines.push(match probe.attempts.as_slice() {
+            [] => "file readers: none available on this desktop".to_owned(),
+            attempts => format!("file readers: {}", attempts.join("; ")),
+        });
+    }
+    lines.extend([
         format!(
             "uploadable flavors: {}",
             KNOWN_MEDIA
@@ -482,7 +518,8 @@ pub async fn diagnostic_lines() -> Vec<String> {
                 .join(", ")
         ),
         "clipboard payloads are neither inspected by this check nor written to logs".to_owned(),
-    ]
+    ]);
+    lines
 }
 
 pub fn write_text(text: &str) -> Result<ClipboardDelivery> {
@@ -586,6 +623,10 @@ pub async fn offered_media() -> Vec<ClipboardMedia> {
 /// The largest name a file reference may carry before it is refused.
 const MAXIMUM_FILE_REFERENCE_BYTES: usize = 8 * 1024;
 
+/// How much of a failed reader's complaint is read, and how much is shown.
+const MAXIMUM_COMPLAINT_BYTES: u64 = 4 * 1024;
+const MAXIMUM_COMPLAINT_CHARS: usize = 200;
+
 /// The files a clipboard is pointing at, rather than any it contains.
 ///
 /// Copying a file in a file manager does not put its bytes on a clipboard. It
@@ -600,53 +641,206 @@ const MAXIMUM_FILE_REFERENCE_BYTES: usize = 8 * 1024;
 /// the file it happened to — there is nothing about the second file that the
 /// first has not already answered.
 pub async fn offered_files() -> Vec<PathBuf> {
+    probe_offered_files().await.paths
+}
+
+/// The files a clipboard names, and what each reader said on the way there.
+///
+/// The account exists because "no file was copied" and "a file was copied and
+/// this could not read it" produced the same empty answer, which is the one
+/// question a person staring at `copied file: none` actually needs answered.
+struct FileProbe {
+    paths: Vec<PathBuf>,
+    attempts: Vec<String>,
+}
+
+async fn probe_offered_files() -> FileProbe {
     if clipboard_context() != ClipboardContext::Desktop {
-        return Vec::new();
+        return FileProbe {
+            paths: Vec::new(),
+            attempts: Vec::new(),
+        };
     }
-    let Some(spec) = file_reference_reader() else {
-        return Vec::new();
+    probe_readers(file_reference_readers()).await
+}
+
+/// Ask each reader in turn. Split from the clipboard context it runs in so the
+/// order it tries things, and the account it keeps, can be tested with readers
+/// that behave like the real ones without needing a desktop to run on.
+async fn probe_readers(readers: Vec<(&'static str, CommandSpec)>) -> FileProbe {
+    let mut attempts = Vec::new();
+    // Readers are tried in order rather than chosen, because a reader that
+    // finds nothing and a reader that is not usable here look the same from
+    // the outside. The first one that names a file answers; the rest are a
+    // fallback for the desktops where it does not.
+    for (label, spec) in readers {
+        match read_reference_output(&spec).await {
+            Err(complaint) => attempts.push(format!("{label}: {complaint}")),
+            Ok(text) => {
+                let paths = local_file_references(&text);
+                if paths.is_empty() {
+                    attempts.push(format!("{label}: answered, naming no local file"));
+                    continue;
+                }
+                attempts.push(format!("{label}: named {} file(s)", paths.len()));
+                return FileProbe { paths, attempts };
+            }
+        }
+    }
+    FileProbe {
+        paths: Vec::new(),
+        attempts,
+    }
+}
+
+/// Run one file-reference reader, answering with its output or with why there
+/// was none.
+///
+/// Separate from [`read_command_bytes`] for one reason: that helper ignores
+/// exit status, so a reader that failed outright was indistinguishable from a
+/// clipboard holding no file. Here a failure is a failure, and it says so.
+async fn read_reference_output(spec: &CommandSpec) -> Result<String, String> {
+    let mut child = tokio::process::Command::new(spec.program)
+        .args(&spec.arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("could not start {}: {error}", spec.program))?;
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err("started without pipes to read".to_owned());
     };
-    let Ok(bytes) = read_command_bytes(
-        spec,
-        MAXIMUM_FILE_REFERENCE_BYTES,
-        "clipboard file reference",
-    )
-    .await
-    else {
-        return Vec::new();
+    let mut output = Vec::new();
+    let mut complaint = Vec::new();
+    let limit = u64::try_from(MAXIMUM_FILE_REFERENCE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    // Both pipes are drained together; draining one and then the other would
+    // deadlock against a reader that fills the pipe it is not being read from.
+    let mut bounded_output = (&mut stdout).take(limit);
+    let mut bounded_complaint = (&mut stderr).take(MAXIMUM_COMPLAINT_BYTES);
+    let drain = async {
+        let _ = tokio::join!(
+            bounded_output.read_to_end(&mut output),
+            bounded_complaint.read_to_end(&mut complaint),
+        );
+        child.wait().await
     };
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Vec::new();
+    let status = match timeout(CLIPBOARD_COMMAND_TIMEOUT, drain).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => return Err(format!("could not be waited on: {error}")),
+        Err(_) => return Err("timed out".to_owned()),
     };
-    local_file_references(&text)
+    if !status.success() {
+        return Err(reader_complaint(&complaint, status.code()));
+    }
+    if output.len() > MAXIMUM_FILE_REFERENCE_BYTES {
+        return Err(format!(
+            "answered more than the {MAXIMUM_FILE_REFERENCE_BYTES}-byte limit"
+        ));
+    }
+    String::from_utf8(output).map_err(|_| "answered bytes that are not text".to_owned())
+}
+
+/// A failed reader's own words, bounded and stripped to printable ASCII.
+///
+/// This is the reader complaining about the clipboard, not the clipboard's
+/// contents, but it is still untrusted text on its way to a terminal, so it is
+/// treated exactly like the flavor names are.
+fn reader_complaint(stderr: &[u8], code: Option<i32>) -> String {
+    let text: String = String::from_utf8_lossy(stderr)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() || character == ' ' {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ending = code.map_or_else(
+        || "killed by a signal".to_owned(),
+        |code| format!("exit {code}"),
+    );
+    if text.is_empty() {
+        return format!("failed ({ending})");
+    }
+    let text: String = text.chars().take(MAXIMUM_COMPLAINT_CHARS).collect();
+    format!("failed ({ending}): {text}")
 }
 
 #[cfg(target_os = "linux")]
-fn file_reference_reader() -> Option<CommandSpec> {
+fn file_reference_readers() -> Vec<(&'static str, CommandSpec)> {
+    let mut readers = Vec::new();
     if env::var_os("WAYLAND_DISPLAY").is_some() && command_available("wl-paste") {
-        return Some(CommandSpec::new("wl-paste", &["--type", "text/uri-list"]));
-    }
-    if env::var_os("DISPLAY").is_some() && command_available("xclip") {
-        return Some(CommandSpec::new(
-            "xclip",
-            &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+        readers.push((
+            "wl-paste",
+            CommandSpec::new("wl-paste", &["--type", "text/uri-list"]),
         ));
     }
-    None
+    if env::var_os("DISPLAY").is_some() && command_available("xclip") {
+        readers.push((
+            "xclip",
+            CommandSpec::new(
+                "xclip",
+                &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+            ),
+        ));
+    }
+    readers
 }
 
 /// macOS answers with paths directly rather than URLs, which avoids having to
 /// undo percent-encoding on a value that becomes a filesystem path. Each file
 /// in the selection comes back on its own line.
+///
+/// The pasteboard is asked through Foundation first because the AppleScript
+/// coercion behind the fallback yields a *single* file however many were
+/// copied — it is a coercion to one file reference, not to a selection — and
+/// silently pasting one of the four files somebody copied is worse than the
+/// error it looks like nothing went wrong. `readObjectsForClasses:` returns the
+/// whole selection. Non-file URLs are dropped here as well as in the parser,
+/// since a copied link is a link and reading it is not this program's business.
 #[cfg(target_os = "macos")]
-fn file_reference_reader() -> Option<CommandSpec> {
-    Some(CommandSpec::new(
+fn file_reference_readers() -> Vec<(&'static str, CommandSpec)> {
+    let foundation = CommandSpec::new(
+        "osascript",
+        &[
+            "-e",
+            "use framework \"Foundation\"",
+            "-e",
+            "use scripting additions",
+            "-e",
+            "set out to \"\"",
+            "-e",
+            "set board to current application's NSPasteboard's generalPasteboard()",
+            "-e",
+            "set refs to board's readObjectsForClasses:{current application's NSURL} options:(missing value)",
+            "-e",
+            "if refs is not missing value then",
+            "-e",
+            "repeat with i from 1 to (count of refs)",
+            "-e",
+            "set one to item i of refs",
+            "-e",
+            "if (one's isFileURL()) as boolean then set out to out & ((one's |path|()) as text) & linefeed",
+            "-e",
+            "end repeat",
+            "-e",
+            "end if",
+            "-e",
+            "return out",
+        ],
+    );
+    let coercion = CommandSpec::new(
         "osascript",
         &[
             "-e",
             "set out to \"\"",
             "-e",
-            "repeat with item_ref in (the clipboard as «class furl»)",
+            "repeat with item_ref in (the clipboard as \u{ab}class furl\u{bb})",
             "-e",
             "set out to out & POSIX path of item_ref & linefeed",
             "-e",
@@ -654,12 +848,16 @@ fn file_reference_reader() -> Option<CommandSpec> {
             "-e",
             "return out",
         ],
-    ))
+    );
+    vec![
+        ("osascript (NSPasteboard)", foundation),
+        ("osascript (furl coercion)", coercion),
+    ]
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn file_reference_reader() -> Option<CommandSpec> {
-    None
+fn file_reference_readers() -> Vec<(&'static str, CommandSpec)> {
+    Vec::new()
 }
 
 /// Every local file a clipboard's reference names, in the order given.
@@ -1459,7 +1657,7 @@ fn media_reader_label(media: ClipboardMedia) -> String {
 ///
 /// An unmapped flavor reports as unsupported instead of guessing a code, which
 /// would ask the pasteboard for something that cannot exist.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_CLASSES: &[(&str, &str)] = &[
     ("image/png", "PNGf"),
     ("image/jpeg", "JPEG"),
@@ -1471,6 +1669,15 @@ const MACOS_CLASSES: &[(&str, &str)] = &[
 
 // WebP and SVG have no classic pasteboard class, so they report as unsupported
 // on macOS rather than being requested under a code that cannot exist.
+
+/// Flavors that carry no bytes this can upload but are worth naming anyway.
+///
+/// `furl` is the one that matters. It is what a file manager puts on the
+/// pasteboard, so seeing it beside `copied file: none` says the reference was
+/// there and this build failed to follow it — a different fault, and a
+/// different fix, from nothing having been copied at all.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACOS_REPORTED_CLASSES: &[(&str, &str)] = &[("file reference", "furl")];
 
 #[cfg(target_os = "macos")]
 fn macos_pasteboard_class(media: ClipboardMedia) -> Option<&'static str> {
@@ -1486,7 +1693,7 @@ fn macos_pasteboard_class(media: ClipboardMedia) -> Option<&'static str> {
 /// flavor is either `«class XXXX»` or a human name. A class this build does not
 /// map is still reported, as `class:XXXX`, so the operator can see what is
 /// actually on the clipboard.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn macos_type_fields(report: &str) -> Vec<String> {
     report
         .split(',')
@@ -1497,8 +1704,9 @@ fn macos_type_fields(report: &str) -> Vec<String> {
             Some(
                 MACOS_CLASSES
                     .iter()
+                    .chain(MACOS_REPORTED_CLASSES)
                     .find(|(_, code)| code.trim_end() == class)
-                    .map_or_else(|| format!("class:{class}"), |(mime, _)| (*mime).to_owned()),
+                    .map_or_else(|| format!("class:{class}"), |(name, _)| (*name).to_owned()),
             )
         })
         .collect()
@@ -2287,6 +2495,116 @@ mod tests {
                 "{text:?} should not resolve to a local file"
             );
         }
+    }
+
+    /// A file on the pasteboard has to be visible in the diagnostic, because
+    /// `copied file: none` on its own cannot tell an operator whether nothing
+    /// was copied or whether the reference was there and went unread.
+    #[test]
+    fn a_copied_file_is_named_among_the_offered_flavors() {
+        use super::macos_type_fields;
+
+        assert_eq!(
+            macos_type_fields("\u{ab}class furl\u{bb}, 132, \u{ab}class utf8\u{bb}, 41"),
+            vec!["file reference".to_owned(), "class:utf8".to_owned()]
+        );
+        assert_eq!(
+            macos_type_fields("\u{ab}class PNGf\u{bb}, 4096"),
+            vec!["image/png".to_owned()]
+        );
+    }
+
+    /// The bug this guards: a reader that fails outright used to be reported
+    /// as a clipboard holding no file, which sent the person reading the check
+    /// to look for a file manager problem that was never there.
+    #[tokio::test]
+    async fn a_failing_file_reader_is_told_apart_from_an_empty_clipboard() {
+        use super::{CommandSpec, read_reference_output};
+
+        let quiet = CommandSpec::new("sh", &["-c", "printf ''"]);
+        assert_eq!(read_reference_output(&quiet).await, Ok(String::new()));
+
+        let named = CommandSpec::new("sh", &["-c", "printf 'file:///tmp/a.c\n'"]);
+        assert_eq!(
+            read_reference_output(&named).await.as_deref(),
+            Ok("file:///tmp/a.c\n")
+        );
+
+        let failed = CommandSpec::new("sh", &["-c", "echo 'cannot coerce' >&2; exit 3"]);
+        let complaint = read_reference_output(&failed).await.unwrap_err();
+        assert!(
+            complaint.contains("exit 3") && complaint.contains("cannot coerce"),
+            "a failure should carry its own account, got {complaint:?}"
+        );
+
+        let missing = CommandSpec::new("super-herdr-no-such-reader", &[]);
+        assert!(
+            read_reference_output(&missing)
+                .await
+                .unwrap_err()
+                .contains("could not start")
+        );
+    }
+
+    /// The fallback exists because the first reader is not always the one that
+    /// works, and the account has to say which answered — otherwise a desktop
+    /// where only the fallback works looks identical to one where both do.
+    #[tokio::test]
+    async fn readers_are_tried_in_turn_and_each_answer_is_accounted_for() {
+        use super::{CommandSpec, probe_readers};
+        use std::path::PathBuf;
+
+        let broken = || CommandSpec::new("sh", &["-c", "echo nope >&2; exit 1"]);
+        let empty = || CommandSpec::new("sh", &["-c", "printf ''"]);
+        let naming =
+            || CommandSpec::new("sh", &["-c", "printf 'file:///tmp/a.c\nfile:///tmp/b.c\n'"]);
+
+        let probe = probe_readers(vec![("first", broken()), ("second", naming())]).await;
+        assert_eq!(
+            probe.paths,
+            vec![PathBuf::from("/tmp/a.c"), PathBuf::from("/tmp/b.c")]
+        );
+        assert!(probe.attempts[0].starts_with("first: failed (exit 1)"));
+        assert_eq!(probe.attempts[1], "second: named 2 file(s)");
+
+        // A reader that answers stops the walk, so a working fallback is not
+        // asked and cannot overwrite what the first one found.
+        let probe = probe_readers(vec![("first", naming()), ("second", naming())]).await;
+        assert_eq!(probe.attempts, vec!["first: named 2 file(s)".to_owned()]);
+
+        // Everything answering nothing is the report that says the clipboard
+        // holds no file, as opposed to the one that says nothing could look.
+        let probe = probe_readers(vec![("first", empty()), ("second", empty())]).await;
+        assert!(probe.paths.is_empty());
+        assert_eq!(
+            probe.attempts,
+            vec![
+                "first: answered, naming no local file".to_owned(),
+                "second: answered, naming no local file".to_owned()
+            ]
+        );
+    }
+
+    /// A reader's complaint reaches a terminal, so it is bounded and stripped
+    /// exactly like the flavor names are.
+    #[test]
+    fn a_readers_complaint_is_bounded_before_it_is_shown() {
+        use super::{MAXIMUM_COMPLAINT_CHARS, reader_complaint};
+
+        assert_eq!(
+            reader_complaint(b"execution error: no\n", Some(1)),
+            "failed (exit 1): execution error: no"
+        );
+        assert_eq!(reader_complaint(b"   \n", Some(1)), "failed (exit 1)");
+        assert_eq!(reader_complaint(b"", None), "failed (killed by a signal)");
+        // Escape sequences are not something a clipboard owner gets to write
+        // to somebody else's terminal.
+        assert_eq!(
+            reader_complaint(b"\x1b[2Jgone", Some(1)),
+            "failed (exit 1): [2Jgone"
+        );
+        let shouted = vec![b'x'; 4096];
+        assert!(reader_complaint(&shouted, Some(1)).len() < MAXIMUM_COMPLAINT_CHARS + 40);
     }
 
     #[test]

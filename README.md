@@ -439,6 +439,7 @@ super-herdr probe --json
 super-herdr probe --json --snapshots
 super-herdr probe --timeout SECONDS
 super-herdr clipboard check
+super-herdr clipboard check --wait SECONDS
 super-herdr notifications check
 super-herdr notifications enable
 super-herdr notifications test
@@ -459,10 +460,17 @@ Running `super-herdr` without a subcommand opens the TUI.
   `--timeout` overrides the configured command timeout for one run, and
   `--snapshots` adds full server snapshots to `--json` output.
 - `clipboard check` reports the active copy, text-paste, and media-paste paths,
-  which flavors the clipboard is currently offering, and which of those this
-  build can upload. It does not read or print clipboard payloads; flavor names
-  are metadata, and are stripped of control characters and bounded before they
-  are shown.
+  which flavors the clipboard is currently offering, any file the clipboard is
+  pointing at, and which flavors this build can upload. When no file is found it
+  also reports what each file reader answered, so a reader that failed is not
+  mistaken for a clipboard that holds no file. It does not read or print
+  clipboard payloads; flavor names and reader complaints are metadata, and are
+  stripped of control characters and bounded before they are shown.
+- `clipboard check --wait SECONDS` watches for up to that long so the file can be
+  copied *after* the command starts. Use it whenever getting the command into the
+  terminal would itself overwrite the clipboard being measured — pasting the
+  command replaces the copied file, and the check then truthfully reports the
+  text that replaced it.
 - `notifications check` reports the configured filters and whether native
   delivery is available without sending anything.
 - `notifications enable` and `notifications disable` atomically update only the

@@ -111,7 +111,13 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum ClipboardCommands {
     /// Report the active native or terminal-mediated clipboard paths.
-    Check,
+    Check {
+        /// Watch for this many seconds so a file can be copied after the
+        /// command starts, for when getting the command into a terminal is
+        /// what overwrote the clipboard.
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -254,13 +260,19 @@ fn stdout_line(arguments: fmt::Arguments<'_>) -> Result<()> {
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Tui);
-    if matches!(
-        &command,
-        Commands::Clipboard {
-            command: ClipboardCommands::Check
+    if let Commands::Clipboard {
+        command: ClipboardCommands::Check { wait },
+    } = &command
+    {
+        let wait =
+            wait.map(|seconds| Duration::from_secs(seconds).min(clipboard::MAXIMUM_PROBE_WAIT));
+        if let Some(wait) = wait {
+            stdout_line(format_args!(
+                "watching the clipboard for {} seconds; copy a file now",
+                wait.as_secs()
+            ))?;
         }
-    ) {
-        for line in clipboard::diagnostic_lines().await {
+        for line in clipboard::diagnostic_lines(wait).await {
             stdout_line(format_args!("{line}"))?;
         }
         return Ok(ExitCode::SUCCESS);
