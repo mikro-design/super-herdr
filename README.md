@@ -22,10 +22,12 @@ It never takes over, stops, starts, or restarts a Herdr session.
   selected remote pane.
 - Verified clipboard file upload to the selected host with path-only injection,
   for PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG.
-- Copying a file in a file manager and pasting it into a pane. A clipboard holds
-  a reference rather than bytes for a copied file, so the reference is followed
-  and the file read from local disk, sent under its own name, and the verified
-  remote path pasted into the pane — the same path an image takes.
+- Copying files in a file manager and pasting them into a pane. A clipboard
+  holds references rather than bytes for copied files, so the references are
+  followed, each file is read from local disk and sent under its own name, and
+  the verified remote paths are pasted in the order they were copied — the same
+  path an image takes. A file that does not arrive is named rather than passed
+  over.
 - Verified transfer of arbitrary content to a target through the daemon, relayed
   as it arrives rather than held, under a name the caller chooses, bounded by
   `transfers.max_bytes` and unstaged on the host if any check fails.
@@ -804,9 +806,9 @@ cargo clippy -j 4 --target x86_64-apple-darwin --all-targets -- -D warnings
   cross-session transfer; `workspace.move` only reorders workspaces inside one
   session. Recreation is the supported substitute and restarts every process.
   A live cross-session move needs a Herdr-side transfer of the panes themselves.
-- Copying several files at once sends only the first. What a second should be
-  called on the far side, and what should happen when the third fails, are
-  questions without an obvious answer yet.
+- A copied file is read whole before it is sent, so one is capped at 32 MiB even
+  though the daemon's own ceiling is larger. Streaming from disk is what would
+  close that gap.
 - WebP and SVG have no classic macOS pasteboard class, so on macOS they report as
   unsupported rather than being requested under a code that cannot exist.
 - Remote-to-local clipboard messages emitted by a program inside a Herdr pane are

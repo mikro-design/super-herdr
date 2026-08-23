@@ -454,12 +454,16 @@ pub async fn diagnostic_lines() -> Vec<String> {
     // file manager is a reference rather than bytes, and whether this can
     // follow it is the difference between a copy that works and one that
     // silently does nothing.
-    let referenced = match offered_file().await {
-        Some(path) => path.display().to_string(),
-        None if context == ClipboardContext::Desktop => {
+    let referenced = match offered_files().await.as_slice() {
+        [] if context == ClipboardContext::Desktop => {
             "none (copy a file in a file manager to test)".to_owned()
         }
-        None => "unavailable to an SSH/nested process".to_owned(),
+        [] => "unavailable to an SSH/nested process".to_owned(),
+        paths => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
     };
 
     vec![
@@ -582,7 +586,7 @@ pub async fn offered_media() -> Vec<ClipboardMedia> {
 /// The largest name a file reference may carry before it is refused.
 const MAXIMUM_FILE_REFERENCE_BYTES: usize = 8 * 1024;
 
-/// A file the clipboard is pointing at, rather than one it contains.
+/// The files a clipboard is pointing at, rather than any it contains.
 ///
 /// Copying a file in a file manager does not put its bytes on a clipboard. It
 /// puts a reference — `public.file-url` on macOS, `text/uri-list` under
@@ -591,24 +595,30 @@ const MAXIMUM_FILE_REFERENCE_BYTES: usize = 8 * 1024;
 /// to every file anybody tried to copy. Following the reference is the whole of
 /// the fix: the bytes are on the local disk, where this process can read them.
 ///
-/// Only the first reference is taken. A file manager can copy several at once,
-/// and moving one file well is worth more than moving several ambiguously —
-/// what a second file should be called on the far side, and what should happen
-/// when the third fails, are questions with no obvious answer yet.
-pub async fn offered_file() -> Option<PathBuf> {
+/// A selection is copied as a selection, so all of it is returned. Each file
+/// carries its own name, each is verified on its own, and a failure belongs to
+/// the file it happened to — there is nothing about the second file that the
+/// first has not already answered.
+pub async fn offered_files() -> Vec<PathBuf> {
     if clipboard_context() != ClipboardContext::Desktop {
-        return None;
+        return Vec::new();
     }
-    let spec = file_reference_reader()?;
-    let bytes = read_command_bytes(
+    let Some(spec) = file_reference_reader() else {
+        return Vec::new();
+    };
+    let Ok(bytes) = read_command_bytes(
         spec,
         MAXIMUM_FILE_REFERENCE_BYTES,
         "clipboard file reference",
     )
     .await
-    .ok()?;
-    let text = String::from_utf8(bytes).ok()?;
-    first_file_reference(&text)
+    else {
+        return Vec::new();
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    local_file_references(&text)
 }
 
 #[cfg(target_os = "linux")]
@@ -625,13 +635,25 @@ fn file_reference_reader() -> Option<CommandSpec> {
     None
 }
 
-/// macOS answers with the path directly rather than a URL, which avoids having
-/// to undo percent-encoding on a value that becomes a filesystem path.
+/// macOS answers with paths directly rather than URLs, which avoids having to
+/// undo percent-encoding on a value that becomes a filesystem path. Each file
+/// in the selection comes back on its own line.
 #[cfg(target_os = "macos")]
 fn file_reference_reader() -> Option<CommandSpec> {
     Some(CommandSpec::new(
         "osascript",
-        &["-e", "POSIX path of (the clipboard as «class furl»)"],
+        &[
+            "-e",
+            "set out to \"\"",
+            "-e",
+            "repeat with item_ref in (the clipboard as «class furl»)",
+            "-e",
+            "set out to out & POSIX path of item_ref & linefeed",
+            "-e",
+            "end repeat",
+            "-e",
+            "return out",
+        ],
     ))
 }
 
@@ -640,31 +662,29 @@ fn file_reference_reader() -> Option<CommandSpec> {
     None
 }
 
-/// The first thing in a clipboard's file reference that names a local file.
+/// Every local file a clipboard's reference names, in the order given.
 ///
-/// Handles both shapes because both are real: a `file://` URI from a
-/// `text/uri-list`, and a bare POSIX path from `osascript`. Anything that is
-/// not a local path is refused rather than guessed at — a `https://` entry in a
-/// uri-list is a link somebody copied, not a file this can read.
-fn first_file_reference(text: &str) -> Option<PathBuf> {
-    for line in text.lines() {
-        let line = line.trim();
+/// Handles both shapes because both are real: `file://` URIs from a
+/// `text/uri-list`, and bare POSIX paths from `osascript`. Anything that is not
+/// a local path is skipped rather than guessed at — a `https://` entry is a
+/// link somebody copied, not a file this can read — and skipping rather than
+/// refusing the lot means one odd entry in a selection does not cost the files
+/// beside it.
+fn local_file_references(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
         // A uri-list may carry comments, and an empty line is not an error.
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("file://") {
-            // `file:///path` has an empty authority; anything else names
-            // another machine and is not a file on this disk.
-            let path = rest.strip_prefix('/').map(|path| format!("/{path}"))?;
-            return Some(PathBuf::from(percent_decoded(&path)));
-        }
-        if line.starts_with('/') {
-            return Some(PathBuf::from(line));
-        }
-        return None;
-    }
-    None
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            if let Some(rest) = line.strip_prefix("file://") {
+                // `file:///path` has an empty authority; anything else names
+                // another machine and is not a file on this disk.
+                let path = rest.strip_prefix('/').map(|path| format!("/{path}"))?;
+                return Some(PathBuf::from(percent_decoded(&path)));
+            }
+            line.starts_with('/').then(|| PathBuf::from(line))
+        })
+        .collect()
 }
 
 /// Undo the percent-encoding a `file://` URI carries. Left alone on anything
@@ -2215,30 +2235,41 @@ mod tests {
     }
 
     #[test]
-    fn a_clipboard_file_reference_resolves_to_a_local_path_or_nothing() {
-        use super::first_file_reference;
+    fn clipboard_file_references_resolve_to_local_paths_and_nothing_else() {
+        use super::local_file_references;
         use std::path::PathBuf;
 
-        // What a uri-list actually looks like, comments and all.
+        let one = |path: &str| vec![PathBuf::from(path)];
+
         assert_eq!(
-            first_file_reference("file:///Users/veba/Downloads/ble_rx_compliance.c"),
-            Some(PathBuf::from("/Users/veba/Downloads/ble_rx_compliance.c"))
-        );
-        assert_eq!(
-            first_file_reference("# comment\r\nfile:///home/veba/a.c\r\nfile:///home/veba/b.c"),
-            Some(PathBuf::from("/home/veba/a.c")),
-            "the first reference is taken; the rest are a question with no answer yet"
+            local_file_references("file:///Users/veba/Downloads/ble_rx_compliance.c"),
+            one("/Users/veba/Downloads/ble_rx_compliance.c")
         );
         // What osascript answers with: the path itself.
         assert_eq!(
-            first_file_reference("/Users/veba/Downloads/ble_rx_compliance.c\n"),
-            Some(PathBuf::from("/Users/veba/Downloads/ble_rx_compliance.c"))
+            local_file_references("/Users/veba/Downloads/ble_rx_compliance.c\n"),
+            one("/Users/veba/Downloads/ble_rx_compliance.c")
         );
         // Percent-encoding is undone, because a file:// URI carries it and a
         // path with a literal %20 in it is not the file anybody copied.
         assert_eq!(
-            first_file_reference("file:///home/veba/two%20words.c"),
-            Some(PathBuf::from("/home/veba/two words.c"))
+            local_file_references("file:///home/veba/two%20words.c"),
+            one("/home/veba/two words.c")
+        );
+
+        // A selection is copied as a selection. All of it, in order.
+        assert_eq!(
+            local_file_references("# comment\r\nfile:///home/veba/a.c\r\nfile:///home/veba/b.c"),
+            vec![
+                PathBuf::from("/home/veba/a.c"),
+                PathBuf::from("/home/veba/b.c")
+            ]
+        );
+
+        // One entry that is not a local file does not cost the files beside it.
+        assert_eq!(
+            local_file_references("https://example.com/thing.c\nfile:///home/veba/real.c"),
+            one("/home/veba/real.c")
         );
 
         for text in [
@@ -2251,9 +2282,8 @@ mod tests {
             // Relative, so there is no way to know what it is relative to.
             "Downloads/a.c",
         ] {
-            assert_eq!(
-                first_file_reference(text),
-                None,
+            assert!(
+                local_file_references(text).is_empty(),
                 "{text:?} should not resolve to a local file"
             );
         }

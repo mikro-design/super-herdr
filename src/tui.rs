@@ -691,7 +691,31 @@ fn atomic_paste_available(resolved: &BTreeMap<TargetSession, Target>, key: &Targ
 /// path comes back verified, and pasting it is this side's job because
 /// bracketed-paste state lives with the parser.
 struct PendingUpload {
-    mime: String,
+    /// What to call it in a message to a person: a MIME type for a clipboard
+    /// payload, a filename for a file.
+    described: String,
+    /// Which batch this belongs to, and where in it. A file copied on its own
+    /// is still a batch of one, so there is one path through the completion
+    /// handling rather than two.
+    batch: Option<UploadBatchEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct UploadBatchEntry {
+    batch: u64,
+    position: usize,
+}
+
+/// Files copied together, arriving apart.
+///
+/// Each upload is verified on its own and finishes whenever its host manages,
+/// so the paths come back in an order nobody chose. A command line wants them
+/// in the order somebody selected them, which is what `paths` being keyed by
+/// position is for.
+struct UploadBatch {
+    expected: usize,
+    paths: BTreeMap<usize, String>,
+    failures: Vec<String>,
 }
 
 enum ConfigRefresh {
@@ -786,6 +810,8 @@ struct App {
     clipboard_feedback: Option<ClipboardFeedback>,
     config_path: Option<PathBuf>,
     configured_targets: Vec<Target>,
+    upload_batches: BTreeMap<u64, UploadBatch>,
+    next_upload_batch: u64,
     /// Targets as they resolved, which is not what the file says. A session
     /// discovered at runtime carries the socket the host reported, and a target
     /// that relies on discovery has none in the file at all — so a question
@@ -840,6 +866,8 @@ impl Default for App {
             clipboard_feedback: None,
             config_path: None,
             configured_targets: Vec::new(),
+            upload_batches: BTreeMap::new(),
+            next_upload_batch: 0,
             resolved_targets: BTreeMap::new(),
             configuration_dirty: false,
             target_manager: None,
@@ -1702,6 +1730,66 @@ async fn tick_selection_autoscroll(app: &mut App) -> Result<bool> {
 }
 
 /// Paste a path the daemon verified into the selected pane.
+/// Paste a finished selection, once every file in it has been answered.
+///
+/// Waiting for the whole batch is what keeps the order: uploads are verified
+/// independently and land whenever their hosts manage, and a command line wants
+/// the files in the order somebody selected them. A file that failed is named
+/// rather than passed over — the ones that arrived are still worth having, and
+/// somebody typing a command needs to know which of them is missing.
+/// What a finished batch amounts to: its paths in the order they were copied,
+/// and a report naming anything that did not arrive.
+///
+/// Separated from the pasting so the order can be asserted. It is not
+/// observable through the paste — that needs a selected pane and a live control
+/// route — and an ordering nothing can check is an ordering nobody will notice
+/// breaking.
+fn settled_batch(state: UploadBatch) -> (Vec<String>, Option<String>) {
+    // Keyed by position, so iteration is selection order rather than arrival
+    // order. That is the whole mechanism, and it is why this is a map.
+    let paths: Vec<String> = state.paths.into_values().collect();
+    let report = (!state.failures.is_empty()).then(|| {
+        format!(
+            "uploaded {} of {}; {} did not arrive: {}",
+            paths.len(),
+            state.expected,
+            state.failures.len(),
+            state.failures.join(", ")
+        )
+    });
+    (paths, report)
+}
+
+fn settle_upload_batch(app: &mut App, batch: u64) {
+    let Some(state) = app.upload_batches.get(&batch) else {
+        return;
+    };
+    if state.paths.len() + state.failures.len() < state.expected {
+        return;
+    }
+    let Some(state) = app.upload_batches.remove(&batch) else {
+        return;
+    };
+    let (paths, report) = settled_batch(state);
+    if !paths.is_empty() {
+        paste_verified_path(
+            app,
+            &paths.join(" "),
+            format!(
+                "uploaded and verified {} file(s); pasted remote paths",
+                paths.len()
+            ),
+        );
+    }
+    // Last, and unconditionally, because which files are missing is worth more
+    // than whatever the paste had to say — including when the paste is what
+    // failed, which is exactly when somebody would otherwise be told nothing
+    // about the transfer at all.
+    if let Some(report) = report {
+        app.message = Some(report);
+    }
+}
+
 fn paste_verified_path(app: &mut App, path: &str, feedback: String) {
     let Some(selected) = app.selected_pane.clone() else {
         app.message = Some("no pane is selected for the uploaded path".to_owned());
@@ -3838,42 +3926,87 @@ async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result
     }
     // Reading the clipboard is a desktop-session capability and stays here.
     // Moving the bytes needs a route to the host, so that half is the daemon's.
-    let offered = match clipboard::read_offered_media(MAX_CLIPBOARD_MEDIA_BYTES).await {
-        Ok((media, payload)) => Some((media.mime.to_owned(), None, payload)),
-        // A clipboard holding no flavour this understands may still be pointing
-        // at a file. Copying one in a file manager puts a reference rather than
-        // bytes, which is what every attempt to copy a file ran into.
-        Err(media_error) => match clipboard::offered_file().await {
-            Some(path) => match read_local_file(&path) {
-                Ok((name, payload)) => {
-                    Some(("application/octet-stream".to_owned(), Some(name), payload))
-                }
-                Err(error) => {
-                    app.message = Some(format!("{}: {error}", path.display()));
-                    return Ok(());
-                }
-            },
-            None => {
-                app.message = Some(format!("clipboard media unavailable: {media_error}"));
-                return Ok(());
-            }
-        },
-    };
-    let Some((mime, name, payload)) = offered else {
-        return Ok(());
+    // One flavour of bytes, or a reference to however many files were copied.
+    // A clipboard holding neither is the only failure worth reporting.
+    let media = clipboard::read_offered_media(MAX_CLIPBOARD_MEDIA_BYTES).await;
+    let files = match &media {
+        Ok(_) => Vec::new(),
+        Err(_) => clipboard::offered_files().await,
     };
     let Some(client) = app.client.clone() else {
         app.message = Some("clipboard upload routing is unavailable".to_owned());
         return Ok(());
     };
-    let bytes = payload.len();
-    let described = name.clone().unwrap_or_else(|| mime.clone());
-    let request = match name {
-        Some(name) => client.upload_file(selected, name, mime.clone(), &payload),
-        None => client.upload_media(selected, mime.clone(), &payload),
+
+    let media_error = match media {
+        Ok((media, payload)) => {
+            let bytes = payload.len();
+            let request = client.upload_media(selected, media.mime.to_owned(), &payload);
+            app.pending_uploads.insert(
+                request,
+                PendingUpload {
+                    described: media.mime.to_owned(),
+                    batch: None,
+                },
+            );
+            app.message = Some(format!("uploading {} {bytes} bytes…", media.mime));
+            return Ok(());
+        }
+        Err(error) => error,
     };
-    app.pending_uploads.insert(request, PendingUpload { mime });
-    app.message = Some(format!("uploading {described} {bytes} bytes…"));
+
+    if files.is_empty() {
+        app.message = Some(format!("clipboard media unavailable: {media_error}"));
+        return Ok(());
+    }
+
+    // Read before sending any of it, so a selection with an unreadable file in
+    // it fails while nothing has moved rather than half way through.
+    let mut payloads = Vec::with_capacity(files.len());
+    for path in &files {
+        match read_local_file(path) {
+            Ok(read) => payloads.push(read),
+            Err(error) => {
+                app.message = Some(format!("{}: {error}", path.display()));
+                return Ok(());
+            }
+        }
+    }
+
+    let batch = app.next_upload_batch;
+    app.next_upload_batch = app.next_upload_batch.wrapping_add(1);
+    let total: usize = payloads.iter().map(|(_, payload)| payload.len()).sum();
+    let described = match payloads.as_slice() {
+        [(name, _)] => name.clone(),
+        many => format!("{} files", many.len()),
+    };
+    for (position, (name, payload)) in payloads.iter().enumerate() {
+        let request = client.upload_file(
+            selected.clone(),
+            name.clone(),
+            "application/octet-stream".to_owned(),
+            payload,
+        );
+        app.pending_uploads.insert(
+            request,
+            PendingUpload {
+                described: name.clone(),
+                // Position rather than arrival: uploads finish in whatever
+                // order their hosts manage, and a command line wants the files
+                // in the order somebody selected them.
+                batch: Some(UploadBatchEntry { batch, position }),
+            },
+        );
+    }
+    app.upload_batches.insert(
+        batch,
+        UploadBatch {
+            expected: payloads.len(),
+            paths: BTreeMap::new(),
+            failures: Vec::new(),
+        },
+    );
+    app.message = Some(format!("uploading {described} {total} bytes…"));
     Ok(())
 }
 
@@ -4421,17 +4554,30 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
             path,
             bytes,
         } => {
-            let mime = app
-                .pending_uploads
-                .remove(&request)
-                .map_or_else(|| "payload".to_owned(), |pending| pending.mime);
-            // Only a verified path is ever injected, and pasting it happens
-            // here because bracketed-paste state lives with the parser.
-            paste_verified_path(
-                app,
-                &path,
-                format!("uploaded and verified {mime} {bytes} bytes; pasted remote path"),
-            );
+            let Some(pending) = app.pending_uploads.remove(&request) else {
+                return;
+            };
+            match pending.batch {
+                // Held until the rest of the selection lands, so the paths are
+                // pasted in the order they were copied rather than the order
+                // their hosts happened to finish.
+                Some(entry) => {
+                    if let Some(batch) = app.upload_batches.get_mut(&entry.batch) {
+                        batch.paths.insert(entry.position, path);
+                    }
+                    settle_upload_batch(app, entry.batch);
+                }
+                // Only a verified path is ever injected, and pasting it happens
+                // here because bracketed-paste state lives with the parser.
+                None => paste_verified_path(
+                    app,
+                    &path,
+                    format!(
+                        "uploaded and verified {} {bytes} bytes; pasted remote path",
+                        pending.described
+                    ),
+                ),
+            }
         }
         ServerMessage::PairingCode {
             code,
@@ -4453,7 +4599,17 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
             // A refusal ends whatever asked for it, so a failed transfer does
             // not leave the frontend waiting on a result that will not come.
             if let Some(request) = request {
-                app.pending_uploads.remove(&request);
+                // A file that failed still has to settle its batch, or the
+                // files that did arrive wait forever for one that never will.
+                if let Some(pending) = app.pending_uploads.remove(&request)
+                    && let Some(entry) = pending.batch
+                {
+                    if let Some(batch) = app.upload_batches.get_mut(&entry.batch) {
+                        batch.failures.push(pending.described);
+                    }
+                    settle_upload_batch(app, entry.batch);
+                    return;
+                }
                 if app.pending_operations.remove(&request).is_some() {
                     app.herdr_action_inflight = false;
                 }
@@ -6515,6 +6671,88 @@ mod tests {
     /// `discover_sessions` and no `socket` line was told it could not do the
     /// one thing it could do — and a multiline paste into a pane without
     /// bracketed paste was refused with a reason that was not true.
+    /// A selection pastes in the order it was copied, whatever order it lands
+    /// in.
+    ///
+    /// Each upload is verified independently and finishes whenever its host
+    /// manages, so arrival order is not selection order and a command line
+    /// cares about the difference. `gcc b.c a.c` is not `gcc a.c b.c`.
+    #[test]
+    fn a_batch_pastes_in_the_order_it_was_copied() {
+        let mut app = App::default();
+        app.upload_batches.insert(
+            7,
+            super::UploadBatch {
+                expected: 3,
+                paths: BTreeMap::new(),
+                failures: Vec::new(),
+            },
+        );
+
+        // Landing backwards, which is the case worth covering.
+        for (position, path) in [(2, "/staged/c.c"), (0, "/staged/a.c")] {
+            app.upload_batches
+                .get_mut(&7)
+                .unwrap()
+                .paths
+                .insert(position, path.to_owned());
+            super::settle_upload_batch(&mut app, 7);
+            assert!(
+                app.upload_batches.contains_key(&7),
+                "a batch settles only once every file has been answered"
+            );
+        }
+
+        app.upload_batches
+            .get_mut(&7)
+            .unwrap()
+            .paths
+            .insert(1, "/staged/b.c".to_owned());
+
+        // Asserted on what the batch amounts to rather than on what the paste
+        // did, because the paste needs a pane and a live route and an ordering
+        // nothing checks is one nobody notices breaking.
+        let state = app
+            .upload_batches
+            .remove(&7)
+            .expect("the batch is complete");
+        let (paths, report) = super::settled_batch(state);
+        assert_eq!(paths, ["/staged/a.c", "/staged/b.c", "/staged/c.c"]);
+        assert!(report.is_none(), "nothing failed, so nothing is reported");
+    }
+
+    /// A file that fails does not strand the ones that arrived.
+    #[test]
+    fn a_batch_settles_even_when_one_file_never_arrives() {
+        let mut app = App::default();
+        app.upload_batches.insert(
+            1,
+            super::UploadBatch {
+                expected: 2,
+                paths: BTreeMap::new(),
+                failures: Vec::new(),
+            },
+        );
+        app.upload_batches
+            .get_mut(&1)
+            .unwrap()
+            .paths
+            .insert(0, "/staged/a.c".to_owned());
+        app.upload_batches
+            .get_mut(&1)
+            .unwrap()
+            .failures
+            .push("b.c".to_owned());
+        super::settle_upload_batch(&mut app, 1);
+
+        assert!(!app.upload_batches.contains_key(&1));
+        let message = app.message.clone().unwrap_or_default();
+        assert!(
+            message.contains("b.c") && message.contains("1 of 2"),
+            "a missing file is named rather than passed over: {message}"
+        );
+    }
+
     #[test]
     fn a_discovered_socket_is_enough_for_an_atomic_paste() {
         let configured = Target {
