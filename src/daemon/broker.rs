@@ -2567,6 +2567,58 @@ mod tests {
         );
     }
 
+    /// A reconnecting page asks for what it was watching, and a drop noticed at
+    /// both ends at once could have it ask twice. Cheap to make harmless and
+    /// expensive to discover in the field, so it is pinned here.
+    #[test]
+    fn subscribing_twice_to_one_pane_leaves_one_subscription() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        let first = subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"hello");
+        let again = subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        assert_eq!(
+            broker.routes[&pane("w1:p1")].subscribers.len(),
+            1,
+            "one client subscribed twice was counted twice"
+        );
+        assert_eq!(
+            broker.clients[&viewer].panes.len(),
+            1,
+            "one pane was recorded twice for one client"
+        );
+        // The second subscription is a fresh one, so it is owed a whole screen
+        // and owes nothing for what the first was sent.
+        assert!(outstanding(&broker, viewer, "w1:p1") <= MAX_OUTSTANDING_SCREEN_UPDATES);
+        assert!(!messages_for(&first, viewer).is_empty());
+        assert!(!messages_for(&again, viewer).is_empty());
+
+        // And releasing once releases it: no phantom subscriber keeps the route
+        // open after the client has gone.
+        broker.disconnect(viewer);
+        assert!(
+            !broker.routes.contains_key(&pane("w1:p1")),
+            "the route outlived the only client that wanted it"
+        );
+    }
+
     /// The bound belongs to the rendered path alone: a frame subscriber is
     /// already stopped by the socket it is not draining.
     #[test]
