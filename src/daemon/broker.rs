@@ -58,6 +58,18 @@ pub enum Effect {
     CloseRoute {
         pane: PaneId,
     },
+    /// Nobody is watching this pane any more.
+    ///
+    /// Not a request to close it. The route is kept, and whoever holds a clock
+    /// decides how long to keep it: a client that drops its connection and
+    /// comes straight back would otherwise pay for a fresh SSH session on
+    /// somebody else's host every time a link flaps. Ask
+    /// [`Broker::close_if_unclaimed`] when the wait is over; it answers
+    /// whether the pane is still unwanted, so a resubscribe inside the window
+    /// silently keeps the route it already had.
+    RouteUnclaimed {
+        pane: PaneId,
+    },
     RouteInput {
         pane: PaneId,
         bytes: Vec<u8>,
@@ -200,6 +212,9 @@ struct Route {
     rows: u16,
     control: Option<ClientId>,
     subscribers: BTreeSet<ClientId>,
+    /// True once the last subscriber left and nobody has come back. The route
+    /// is still open; it is waiting to find out whether it is wanted again.
+    unclaimed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,6 +893,23 @@ impl Broker {
         }
     }
 
+    /// Close a pane's route if it is still unwanted, or say nothing if it is
+    /// not.
+    ///
+    /// Asked by whoever has been holding the wait. The answer is decided here
+    /// rather than there, because whether a route is wanted is a fact about
+    /// subscribers and this is where they live — a caller that remembered
+    /// "unclaimed at the time I started waiting" would close a route somebody
+    /// is watching by the time it acts.
+    pub fn close_if_unclaimed(&mut self, pane: &PaneId) -> Vec<Effect> {
+        if !self.routes.get(pane).is_some_and(|route| route.unclaimed) {
+            return Vec::new();
+        }
+        self.routes.remove(pane);
+        self.screens.remove(pane);
+        vec![Effect::CloseRoute { pane: pane.clone() }]
+    }
+
     /// The route's own stream ended. Subscribers keep their subscription
     /// records only until they are told, so no client is left waiting on a
     /// stream that no longer exists.
@@ -1003,6 +1035,11 @@ impl Broker {
 
         let granted = match self.routes.get_mut(&pane) {
             Some(route) => {
+                // Somebody came back before the wait was over, so the route
+                // this client would have paid to reopen is the one it already
+                // has. Nothing is signalled: the far side never learned it was
+                // going away.
+                route.unclaimed = false;
                 route.subscribers.insert(client);
                 if access == TerminalAccess::Control && route.control.is_none() {
                     route.control = Some(client);
@@ -1024,6 +1061,7 @@ impl Broker {
                         rows,
                         control,
                         subscribers: BTreeSet::from([client]),
+                        unclaimed: false,
                     },
                 );
                 effects.push(Effect::OpenRoute {
@@ -1168,9 +1206,21 @@ impl Broker {
         let emptied = route.subscribers.is_empty();
         let held_control = route.control == Some(client);
         if emptied {
-            self.routes.remove(pane);
-            self.screens.remove(pane);
-            effects.push(Effect::CloseRoute { pane: pane.clone() });
+            // Kept rather than closed. Whether it is worth keeping, and for how
+            // long, is a question for whoever has a clock — this only reports
+            // that nobody is watching.
+            route.unclaimed = true;
+            route.control = None;
+            // The rendered screen stays with the route. Reusing a route removes
+            // the repaint that reopening one used to provide, and a viewer
+            // returning to an idle pane has nothing else to prompt the far side
+            // with — its stream never stopped, so no frame is coming. Dropping
+            // the screen here would leave exactly that viewer looking at
+            // nothing, which is the case this window exists to serve. It goes
+            // when the route goes, in `close_if_unclaimed` and
+            // `pane_route_closed`, and a busy pane drops it in `pane_frame`
+            // anyway once nobody is rendering.
+            effects.push(Effect::RouteUnclaimed { pane: pane.clone() });
             return;
         }
         // The one leaving may have been the last watching this pane as a
@@ -1911,9 +1961,153 @@ mod tests {
                 pane: pane("w1:p1"),
             },
         );
-        assert!(last.contains(&Effect::CloseRoute {
+        // The last one leaving does not close the route: it reports that
+        // nobody is watching, and something with a clock decides how long to
+        // wait for somebody to come back.
+        assert!(last.contains(&Effect::RouteUnclaimed {
             pane: pane("w1:p1")
         }));
+        assert!(
+            !last
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseRoute { .. }))
+        );
+
+        // And when the wait is over, it closes.
+        assert_eq!(
+            broker.close_if_unclaimed(&pane("w1:p1")),
+            vec![Effect::CloseRoute {
+                pane: pane("w1:p1")
+            }]
+        );
+    }
+
+    /// Reusing a route removes the repaint that reopening one used to provide.
+    ///
+    /// A viewer that comes back to an idle pane has nothing to prompt the far
+    /// side with — its stream never stopped, so no frame is coming — and if the
+    /// rendered screen was dropped when the route was released there is nothing
+    /// to send it either. It would sit on an empty viewer for as long as the
+    /// pane stayed quiet, which is the exact case the grace window exists for.
+    #[test]
+    fn a_viewer_returning_to_an_idle_pane_is_sent_the_screen_it_left() {
+        let mut broker = broker();
+        let viewer = greet(&mut broker);
+        subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+        frame(&mut broker, "w1:p1", b"still here\r\n");
+        broker.handle(
+            viewer,
+            ClientMessage::UnsubscribePane {
+                pane: pane("w1:p1"),
+            },
+        );
+
+        let returning = subscribe_as(
+            &mut broker,
+            viewer,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+            PaneRepresentation::Screen,
+        );
+
+        let messages = messages_for(&returning, viewer);
+        let screen = messages.iter().find_map(|message| match message {
+            ServerMessage::PaneScreen { screen, .. } => Some(screen.clone()),
+            _ => None,
+        });
+        let screen = screen.unwrap_or_else(|| {
+            panic!("a returning viewer was sent no screen and no frame is coming: {messages:?}")
+        });
+        assert_eq!(row_text(&screen, 0), "still here");
+
+        // And it is not kept for ever: when the route really goes, so does it.
+        broker.handle(
+            viewer,
+            ClientMessage::UnsubscribePane {
+                pane: pane("w1:p1"),
+            },
+        );
+        broker.close_if_unclaimed(&pane("w1:p1"));
+        assert!(
+            broker.screens.is_empty(),
+            "the rendered screen outlived the route it belonged to"
+        );
+    }
+
+    /// The point of keeping an unclaimed route: a client that drops and comes
+    /// straight back gets the stream it already had, rather than paying for a
+    /// fresh SSH session on somebody else's host every time a link flaps.
+    #[test]
+    fn a_route_reclaimed_before_the_wait_is_over_is_never_closed() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        subscribe(
+            &mut broker,
+            client,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+        );
+        broker.handle(
+            client,
+            ClientMessage::UnsubscribePane {
+                pane: pane("w1:p1"),
+            },
+        );
+
+        // Back before anybody asked whether it was still unwanted.
+        let returning = subscribe(
+            &mut broker,
+            client,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+        );
+        assert!(
+            !returning
+                .iter()
+                .any(|effect| matches!(effect, Effect::OpenRoute { .. })),
+            "the route was reopened rather than reused"
+        );
+
+        assert!(
+            broker.close_if_unclaimed(&pane("w1:p1")).is_empty(),
+            "a route somebody is watching was closed by a stale wait"
+        );
+        assert!(broker.routes.contains_key(&pane("w1:p1")));
+    }
+
+    /// Asking twice settles it once. The sweep runs on a timer and a pane can
+    /// be swept after it has already gone.
+    #[test]
+    fn closing_an_unclaimed_route_twice_says_nothing_the_second_time() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        subscribe(
+            &mut broker,
+            client,
+            "w1:p1",
+            TerminalAccess::Observe,
+            80,
+            24,
+        );
+        broker.disconnect(client);
+
+        assert_eq!(broker.close_if_unclaimed(&pane("w1:p1")).len(), 1);
+        assert!(broker.close_if_unclaimed(&pane("w1:p1")).is_empty());
+        assert!(broker.close_if_unclaimed(&pane("never-existed")).is_empty());
     }
 
     #[test]
@@ -2611,8 +2805,9 @@ mod tests {
         assert!(!messages_for(&again, viewer).is_empty());
 
         // And releasing once releases it: no phantom subscriber keeps the route
-        // open after the client has gone.
+        // claimed after the client has gone.
         broker.disconnect(viewer);
+        broker.close_if_unclaimed(&pane("w1:p1"));
         assert!(
             !broker.routes.contains_key(&pane("w1:p1")),
             "the route outlived the only client that wanted it"
@@ -3040,12 +3235,22 @@ mod tests {
 
         let effects = broker.disconnect(client);
 
-        assert!(effects.contains(&Effect::CloseRoute {
+        // Released, not closed — the routes are held for whoever is deciding
+        // how long to wait.
+        assert!(effects.contains(&Effect::RouteUnclaimed {
             pane: pane("w1:p1")
         }));
-        assert!(effects.contains(&Effect::CloseRoute {
+        assert!(effects.contains(&Effect::RouteUnclaimed {
             pane: pane("w1:p2")
         }));
         assert!(broker.disconnect(client).is_empty());
+        for resource in ["w1:p1", "w1:p2"] {
+            assert_eq!(
+                broker.close_if_unclaimed(&pane(resource)),
+                vec![Effect::CloseRoute {
+                    pane: pane(resource)
+                }]
+            );
+        }
     }
 }

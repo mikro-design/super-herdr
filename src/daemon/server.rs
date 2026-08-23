@@ -1495,6 +1495,13 @@ impl Daemon {
                     cols,
                     rows,
                 } => self.open_route(pane, access, cols, rows),
+                Effect::RouteUnclaimed { pane } => {
+                    // Nothing waits yet, so a pane nobody is watching is closed
+                    // in the same pass — which is exactly what happened before
+                    // this effect existed. The wait belongs to whoever holds a
+                    // clock and arrives separately.
+                    pending.extend(self.broker.close_if_unclaimed(&pane));
+                }
                 Effect::CloseRoute { pane } => {
                     if let Some(route) = self.routes.remove(&pane) {
                         route.shutdown();
