@@ -761,9 +761,20 @@ struct ContextMenu {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TextPromptAction {
-    CreateWorkspace { target: TargetSession },
-    RenameWorkspace { workspace: WorkspaceId },
-    RenameTab { tab: TabId },
+    /// Send a file named by path rather than by clipboard, which is what a file
+    /// dragged onto a terminal amounts to.
+    SendFile {
+        pane: PaneId,
+    },
+    CreateWorkspace {
+        target: TargetSession,
+    },
+    RenameWorkspace {
+        workspace: WorkspaceId,
+    },
+    RenameTab {
+        tab: TabId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -773,6 +784,11 @@ struct TextPrompt {
     value: String,
     action: TextPromptAction,
     error: Option<String>,
+    /// Bytes of a character that has not finished arriving. Input reaches here
+    /// one byte at a time, so a name like `Sønderborg.c` is several bytes that
+    /// are not characters on their own — dropping them, which is what
+    /// restricting the prompt to ASCII did, silently mistypes the path.
+    partial: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2096,7 +2112,7 @@ async fn handle_input(
         return handle_close_confirmation_input(key, app);
     }
     if app.text_prompt.is_some() {
-        return handle_text_prompt_input(key, app);
+        return handle_text_prompt_input(key, state, app);
     }
     if app.command_palette.is_some() {
         return handle_command_palette_input(key, state, app);
@@ -2172,6 +2188,7 @@ async fn handle_input(
                 b'p' => cycle_tab(state, app, -1),
                 b'v' => paste_system_clipboard(state, app).await?,
                 b'i' => paste_clipboard_media(state, app).await?,
+                b'f' => open_send_file_prompt(app),
                 b'h' => {
                     app.target_manager = Some(TargetManager::new(app.configured_targets.clone()));
                 }
@@ -2969,6 +2986,7 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
                 value: String::new(),
                 action: TextPromptAction::CreateWorkspace { target },
                 error: None,
+                partial: Vec::new(),
             });
         }
         ResourceAction::RenameWorkspace {
@@ -2981,6 +2999,7 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
                 value: String::new(),
                 action: TextPromptAction::RenameWorkspace { workspace },
                 error: None,
+                partial: Vec::new(),
             });
         }
         ResourceAction::RenameTab { tab, current_label } => {
@@ -2990,6 +3009,7 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
                 value: String::new(),
                 action: TextPromptAction::RenameTab { tab },
                 error: None,
+                partial: Vec::new(),
             });
         }
         ResourceAction::CloseWorkspace { .. }
@@ -3051,7 +3071,72 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
     }
 }
 
-fn handle_text_prompt_input(key: u8, app: &mut App) -> Result<bool> {
+/// Ask for a file by path.
+///
+/// The prompt exists because a file arrives named far more often than it
+/// arrives copied: dragging one onto a terminal types its path, and until now
+/// nothing in this program could be handed a path at all.
+fn open_send_file_prompt(app: &mut App) {
+    let Some(pane) = app.selected_pane.clone() else {
+        app.message = Some("no terminal pane is selected".to_owned());
+        return;
+    };
+    app.text_prompt = Some(TextPrompt {
+        title: "Send a file".to_owned(),
+        label: "drag a file here, or type its path".to_owned(),
+        value: String::new(),
+        action: TextPromptAction::SendFile { pane },
+        error: None,
+        partial: Vec::new(),
+    });
+}
+
+/// What a terminal actually inserts when a file is dropped on it.
+///
+/// A drop is not a path: it is a path spelled for a shell. Terminal.app
+/// backslash-escapes the spaces and adds a trailing one, other terminals quote
+/// the whole thing, and a person typing by hand will use `~`. All four are the
+/// same file, and refusing three of them would make the feature useless for
+/// exactly the paths people have — `~/Downloads/some file.c` is not an exotic
+/// case.
+fn dropped_path(text: &str) -> PathBuf {
+    let text = text.trim();
+    let unquoted = match (text.chars().next(), text.chars().last(), text.len()) {
+        (Some('\''), Some('\''), 2..) => text[1..text.len() - 1].replace("'\\''", "'"),
+        (Some('"'), Some('"'), 2..) => unescaped(&text[1..text.len() - 1]),
+        _ => unescaped(text),
+    };
+    // `~` alone is a home directory too, and `~other` is somebody else's, which
+    // this deliberately does not try to resolve.
+    let expanded = match unquoted.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match std::env::var_os("HOME") {
+            Some(home) => return PathBuf::from(home).join(rest.trim_start_matches('/')),
+            None => unquoted,
+        },
+        _ => unquoted,
+    };
+    PathBuf::from(expanded)
+}
+
+/// Undo shell escaping: a backslash quotes whatever follows it. A trailing
+/// backslash is kept as itself rather than swallowing the end of the path.
+fn unescaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some(escaped) => out.push(escaped),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn handle_text_prompt_input(key: u8, state: &FederationState, app: &mut App) -> Result<bool> {
     let Some(mut prompt) = app.text_prompt.take() else {
         return Ok(false);
     };
@@ -3059,12 +3144,32 @@ fn handle_text_prompt_input(key: u8, app: &mut App) -> Result<bool> {
         0x1b => return Ok(false),
         b'\r' | b'\n' => {
             let value = prompt.value.trim().to_owned();
+            if matches!(prompt.action, TextPromptAction::SendFile { .. }) {
+                // The pane is read again here rather than trusted from when the
+                // prompt opened: a lease can be lost, and a target can go away,
+                // while somebody is still typing a path.
+                match (value.is_empty(), upload_destination(state, app)) {
+                    (true, _) => prompt.error = Some("A path is required".to_owned()),
+                    (_, Err(message)) => prompt.error = Some(message),
+                    (_, Ok(pane)) => match app.client.clone() {
+                        Some(client) => {
+                            send_local_files(app, &pane, &client, &[dropped_path(&value)])?;
+                            return Ok(false);
+                        }
+                        None => prompt.error = Some("file routing is unavailable".to_owned()),
+                    },
+                }
+                app.text_prompt = Some(prompt);
+                return Ok(false);
+            }
             if value.is_empty() {
                 prompt.error = Some("A non-empty label is required".to_owned());
             } else {
                 // The prompt is where an intent becomes an operation: the label
                 // the person typed is now part of what the daemon is asked to do.
                 let (operation, description, follow_server_focus) = match prompt.action {
+                    // Handled above: a file is sent rather than operated on.
+                    TextPromptAction::SendFile { .. } => return Ok(false),
                     TextPromptAction::CreateWorkspace { target } => (
                         Operation::CreateWorkspace {
                             target: target.clone(),
@@ -3110,6 +3215,24 @@ fn handle_text_prompt_input(key: u8, app: &mut App) -> Result<bool> {
         }
         0x20..=0x7e => {
             prompt.value.push(char::from(key));
+            prompt.partial.clear();
+            prompt.error = None;
+        }
+        // The bytes of a character that arrives in more than one piece. Held
+        // until they spell something, then appended whole.
+        0x80.. => {
+            prompt.partial.push(key);
+            match std::str::from_utf8(&prompt.partial) {
+                Ok(text) => {
+                    prompt.value.push_str(text);
+                    prompt.partial.clear();
+                }
+                // Still incomplete: a longer sequence is on its way.
+                Err(error) if error.error_len().is_none() && prompt.partial.len() < 4 => {}
+                // Not a character at all, so nothing is appended and the next
+                // byte starts over rather than being read as a continuation.
+                Err(_) => prompt.partial.clear(),
+            }
             prompt.error = None;
         }
         _ => {}
@@ -3900,30 +4023,42 @@ async fn paste_text_into_selected(
     Ok(())
 }
 
-async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result<()> {
-    let Some(selected) = app.selected_pane.clone() else {
-        app.message = Some("no terminal pane is selected".to_owned());
-        return Ok(());
-    };
-    let key = selected.target_session();
-    let Some(runtime) = state.targets.get(&key) else {
-        app.message = Some("selected target is unavailable".to_owned());
-        return Ok(());
-    };
-    let Some(route) = app.routes.get(&selected) else {
-        app.message = Some("selected pane has no control route".to_owned());
-        return Ok(());
-    };
+/// The pane a file or a payload can actually be sent to, or why it cannot.
+///
+/// Shared by both ways in, because a file named by a prompt needs exactly what
+/// a file named by the clipboard needs: a selected pane, a live target, and a
+/// control lease this client still holds.
+fn upload_destination(state: &FederationState, app: &mut App) -> Result<PaneId, String> {
+    let selected = app
+        .selected_pane
+        .clone()
+        .ok_or("no terminal pane is selected")?;
+    let runtime = state
+        .targets
+        .get(&selected.target_session())
+        .ok_or("selected target is unavailable")?;
+    let route = app
+        .routes
+        .get(&selected)
+        .ok_or("selected pane has no control route")?;
     if route.access != TerminalAccess::Control {
-        app.message =
-            Some("read-only: another Herdr client owns control; cannot paste media".to_owned());
-        return Ok(());
+        return Err("read-only: another Herdr client owns control; cannot send".to_owned());
     }
     if !runtime.accepts_generation(route.generation) {
         app.routes.remove(&selected);
-        app.message = Some("control route became stale".to_owned());
-        return Ok(());
+        return Err("control route became stale".to_owned());
     }
+    Ok(selected)
+}
+
+async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result<()> {
+    let selected = match upload_destination(state, app) {
+        Ok(selected) => selected,
+        Err(message) => {
+            app.message = Some(message);
+            return Ok(());
+        }
+    };
     // Reading the clipboard is a desktop-session capability and stays here.
     // Moving the bytes needs a route to the host, so that half is the daemon's.
     // One flavour of bytes, or a reference to however many files were copied.
@@ -3960,10 +4095,25 @@ async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result
         return Ok(());
     }
 
+    send_local_files(app, &selected, &client, &files)
+}
+
+/// Send files this process can read to a pane, whatever named them.
+///
+/// Split from the clipboard because the clipboard is one way to name a file and
+/// not the only one: dragging a file onto a terminal types its path and never
+/// touches a pasteboard at all, which is why a bridge that only ever read the
+/// clipboard looked broken to somebody whose files were arriving as text.
+fn send_local_files(
+    app: &mut App,
+    selected: &PaneId,
+    client: &ClientCommands,
+    files: &[PathBuf],
+) -> Result<()> {
     // Read before sending any of it, so a selection with an unreadable file in
     // it fails while nothing has moved rather than half way through.
     let mut payloads = Vec::with_capacity(files.len());
-    for path in &files {
+    for path in files {
         match read_local_file(path) {
             Ok(read) => payloads.push(read),
             Err(error) => {
@@ -7668,6 +7818,127 @@ mod tests {
         );
         assert_eq!(app.attention.unread_count(), 0);
         assert!(app.attention_center.is_none());
+    }
+
+    /// A drop is a path spelled for a shell, not a path. All four spellings
+    /// name the same file, and refusing three of them would make the feature
+    /// useless for exactly the paths people have.
+    #[test]
+    fn a_dropped_file_is_read_however_the_terminal_spelled_it() {
+        use std::path::PathBuf;
+
+        use super::dropped_path;
+
+        let plain = PathBuf::from("/Users/veba/Downloads/ble_rx_compliance.c");
+        assert_eq!(
+            dropped_path("/Users/veba/Downloads/ble_rx_compliance.c"),
+            plain
+        );
+        // Terminal.app escapes the spaces and leaves a trailing one behind.
+        assert_eq!(
+            dropped_path("/Users/veba/Downloads/ble\\ rx\\ compliance.c "),
+            PathBuf::from("/Users/veba/Downloads/ble rx compliance.c")
+        );
+        // Other terminals quote the whole thing instead.
+        assert_eq!(
+            dropped_path("'/Users/veba/Downloads/ble rx compliance.c'"),
+            PathBuf::from("/Users/veba/Downloads/ble rx compliance.c")
+        );
+        assert_eq!(
+            dropped_path("\"/Users/veba/Downloads/ble rx compliance.c\""),
+            PathBuf::from("/Users/veba/Downloads/ble rx compliance.c")
+        );
+        // A quoted path keeps the characters a shell would have eaten.
+        assert_eq!(
+            dropped_path("'/Users/veba/a$b/c`d.c'"),
+            PathBuf::from("/Users/veba/a$b/c`d.c")
+        );
+        // A trailing backslash is a character, not the start of an escape that
+        // swallows the end of the path.
+        assert_eq!(dropped_path("/tmp/odd\\"), PathBuf::from("/tmp/odd\\"));
+
+        // Typed by hand, which is the only spelling a person produces.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(home) = home {
+            assert_eq!(dropped_path("~/Downloads/a.c"), home.join("Downloads/a.c"));
+            assert_eq!(dropped_path("~"), home);
+        }
+        // Somebody else's home is not this program's guess to make.
+        assert_eq!(dropped_path("~other/a.c"), PathBuf::from("~other/a.c"));
+    }
+
+    /// A path is only worth sending to a pane this client can still write to,
+    /// and both are read again when Enter is pressed rather than when the
+    /// prompt opened — a lease can be lost while somebody is typing.
+    #[test]
+    fn a_submitted_path_is_refused_when_the_pane_is_not_writable() {
+        use super::{TextPrompt, TextPromptAction, handle_text_prompt_input};
+
+        let mut app = App {
+            text_prompt: Some(TextPrompt {
+                title: "Send a file".to_owned(),
+                label: String::new(),
+                value: "/tmp/a.c".to_owned(),
+                action: TextPromptAction::SendFile {
+                    pane: PaneId::new("first", "main", "w1:p1"),
+                },
+                error: None,
+                partial: Vec::new(),
+            }),
+            ..App::default()
+        };
+
+        handle_text_prompt_input(b'\r', &FederationState::default(), &mut app).unwrap();
+
+        // Still open, saying why, rather than closed having sent nothing.
+        let prompt = app.text_prompt.as_ref().expect("the prompt stays open");
+        assert_eq!(prompt.value, "/tmp/a.c");
+        assert_eq!(
+            prompt.error.as_deref(),
+            Some("no terminal pane is selected")
+        );
+    }
+
+    /// Input arrives one byte at a time, so a character that takes several is
+    /// several non-characters. Dropping them silently mistypes the path — and
+    /// `Sønderborg.c` is a filename, not an edge case.
+    #[test]
+    fn a_prompt_accepts_a_character_that_arrives_in_pieces() {
+        use super::{TextPrompt, TextPromptAction, handle_text_prompt_input};
+
+        let mut app = App {
+            text_prompt: Some(TextPrompt {
+                title: "Send a file".to_owned(),
+                label: String::new(),
+                value: String::new(),
+                action: TextPromptAction::SendFile {
+                    pane: PaneId::new("first", "main", "w1:p1"),
+                },
+                error: None,
+                partial: Vec::new(),
+            }),
+            ..App::default()
+        };
+
+        let state = FederationState::default();
+        for byte in "/tmp/Sønderborg.c".as_bytes() {
+            handle_text_prompt_input(*byte, &state, &mut app).unwrap();
+        }
+
+        assert_eq!(
+            app.text_prompt.as_ref().map(|prompt| prompt.value.as_str()),
+            Some("/tmp/Sønderborg.c")
+        );
+
+        // A byte that spells nothing is dropped without eating the next
+        // character with it.
+        for byte in [0xff, b'x'] {
+            handle_text_prompt_input(byte, &state, &mut app).unwrap();
+        }
+        assert_eq!(
+            app.text_prompt.as_ref().map(|prompt| prompt.value.as_str()),
+            Some("/tmp/Sønderborg.cx")
+        );
     }
 
     #[test]

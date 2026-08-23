@@ -92,6 +92,19 @@ has already hidden a fault that shipped:
   process does — an installed artifact and a built one are not the same thing
   and nothing in the version distinguishes them.
 
+- **The browser client's own logic.** `src/daemon/app.html` is served and
+  embedded in the binary, and no automated check executes a line of it. This is
+  a decision, not an oversight: CI stays Rust-only rather than acquiring a
+  JavaScript toolchain for one file. The consequence is that the page's parser,
+  diff applier and painter are verified by hand or not at all, so **a change to
+  that file carries a stronger obligation to run the page than a change to Rust
+  does** — nothing else will. Two defects have already been found by running it
+  once by hand, both invisible to reading: an explanation written into a panel
+  the same function hides, and a top-level `let history` shadowing
+  `window.history` so that a scanned pairing code opened a blank page. If that
+  count keeps growing, the decision is worth revisiting with the list as the
+  argument.
+
 The rule this implies: a path that has only ever been reasoned about has not
 been tested, however carefully the reasoning was done. Prefer a run against a
 real target, even a loopback one, over another round of argument about

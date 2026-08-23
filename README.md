@@ -412,6 +412,14 @@ Target fields:
 Each discovered session is supervised independently. A failed target does not
 freeze or tear down other targets.
 
+A file can be sent without the clipboard at all. `Ctrl+]` then `f` opens a
+prompt: drag the file from a file manager onto the terminal, which types its
+path, and press Enter. Dragging a file onto a terminal does not copy it — the
+path arrives as text and the clipboard is never touched — so this is the route
+for a file that was dragged rather than copied. The path is read the way a shell
+would read it: backslash escapes, single or double quotes, a trailing space, and
+a leading `~` all name the file they look like.
+
 `transfers.max_bytes` is the largest transfer this daemon will accept, and it
 defaults to one gibibyte. It bounds the target host's disk rather than
 Super-Herdr's memory: a transfer is relayed onto the host as it arrives rather
@@ -498,6 +506,7 @@ workspace actions:
 | `Ctrl+]`, then `h` | Open the target manager |
 | `Ctrl+]`, then `v` | Paste desktop clipboard text into the selected pane |
 | `Ctrl+]`, then `i` | Upload the clipboard's file and paste its verified target path |
+| `Ctrl+]`, then `f` | Send a file by path: drag one onto the terminal, or type it, then Enter |
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |
