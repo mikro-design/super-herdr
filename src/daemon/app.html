@@ -420,8 +420,15 @@ function stopWatching(why) {
   if (watching) send({ type: 'pane.unsubscribe', pane: watching });
   watching = null;
   screen = null;
-  el('viewer').hidden = true;
-  el('screen-note').textContent = text(why);
+  cell = null;
+  el('screen').innerHTML = '';
+  const reason = text(why);
+  // The reason lives inside the viewer, so hiding the viewer would write an
+  // explanation into something nobody can read — a pane that closed under
+  // somebody would simply vanish. Only a person choosing to stop takes the
+  // panel away; a viewer that stopped on its own stays up to say why.
+  el('viewer').hidden = !reason;
+  el('screen-note').textContent = reason;
   renderPanes();
 }
 
