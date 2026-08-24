@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "super-herdr"
-version = "0.7.10"
+version = "0.7.11"
 dependencies = [
  "anyhow",
  "base64",
