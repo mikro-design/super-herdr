@@ -98,20 +98,45 @@ pub fn pairing_url(url: &str) -> Result<String> {
     if !matches!(scheme, "http" | "https") {
         bail!("a pairing URL must be http or https; {scheme:?} is neither");
     }
-    if scheme == "http" && !rest.starts_with("127.0.0.1") && !rest.starts_with("localhost") {
-        // A token authenticates a device and encrypts nothing, which is why the
-        // listener refuses a public address. Offering one over plain HTTP would
-        // put the pairing code itself on the wire.
-        bail!("a pairing URL over http would carry the code in clear; use https");
-    }
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if host.is_empty() {
         bail!("a pairing URL needs a host");
+    }
+    // A token authenticates a device and encrypts nothing, so the code must not
+    // cross a network that provides no confidentiality of its own.
+    //
+    // The rule used to be loopback or nothing, which refused the address of the
+    // very listener this daemon is willing to bind. That protected nobody: the
+    // browser has to send the code to the same host over the same plain HTTP to
+    // pair at all, so refusing to make a QR of it left the code on the wire and
+    // took the QR away. Whatever the listener will bind, a code may name.
+    if scheme == "http" && !reachable_privately(host) {
+        bail!("a pairing URL over http would carry the code in clear; use https");
     }
     if trimmed.contains('#') {
         bail!("a pairing URL cannot carry a fragment; the code is the fragment");
     }
     Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+/// Whether a URL's host is somewhere a private network already protects.
+///
+/// Deliberately the same question [`crate::daemon::web::bindable`] answers, and
+/// for the same reason — one of them saying yes while the other says no is how
+/// a daemon ends up serving an address it will not name.
+fn reachable_privately(host: &str) -> bool {
+    let host = host.split('@').next_back().unwrap_or(host);
+    // `[::1]:8790` and `192.168.1.4:8790` both carry a port; only the bracketed
+    // form can contain a colon in the host itself.
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    if name.eq_ignore_ascii_case("localhost") || name.to_ascii_lowercase().ends_with(".local") {
+        return true;
+    }
+    name.parse::<std::net::IpAddr>()
+        .is_ok_and(crate::daemon::web::bindable)
 }
 
 /// Compare without revealing where two values first differ.
@@ -222,6 +247,14 @@ mod tests {
             // Loopback over http is the one plain case that is not on a wire.
             "http://127.0.0.1:8790",
             "http://localhost:8790",
+            // And the addresses the listener will actually bind. Refusing
+            // these protected nothing: pairing sends the code to the same host
+            // over the same plain HTTP whether it was scanned or typed.
+            "http://192.168.1.42:8790",
+            "http://10.0.0.4:8790",
+            "http://100.101.102.103:8790",
+            "http://[fd00::1]:8790",
+            "http://vemunds-macbook-pro.local:8790",
         ] {
             assert!(super::pairing_url(url).is_ok(), "{url} should be accepted");
         }
@@ -229,9 +262,12 @@ mod tests {
         for (url, expected) in [
             ("host.example:8790", "scheme"),
             ("ftp://host.example", "http or https"),
-            // A token authenticates and encrypts nothing, so plain http off
-            // this machine would put the code itself on the wire.
+            // A token authenticates and encrypts nothing, so plain http across
+            // a network nobody controls would put the code on the wire. This
+            // is the line that moved: private yes, public still no.
             ("http://host.example:8790", "clear"),
+            ("http://93.184.216.34:8790", "clear"),
+            ("http://8.8.8.8", "clear"),
             ("https://", "host"),
             // The code becomes the fragment; one already there would vanish.
             ("https://host.example/#already", "fragment"),

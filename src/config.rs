@@ -58,6 +58,30 @@ impl WebConfig {
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
+
+    /// Where a device reaches the browser client, given or worked out.
+    ///
+    /// Worked out, because asking somebody to write down a URL for a listener
+    /// they have already located is a question with an answer the program is
+    /// holding: bound to a private address on a known port, the URL is that
+    /// address on that port and nothing else.
+    ///
+    /// Not derivable from loopback, which no other device can reach, and not
+    /// derivable through a proxy that terminates TLS somewhere else — that is
+    /// what `url` is for, and it stays the override.
+    pub fn scannable_url(&self) -> Option<String> {
+        if let Some(url) = self.url.clone() {
+            return Some(url);
+        }
+        let (address, port) = (self.address?, self.port?);
+        if address.is_loopback() || !crate::daemon::web::bindable(address) {
+            return None;
+        }
+        Some(match address {
+            std::net::IpAddr::V4(address) => format!("http://{address}:{port}"),
+            std::net::IpAddr::V6(address) => format!("http://[{address}]:{port}"),
+        })
+    }
 }
 
 /// One paired device.
@@ -960,6 +984,69 @@ name = "local"
         .unwrap_err();
 
         assert!(error.to_string().contains("duplicate target"));
+    }
+
+    /// The URL a phone needs is not a question worth asking somebody who has
+    /// already said where the listener is. Bound to a private address on a
+    /// known port, the answer is that address on that port.
+    #[test]
+    fn a_scannable_url_is_worked_out_from_the_bind_when_one_is_not_given() {
+        let web = |table: &str| {
+            Config::parse(&format!(
+                r#"
+                {table}
+                [[targets]]
+                name = "development"
+                ssh = "development-host"
+            "#
+            ))
+            .map(|config| config.web)
+        };
+
+        // A LAN address is reachable and derivable.
+        assert_eq!(
+            web("[web]\nport = 8790\naddress = \"192.168.1.42\"")
+                .unwrap()
+                .scannable_url()
+                .as_deref(),
+            Some("http://192.168.1.42:8790")
+        );
+        // The mesh range Tailscale hands out, which is the common case.
+        assert_eq!(
+            web("[web]\nport = 8790\naddress = \"100.101.102.103\"")
+                .unwrap()
+                .scannable_url()
+                .as_deref(),
+            Some("http://100.101.102.103:8790")
+        );
+        // v6 is bracketed, or it is not a URL.
+        assert_eq!(
+            web("[web]\nport = 8790\naddress = \"fd00::1\"")
+                .unwrap()
+                .scannable_url()
+                .as_deref(),
+            Some("http://[fd00::1]:8790")
+        );
+
+        // An explicit URL wins: a proxy terminating TLS elsewhere cannot be
+        // worked out from what this process binds.
+        assert_eq!(
+            web("[web]\nport = 8795\naddress = \"100.101.102.103\"\nurl = \"https://host.tailnet.ts.net\"")
+                .unwrap()
+                .scannable_url()
+                .as_deref(),
+            Some("https://host.tailnet.ts.net")
+        );
+
+        // Nothing to scan when nothing else could reach it.
+        assert_eq!(
+            web("[web]\nport = 8790\naddress = \"127.0.0.1\"")
+                .unwrap()
+                .scannable_url(),
+            None
+        );
+        assert_eq!(web("[web]\nport = 8790").unwrap().scannable_url(), None);
+        assert_eq!(web("").unwrap().scannable_url(), None);
     }
 
     /// A browser client nobody serves cannot be reached, and a QR is an

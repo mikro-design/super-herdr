@@ -432,16 +432,25 @@ hosted by the frontend, so pairing works without a second command:
 ```toml
 [web]
 port = 8790
-url = "https://host.tailnet.ts.net:8790"
+address = "100.101.102.103"   # this machine, on the LAN or the mesh
 ```
 
-`port` serves the client, `address` binds it somewhere other than loopback, and
-`url` is where a device outside this machine reaches it. `url` cannot be derived
-from the bind — behind a proxy that terminates TLS the host, port and scheme a
-phone needs all differ from what this process listens on — so without it a
-pairing code is offered to be typed rather than scanned. The `daemon`
-subcommand's `--web`, `--web-address` and `--web-url` flags override the table
-for one run.
+`port` serves the client and `address` binds it. Give it the machine's own
+private address — a LAN address, or the `100.x` one a mesh like Tailscale hands
+out — and **the scannable URL is worked out from that**: there is nothing else
+to write down. Loopback stays unscannable, because no other device can reach it.
+
+`url` is only needed when the address a phone uses is not the address this
+process binds, which is what a proxy terminating TLS elsewhere does — with
+`tailscale serve` in front, the host, port and scheme all differ and cannot be
+derived. Then it is the override.
+
+A pairing code may name any address the daemon is willing to bind, over plain
+HTTP included. Pairing sends the code to that host over that connection whether
+it was scanned or typed, so refusing to encode a URL the browser is about to use
+anyway removed the QR without protecting the code. A public address over HTTP is
+still refused. The `daemon` subcommand's `--web`, `--web-address` and
+`--web-url` flags override the table for one run.
 
 `transfers.max_bytes` is the largest transfer this daemon will accept, and it
 defaults to one gibibyte. It bounds the target host's disk rather than

@@ -395,7 +395,7 @@ async fn run() -> Result<ExitCode> {
             options.web_port = web.or(config.web.port);
             options.web_address = web_address.or(config.web.address);
             options.web_url = web_url
-                .or_else(|| config.web.url.clone())
+                .or_else(|| config.web.scannable_url())
                 .map(|url| super_herdr::pairing::pairing_url(&url))
                 .transpose()?;
             // The daemon announces itself once it is actually listening; a

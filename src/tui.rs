@@ -930,7 +930,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     // out of.
     daemon_options.web_port = active_config.web.port;
     daemon_options.web_address = active_config.web.address;
-    daemon_options.web_url = active_config.web.url.clone();
+    daemon_options.web_url = active_config.web.scannable_url();
     let daemon = spawn_in_process(
         active_config.clone(),
         Some(config_path.clone()),
