@@ -746,9 +746,11 @@ pub fn spawn_in_process(
         config_path,
         options,
         None,
+        attach.clone(),
         attachments,
         std::future::pending(),
-        // A hosted daemon serves no browser, so no code is ever outstanding.
+        // Shared with the browser client this daemon may serve, so a code the
+        // frontend issues is a code a phone can spend.
         Arc::new(Mutex::new(None)),
     ));
     DaemonHandle { attach, task }
@@ -780,59 +782,12 @@ async fn serve_until(
     let (attach, attachments) = mpsc::unbounded_channel();
     let pending_pairing: Arc<Mutex<Option<PendingPairing>>> = Arc::new(Mutex::new(None));
 
-    // The browser client is an ordinary in-process attachment, so it speaks the
-    // same framing through the same handshake as every other client.
-    // Devices are not affected by session discovery, so the configuration is
-    // read as given rather than expanded a second time — discovery reaches
-    // every host, and doing it twice at startup would double that for nothing.
-    let paired = config.devices.clone();
-    let web = match options.web_port {
-        Some(port) => {
-            let address = match options.web_address {
-                Some(address) => std::net::SocketAddr::new(address, port),
-                None => web::loopback(port),
-            };
-            let listener = web::bind(address).await?;
-            let attach = attach.clone();
-            let open: web::Attach = std::sync::Arc::new(move || {
-                let (theirs, ours) = tokio::io::duplex(IN_PROCESS_BUFFER);
-                attach
-                    .send(theirs)
-                    .map_err(|_| anyhow::anyhow!("the daemon is no longer running"))?;
-                Ok(ours)
-            });
-            let policy: std::sync::Arc<dyn web::Devices> = std::sync::Arc::new(DevicePolicy {
-                config_path: config_path.clone(),
-                devices: Mutex::new(paired.clone()),
-                pending: pending_pairing.clone(),
-            });
-            Some((address, tokio::spawn(web::serve(listener, open, policy))))
-        }
-        None => None,
-    };
-    // Announced only once everything it names is actually listening. Printing
-    // as each one binds meant a daemon that failed to start still said it was
-    // serving, which is the first thing an operator reads and the last thing
-    // they should have to doubt.
-    println!(
-        "super-herdr daemon listening on {}",
-        options.socket.display()
-    );
-    if let Some((address, _)) = web.as_ref() {
-        // Printed rather than logged, because the address is what a person
-        // needs in order to forward it.
-        println!("super-herdr web client on http://{address}");
-        if address.ip().is_loopback() {
-            println!("  forward this port to reach it from another device");
-        } else if paired.is_empty() {
-            println!("  no device is paired yet; ask the terminal client for a pairing code");
-        }
-    }
     let result = run(
         config,
         config_path,
         options,
         Some(listener),
+        attach,
         attachments,
         shutdown,
         pending_pairing,
@@ -840,9 +795,6 @@ async fn serve_until(
     .await;
     // The socket outlives the daemon otherwise, and the next start would have
     // to decide whether the path it found belongs to a live process.
-    if let Some((_, task)) = web {
-        task.abort();
-    }
     let _ = fs::remove_file(&socket);
     result
 }
@@ -871,17 +823,99 @@ async fn terminated() {
     }
 }
 
+/// Serve the browser client, if one was asked for.
+///
+/// Called from `run` rather than from the socket path alone, because the
+/// frontend hosts its own daemon and skips that path entirely: for as long as
+/// this lived beside the socket listener, a pairing code offered by the
+/// frontend named a port nothing was listening on. The browser client is an
+/// ordinary in-process attachment, so it speaks the same framing through the
+/// same handshake as every other client.
+async fn serve_web_client(
+    options: &DaemonOptions,
+    config: &Config,
+    config_path: Option<&Path>,
+    attach: &mpsc::UnboundedSender<DuplexStream>,
+    pending_pairing: &Arc<Mutex<Option<PendingPairing>>>,
+) -> Result<Option<(std::net::SocketAddr, JoinHandle<()>)>> {
+    let Some(port) = options.web_port else {
+        return Ok(None);
+    };
+    let address = match options.web_address {
+        Some(address) => std::net::SocketAddr::new(address, port),
+        None => web::loopback(port),
+    };
+    let listener = web::bind(address).await?;
+    let attach = attach.clone();
+    let open: web::Attach = std::sync::Arc::new(move || {
+        let (theirs, ours) = tokio::io::duplex(IN_PROCESS_BUFFER);
+        attach
+            .send(theirs)
+            .map_err(|_| anyhow::anyhow!("the daemon is no longer running"))?;
+        Ok(ours)
+    });
+    // Devices are not affected by session discovery, so the configuration is
+    // read as given rather than expanded a second time — discovery reaches
+    // every host, and doing it twice at startup would double that for nothing.
+    let policy: std::sync::Arc<dyn web::Devices> = std::sync::Arc::new(DevicePolicy {
+        config_path: config_path.map(Path::to_path_buf),
+        devices: Mutex::new(config.devices.clone()),
+        pending: pending_pairing.clone(),
+    });
+    Ok(Some((
+        address,
+        tokio::spawn(web::serve(listener, open, policy)),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run(
     config: Config,
     config_path: Option<PathBuf>,
     options: DaemonOptions,
     listener: Option<UnixListener>,
+    attach: mpsc::UnboundedSender<DuplexStream>,
     mut attachments: mpsc::UnboundedReceiver<DuplexStream>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     // Shared with the web layer when one is serving, so a code minted for a
     // person on one screen is the code a browser can spend.
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
 ) -> Result<()> {
+    // Before anything slow, because a browser client that cannot bind is a
+    // pairing code that will name a port nothing answers on — and that is a
+    // failure worth having at startup rather than at the pairing screen.
+    let web = serve_web_client(
+        &options,
+        &config,
+        config_path.as_deref(),
+        &attach,
+        &pending_pairing,
+    )
+    .await?;
+    if listener.is_some() {
+        // Printed only by a daemon that owns its standard output. A frontend
+        // hosting one is drawing a terminal UI on it.
+        //
+        // Announced only once everything it names is actually listening.
+        // Printing as each one binds meant a daemon that failed to start still
+        // said it was serving, which is the first thing an operator reads and
+        // the last thing they should have to doubt.
+        println!(
+            "super-herdr daemon listening on {}",
+            options.socket.display()
+        );
+        if let Some((address, _)) = web.as_ref() {
+            // Printed rather than logged, because the address is what a person
+            // needs in order to forward it.
+            println!("super-herdr web client on http://{address}");
+            if address.ip().is_loopback() {
+                println!("  forward this port to reach it from another device");
+            } else if config.devices.is_empty() {
+                println!("  no device is paired yet; ask the terminal client for a pairing code");
+            }
+        }
+    }
+
     let active = expand_discovered_sessions(config).await;
     let (inputs, mut received) = mpsc::unbounded_channel();
 
@@ -972,6 +1006,9 @@ async fn run(
     signalled.abort();
     if let Some(refreshing) = refreshing {
         refreshing.abort();
+    }
+    if let Some((_, serving)) = web {
+        serving.abort();
     }
     daemon.discard_retained().await;
     daemon.stop_federation().await;
@@ -2591,6 +2628,63 @@ mod tests {
         ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage, decode, encode,
     };
     use crate::terminal::TerminalAccess;
+
+    /// A frontend hosting its own daemon must serve the browser client too.
+    ///
+    /// The bug this is here for: the listener was started beside the *socket*,
+    /// which only the `daemon` subcommand creates. Run as the frontend — the
+    /// way this is normally run — the daemon skipped it entirely, so a pairing
+    /// code named a port nothing was listening on. Scanning it produced a URL
+    /// that opened nothing, which looks like a broken QR and is not one.
+    #[tokio::test]
+    async fn a_hosted_daemon_serves_the_browser_client_too() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Asked for and released, so the port is one this machine will give.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let directory = tempfile::tempdir().unwrap();
+        let options = DaemonOptions {
+            socket: directory.path().join("daemon.sock"),
+            attention_state: Some(directory.path().join("attention.json")),
+            refresh_interval: Duration::from_secs(3600),
+            web_port: Some(port),
+            // Loopback, because a test may not have any other address.
+            web_address: None,
+            web_url: None,
+        };
+
+        let daemon = super::spawn_in_process(empty_config(), None, options);
+        let page = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await {
+                    stream
+                        .write_all(b"GET / HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    return String::from_utf8_lossy(&response).into_owned();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hosted daemon never served the browser client");
+
+        assert!(
+            page.starts_with("HTTP/1.1 200"),
+            "{}",
+            &page[..40.min(page.len())]
+        );
+        assert!(page.contains("<!doctype html>") || page.contains("<!DOCTYPE html>"));
+        drop(daemon);
+    }
 
     /// A federation with no targets exercises the whole I/O path without
     /// starting a single Herdr command.
