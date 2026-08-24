@@ -2599,6 +2599,7 @@ mod tests {
             transport: Default::default(),
             notifications: Default::default(),
             transfers: Default::default(),
+            web: Default::default(),
             targets: Vec::new(),
             devices: Vec::new(),
         }
@@ -3160,6 +3161,7 @@ mod tests {
             transport: Default::default(),
             notifications: Default::default(),
             transfers: Default::default(),
+            web: Default::default(),
             targets: vec![Target {
                 name: "here".to_owned(),
                 // No ssh destination: the sink is this machine, which is what

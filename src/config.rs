@@ -17,6 +17,8 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     #[serde(default, skip_serializing_if = "TransferConfig::is_default")]
     pub transfers: TransferConfig,
+    #[serde(default, skip_serializing_if = "WebConfig::is_default")]
+    pub web: WebConfig,
     pub targets: Vec<Target>,
     /// Devices allowed to reach this daemon over a network. Empty means none,
     /// which is why a daemon with no paired device serves loopback only.
@@ -47,6 +49,12 @@ impl Default for TransferConfig {
 }
 
 impl TransferConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl WebConfig {
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
@@ -89,6 +97,33 @@ impl Default for TransportConfig {
             command_timeout_seconds: default_command_timeout(),
         }
     }
+}
+
+/// Where the browser client is served, and where a phone reaches it.
+///
+/// These lived only on `super-herdr daemon`, which meant the frontend — the way
+/// the program is normally run — hosted a daemon that served no browser client
+/// and knew no address. Pairing from there could only ever offer a code to be
+/// typed into a client that was not running, and a QR needs an address, so
+/// there was never one to show. A configuration file is where a machine's own
+/// address belongs anyway: it does not change between runs, and retyping it as
+/// a flag every time is how it ends up not being set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Serve the browser client on this port. `None` serves none at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// What to bind. Loopback by default; a private or mesh address lets a
+    /// paired device reach it directly, and a public one is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<std::net::IpAddr>,
+    /// Where a device outside this machine reaches it. Never derived from the
+    /// bind: behind a proxy that terminates TLS the host, port and scheme a
+    /// phone needs are all different from what this process listens on, and a
+    /// derived one would be a perfectly valid code for an unreachable address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +246,7 @@ impl Config {
                 transport: TransportConfig::default(),
                 notifications: NotificationsConfig::default(),
                 transfers: TransferConfig::default(),
+                web: Default::default(),
                 targets: vec![target],
                 devices: Vec::new(),
             };
@@ -311,6 +347,19 @@ impl Config {
         if self.transport.command_timeout_seconds == 0 {
             bail!("transport.command_timeout_seconds must be greater than zero");
         }
+        // Checked here rather than where it is served, so a configuration file
+        // that cannot work says so when it is read instead of when somebody
+        // finally tries to pair a phone.
+        if let Some(url) = self.web.url.as_deref() {
+            crate::pairing::pairing_url(url)?;
+        }
+        if self.web.url.is_some() && self.web.port.is_none() {
+            bail!("web.url names an address for a browser client that web.port does not serve");
+        }
+        if self.web.address.is_some() && self.web.port.is_none() {
+            bail!("web.address binds a browser client that web.port does not serve");
+        }
+
         if self.notifications.minimum_interval_seconds == 0
             || self.notifications.minimum_interval_seconds > 3600
         {
@@ -911,6 +960,46 @@ name = "local"
         .unwrap_err();
 
         assert!(error.to_string().contains("duplicate target"));
+    }
+
+    /// A browser client nobody serves cannot be reached, and a QR is an
+    /// address rather than a code — so a configuration naming one without the
+    /// other is a pairing screen that will disappoint somebody holding a phone.
+    #[test]
+    fn a_web_address_without_a_server_is_refused() {
+        let with = |table: &str| {
+            Config::parse(&format!(
+                r#"
+                {table}
+                [[targets]]
+                name = "development"
+                ssh = "development-host"
+            "#
+            ))
+        };
+
+        let served = with("[web]\nport = 8790\nurl = \"https://host.tailnet.ts.net:8790\"")
+            .expect("a served address is usable");
+        assert_eq!(served.web.port, Some(8790));
+        assert_eq!(
+            served.web.url.as_deref(),
+            Some("https://host.tailnet.ts.net:8790")
+        );
+
+        assert!(
+            with("[web]\nurl = \"https://host.tailnet.ts.net:8790\"")
+                .unwrap_err()
+                .to_string()
+                .contains("web.port does not serve")
+        );
+        // Refused where it is read rather than where it is served, so a file
+        // that cannot work says so before somebody tries to pair a phone.
+        assert!(with("[web]\nport = 8790\nurl = \"http://example.com\"").is_err());
+
+        // Unset is a daemon that serves no browser client, which is the
+        // default and must stay the default.
+        let silent = with("").expect("no [web] table is fine");
+        assert_eq!(silent.web, Default::default());
     }
 
     #[test]

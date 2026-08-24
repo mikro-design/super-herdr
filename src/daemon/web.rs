@@ -638,6 +638,7 @@ mod tests {
                 transport: Default::default(),
                 notifications: Default::default(),
                 transfers: Default::default(),
+                web: Default::default(),
                 targets: Vec::new(),
                 devices: Vec::new(),
             },

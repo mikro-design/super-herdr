@@ -389,9 +389,13 @@ async fn run() -> Result<ExitCode> {
             if let Some(socket) = socket {
                 options.socket = socket;
             }
-            options.web_port = web;
-            options.web_address = web_address;
+            // A flag overrides the file; absent, the file is what the frontend
+            // and this subcommand agree on, so a machine's own address is
+            // stated once rather than retyped per invocation.
+            options.web_port = web.or(config.web.port);
+            options.web_address = web_address.or(config.web.address);
             options.web_url = web_url
+                .or_else(|| config.web.url.clone())
                 .map(|url| super_herdr::pairing::pairing_url(&url))
                 .transpose()?;
             // The daemon announces itself once it is actually listening; a

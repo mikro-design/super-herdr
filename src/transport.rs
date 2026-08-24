@@ -81,6 +81,7 @@ pub async fn expand_discovered_sessions(config: crate::config::Config) -> crate:
     let transport = config.transport.clone();
     let notifications = config.notifications.clone();
     let transfers = config.transfers.clone();
+    let web = config.web.clone();
     let devices = config.devices.clone();
     let originals = config.targets;
     let mut tasks = tokio::task::JoinSet::new();
@@ -106,6 +107,7 @@ pub async fn expand_discovered_sessions(config: crate::config::Config) -> crate:
         transport,
         notifications,
         transfers,
+        web,
         targets: expanded,
         devices,
     }

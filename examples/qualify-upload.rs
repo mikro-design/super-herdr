@@ -201,6 +201,7 @@ async fn relay(
             transport: transport.clone(),
             notifications: Default::default(),
             transfers: Default::default(),
+            web: Default::default(),
             targets: vec![Target {
                 name: "qualify".to_owned(),
                 ssh: Some(destination.to_owned()),

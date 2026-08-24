@@ -412,13 +412,36 @@ Target fields:
 Each discovered session is supervised independently. A failed target does not
 freeze or tear down other targets.
 
-A file can be sent without the clipboard at all. `Ctrl+]` then `f` opens a
-prompt: drag the file from a file manager onto the terminal, which types its
-path, and press Enter. Dragging a file onto a terminal does not copy it — the
-path arrives as text and the clipboard is never touched — so this is the route
-for a file that was dragged rather than copied. The path is read the way a shell
-would read it: backslash escapes, single or double quotes, a trailing space, and
-a leading `~` all name the file they look like.
+**Drop a file onto the terminal and it is sent** to the selected pane. Dragging a
+file onto a terminal does not copy it and does not paste it: the terminal types
+the path in, which is why a bridge that only read the clipboard never saw the
+file. A drop and a paste arrive identically, so what the text names is what
+tells them apart — every word an absolute path to a readable file makes it a
+drop, and anything else is pasted as text, as before. It is all or nothing: a
+selection containing one file that is not there is pasted rather than half sent.
+
+`Ctrl+]` then `f` does the same thing for a path you would rather type. Either
+way the path is read the way a shell reads it: backslash escapes, single or
+double quotes, a trailing space, and a leading `~` all name the file they look
+like.
+
+The `[web]` table serves the browser client and makes a pairing code
+scannable. It applies whether the daemon is run as `super-herdr daemon` or
+hosted by the frontend, so pairing works without a second command:
+
+```toml
+[web]
+port = 8790
+url = "https://host.tailnet.ts.net:8790"
+```
+
+`port` serves the client, `address` binds it somewhere other than loopback, and
+`url` is where a device outside this machine reaches it. `url` cannot be derived
+from the bind — behind a proxy that terminates TLS the host, port and scheme a
+phone needs all differ from what this process listens on — so without it a
+pairing code is offered to be typed rather than scanned. The `daemon`
+subcommand's `--web`, `--web-address` and `--web-url` flags override the table
+for one run.
 
 `transfers.max_bytes` is the largest transfer this daemon will accept, and it
 defaults to one gibibyte. It bounds the target host's disk rather than
@@ -506,7 +529,7 @@ workspace actions:
 | `Ctrl+]`, then `h` | Open the target manager |
 | `Ctrl+]`, then `v` | Paste desktop clipboard text into the selected pane |
 | `Ctrl+]`, then `i` | Upload the clipboard's file and paste its verified target path |
-| `Ctrl+]`, then `f` | Send a file by path: drag one onto the terminal, or type it, then Enter |
+| `Ctrl+]`, then `f` | Send a file by typing its path |
 | `Ctrl+]`, then `q` | Quit Super-Herdr |
 | `Ctrl+]` twice | Send a literal `Ctrl+]` to the selected pane |
 | `Escape` after `Ctrl+]` | Cancel the Super-Herdr prefix |

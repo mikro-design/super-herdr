@@ -481,6 +481,7 @@ impl TargetForm {
             transport: TransportConfig::default(),
             notifications: crate::config::NotificationsConfig::default(),
             transfers: Default::default(),
+            web: Default::default(),
             targets,
             devices: Vec::new(),
         }
@@ -921,7 +922,15 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     // daemon a phone would reach, spoken over an in-memory pipe rather than a
     // socket, so both paths exercise one implementation.
     //
-    let daemon_options = DaemonOptions::discover()?;
+    let mut daemon_options = DaemonOptions::discover()?;
+    // The frontend's daemon is the one a phone reaches, so it needs the same
+    // browser client and the same address the `daemon` subcommand can be given
+    // — otherwise pairing from here can only ever offer a code to be typed
+    // into a client nothing is serving, and there is no address to make a QR
+    // out of.
+    daemon_options.web_port = active_config.web.port;
+    daemon_options.web_address = active_config.web.address;
+    daemon_options.web_url = active_config.web.url.clone();
     let daemon = spawn_in_process(
         active_config.clone(),
         Some(config_path.clone()),
@@ -1328,6 +1337,22 @@ async fn handle_decoded_input(
                         return Ok(false);
                     }
                 };
+                // A drop reaches this the same way a paste does, so what the
+                // text names is the only thing that separates them. Files go
+                // to the host as files; anything else is typed, as before.
+                let files = dropped_files(&text);
+                if !files.is_empty() {
+                    match (upload_destination(state, app), app.client.clone()) {
+                        (Ok(pane), Some(client)) => {
+                            send_local_files(app, &pane, &client, &files)?;
+                        }
+                        (Err(message), _) => app.message = Some(message),
+                        (_, None) => {
+                            app.message = Some("file routing is unavailable".to_owned());
+                        }
+                    }
+                    return Ok(false);
+                }
                 let characters = text.chars().count();
                 paste_text_into_selected(
                     state,
@@ -3116,6 +3141,83 @@ fn dropped_path(text: &str) -> PathBuf {
         _ => unquoted,
     };
     PathBuf::from(expanded)
+}
+
+/// The files a terminal drop names, or nothing if that is not what this is.
+///
+/// Dropping a file onto a terminal does not copy it and does not paste it: the
+/// terminal types the path in, and delivers it the same way it delivers a
+/// paste. So a drop and a paste arrive here identically, and the only thing
+/// that tells them apart is what the text says — every word an absolute path
+/// to a file this process can open. Ordinary pasted prose cannot satisfy that
+/// by accident, and a drop always satisfies it, which is what makes the test
+/// safe to make silently.
+///
+/// All or nothing on purpose. Half a drop treated as files and half as text
+/// would send some of a selection and type the rest into somebody's shell.
+fn dropped_files(text: &str) -> Vec<PathBuf> {
+    let Some(words) = shell_words(text) else {
+        return Vec::new();
+    };
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<PathBuf> = words.iter().map(|word| dropped_path(word)).collect();
+    let every_one_a_file = paths.iter().all(|path| {
+        path.is_absolute() && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+    });
+    if every_one_a_file { paths } else { Vec::new() }
+}
+
+/// Split text the way a shell would: on whitespace that is not escaped or
+/// quoted. `None` when a quote is never closed, since that is not a drop.
+///
+/// Dropping several files at once inserts them separated by spaces, and their
+/// names contain spaces too — so splitting on whitespace alone would turn one
+/// file into two words that name nothing.
+fn shell_words(text: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                word.push('\\');
+                word.push(characters.next()?);
+                started = true;
+            }
+            quote @ ('\'' | '"') => {
+                word.push(quote);
+                loop {
+                    match characters.next()? {
+                        closing if closing == quote => break,
+                        '\\' if quote == '"' => {
+                            word.push('\\');
+                            word.push(characters.next()?);
+                        }
+                        held => word.push(held),
+                    }
+                }
+                word.push(quote);
+                started = true;
+            }
+            space if space.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            held => {
+                word.push(held);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// Undo shell escaping: a backslash quotes whatever follows it. A trailing
@@ -6921,6 +7023,7 @@ mod tests {
             transport: Default::default(),
             notifications: Default::default(),
             transfers: Default::default(),
+            web: Default::default(),
             targets: vec![configured.clone()],
             devices: Vec::new(),
         });
@@ -6936,6 +7039,7 @@ mod tests {
             transport: Default::default(),
             notifications: Default::default(),
             transfers: Default::default(),
+            web: Default::default(),
             targets: vec![discovered],
             devices: Vec::new(),
         });
@@ -7818,6 +7922,72 @@ mod tests {
         );
         assert_eq!(app.attention.unread_count(), 0);
         assert!(app.attention_center.is_none());
+    }
+
+    /// A drop and a paste arrive identically, so what the text says is the
+    /// only thing that separates them. Getting this wrong in either direction
+    /// is bad: prose treated as files sends nothing and loses the paste, and a
+    /// drop treated as prose types somebody's local path into a remote shell.
+    #[test]
+    fn a_drop_is_told_from_a_paste_by_what_the_text_names() {
+        use std::path::PathBuf;
+
+        use super::dropped_files;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("ble rx compliance.c");
+        let second = directory.path().join("other.c");
+        std::fs::write(&first, b"int main(void) { return 0; }").unwrap();
+        std::fs::write(&second, b"int other(void) { return 1; }").unwrap();
+        let escaped = first.display().to_string().replace(' ', "\\ ");
+
+        // One file, spelled the way Terminal.app spells it.
+        assert_eq!(dropped_files(&format!("{escaped} ")), vec![first.clone()]);
+        // Several at once: space-separated, each escaped.
+        assert_eq!(
+            dropped_files(&format!("{escaped} {}", second.display())),
+            vec![first.clone(), second.clone()]
+        );
+        // And quoted, which is how other terminals spell the same thing.
+        assert_eq!(
+            dropped_files(&format!("'{}'", first.display())),
+            vec![first.clone()]
+        );
+
+        for prose in [
+            // Ordinary pasted text, which must still be typed rather than sent.
+            "hello world",
+            "cargo test --all-targets",
+            "",
+            "   ",
+            // Absolute, and names nothing.
+            "/Users/veba/Downloads/not-here.c",
+            // A directory is not a file, whatever it is spelled like.
+            &directory.path().display().to_string(),
+            // An unclosed quote is not a drop.
+            &format!("'{}", first.display()),
+        ] {
+            assert!(
+                dropped_files(prose).is_empty(),
+                "{prose:?} should have been pasted as text"
+            );
+        }
+
+        // All or nothing: half a selection sent and half typed would be worse
+        // than either.
+        assert!(
+            dropped_files(&format!("{} /nowhere/x.c", first.display())).is_empty(),
+            "a selection with a file that is not there should not half-send"
+        );
+
+        // Splitting has to respect the escaping, or one file becomes two words
+        // that name nothing.
+        assert_eq!(
+            super::shell_words("a\\ b 'c d' e").unwrap(),
+            vec!["a\\ b".to_owned(), "'c d'".to_owned(), "e".to_owned()]
+        );
+        assert_eq!(dropped_files("").len(), 0);
+        let _ = PathBuf::new();
     }
 
     /// A drop is a path spelled for a shell, not a path. All four spellings
