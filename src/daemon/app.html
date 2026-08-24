@@ -62,6 +62,13 @@
     padding: .35rem .7rem; cursor: pointer;
   }
   .actions { display: flex; gap: .5rem; margin-top: .7rem; }
+  #line {
+    flex: 1; min-width: 0; padding: .5rem .6rem; font: inherit;
+    color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: .4rem;
+  }
+  .keys { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
+  .keys button { min-width: 3.4rem; }
   #version { font-size: .72rem; color: var(--dim); }
   #pairing { padding: 1rem; max-width: 26rem; margin: 0 auto; }
   #pairing label { display: block; margin: .8rem 0; color: var(--dim); font-size: .82rem; }
@@ -123,7 +130,23 @@
     <div id="screen" class="screen"></div>
     <div class="actions">
       <button id="stop">Stop watching</button>
+      <button id="control">Take control</button>
       <span class="note" id="screen-note"></span>
+    </div>
+    <div id="keyboard" hidden>
+      <form id="line-form" class="actions">
+        <input id="line" placeholder="type a command" autocapitalize="off"
+               autocomplete="off" autocorrect="off" spellcheck="false">
+        <button id="send" type="submit">Send</button>
+      </form>
+      <div class="keys">
+        <button data-key="enter">Enter</button>
+        <button data-key="tab">Tab</button>
+        <button data-key="escape">Esc</button>
+        <button data-key="interrupt">Ctrl-C</button>
+        <button data-key="up">&uarr;</button>
+        <button data-key="down">&darr;</button>
+      </div>
     </div>
   </section>
 
@@ -269,6 +292,10 @@ function renderTargets() {
 // rather than guessed at, because a grid painted from a missed update stays
 // wrong forever and says nothing about it.
 let watching = null;
+// The access this page holds on what it is watching. Observing is the default
+// and the safe one: a viewer that could type without being asked to would be a
+// phone in a pocket sending keystrokes to somebody's shell.
+let lease = 'observe';
 let screen = null;
 let cell = null;
 
@@ -399,6 +426,10 @@ function observe(pane, label) {
   watching = pane;
   screen = null;
   cell = null;
+  // A lease belongs to a pane, not to this page: watching something else means
+  // holding nothing until the daemon says otherwise.
+  lease = 'observe';
+  renderKeyboard();
   el('viewer').hidden = false;
   el('viewing').textContent = label || `${pane.target}/${pane.session}/${pane.resource}`;
   el('screen-note').textContent = 'waiting for output…';
@@ -420,9 +451,52 @@ function subscribeScreen(pane) {
   });
 }
 
+// Control is asked for rather than assumed. The daemon hands the lease over
+// and tells whoever held it, so this never takes one silently.
+function takeControl() {
+  if (!watching) return;
+  send({ type: 'pane.take_control', pane: watching });
+  el('screen-note').textContent = 'asking for control…';
+}
+
+// One place that turns text into bytes, because a pane is a terminal and a
+// terminal takes bytes: what is typed on a phone is UTF-8, and the protocol
+// carries it base64 so that a byte a JSON string cannot hold still arrives.
+function sendBytes(bytes) {
+  if (!watching || lease !== 'control') return;
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  send({ type: 'pane.input', pane: watching, bytes: btoa(binary) });
+}
+
+function sendText(text) {
+  sendBytes(new TextEncoder().encode(text));
+}
+
+// What the buttons send. Named rather than numbered so the markup says what it
+// means, and kept here rather than in the markup so a key is one definition.
+const KEYS = {
+  enter: '\r',
+  tab: '\t',
+  escape: '\x1b',
+  interrupt: '\x03',
+  up: '\x1b[A',
+  down: '\x1b[B',
+};
+
+// Shown only while this page holds control, because offering a keyboard that
+// cannot type is worse than offering none.
+function renderKeyboard() {
+  const holding = Boolean(watching) && lease === 'control';
+  el('keyboard').hidden = !holding;
+  el('control').hidden = holding || !watching;
+}
+
 function stopWatching(why) {
   if (watching) send({ type: 'pane.unsubscribe', pane: watching });
   watching = null;
+  lease = 'observe';
+  renderKeyboard();
   screen = null;
   cell = null;
   el('screen').innerHTML = '';
@@ -543,8 +617,14 @@ function apply(message) {
       break;
     }
     case 'pane.lease':
-      if (sameId(message.pane, watching) && message.access !== 'observe') {
-        el('screen-note').textContent = `holding ${message.access}`;
+      if (sameId(message.pane, watching)) {
+        lease = message.access;
+        // A control lease that is refused or lost arrives as a downgrade to
+        // observe rather than as an error, so this is also how the keyboard
+        // goes away when somebody else takes the pane.
+        el('screen-note').textContent =
+          lease === 'control' ? 'holding control' : 'watching';
+        renderKeyboard();
       }
       break;
     case 'pane.closed':
@@ -590,6 +670,18 @@ function connect() {
 }
 
 el('mark').onclick = () => send({ type: 'attention.mark_all_seen' });
+el('control').onclick = takeControl;
+el('line-form').onsubmit = event => {
+  event.preventDefault();
+  const line = el('line').value;
+  // Enter is what a shell is waiting for, so a sent line carries it. An empty
+  // line is still a line — it is how somebody asks for a fresh prompt.
+  sendText(`${line}\r`);
+  el('line').value = '';
+};
+for (const button of document.querySelectorAll('.keys button')) {
+  button.onclick = () => sendText(KEYS[button.dataset.key] || '');
+}
 el('stop').onclick = () => stopWatching('');
 
 // A rotation or a resize changes how much of the pane fits, not the pane.

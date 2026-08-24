@@ -446,6 +446,15 @@ process binds, which is what a proxy terminating TLS elsewhere does — with
 `tailscale serve` in front, the host, port and scheme all differ and cannot be
 derived.
 
+A paired device watches panes and, when it asks for control, types into them.
+Control is asked for rather than assumed — a phone in a pocket should not be
+sending keystrokes to a shell — so the browser client opens a pane as an
+observer and offers a **Take control** button. The daemon hands the lease over
+and tells whoever held it, so nothing is taken silently. With control held, a
+line of text and the keys a terminal needs (Enter, Tab, Esc, Ctrl-C, and the
+arrows for shell history) reach the pane. Losing the lease to another client
+takes the keyboard away again rather than leaving one that cannot type.
+
 A pairing code may name any address the daemon is willing to bind, over plain
 HTTP included. Pairing sends the code to that host over that connection whether
 it was scanned or typed, so refusing to encode a URL the browser is about to use

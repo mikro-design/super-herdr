@@ -105,6 +105,18 @@ has already hidden a fault that shipped:
   count keeps growing, the decision is worth revisiting with the list as the
   argument.
 
+  `tools/page-harness.mjs` is how to run it. It loads the real script against a
+  stub DOM and asserts what the page sends, so "verified by hand" is repeatable
+  rather than a promise:
+
+  ```sh
+  node tools/page-harness.mjs src/daemon/app.html
+  ```
+
+  It is deliberately not wired into CI, which stays Rust-only. Run it after
+  changing the page, and extend it when the page gains a behaviour worth
+  keeping.
+
 The rule this implies: a path that has only ever been reasoned about has not
 been tested, however carefully the reasoning was done. Prefer a run against a
 real target, even a loopback one, over another round of argument about
