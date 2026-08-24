@@ -54,6 +54,22 @@ impl TransferConfig {
     }
 }
 
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            port: default_web_port(),
+            address: None,
+            url: None,
+        }
+    }
+}
+
+/// Zero is how somebody turns the browser client off, since removing the key
+/// only restores the default.
+fn default_web_port() -> Option<u16> {
+    Some(crate::daemon::web::DEFAULT_WEB_PORT)
+}
+
 impl WebConfig {
     fn is_default(&self) -> bool {
         self == &Self::default()
@@ -70,10 +86,30 @@ impl WebConfig {
     /// derivable through a proxy that terminates TLS somewhere else — that is
     /// what `url` is for, and it stays the override.
     pub fn scannable_url(&self) -> Option<String> {
+        self.scannable_url_from(own_private_address())
+    }
+
+    /// What to bind: the address given, or this machine's own if it has one.
+    ///
+    /// Serving the browser client is only ever for another device, so binding
+    /// somewhere no other device can reach makes the feature ornamental.
+    pub fn bind_address(&self) -> Option<std::net::IpAddr> {
+        self.served_port()?;
+        self.address.or_else(own_private_address)
+    }
+
+    /// The port actually served, with zero meaning none.
+    pub fn served_port(&self) -> Option<u16> {
+        self.port.filter(|port| *port != 0)
+    }
+
+    /// Split from the detection so the rule is assertable without a network.
+    fn scannable_url_from(&self, detected: Option<std::net::IpAddr>) -> Option<String> {
         if let Some(url) = self.url.clone() {
             return Some(url);
         }
-        let (address, port) = (self.address?, self.port?);
+        let port = self.port.filter(|port| *port != 0)?;
+        let address = self.address.or(detected)?;
         if address.is_loopback() || !crate::daemon::web::bindable(address) {
             return None;
         }
@@ -82,6 +118,31 @@ impl WebConfig {
             std::net::IpAddr::V6(address) => format!("http://[{address}]:{port}"),
         })
     }
+}
+
+/// This machine's own address on whatever private network it is on.
+///
+/// Asking somebody for their own IP is asking for something the machine knows.
+/// A connected UDP socket answers it: connecting chooses a route and assigns a
+/// local address, and no packet is ever sent — so this costs nothing and talks
+/// to nobody. The mesh is probed first because an address that works from
+/// another network beats one that only works on this one.
+///
+/// `None` on a machine with nothing but loopback, which is a machine no phone
+/// can reach.
+fn own_private_address() -> Option<std::net::IpAddr> {
+    // Tailscale's own resolver address, and TEST-NET-1, which exists to be
+    // routed nowhere. Neither is contacted.
+    ["100.100.100.100:9", "192.0.2.1:9"]
+        .into_iter()
+        .find_map(address_toward)
+}
+
+fn address_toward(remote: &str) -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect(remote).ok()?;
+    let address = socket.local_addr().ok()?.ip();
+    (!address.is_loopback() && crate::daemon::web::bindable(address)).then_some(address)
 }
 
 /// One paired device.
@@ -132,11 +193,19 @@ impl Default for TransportConfig {
 /// there was never one to show. A configuration file is where a machine's own
 /// address belongs anyway: it does not change between runs, and retyping it as
 /// a flag every time is how it ends up not being set.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebConfig {
-    /// Serve the browser client on this port. `None` serves none at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Serve the browser client on this port.
+    ///
+    /// Served by default, because a pairing code with nothing to pair to is
+    /// the state this spent its whole life in: the frontend hosted a daemon
+    /// that served no client, so the code named nothing and there was no
+    /// address to make a QR of. The listener binds a private address, refuses
+    /// a public one, and answers nothing to a device that has not been paired
+    /// — so what it costs is a port on a network somebody already trusts.
+    /// `port = 0` serves nothing at all.
+    #[serde(default = "default_web_port")]
     pub port: Option<u16>,
     /// What to bind. Loopback by default; a private or mesh address lets a
     /// paired device reach it directly, and a public one is refused.
@@ -377,11 +446,10 @@ impl Config {
         if let Some(url) = self.web.url.as_deref() {
             crate::pairing::pairing_url(url)?;
         }
-        if self.web.url.is_some() && self.web.port.is_none() {
-            bail!("web.url names an address for a browser client that web.port does not serve");
-        }
-        if self.web.address.is_some() && self.web.port.is_none() {
-            bail!("web.address binds a browser client that web.port does not serve");
+        if self.web.served_port().is_none()
+            && (self.web.url.is_some() || self.web.address.is_some())
+        {
+            bail!("web.port = 0 serves no browser client for web.url or web.address to reach");
         }
 
         if self.notifications.minimum_interval_seconds == 0
@@ -986,11 +1054,13 @@ name = "local"
         assert!(error.to_string().contains("duplicate target"));
     }
 
-    /// The URL a phone needs is not a question worth asking somebody who has
-    /// already said where the listener is. Bound to a private address on a
-    /// known port, the answer is that address on that port.
+    /// The URL a phone needs is not a question worth asking somebody who is
+    /// holding the machine it names. Given the address, the answer follows;
+    /// given nothing, the machine's own address is the answer.
     #[test]
-    fn a_scannable_url_is_worked_out_from_the_bind_when_one_is_not_given() {
+    fn a_scannable_url_is_worked_out_rather_than_asked_for() {
+        use std::net::IpAddr;
+
         let web = |table: &str| {
             Config::parse(&format!(
                 r#"
@@ -1002,91 +1072,90 @@ name = "local"
             ))
             .map(|config| config.web)
         };
+        let mesh: IpAddr = "100.101.102.103".parse().unwrap();
 
-        // A LAN address is reachable and derivable.
+        // Nothing configured at all: the client is served, and the machine's
+        // own address is what a phone is told to use.
         assert_eq!(
-            web("[web]\nport = 8790\naddress = \"192.168.1.42\"")
+            web("").unwrap().scannable_url_from(Some(mesh)).as_deref(),
+            Some("http://100.101.102.103:8790")
+        );
+        // A configured address wins over the detected one.
+        assert_eq!(
+            web("[web]\naddress = \"192.168.1.42\"")
                 .unwrap()
-                .scannable_url()
+                .scannable_url_from(Some(mesh))
                 .as_deref(),
             Some("http://192.168.1.42:8790")
         );
-        // The mesh range Tailscale hands out, which is the common case.
-        assert_eq!(
-            web("[web]\nport = 8790\naddress = \"100.101.102.103\"")
-                .unwrap()
-                .scannable_url()
-                .as_deref(),
-            Some("http://100.101.102.103:8790")
-        );
         // v6 is bracketed, or it is not a URL.
         assert_eq!(
-            web("[web]\nport = 8790\naddress = \"fd00::1\"")
+            web("[web]\naddress = \"fd00::1\"")
                 .unwrap()
-                .scannable_url()
+                .scannable_url_from(None)
                 .as_deref(),
             Some("http://[fd00::1]:8790")
         );
-
-        // An explicit URL wins: a proxy terminating TLS elsewhere cannot be
-        // worked out from what this process binds.
+        // An explicit URL wins over both: a proxy terminating TLS somewhere
+        // else cannot be worked out from anything this machine knows.
         assert_eq!(
-            web("[web]\nport = 8795\naddress = \"100.101.102.103\"\nurl = \"https://host.tailnet.ts.net\"")
+            web("[web]\nurl = \"https://host.tailnet.ts.net\"")
                 .unwrap()
-                .scannable_url()
+                .scannable_url_from(Some(mesh))
                 .as_deref(),
             Some("https://host.tailnet.ts.net")
         );
 
-        // Nothing to scan when nothing else could reach it.
+        // Nothing to scan when nothing could reach it.
+        assert_eq!(web("").unwrap().scannable_url_from(None), None);
         assert_eq!(
-            web("[web]\nport = 8790\naddress = \"127.0.0.1\"")
+            web("[web]\naddress = \"127.0.0.1\"")
                 .unwrap()
-                .scannable_url(),
+                .scannable_url_from(Some(mesh)),
             None
         );
-        assert_eq!(web("[web]\nport = 8790").unwrap().scannable_url(), None);
-        assert_eq!(web("").unwrap().scannable_url(), None);
+        // Off is off: zero serves nothing, so there is nothing to point at.
+        assert_eq!(
+            web("[web]\nport = 0")
+                .unwrap()
+                .scannable_url_from(Some(mesh)),
+            None
+        );
+        assert_eq!(web("[web]\nport = 0").unwrap().bind_address(), None);
     }
 
-    /// A browser client nobody serves cannot be reached, and a QR is an
-    /// address rather than a code — so a configuration naming one without the
-    /// other is a pairing screen that will disappoint somebody holding a phone.
+    /// Turning the client off and then naming an address for it is a
+    /// contradiction worth refusing where it is written rather than where it
+    /// disappoints somebody holding a phone.
     #[test]
-    fn a_web_address_without_a_server_is_refused() {
-        let with = |table: &str| {
-            Config::parse(&format!(
+    fn an_address_for_a_client_that_is_switched_off_is_refused() {
+        let error = Config::parse(
+            r#"
+                [web]
+                port = 0
+                url = "https://host.tailnet.ts.net"
+                [[targets]]
+                name = "development"
+                ssh = "development-host"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("serves no browser client"), "{error}");
+        // And a URL that could never work is still refused on sight.
+        assert!(
+            Config::parse(
                 r#"
-                {table}
+                [web]
+                url = "http://example.com"
                 [[targets]]
                 name = "development"
                 ssh = "development-host"
             "#
-            ))
-        };
-
-        let served = with("[web]\nport = 8790\nurl = \"https://host.tailnet.ts.net:8790\"")
-            .expect("a served address is usable");
-        assert_eq!(served.web.port, Some(8790));
-        assert_eq!(
-            served.web.url.as_deref(),
-            Some("https://host.tailnet.ts.net:8790")
+            )
+            .is_err()
         );
-
-        assert!(
-            with("[web]\nurl = \"https://host.tailnet.ts.net:8790\"")
-                .unwrap_err()
-                .to_string()
-                .contains("web.port does not serve")
-        );
-        // Refused where it is read rather than where it is served, so a file
-        // that cannot work says so before somebody tries to pair a phone.
-        assert!(with("[web]\nport = 8790\nurl = \"http://example.com\"").is_err());
-
-        // Unset is a daemon that serves no browser client, which is the
-        // default and must stay the default.
-        let silent = with("").expect("no [web] table is fine");
-        assert_eq!(silent.web, Default::default());
     }
 
     #[test]

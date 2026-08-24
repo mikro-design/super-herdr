@@ -425,25 +425,26 @@ way the path is read the way a shell reads it: backslash escapes, single or
 double quotes, a trailing space, and a leading `~` all name the file they look
 like.
 
-The `[web]` table serves the browser client and makes a pairing code
-scannable. It applies whether the daemon is run as `super-herdr daemon` or
-hosted by the frontend, so pairing works without a second command:
+The browser client is served by default, on port 8790, bound to this machine's
+own private address — the LAN one, or the `100.x` a mesh like Tailscale hands
+out — which it works out for itself. Nothing has to be configured for a pairing
+code to be scannable: `Ctrl+]` then `P` draws a QR pointing at an address the
+phone in your hand can reach. The listener refuses a public address, and answers
+nothing at all to a device that has not been paired.
+
+The `[web]` table changes that when it needs changing:
 
 ```toml
 [web]
-port = 8790
-address = "100.101.102.103"   # this machine, on the LAN or the mesh
+port = 8790                     # 0 serves no browser client at all
+address = "192.168.1.42"        # override what the machine worked out
+url = "https://host.ts.net"     # where a phone reaches it, if that differs
 ```
-
-`port` serves the client and `address` binds it. Give it the machine's own
-private address — a LAN address, or the `100.x` one a mesh like Tailscale hands
-out — and **the scannable URL is worked out from that**: there is nothing else
-to write down. Loopback stays unscannable, because no other device can reach it.
 
 `url` is only needed when the address a phone uses is not the address this
 process binds, which is what a proxy terminating TLS elsewhere does — with
 `tailscale serve` in front, the host, port and scheme all differ and cannot be
-derived. Then it is the override.
+derived.
 
 A pairing code may name any address the daemon is willing to bind, over plain
 HTTP included. Pairing sends the code to that host over that connection whether

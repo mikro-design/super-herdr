@@ -928,8 +928,8 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     // — otherwise pairing from here can only ever offer a code to be typed
     // into a client nothing is serving, and there is no address to make a QR
     // out of.
-    daemon_options.web_port = active_config.web.port;
-    daemon_options.web_address = active_config.web.address;
+    daemon_options.web_port = active_config.web.served_port();
+    daemon_options.web_address = active_config.web.bind_address();
     daemon_options.web_url = active_config.web.scannable_url();
     let daemon = spawn_in_process(
         active_config.clone(),
@@ -6900,6 +6900,52 @@ mod tests {
             Some("https://host.tail0.ts.net:8790#ABCD-2345"),
             "the code must ride in the fragment, never in a query"
         );
+    }
+
+    /// The QR has to actually fit the popup it is drawn in, at the address a
+    /// machine derives for itself. Encoding is not the same as fitting, and a
+    /// code that does not fit is not drawn at all — which is indistinguishable,
+    /// from the outside, from the pairing screen that never had an address.
+    #[test]
+    fn a_derived_address_makes_a_qr_that_fits_the_pairing_popup() {
+        use ratatui::layout::Rect;
+
+        use super::{PairingOffer, centered_popup, qr_rows};
+
+        // What `[web]` with nothing in it works out on a mesh, and the longer
+        // shape a LAN address with an explicit URL produces.
+        for url in [
+            "http://100.87.78.39:8790",
+            "http://192.168.1.42:8790",
+            "https://vemunds-macbook-pro.tail15b0b2.ts.net:8790",
+        ] {
+            let offer = PairingOffer {
+                code: "ABCD-2345".to_owned(),
+                url: Some(url.to_owned()),
+                expires_in_seconds: 300,
+            };
+            let target = offer.scan_target().expect("an address is scannable");
+            assert!(target.ends_with("#ABCD-2345"), "{target}");
+
+            // The popup as `render_pairing` asks for it, inside an ordinary
+            // terminal, less the border and padding it draws.
+            let popup = centered_popup(Rect::new(0, 0, 120, 40), 60, 34);
+            let inner = Rect::new(
+                popup.x + 2,
+                popup.y + 1,
+                popup.width - 4,
+                popup.height.saturating_sub(2),
+            );
+            let rows = qr_rows(&target, inner)
+                .unwrap_or_else(|| panic!("{url} should fit a {inner:?} popup"));
+            assert!(!rows.is_empty());
+            assert!(
+                rows.iter()
+                    .all(|row| row.chars().count() <= inner.width as usize),
+                "{url} drew wider than the popup"
+            );
+            assert!(rows.len() <= inner.height as usize, "{url} drew taller");
+        }
     }
 
     /// A daemon that was never told its public address offers nothing to scan,
