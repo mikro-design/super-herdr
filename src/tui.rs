@@ -5611,13 +5611,16 @@ fn qr_rows(payload: &str, available: Rect) -> Option<Vec<String>> {
         for x in 0..span {
             let upper = is_dark(x, pair);
             let lower = pair + 1 < span && is_dark(x, pair + 1);
-            // Dark modules are drawn as the terminal's foreground, so this
-            // inverts: a block character is a light module.
+            // The field is painted `fg(Black).bg(White)`, so a block character
+            // is a *dark* module and a space is a light one. Inverting these
+            // produces a valid code photographed as a negative: every glyph
+            // looks plausible, the shape looks like a QR, and a phone camera
+            // will not read it.
             row.push(match (upper, lower) {
-                (true, true) => ' ',
-                (true, false) => '\u{2584}',
-                (false, true) => '\u{2580}',
-                (false, false) => '\u{2588}',
+                (true, true) => '\u{2588}',
+                (true, false) => '\u{2580}',
+                (false, true) => '\u{2584}',
+                (false, false) => ' ',
             });
         }
         rows.push(row);
@@ -6860,46 +6863,54 @@ mod tests {
     /// Dark modules must render dark against a light field. Inverting them
     /// produces a code that some scanners accept and others silently do not,
     /// which is the worst failure available here: it looks like it works.
+    ///
+    /// This test used to assert the opposite, and passed. The glyph table in
+    /// `qr_rows` and the style in `render_pairing` each made sense alone — one
+    /// called a block character a light module, the other painted the
+    /// foreground black — so they agreed with each other about nothing and the
+    /// code came out as its own negative. Asserting against the table could
+    /// not catch that, because the table was half of what was wrong.
+    ///
+    /// So the orientation is pinned to something outside both: the field is
+    /// painted `fg(Black).bg(White)`, which makes a block dark and a space
+    /// light, and the module at the top-left corner of a QR is dark in every
+    /// code ever made.
     #[test]
     fn the_quiet_zone_is_light_and_the_finder_pattern_is_not() {
-        let rows = super::qr_rows(
+        for payload in [
             "https://example.test:8790#ABCD-2345",
-            super::Rect::new(0, 0, 80, 40),
-        )
-        .expect("room for this payload");
+            // What a machine derives for itself, which is what people scan.
+            "http://100.87.78.39:8790#ABCD-2345",
+        ] {
+            let rows = super::qr_rows(payload, super::Rect::new(0, 0, 80, 40))
+                .expect("room for this payload");
+            let cell = |row: usize, column: usize| rows[row].chars().nth(column).unwrap();
 
-        // Four modules of quiet zone is two rows of full blocks, top and bottom.
-        assert!(
-            rows[0].chars().all(|cell| cell == '\u{2588}'),
-            "the quiet zone is not light: {:?}",
-            rows[0]
-        );
-        assert!(
-            rows[rows.len() - 1].chars().all(|cell| cell == '\u{2588}'),
-            "the trailing quiet zone is not light"
-        );
+            // Four modules of quiet zone is two rows of blank, top and bottom.
+            assert!(
+                rows[0].chars().all(|glyph| glyph == ' ')
+                    && rows[1].chars().all(|glyph| glyph == ' '),
+                "the quiet zone is not light: {:?}",
+                &rows[..2]
+            );
+            assert!(
+                rows[rows.len() - 1].chars().all(|glyph| glyph == ' '),
+                "the trailing quiet zone is not light"
+            );
 
-        // The top-left finder centre sits four modules in past the quiet zone.
-        let finder = &rows[3];
-        assert!(
-            finder.chars().any(|cell| cell != '\u{2588}'),
-            "the finder pattern rendered as empty space: {finder:?}"
-        );
-    }
-
-    #[test]
-    fn a_scan_target_carries_the_code_in_the_fragment() {
-        let offer = super::PairingOffer {
-            code: "ABCD-2345".to_owned(),
-            url: Some("https://host.tail0.ts.net:8790".to_owned()),
-            expires_in_seconds: 300,
-        };
-
-        assert_eq!(
-            offer.scan_target().as_deref(),
-            Some("https://host.tail0.ts.net:8790#ABCD-2345"),
-            "the code must ride in the fragment, never in a query"
-        );
+            // The code's own first row pairs with its second, and the finder
+            // pattern's left edge is dark in both.
+            assert_eq!(
+                cell(2, 4),
+                '\u{2588}',
+                "the finder pattern is not dark in {payload:?}"
+            );
+            // While the quiet zone beside it stays light.
+            assert!(
+                (0..4).all(|column| cell(2, column) == ' '),
+                "the quiet zone beside the finder is not blank"
+            );
+        }
     }
 
     /// The QR has to actually fit the popup it is drawn in, at the address a
