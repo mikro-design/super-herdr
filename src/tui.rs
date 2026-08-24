@@ -5574,62 +5574,113 @@ impl PairingOffer {
     }
 }
 
-/// One QR, drawn two module rows to a text row.
+/// The modules of a QR for this payload, and how wide it is including the
+/// quiet zone.
 ///
-/// Half blocks rather than two spaces per module: a terminal cell is about
-/// twice as tall as it is wide, so stacking two modules in one cell keeps them
-/// square, and a square module is what a scanner is looking for.
-///
-/// `None` when it will not fit. That refusal is the point of this returning an
-/// option at all — a clipped QR is still a rectangle of black squares, and the
-/// person holding the phone cannot tell a truncated code from a bad angle or
-/// poor light. Text they can read; half a QR they can only fail at.
-fn qr_rows(payload: &str, available: Rect) -> Option<Vec<String>> {
+/// Four modules of quiet on every side, which the specification requires and
+/// scanners genuinely rely on against a busy terminal.
+fn qr_modules(payload: &str) -> Option<(usize, Vec<bool>)> {
     let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M).ok()?;
     let width = code.width();
-    // Four modules of quiet zone on every side, which the specification
-    // requires and scanners genuinely rely on against a busy terminal.
     let quiet = 4usize;
     let span = width + quiet * 2;
-    let needed_columns = u16::try_from(span).ok()?;
-    let needed_rows = u16::try_from(span.div_ceil(2)).ok()?;
-    if needed_columns > available.width || needed_rows > available.height {
+    let colors = code.to_colors();
+    let mut modules = vec![false; span * span];
+    for y in 0..width {
+        for x in 0..width {
+            modules[(y + quiet) * span + x + quiet] = colors[y * width + x] == qrcode::Color::Dark;
+        }
+    }
+    Some((span, modules))
+}
+
+/// Black and white as themselves, not as whatever a terminal theme has decided
+/// its "black" and "white" mean. A scanner is measuring contrast, and a palette
+/// that renders white as beige is a palette that can fail one.
+const QR_DARK: Color = Color::Rgb(0, 0, 0);
+const QR_LIGHT: Color = Color::Rgb(255, 255, 255);
+
+/// One QR, drawn as large as the space allows.
+///
+/// Two ways to draw it, and the difference matters more than it looks.
+///
+/// Given the room, each module becomes two cells of *background colour* and
+/// nothing else: no glyph is drawn at all, so no font has to have one, and
+/// nothing depends on a block character filling its cell exactly. Two cells
+/// wide by one tall is close to square, because a cell is about twice as tall
+/// as it is wide.
+///
+/// Where that will not fit, modules are stacked two to a row with half blocks,
+/// which is half the height and needs `▀` to be drawn without a seam. That is
+/// usually true and not always: a terminal that adds line spacing, or a font
+/// that draws the block a pixel short, leaves white lines through the code and
+/// a camera sees stripes rather than modules. So it is the fallback rather than
+/// the default.
+///
+/// `None` when neither fits. That refusal is the point of the option — a
+/// clipped QR is still a rectangle of black squares, and the person holding the
+/// phone cannot tell a truncated code from a bad angle or poor light. Text they
+/// can read; half a QR they can only fail at.
+fn qr_lines(payload: &str, available: Rect) -> Option<Vec<Line<'static>>> {
+    let (span, modules) = qr_modules(payload)?;
+    let dark = |x: usize, y: usize| modules[y * span + x];
+
+    let wide = u16::try_from(span * 2).ok()?;
+    let tall = u16::try_from(span).ok()?;
+    if wide <= available.width && tall <= available.height {
+        return Some(
+            (0..span)
+                .map(|y| {
+                    Line::from(
+                        (0..span)
+                            .map(|x| {
+                                let shade = if dark(x, y) { QR_DARK } else { QR_LIGHT };
+                                Span::styled("  ", Style::default().bg(shade))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    let narrow = u16::try_from(span).ok()?;
+    let short = u16::try_from(span.div_ceil(2)).ok()?;
+    if narrow > available.width || short > available.height {
         return None;
     }
-
-    let dark = code.to_colors();
-    let is_dark = |x: usize, y: usize| -> bool {
-        if x < quiet || y < quiet || x >= quiet + width || y >= quiet + width {
-            return false;
-        }
-        dark[(y - quiet) * width + (x - quiet)] == qrcode::Color::Dark
-    };
-
-    let mut rows = Vec::with_capacity(span.div_ceil(2));
-    for pair in (0..span).step_by(2) {
-        let mut row = String::with_capacity(span);
-        for x in 0..span {
-            let upper = is_dark(x, pair);
-            let lower = pair + 1 < span && is_dark(x, pair + 1);
-            // The field is painted `fg(Black).bg(White)`, so a block character
-            // is a *dark* module and a space is a light one. Inverting these
-            // produces a valid code photographed as a negative: every glyph
-            // looks plausible, the shape looks like a QR, and a phone camera
-            // will not read it.
-            row.push(match (upper, lower) {
-                (true, true) => '\u{2588}',
-                (true, false) => '\u{2580}',
-                (false, true) => '\u{2584}',
-                (false, false) => ' ',
-            });
-        }
-        rows.push(row);
-    }
-    Some(rows)
+    let paper = Style::default().fg(QR_DARK).bg(QR_LIGHT);
+    Some(
+        (0..span)
+            .step_by(2)
+            .map(|pair| {
+                let row: String = (0..span)
+                    .map(|x| {
+                        let upper = dark(x, pair);
+                        let lower = pair + 1 < span && dark(x, pair + 1);
+                        // A block character is painted in the foreground, which
+                        // is the dark one. Inverting these produces a valid code
+                        // photographed as a negative: every glyph looks
+                        // plausible and no camera will read it.
+                        match (upper, lower) {
+                            (true, true) => '\u{2588}',
+                            (true, false) => '\u{2580}',
+                            (false, true) => '\u{2584}',
+                            (false, false) => ' ',
+                        }
+                    })
+                    .collect();
+                Line::styled(row, paper)
+            })
+            .collect(),
+    )
 }
 
 fn render_pairing(frame: &mut Frame, offer: &PairingOffer) {
-    let area = centered_popup(frame.area(), 60, 34);
+    // Big enough for the glyph-free form, which is twice as wide and twice as
+    // tall as the fallback. A smaller popup would quietly always take the
+    // fallback, whatever the terminal could actually have shown.
+    let area = centered_popup(frame.area(), 120, 60);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(" pair a device ", Style::default().bold()))
@@ -5645,13 +5696,10 @@ fn render_pairing(frame: &mut Frame, offer: &PairingOffer) {
     // A QR is drawn on a white field with dark modules, whatever the terminal's
     // own colours are. A scanner needs the contrast to be this way round, and a
     // dark-themed terminal would otherwise invert it.
-    let paper = Style::default().fg(Color::Black).bg(Color::White);
     match offer.scan_target() {
-        Some(target) => match qr_rows(&target, inner) {
+        Some(target) => match qr_lines(&target, inner) {
             Some(rows) => {
-                for row in rows {
-                    lines.push(Line::styled(row, paper));
-                }
+                lines.extend(rows);
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!("code {}", offer.code),
@@ -6831,32 +6879,97 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// A QR that will not fit is not drawn at all.
+    /// What a camera would see: the drawn lines as pixels, dark where the
+    /// terminal paints dark.
     ///
-    /// This is the whole reason `qr_rows` returns an option. A clipped code is
-    /// still a rectangle of squares, and the person holding the phone cannot
-    /// tell a truncated code from a bad angle or poor light — they only know it
-    /// does not work. Text in the same space is legible.
-    #[test]
-    fn a_code_that_would_be_clipped_is_refused_rather_than_drawn() {
-        let target = "https://onio-ws01.tail15b0b2.ts.net:8790#ABCD-2345";
-        let roomy = super::qr_rows(target, super::Rect::new(0, 0, 80, 40))
-            .expect("80x40 has room for this payload");
+    /// Both drawing modes reduce to this — a module of two background-coloured
+    /// cells, or a half block in a dark foreground — which is the point. The
+    /// assertions below are about what ends up on the glass, not about which
+    /// glyph was chosen to put it there.
+    fn drawn_pixels(lines: &[ratatui::text::Line<'static>]) -> Vec<Vec<bool>> {
+        let mut pixels = Vec::new();
+        for line in lines {
+            let (mut upper, mut lower) = (Vec::new(), Vec::new());
+            for span in &line.spans {
+                let filled = span.style.bg == Some(super::QR_DARK);
+                for glyph in span.content.chars() {
+                    let (top, bottom) = match glyph {
+                        ' ' => (filled, filled),
+                        '\u{2588}' => (true, true),
+                        '\u{2580}' => (true, false),
+                        '\u{2584}' => (false, true),
+                        other => panic!("unexpected glyph {other:?}"),
+                    };
+                    upper.push(top);
+                    lower.push(bottom);
+                }
+            }
+            pixels.push(upper);
+            pixels.push(lower);
+        }
+        pixels
+    }
 
-        // Square once the two-modules-per-cell packing is undone. The span is
-        // odd for most versions, so the final row carries one module rather
-        // than two — hence the ceiling rather than a doubling.
-        let span = roomy[0].chars().count();
-        assert_eq!(roomy.len(), span.div_ceil(2));
-        for narrow in [
-            super::Rect::new(0, 0, 20, 40),
-            super::Rect::new(0, 0, 80, 6),
-            super::Rect::new(0, 0, 1, 1),
+    /// Decode what was drawn. If a phone cannot read it, this cannot either.
+    ///
+    /// Written after shipping a code drawn as its own negative, past a test
+    /// that checked the glyph table and passed — because the glyph table was
+    /// half of what was wrong. Nothing about a convention can satisfy this one.
+    fn assert_decodes(lines: &[ratatui::text::Line<'static>], payload: &str) {
+        let pixels = drawn_pixels(lines);
+        let width = pixels[0].len();
+        // Scaled up because a decoder wants more than a pixel per module, as
+        // does a camera.
+        const SCALE: usize = 4;
+        let (columns, rows) = (width * SCALE, pixels.len() * SCALE);
+        let mut luma = vec![255_u8; columns * rows];
+        for (y, row) in pixels.iter().enumerate() {
+            for (x, dark) in row.iter().enumerate() {
+                if !*dark {
+                    continue;
+                }
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        luma[(y * SCALE + dy) * columns + x * SCALE + dx] = 0;
+                    }
+                }
+            }
+        }
+        let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(columns, rows, |x, y| {
+            luma[y * columns + x]
+        });
+        let grids = prepared.detect_grids();
+        assert_eq!(grids.len(), 1, "no QR was found in what was drawn");
+        let (_, decoded) = grids[0].decode().expect("the drawn code decodes");
+        assert_eq!(decoded, payload);
+    }
+
+    /// Both ways of drawing it have to produce a readable code, because the
+    /// terminal decides which one is used.
+    #[test]
+    fn what_is_drawn_decodes_back_to_what_it_encodes() {
+        for payload in [
+            "http://100.87.78.39:8790#ABCD-2345",
+            "https://onio-ws01.tail15b0b2.ts.net:8790#ABCD-2345",
         ] {
+            // Room for the glyph-free form: two cells per module, one row each.
+            let large = super::qr_lines(payload, super::Rect::new(0, 0, 160, 80))
+                .expect("room for the larger form");
             assert!(
-                super::qr_rows(target, narrow).is_none(),
-                "a code was drawn into {narrow:?}, where it cannot be scanned"
+                large.iter().all(|line| line
+                    .spans
+                    .iter()
+                    .all(|span| span.content.chars().all(|glyph| glyph == ' '))),
+                "the larger form should draw no glyphs at all"
             );
+            assert_decodes(&large, payload);
+
+            // And the half-block fallback, which is what a narrower terminal
+            // gets — too tight for two cells a module, wide enough for one.
+            let small = super::qr_lines(payload, super::Rect::new(0, 0, 60, 24))
+                .expect("room for the fallback");
+            assert!(small.len() < large.len(), "the fallback should be shorter");
+            assert_decodes(&small, payload);
         }
     }
 
@@ -6864,51 +6977,61 @@ mod tests {
     /// produces a code that some scanners accept and others silently do not,
     /// which is the worst failure available here: it looks like it works.
     ///
-    /// This test used to assert the opposite, and passed. The glyph table in
-    /// `qr_rows` and the style in `render_pairing` each made sense alone — one
-    /// called a block character a light module, the other painted the
-    /// foreground black — so they agreed with each other about nothing and the
-    /// code came out as its own negative. Asserting against the table could
-    /// not catch that, because the table was half of what was wrong.
-    ///
-    /// So the orientation is pinned to something outside both: the field is
-    /// painted `fg(Black).bg(White)`, which makes a block dark and a space
-    /// light, and the module at the top-left corner of a QR is dark in every
-    /// code ever made.
+    /// Pinned to the pixels rather than to the glyphs, because the glyph table
+    /// and the style it is painted with were once wrong together — each
+    /// self-consistent, agreeing with each other about nothing.
     #[test]
     fn the_quiet_zone_is_light_and_the_finder_pattern_is_not() {
-        for payload in [
-            "https://example.test:8790#ABCD-2345",
-            // What a machine derives for itself, which is what people scan.
-            "http://100.87.78.39:8790#ABCD-2345",
+        for area in [
+            super::Rect::new(0, 0, 160, 80),
+            super::Rect::new(0, 0, 60, 24),
         ] {
-            let rows = super::qr_rows(payload, super::Rect::new(0, 0, 80, 40))
+            let lines = super::qr_lines("https://example.test:8790#ABCD-2345", area)
                 .expect("room for this payload");
-            let cell = |row: usize, column: usize| rows[row].chars().nth(column).unwrap();
+            let pixels = drawn_pixels(&lines);
+            // Modules are two pixels wide in the larger form and one in the
+            // fallback; the quiet zone is four of them either way.
+            let per_module = pixels[0].len() / (pixels.len() / 2);
+            let quiet = 4 * per_module;
 
-            // Four modules of quiet zone is two rows of blank, top and bottom.
             assert!(
-                rows[0].chars().all(|glyph| glyph == ' ')
-                    && rows[1].chars().all(|glyph| glyph == ' '),
-                "the quiet zone is not light: {:?}",
-                &rows[..2]
+                pixels[..quiet].iter().flatten().all(|dark| !*dark),
+                "the quiet zone above the code is not light"
             );
             assert!(
-                rows[rows.len() - 1].chars().all(|glyph| glyph == ' '),
+                pixels[pixels.len() - quiet..]
+                    .iter()
+                    .flatten()
+                    .all(|dark| !*dark),
                 "the trailing quiet zone is not light"
             );
-
-            // The code's own first row pairs with its second, and the finder
-            // pattern's left edge is dark in both.
-            assert_eq!(
-                cell(2, 4),
-                '\u{2588}',
-                "the finder pattern is not dark in {payload:?}"
-            );
-            // While the quiet zone beside it stays light.
+            // The module at the code's top-left corner is dark in every QR ever
+            // made, and the quiet zone beside it is not.
+            assert!(pixels[quiet][quiet], "the finder pattern is not dark");
             assert!(
-                (0..4).all(|column| cell(2, column) == ' '),
-                "the quiet zone beside the finder is not blank"
+                pixels[quiet][..quiet].iter().all(|dark| !*dark),
+                "the quiet zone beside the finder is not light"
+            );
+        }
+    }
+
+    /// A QR that will not fit is not drawn at all.
+    ///
+    /// This is the whole reason `qr_lines` returns an option. A clipped code is
+    /// still a rectangle of squares, and the person holding the phone cannot
+    /// tell a truncated code from a bad angle or poor light — they only know it
+    /// does not work. Text in the same space is legible.
+    #[test]
+    fn a_code_that_would_be_clipped_is_refused_rather_than_drawn() {
+        let target = "https://onio-ws01.tail15b0b2.ts.net:8790#ABCD-2345";
+        for narrow in [
+            super::Rect::new(0, 0, 20, 40),
+            super::Rect::new(0, 0, 80, 6),
+            super::Rect::new(0, 0, 1, 1),
+        ] {
+            assert!(
+                super::qr_lines(target, narrow).is_none(),
+                "a code was drawn into {narrow:?}, where it cannot be scanned"
             );
         }
     }
@@ -6921,7 +7044,7 @@ mod tests {
     fn a_derived_address_makes_a_qr_that_fits_the_pairing_popup() {
         use ratatui::layout::Rect;
 
-        use super::{PairingOffer, centered_popup, qr_rows};
+        use super::{PairingOffer, centered_popup, qr_lines};
 
         // What `[web]` with nothing in it works out on a mesh, and the longer
         // shape a LAN address with an explicit URL produces.
@@ -6940,19 +7063,18 @@ mod tests {
 
             // The popup as `render_pairing` asks for it, inside an ordinary
             // terminal, less the border and padding it draws.
-            let popup = centered_popup(Rect::new(0, 0, 120, 40), 60, 34);
+            let popup = centered_popup(Rect::new(0, 0, 120, 40), 120, 60);
             let inner = Rect::new(
                 popup.x + 2,
                 popup.y + 1,
                 popup.width - 4,
                 popup.height.saturating_sub(2),
             );
-            let rows = qr_rows(&target, inner)
+            let rows = qr_lines(&target, inner)
                 .unwrap_or_else(|| panic!("{url} should fit a {inner:?} popup"));
             assert!(!rows.is_empty());
             assert!(
-                rows.iter()
-                    .all(|row| row.chars().count() <= inner.width as usize),
+                rows.iter().all(|row| row.width() <= inner.width as usize),
                 "{url} drew wider than the popup"
             );
             assert!(rows.len() <= inner.height as usize, "{url} drew taller");
