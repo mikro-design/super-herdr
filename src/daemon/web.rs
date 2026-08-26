@@ -664,6 +664,8 @@ mod tests {
             APP.contains("EventSource"),
             "the page opens the event stream"
         );
+        assert_eq!(APP.matches("class=\"code-box\"").count(), 8);
+        assert!(APP.contains("el('code').onpaste"));
     }
 
     async fn serve_test_daemon() -> (

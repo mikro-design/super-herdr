@@ -43,12 +43,17 @@ const keyButtons = ['enter', 'tab', 'escape', 'interrupt', 'up', 'down'].map(key
   button.dataset = { key };
   return button;
 });
+const codeBoxNodes = Array.from({ length: 8 }, (_, index) => node(`code-${index}`));
 
 globalThis.document = {
   getElementById: node,
   createElement: () => node(`created-${created++}`),
   querySelector: selector => node(`sel-${selector}`),
-  querySelectorAll: selector => (selector === '.keys button' ? keyButtons : []),
+  querySelectorAll: selector => {
+    if (selector === '.keys button') return keyButtons;
+    if (selector === '.code-box') return codeBoxNodes;
+    return [];
+  },
   body: node('body'),
   addEventListener() {},
 };
@@ -73,7 +78,7 @@ class StubEventSource {
 }
 globalThis.EventSource = StubEventSource;
 
-const module = new Function(`${script}\nreturn { apply, observe, takeControl, el, KEYS, endpoint, renderPanes };`);
+const module = new Function(`${script}\nreturn { apply, observe, takeControl, el, KEYS, endpoint, renderPanes, codeBoxes, enteredCode };`);
 const page = module();
 
 const deliver = message => page.apply(message);
@@ -89,6 +94,14 @@ const check = (what, condition) => {
 
 const expectedPrefix = pathname.startsWith('/r/') ? pathname.replace(/\/$/, '') : '';
 check('requests stay on the served route', page.endpoint('/session') === `${expectedPrefix}/session`);
+check('pairing uses eight separate code boxes', page.codeBoxes.length === 8);
+let pastePrevented = false;
+page.el('code').onpaste({
+  clipboardData: { getData: () => 'abCD-2345' },
+  preventDefault() { pastePrevented = true; },
+});
+check('a complete code pastes across all boxes', page.enteredCode() === 'ABCD2345');
+check('pasting the code suppresses the one-field default', pastePrevented);
 
 // Navigation mirrors the identity hierarchy instead of flattening every pane.
 deliver({

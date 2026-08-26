@@ -86,12 +86,20 @@
   #version { font-size: .72rem; color: var(--dim); }
   #pairing { padding: 1rem; max-width: 26rem; margin: 0 auto; }
   #pairing label { display: block; margin: .8rem 0; color: var(--dim); font-size: .82rem; }
-  #pairing input {
+  #pairing .field-input {
     display: block; width: 100%; margin-top: .3rem; padding: .6rem .7rem;
     font: inherit; color: var(--text); background: var(--panel);
     border: 1px solid var(--line); border-radius: .55rem;
   }
-  #code { text-transform: uppercase; letter-spacing: .12em; font-family: ui-monospace, monospace; }
+  .code-boxes { display: flex; gap: .35rem; margin-top: .35rem; }
+  #pairing .code-box {
+    width: min(2.6rem, calc((100vw - 6.5rem) / 8)); height: 3rem; box-sizing: border-box; padding: 0;
+    color: var(--text); background: var(--panel); border: 1px solid var(--line);
+    border-radius: .5rem; text-align: center; text-transform: uppercase;
+    font: 700 1.25rem ui-monospace, monospace;
+  }
+  #pairing .code-box:nth-child(5) { margin-left: .45rem; }
+  #pairing .code-box:focus { border-color: var(--accent); outline: 2px solid #60a5fa55; }
   #pair-error { color: var(--wait); min-height: 1.2em; }
   #pair-confirmation { padding: .7rem; border: 1px solid var(--line); border-radius: .55rem; }
   #pair-confirmation strong { display: block; color: var(--text); font: 700 1.4rem ui-monospace, monospace; letter-spacing: .16em; }
@@ -127,9 +135,18 @@
     Ask the terminal client for a pairing code, then enter it here. The code is
     good once and expires in a few minutes.
   </p>
-  <label>Code <input id="code" autocomplete="off" autocapitalize="characters"
-    spellcheck="false" placeholder="ABCD-2345"></label>
-  <label>Name this device <input id="name" autocomplete="off"
+  <span id="code-label" class="note">Code</span>
+  <div id="code" class="code-boxes" role="group" aria-labelledby="code-label">
+    <input class="code-box" aria-label="Code character 1" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 2" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 3" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 4" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 5" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 6" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 7" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    <input class="code-box" aria-label="Code character 8" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+  </div>
+  <label>Name this device <input id="name" class="field-input" autocomplete="off"
     placeholder="phone"></label>
   <div class="actions"><button id="pair">Pair</button></div>
   <p class="note" id="pair-confirmation" hidden>
@@ -195,6 +212,49 @@ let attention = [];
 
 const el = id => document.getElementById(id);
 const text = value => String(value == null ? '' : value);
+const codeBoxes = [...document.querySelectorAll('.code-box')];
+const codeCharacters = value => String(value || '')
+  .toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, codeBoxes.length);
+const enteredCode = () => codeBoxes.map(box => box.value).join('');
+
+function fillCode(value) {
+  const characters = codeCharacters(value);
+  codeBoxes.forEach((box, index) => { box.value = characters[index] || ''; });
+  codeBoxes[Math.min(characters.length, codeBoxes.length - 1)].focus();
+}
+
+for (const [index, box] of codeBoxes.entries()) {
+  box.oninput = () => {
+    const characters = codeCharacters(box.value);
+    box.value = characters[0] || '';
+    if (characters.length > 1) {
+      const combined = codeBoxes.slice(0, index).map(one => one.value).join('') + characters;
+      fillCode(combined);
+    } else if (characters.length === 1 && index + 1 < codeBoxes.length) {
+      codeBoxes[index + 1].focus();
+    }
+  };
+  box.onkeydown = event => {
+    if (event.key === 'Backspace' && !box.value && index > 0) {
+      codeBoxes[index - 1].value = '';
+      codeBoxes[index - 1].focus();
+      event.preventDefault();
+    } else if (event.key === 'ArrowLeft' && index > 0) {
+      codeBoxes[index - 1].focus();
+      event.preventDefault();
+    } else if (event.key === 'ArrowRight' && index + 1 < codeBoxes.length) {
+      codeBoxes[index + 1].focus();
+      event.preventDefault();
+    }
+  };
+}
+el('code').onpaste = event => {
+  const pasted = event.clipboardData && event.clipboardData.getData('text');
+  if (pasted) {
+    event.preventDefault();
+    fillCode(pasted);
+  }
+};
 
 function send(message) {
   return fetch(endpoint(`/command?session=${session}`), {
@@ -825,7 +885,7 @@ async function start() {
   if (!session_state.paired) {
     el('pairing').hidden = false;
     el('name').value = el('name').value || suggestedName();
-    el('code').focus();
+    codeBoxes[0].focus();
     return;
   }
   document.querySelector('main').hidden = false;
@@ -834,6 +894,12 @@ async function start() {
 
 el('pair').onclick = async () => {
   el('pair-error').textContent = '';
+  const code = enteredCode();
+  if (code.length !== codeBoxes.length) {
+    el('pair-error').textContent = 'Enter all eight code characters.';
+    (codeBoxes.find(box => !box.value) || codeBoxes[0]).focus();
+    return;
+  }
   el('pair').disabled = true;
   try {
     const confirmation = confirmationNumber();
@@ -843,7 +909,7 @@ el('pair').onclick = async () => {
     const response = await fetch(endpoint('/pair'), {
       method: 'POST',
       body: JSON.stringify({
-        code: el('code').value,
+        code,
         name: el('name').value,
         confirmation,
       }),

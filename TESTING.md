@@ -105,12 +105,14 @@ has already hidden a fault that shipped:
   count keeps growing, the decision is worth revisiting with the list as the
   argument.
 
-  `tools/page-harness.mjs` is how to run it. It loads the real script against a
-  stub DOM and asserts what the page sends, so "verified by hand" is repeatable
-  rather than a promise:
+  `tools/page-harness.mjs` and `tools/bridge-page-harness.mjs` load the real
+  scripts against stub DOMs and assert what the pages send, so "verified by
+  hand" is repeatable rather than a promise:
 
   ```sh
   node tools/page-harness.mjs src/daemon/app.html
+  node tools/page-harness.mjs src/daemon/app.html /r/0123456789abcdef0123456789abcdef/
+  node tools/bridge-page-harness.mjs crates/bridge/src/bridge.html
   ```
 
   It is deliberately not wired into CI, which stays Rust-only. Run it after

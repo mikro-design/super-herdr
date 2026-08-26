@@ -482,7 +482,9 @@ at compile time.
 Pairing still starts from a client that is already trusted: it asks the daemon
 for a short code, the code appears on a screen someone already has, and the
 daemon publishes that code over its authenticated connector for at most five
-minutes. A browser opens the fixed bridge page and types the code there. The
+minutes. A browser opens the fixed bridge page and types the code into eight
+single-character boxes there; paste distributes a complete code across them.
+The
 bridge uses it only to select the owning route and forwards the request. The
 browser generates a six-digit comparison number with Web Crypto, and the daemon
 forwards the name and number to state-subscribed trusted clients. It atomically
@@ -493,6 +495,19 @@ routes and pending codes; an accidental code collision is ambiguous and routes
 neither person. The bridge also bounds pairing submissions per Cloudflare
 source, but this is flood control rather than the authority check: even a valid
 short code grants only a comparison prompt.
+
+The fixed bridge URL is reserved. An old configuration may spell it explicitly
+as `web.url`; resolution still treats that exact address as the hosted outbound
+bridge. Treating it as a generic operator proxy would render the correct QR but
+open no connector, leaving every correctly entered code absent from the public
+registry.
+
+On Linux, the outbound connector explicitly installs Rustls's ring crypto
+provider before spawning its TLS task. The bridge crate is linked into a larger
+desktop binary, so provider inference from the final feature graph is not a
+stable startup rule; a failure there must not become an unnoticed
+background-task panic while the pairing screen continues to advertise an
+unpublished code. macOS uses its native TLS stack instead.
 The successful token cookie is scoped to the random route, so devices for two
 daemons in one browser do not overwrite or cross-send one another. The daemon
 stores only the token's digest, so

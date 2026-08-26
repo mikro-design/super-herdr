@@ -75,6 +75,24 @@ fn default_web_port() -> Option<u16> {
 }
 
 impl WebConfig {
+    /// Whether this configuration names the hosted rendezvous rather than an
+    /// operator-managed proxy.
+    ///
+    /// Early bridge instructions told people to write the fixed URL into
+    /// `web.url`. Treating that exact reserved address as a generic proxy made
+    /// the QR look right while skipping the outbound connector, so its codes
+    /// could never exist at the bridge. Accept that spelling, including a
+    /// trailing slash, as the hosted bridge it unambiguously names.
+    fn hosted_bridge_requested(&self) -> bool {
+        if self.address.is_some() {
+            return false;
+        }
+        match self.url.as_deref() {
+            Some(url) => url.trim().trim_end_matches('/') == crate::bridge::DEFAULT_BRIDGE_URL,
+            None => self.bridge,
+        }
+    }
+
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
@@ -141,10 +159,10 @@ impl WebConfig {
     /// here creates or changes Serve or Funnel state.
     pub async fn resolve(&self) -> ResolvedWeb {
         let detected = own_private_address();
-        if self.served_port().is_none() || self.address.is_some() || self.url.is_some() {
+        if self.served_port().is_none() || self.address.is_some() {
             return self.resolve_from(detected, None);
         }
-        if self.bridge
+        if self.hosted_bridge_requested()
             && let Ok(route) = crate::bridge::Route::new(crate::bridge::DEFAULT_BRIDGE_URL)
         {
             return ResolvedWeb {
@@ -153,6 +171,9 @@ impl WebConfig {
                 url: Some(route.login_url()),
                 bridge: Some(route),
             };
+        }
+        if self.url.is_some() {
+            return self.resolve_from(detected, None);
         }
         let status = tailscale_serve_status().await;
         self.resolve_from(detected, status.as_deref())
@@ -1337,6 +1358,31 @@ name = "local"
             Some("https://super-herdr.key-value.co")
         );
         assert!(resolved.bridge.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_fixed_bridge_url_in_an_existing_config_still_opens_its_connector() {
+        for configured in [
+            "[web]\nurl = \"https://super-herdr.key-value.co\"",
+            "[web]\nbridge = false\nurl = \"https://super-herdr.key-value.co/\"",
+        ] {
+            let web = Config::parse(&format!(
+                "{configured}\n[[targets]]\nname = \"development\""
+            ))
+            .unwrap()
+            .web;
+            let resolved = web.resolve().await;
+            assert_eq!(resolved.port, Some(8790));
+            assert_eq!(resolved.address, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            assert_eq!(
+                resolved.url.as_deref(),
+                Some("https://super-herdr.key-value.co")
+            );
+            assert!(
+                resolved.bridge.is_some(),
+                "configuration was {configured:?}"
+            );
+        }
     }
 
     /// Tailscale already knows both halves of a reverse proxy. The outside

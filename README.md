@@ -122,6 +122,15 @@ provided Makefile targets.
 
 ## Install
 
+Upgrade from 0.7.14 if `[web] url` explicitly names
+`https://super-herdr.key-value.co`, or if the fixed page reports that every code
+is missing. That release did not select a Rustls crypto provider before its
+background connector opened TLS, so the connector could terminate while the
+TUI kept running. It also mistook an explicitly written fixed address for an
+operator proxy and opened no connector at all. 0.7.15 makes the TLS choice
+explicit, recognizes the reserved URL as the hosted bridge, and presents the
+code as eight single-character boxes.
+
 Upgrade from 0.7.13 before using the browser client. That release could put the
 pairing code in the scanned URL and did not require a separate trusted approval
 after the code was entered. 0.7.14 keeps the code out of the URL, requires it to
@@ -162,7 +171,7 @@ brew install mikro-design/tap/super-herdr
 
 # Debian and Ubuntu. The version is part of the asset name, so there is no
 # stable "latest" URL; set these to a published release and your architecture.
-version=0.7.14
+version=0.7.15
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -186,7 +195,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.7.14
+tag=v0.7.15
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -240,8 +249,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.7.14`
-must be tagged `v0.7.14`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.7.15`
+must be tagged `v0.7.15`.
 
 ### macOS
 
@@ -479,12 +488,16 @@ address = "192.168.1.42"        # use a direct private/mesh listener instead
 url = "https://host.ts.net"     # or name an operator-managed proxy
 ```
 
-An explicit `address` or `url` bypasses the hosted bridge. With `bridge = false`
-and neither explicit value, Super-Herdr may reuse one unambiguous existing
-Tailscale Serve route by reading `tailscale serve status --json`; it never
-creates or changes Serve/Funnel state. Otherwise it derives a private or mesh
-address. Explicit `url` with no `address` keeps the listener on loopback; set
-`port` to the proxy's local target port when it differs from the outside port.
+An explicit `address`, or a `url` other than the fixed bridge address, bypasses
+the hosted bridge. Writing `url = "https://super-herdr.key-value.co"` explicitly
+still selects the hosted connector; this keeps older configurations from
+showing the right login page without ever publishing their code. With
+`bridge = false` and neither explicit value, Super-Herdr may reuse one
+unambiguous existing Tailscale Serve route by reading
+`tailscale serve status --json`; it never creates or changes Serve/Funnel
+state. Otherwise it derives a private or mesh address. An operator proxy URL
+with no `address` keeps the listener on loopback; set `port` to the proxy's
+local target port when it differs from the outside port.
 
 A paired device watches panes and, when it asks for control, types into them.
 Control is asked for rather than assumed — a phone in a pocket should not be
@@ -495,13 +508,13 @@ line of text and the keys a terminal needs (Enter, Tab, Esc, Ctrl-C, and the
 arrows for shell history) reach the pane. Losing the lease to another client
 takes the keyboard away again rather than leaving one that cannot type.
 
-The QR and printed URL never contain the pairing code. It is typed into the
-browser and sent in a bounded POST body, which the bridge and proxy must not
-log. The browser then waits while the trusted TUI shows its name and comparison
-number; approving a different number is a refusal. Browsers never inherit trust
-from reaching loopback. A public address over HTTP is refused. The `daemon`
-subcommand's `--web`, `--web-address` and `--web-url` flags override the table
-for one run.
+The QR and printed URL never contain the pairing code. It is typed into eight
+separate character boxes (a whole code can still be pasted) and sent in a
+bounded POST body, which the bridge and proxy must not log. The browser then
+waits while the trusted TUI shows its name and comparison number; approving a
+different number is a refusal. Browsers never inherit trust from reaching
+loopback. A public address over HTTP is refused. The `daemon` subcommand's
+`--web`, `--web-address` and `--web-url` flags override the table for one run.
 
 `transfers.max_bytes` is the largest transfer this daemon will accept, and it
 defaults to one gibibyte. It bounds the target host's disk rather than

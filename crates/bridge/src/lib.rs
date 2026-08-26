@@ -236,6 +236,7 @@ pub fn spawn_connector(
     local: SocketAddr,
     pairing_codes: watch::Receiver<Option<String>>,
 ) -> JoinHandle<()> {
+    install_crypto_provider();
     tokio::spawn(async move {
         loop {
             let _ = connect_once(&route, local, pairing_codes.clone()).await;
@@ -243,6 +244,20 @@ pub fn spawn_connector(
         }
     })
 }
+
+/// Rustls intentionally leaves provider choice to an application whose
+/// dependency graph does not enable exactly one provider feature. The bridge
+/// is also linked into the desktop binary on Linux, so make the choice explicit
+/// before the connector opens TLS instead of letting a background task panic.
+#[cfg(target_os = "linux")]
+fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_crypto_provider() {}
 
 async fn connect_once(
     route: &Route,
@@ -806,7 +821,7 @@ async fn pair_device(
         return write_text_status(
             &mut stream,
             "404 Not Found",
-            "that code was not found, is ambiguous, or has expired",
+            "No running Super-Herdr published that code. Keep its pairing screen open, check all eight characters, and try again.",
         )
         .await;
     };
@@ -1274,6 +1289,8 @@ impl AsyncWrite for PrefixedStream {
 mod tests {
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
+    use super::install_crypto_provider;
     use super::{
         LOGIN_PAGE, MAX_PAIR_ATTEMPTS_PER_SOURCE, Packet, RelayState, Route, pairing_source,
         parse_request, read_http_head, rewrite_device_request, serve_listener, spawn_connector,
@@ -1286,6 +1303,13 @@ mod tests {
 
     const ROUTE: &str = "0123456789abcdef0123456789abcdef";
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_outbound_tls_connector_selects_a_crypto_provider() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn route_names_are_public_but_registration_secrets_are_not_debugged() {
@@ -1310,7 +1334,10 @@ mod tests {
     fn login_page_accepts_a_typed_code_without_putting_it_in_a_url() {
         assert!(LOGIN_PAGE.contains("fetch('/_bridge/pair'"));
         assert!(LOGIN_PAGE.contains("JSON.stringify({"));
-        assert!(LOGIN_PAGE.contains("code: el('code').value"));
+        assert!(LOGIN_PAGE.contains("const enteredCode = ()"));
+        assert!(LOGIN_PAGE.contains("code,"));
+        assert_eq!(LOGIN_PAGE.matches("class=\"code-box\"").count(), 8);
+        assert!(LOGIN_PAGE.contains("el('code').onpaste"));
         assert!(LOGIN_PAGE.contains("confirmation,"));
         assert!(LOGIN_PAGE.contains("Waiting for approval"));
         assert!(!LOGIN_PAGE.contains("location.hash"));

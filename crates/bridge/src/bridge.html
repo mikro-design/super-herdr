@@ -6,12 +6,19 @@
 <style>
   :root { color-scheme: dark light; font-family: ui-sans-serif, -apple-system, system-ui, sans-serif; }
   body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #11131a; color: #e6e9f0; }
-  main { width: min(26rem, calc(100% - 2rem)); padding: 1.4rem; background: #171a23; border: 1px solid #262b38; border-radius: .8rem; }
+  main { box-sizing: border-box; width: min(26rem, calc(100% - 2rem)); padding: 1.4rem; background: #171a23; border: 1px solid #262b38; border-radius: .8rem; }
   h1 { margin: 0 0 .5rem; font-size: 1.2rem; }
   p { color: #a8afbf; line-height: 1.45; }
-  label { display: block; margin-top: 1rem; color: #a8afbf; font-size: .84rem; }
-  input { display: block; width: 100%; box-sizing: border-box; margin-top: .3rem; padding: .7rem; font: inherit; color: inherit; background: #11131a; border: 1px solid #343b4d; border-radius: .5rem; }
-  #code { text-transform: uppercase; letter-spacing: .13em; font-family: ui-monospace, monospace; }
+  label, .field-label { display: block; margin-top: 1rem; color: #a8afbf; font-size: .84rem; }
+  .field-input { display: block; width: 100%; box-sizing: border-box; margin-top: .3rem; padding: .7rem; font: inherit; color: inherit; background: #11131a; border: 1px solid #343b4d; border-radius: .5rem; }
+  .code-boxes { display: flex; gap: .35rem; margin-top: .35rem; }
+  .code-box {
+    width: min(2.6rem, calc((100vw - 6.5rem) / 8)); height: 3rem; box-sizing: border-box; padding: 0;
+    color: inherit; background: #11131a; border: 1px solid #343b4d; border-radius: .5rem;
+    text-align: center; text-transform: uppercase; font: 700 1.25rem ui-monospace, monospace;
+  }
+  .code-box:nth-child(5) { margin-left: .45rem; }
+  .code-box:focus { border-color: #60a5fa; outline: 2px solid #2563eb55; }
   button { margin-top: 1rem; padding: .6rem .9rem; font: inherit; color: #fff; background: #2563eb; border: 0; border-radius: .5rem; cursor: pointer; }
   button:disabled { opacity: .6; cursor: wait; }
   #error { min-height: 1.4em; color: #ffb454; }
@@ -21,19 +28,26 @@
     body { background: #f6f7fa; color: #12151c; }
     main { background: #fff; border-color: #dfe3ec; }
     p, label { color: #5b6376; }
-    input { background: #fff; border-color: #c7ccda; }
+    .field-input, .code-box { background: #fff; border-color: #c7ccda; }
   }
 </style>
 <main>
   <h1>Connect to Super-Herdr</h1>
   <p>Enter the one-time code shown by Super-Herdr. It expires after five minutes.</p>
   <form id="connect">
-    <label>Code
-      <input id="code" autocomplete="one-time-code" autocapitalize="characters"
-        spellcheck="false" maxlength="16" placeholder="ABCD-2345" required autofocus>
-    </label>
+    <span id="code-label" class="field-label">Code</span>
+    <div id="code" class="code-boxes" role="group" aria-labelledby="code-label">
+      <input class="code-box" aria-label="Code character 1" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="1" required autofocus>
+      <input class="code-box" aria-label="Code character 2" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+      <input class="code-box" aria-label="Code character 3" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+      <input class="code-box" aria-label="Code character 4" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+      <input class="code-box" aria-label="Code character 5" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+      <input class="code-box" aria-label="Code character 6" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+      <input class="code-box" aria-label="Code character 7" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+      <input class="code-box" aria-label="Code character 8" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
+    </div>
     <label>Name this device
-      <input id="name" autocomplete="off" maxlength="48" placeholder="phone">
+      <input id="name" class="field-input" autocomplete="off" maxlength="48" placeholder="phone">
     </label>
     <button id="submit" type="submit">Connect</button>
   </form>
@@ -44,6 +58,50 @@
 </main>
 <script>
 const el = id => document.getElementById(id);
+const codeBoxes = [...document.querySelectorAll('.code-box')];
+
+const codeCharacters = value => String(value || '')
+  .toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, codeBoxes.length);
+const enteredCode = () => codeBoxes.map(box => box.value).join('');
+
+function fillCode(value) {
+  const characters = codeCharacters(value);
+  codeBoxes.forEach((box, index) => { box.value = characters[index] || ''; });
+  codeBoxes[Math.min(characters.length, codeBoxes.length - 1)].focus();
+}
+
+for (const [index, box] of codeBoxes.entries()) {
+  box.oninput = () => {
+    const characters = codeCharacters(box.value);
+    box.value = characters[0] || '';
+    if (characters.length > 1) {
+      const combined = codeBoxes.slice(0, index).map(one => one.value).join('') + characters;
+      fillCode(combined);
+    } else if (characters.length === 1 && index + 1 < codeBoxes.length) {
+      codeBoxes[index + 1].focus();
+    }
+  };
+  box.onkeydown = event => {
+    if (event.key === 'Backspace' && !box.value && index > 0) {
+      codeBoxes[index - 1].value = '';
+      codeBoxes[index - 1].focus();
+      event.preventDefault();
+    } else if (event.key === 'ArrowLeft' && index > 0) {
+      codeBoxes[index - 1].focus();
+      event.preventDefault();
+    } else if (event.key === 'ArrowRight' && index + 1 < codeBoxes.length) {
+      codeBoxes[index + 1].focus();
+      event.preventDefault();
+    }
+  };
+}
+el('code').onpaste = event => {
+  const pasted = event.clipboardData && event.clipboardData.getData('text');
+  if (pasted) {
+    event.preventDefault();
+    fillCode(pasted);
+  }
+};
 
 function confirmationNumber() {
   if (!globalThis.crypto || !crypto.getRandomValues) {
@@ -65,6 +123,12 @@ el('name').value = suggestedName();
 el('connect').onsubmit = async event => {
   event.preventDefault();
   el('error').textContent = '';
+  const code = enteredCode();
+  if (code.length !== codeBoxes.length) {
+    el('error').textContent = 'Enter all eight code characters.';
+    (codeBoxes.find(box => !box.value) || codeBoxes[0]).focus();
+    return;
+  }
   el('submit').disabled = true;
   try {
     const confirmation = confirmationNumber();
@@ -75,7 +139,7 @@ el('connect').onsubmit = async event => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        code: el('code').value,
+        code,
         name: el('name').value,
         confirmation,
       }),
