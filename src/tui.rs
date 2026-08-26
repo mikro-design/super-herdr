@@ -841,6 +841,7 @@ struct App {
     next_target_test_request: u64,
     agent_navigator: Option<AgentNavigator>,
     pairing: Option<PairingOffer>,
+    pairing_approval: Option<PairingApproval>,
     attention: AttentionIndex,
     attention_center: Option<AttentionCenter>,
     notification_queue: NotificationQueue,
@@ -892,6 +893,7 @@ impl Default for App {
             next_target_test_request: 1,
             agent_navigator: None,
             pairing: None,
+            pairing_approval: None,
             attention: AttentionIndex::default(),
             attention_center: None,
             notification_queue: NotificationQueue::default(),
@@ -911,6 +913,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let configured_targets = config.targets.clone();
     let configured_notifications = config.notifications.clone();
     let mut active_config = expand_discovered_sessions(config).await;
+    let resolved_web = active_config.web.resolve().await;
     let (mut terminal, _guard) = enter_terminal()?;
     // The frontend keeps no target map: nothing it does reaches a Herdr server
     // directly any more. What it still needs from configuration is the
@@ -928,9 +931,10 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     // — otherwise pairing from here can only ever offer a code to be typed
     // into a client nothing is serving, and there is no address to make a QR
     // out of.
-    daemon_options.web_port = active_config.web.served_port();
-    daemon_options.web_address = active_config.web.bind_address();
-    daemon_options.web_url = active_config.web.scannable_url();
+    daemon_options.web_port = resolved_web.port;
+    daemon_options.web_address = resolved_web.address;
+    daemon_options.web_url = resolved_web.url;
+    daemon_options.web_bridge = resolved_web.bridge;
     let daemon = spawn_in_process(
         active_config.clone(),
         Some(config_path.clone()),
@@ -2144,6 +2148,29 @@ async fn handle_input(
     }
     if app.target_manager.is_some() {
         return handle_target_manager_input(key, transport_config, app);
+    }
+    if let Some(approval) = app.pairing_approval.clone() {
+        let approve = match key {
+            b'y' | b'Y' => Some(true),
+            b'n' | b'N' | 0x1b => Some(false),
+            _ => None,
+        };
+        if let Some(approve) = approve {
+            if let Some(client) = app.client.as_ref() {
+                client.decide_pairing(approval.attempt, approve);
+                app.message = Some(if approve {
+                    format!("approving {}…", approval.name)
+                } else {
+                    format!("rejecting {}…", approval.name)
+                });
+            } else {
+                app.message = Some("pairing approval is unavailable".to_owned());
+            }
+            app.pairing_approval = None;
+        } else {
+            app.message = Some("pairing approval: y approve · n reject".to_owned());
+        }
+        return Ok(false);
     }
     if app.pairing.is_some() {
         // A live pairing code is on screen; any key takes it down. There is
@@ -4847,6 +4874,37 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                 expires_in_seconds,
             });
         }
+        ServerMessage::PairingApprovalRequired {
+            attempt,
+            name,
+            confirmation,
+            expires_in_seconds,
+        } => {
+            app.pairing = None;
+            app.message = Some(format!(
+                "{name} requests access · confirm {confirmation} · y approve · n reject"
+            ));
+            app.pairing_approval = Some(PairingApproval {
+                attempt,
+                name,
+                confirmation,
+                expires_in_seconds,
+            });
+        }
+        ServerMessage::PairingDecision {
+            attempt,
+            approved: _,
+            message,
+        } => {
+            if app
+                .pairing_approval
+                .as_ref()
+                .is_some_and(|approval| approval.attempt == attempt)
+            {
+                app.pairing_approval = None;
+            }
+            app.message = Some(message);
+        }
         ServerMessage::Error { request, message } => {
             // A refusal ends whatever asked for it, so a failed transfer does
             // not leave the frontend waiting on a result that will not come.
@@ -4955,7 +5013,9 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
     }
     render_tabs(frame, state, app, tab_area);
     render_terminal_surfaces(frame, state, app, terminal_area);
-    if let Some(offer) = app.pairing.as_ref() {
+    if let Some(approval) = app.pairing_approval.as_ref() {
+        render_pairing_approval(frame, approval);
+    } else if let Some(offer) = app.pairing.as_ref() {
         render_pairing(frame, offer);
     } else if let Some(manager) = app.target_manager.as_ref() {
         render_target_manager(frame, manager);
@@ -5561,16 +5621,23 @@ struct PairingOffer {
     expires_in_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingApproval {
+    attempt: String,
+    name: String,
+    confirmation: String,
+    expires_in_seconds: u64,
+}
+
 impl PairingOffer {
     /// What a scanner should be sent to.
     ///
-    /// The code rides in the fragment rather than a query parameter, so it is
-    /// never sent to the server: it stays out of request lines, out of access
-    /// logs, and out of any reverse proxy in front. `None` when there is no
-    /// address to send anyone to.
+    /// The QR opens the fixed login page; the person types the separately
+    /// displayed one-time code there, like a device-login flow. Keeping the
+    /// code out of the QR also keeps it out of copied URLs and browser history.
+    /// `None` when there is no address to send anyone to.
     fn scan_target(&self) -> Option<String> {
-        let url = self.url.as_ref()?.trim_end_matches('#');
-        Some(format!("{url}#{}", self.code))
+        self.url.clone()
     }
 }
 
@@ -5754,6 +5821,44 @@ fn render_pairing(frame: &mut Frame, offer: &PairingOffer) {
     }
 
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+}
+
+fn render_pairing_approval(frame: &mut Frame, approval: &PairingApproval) {
+    let area = centered_popup(frame.area(), 58, 13);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" approve device ", Style::default().bold()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let seconds = approval.expires_in_seconds;
+    let confirmation = approval
+        .confirmation
+        .split_at(approval.confirmation.len().min(3));
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("{} wants to connect", approval.name)),
+            Line::default(),
+            Line::styled(
+                format!("{} {}", confirmation.0, confirmation.1),
+                Style::default().bold().fg(Color::Yellow),
+            ),
+            Line::styled(
+                "approve only if this number matches the browser",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::default(),
+            Line::from("[y] approve    [n] reject"),
+            Line::styled(
+                format!("expires in {seconds} seconds"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+        .alignment(Alignment::Center),
+        inner,
+    );
 }
 
 fn render_agent_navigator(frame: &mut Frame, state: &FederationState, navigator: &AgentNavigator) {
@@ -7059,7 +7164,7 @@ mod tests {
                 expires_in_seconds: 300,
             };
             let target = offer.scan_target().expect("an address is scannable");
-            assert!(target.ends_with("#ABCD-2345"), "{target}");
+            assert_eq!(target, url);
 
             // The popup as `render_pairing` asks for it, inside an ordinary
             // terminal, less the border and padding it draws.

@@ -32,7 +32,7 @@ use tokio::io::{
 use tokio::net::UnixListener;
 use tokio::process::Child;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::attention::{AttentionIndex, AttentionStore};
@@ -58,6 +58,7 @@ use crate::workspace_move;
 /// discovery. This matches the frontend's own refresh cadence, because both are
 /// bounded reads of the same durable file.
 pub const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_PENDING_PAIRING_APPROVALS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -74,14 +75,13 @@ pub struct DaemonOptions {
     pub web_address: Option<std::net::IpAddr>,
     /// The address a device outside this machine reaches the browser client on.
     ///
-    /// It cannot be derived from the bind, and a daemon that tried would be
-    /// confidently wrong: this process binds loopback, while a phone needs
-    /// whatever host, port and scheme the proxy in front of it terminates —
-    /// `https://host.tailnet.ts.net:8790` against a `127.0.0.1:8795` listener.
-    /// Deriving one from the other produces a perfectly valid QR of an
-    /// unreachable address, which is worse than no QR at all, so it is told
-    /// rather than guessed and `None` means a client shows the code alone.
+    /// The resolver supplies either the hosted bridge route, an explicit
+    /// operator URL, or a direct private/mesh route. `None` means a client
+    /// shows the pairing code alone.
     pub web_url: Option<String>,
+    /// Outbound public route for the loopback web listener. Its registration
+    /// secret is memory-only and redacted by the route's Debug implementation.
+    pub web_bridge: Option<crate::bridge::Route>,
 }
 
 impl DaemonOptions {
@@ -105,6 +105,7 @@ impl DaemonOptions {
             web_port: None,
             web_address: None,
             web_url: None,
+            web_bridge: None,
         })
     }
 }
@@ -172,6 +173,15 @@ enum Input {
         request: u64,
         transfer: String,
         staged: u64,
+    },
+    /// A browser proved knowledge of the short code. The durable device is not
+    /// created until a trusted client compares its confirmation number.
+    PairingRequested {
+        attempt: String,
+        name: String,
+        confirmation: String,
+        expires_at: SystemTime,
+        decision: oneshot::Sender<std::result::Result<String, String>>,
     },
     /// Stop serving. The loop leaves through the same exit a closed input
     /// channel uses, so shutdown has one path rather than two.
@@ -688,9 +698,13 @@ struct Daemon {
     /// pipe nobody is emptying.
     downloads: BTreeMap<(ClientId, u64), Download>,
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
+    pending_pairing_approvals: BTreeMap<String, PendingPairingApproval>,
     /// Where a device outside this machine reaches the browser client, when
     /// somebody told the daemon. Never derived: see `DaemonOptions::web_url`.
     web_url: Option<String>,
+    /// The short code currently published at the multi-tenant bridge. A watch
+    /// channel retains it across connector retries without writing it to disk.
+    bridge_pairing: Option<watch::Sender<Option<String>>>,
     /// Panes whose route opened with less access than was asked for, drained
     /// into the broker on the next pass.
     downgraded: Vec<PaneId>,
@@ -701,6 +715,12 @@ struct Daemon {
     refresh_inflight: bool,
     store: Option<FederationStore>,
     watcher: Option<JoinHandle<()>>,
+}
+
+struct PendingPairingApproval {
+    name: String,
+    expires_at: SystemTime,
+    decision: oneshot::Sender<std::result::Result<String, String>>,
 }
 
 /// One in-memory client attachment, for a frontend hosting its own daemon.
@@ -836,8 +856,10 @@ async fn serve_web_client(
     config: &Config,
     config_path: Option<&Path>,
     attach: &mpsc::UnboundedSender<DuplexStream>,
+    inputs: &mpsc::UnboundedSender<Input>,
     pending_pairing: &Arc<Mutex<Option<PendingPairing>>>,
-) -> Result<Option<(std::net::SocketAddr, JoinHandle<()>)>> {
+    bridge_pairing: &watch::Sender<Option<String>>,
+) -> Result<Option<(std::net::SocketAddr, JoinHandle<()>, Option<JoinHandle<()>>)>> {
     let Some(port) = options.web_port else {
         return Ok(None);
     };
@@ -860,11 +882,18 @@ async fn serve_web_client(
     let policy: std::sync::Arc<dyn web::Devices> = std::sync::Arc::new(DevicePolicy {
         config_path: config_path.map(Path::to_path_buf),
         devices: Mutex::new(config.devices.clone()),
+        inputs: inputs.clone(),
         pending: pending_pairing.clone(),
+        bridge_pairing: options.web_bridge.as_ref().map(|_| bridge_pairing.clone()),
     });
+    let bridge = options
+        .web_bridge
+        .clone()
+        .map(|route| crate::bridge::spawn_connector(route, address, bridge_pairing.subscribe()));
     Ok(Some((
         address,
         tokio::spawn(web::serve(listener, open, policy)),
+        bridge,
     )))
 }
 
@@ -881,6 +910,8 @@ async fn run(
     // person on one screen is the code a browser can spend.
     pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
 ) -> Result<()> {
+    let (bridge_pairing, _) = watch::channel::<Option<String>>(None);
+    let (inputs, mut received) = mpsc::unbounded_channel();
     // Before anything slow, because a browser client that cannot bind is a
     // pairing code that will name a port nothing answers on — and that is a
     // failure worth having at startup rather than at the pairing screen.
@@ -889,7 +920,9 @@ async fn run(
         &config,
         config_path.as_deref(),
         &attach,
+        &inputs,
         &pending_pairing,
+        &bridge_pairing,
     )
     .await?;
     if listener.is_some() {
@@ -904,12 +937,16 @@ async fn run(
             "super-herdr daemon listening on {}",
             options.socket.display()
         );
-        if let Some((address, _)) = web.as_ref() {
+        if let Some((address, _, bridge)) = web.as_ref() {
             // Printed rather than logged, because the address is what a person
             // needs in order to forward it.
             println!("super-herdr web client on http://{address}");
             if address.ip().is_loopback() {
-                println!("  forward this port to reach it from another device");
+                if bridge.is_some() {
+                    println!("  public bridge connector enabled");
+                } else {
+                    println!("  forward this port to reach it from another device");
+                }
             } else if config.devices.is_empty() {
                 println!("  no device is paired yet; ask the terminal client for a pairing code");
             }
@@ -917,8 +954,6 @@ async fn run(
     }
 
     let active = expand_discovered_sessions(config).await;
-    let (inputs, mut received) = mpsc::unbounded_channel();
-
     let attention_store = match options.attention_state.clone() {
         Some(path) => Some(AttentionStore::at(path)),
         None => AttentionStore::discover().ok(),
@@ -931,6 +966,7 @@ async fn run(
     let mut daemon = Daemon {
         broker: Broker::new(env!("CARGO_PKG_VERSION"), vec!["terminal".to_owned()]),
         web_url: options.web_url.clone(),
+        bridge_pairing: options.web_bridge.as_ref().map(|_| bridge_pairing.clone()),
         outboxes: BTreeMap::new(),
         routes: BTreeMap::new(),
         targets: target_map(&active),
@@ -945,6 +981,7 @@ async fn run(
         retained: BTreeMap::new(),
         downloads: BTreeMap::new(),
         pending_pairing,
+        pending_pairing_approvals: BTreeMap::new(),
         downgraded: Vec::new(),
         active,
         config_path: config_path.clone(),
@@ -1007,8 +1044,11 @@ async fn run(
     if let Some(refreshing) = refreshing {
         refreshing.abort();
     }
-    if let Some((_, serving)) = web {
+    if let Some((_, serving, bridge)) = web {
         serving.abort();
+        if let Some(bridge) = bridge {
+            bridge.abort();
+        }
     }
     daemon.discard_retained().await;
     daemon.stop_federation().await;
@@ -1023,7 +1063,9 @@ async fn run(
 struct DevicePolicy {
     config_path: Option<PathBuf>,
     devices: Mutex<Vec<Device>>,
+    inputs: mpsc::UnboundedSender<Input>,
     pending: Arc<Mutex<Option<PendingPairing>>>,
+    bridge_pairing: Option<watch::Sender<Option<String>>>,
 }
 
 impl DevicePolicy {
@@ -1041,6 +1083,12 @@ impl DevicePolicy {
             .map(|held| held.clone())
             .unwrap_or_default()
     }
+
+    fn clear_bridge_pairing(&self) {
+        if let Some(pairing) = self.bridge_pairing.as_ref() {
+            pairing.send_replace(None);
+        }
+    }
 }
 
 impl web::Devices for DevicePolicy {
@@ -1051,10 +1099,16 @@ impl web::Devices for DevicePolicy {
             .any(|device| pairing::matches(&device.token_sha256, &offered))
     }
 
-    fn pair(&self, code: &str, name: &str) -> Result<String> {
-        let Some(path) = self.config_path.clone() else {
+    fn pair(&self, code: &str, name: &str, confirmation: &str) -> Result<web::PairingDecision> {
+        if self.config_path.is_none() {
             anyhow::bail!("this daemon has no configuration file to record a device in");
-        };
+        }
+        if confirmation.len() != 6 || !confirmation.bytes().all(|byte| byte.is_ascii_digit()) {
+            anyhow::bail!("the browser did not provide a valid confirmation number");
+        }
+        let name = device_name(name);
+        let attempt = pairing::token()?;
+        let (decision, waiting) = oneshot::channel();
         let now = SystemTime::now();
         // The code is consumed by a match, not by an attempt: a wrong entry is
         // far more often a typo than an attack, and making somebody fetch a new
@@ -1069,6 +1123,7 @@ impl web::Devices for DevicePolicy {
             };
             if pending.expired(now) {
                 *held = None;
+                self.clear_bridge_pairing();
                 anyhow::bail!("that pairing code has expired; ask for another");
             }
             if !pending.accepts(code, now) {
@@ -1076,6 +1131,7 @@ impl web::Devices for DevicePolicy {
                 let remaining = pending.attempts_remaining();
                 if spent {
                     *held = None;
+                    self.clear_bridge_pairing();
                     anyhow::bail!("too many wrong codes; ask for another");
                 }
                 anyhow::bail!(
@@ -1085,17 +1141,17 @@ impl web::Devices for DevicePolicy {
             // Matched, so it is spent: a code overheard after use opens nothing.
             *held = None;
         }
-        let name = device_name(name);
-        let token = pairing::token()?;
-        Config::add_device_file(
-            Some(&path),
-            Device {
+        self.clear_bridge_pairing();
+        self.inputs
+            .send(Input::PairingRequested {
+                attempt,
                 name,
-                token_sha256: pairing::fingerprint(&token),
-                paired_at_ms: pairing::now_ms(now),
-            },
-        )?;
-        Ok(token)
+                confirmation: confirmation.to_owned(),
+                expires_at: now + web::PAIRING_APPROVAL_LIFETIME,
+                decision,
+            })
+            .map_err(|_| anyhow::anyhow!("the daemon stopped before it could ask for approval"))?;
+        Ok(waiting)
     }
 
     fn version(&self) -> String {
@@ -1483,6 +1539,39 @@ impl Daemon {
                 );
                 Vec::new()
             }
+            Input::PairingRequested {
+                attempt,
+                name,
+                confirmation,
+                expires_at,
+                decision,
+            } => {
+                if self.pending_pairing_approvals.len() >= MAX_PENDING_PAIRING_APPROVALS {
+                    let _ = decision.send(Err(
+                        "too many device approvals are already waiting".to_owned()
+                    ));
+                    Vec::new()
+                } else {
+                    let expires_in_seconds = expires_at
+                        .duration_since(SystemTime::now())
+                        .unwrap_or_default()
+                        .as_secs();
+                    self.pending_pairing_approvals.insert(
+                        attempt.clone(),
+                        PendingPairingApproval {
+                            name: name.clone(),
+                            expires_at,
+                            decision,
+                        },
+                    );
+                    self.broker.pairing_approval_required(
+                        attempt,
+                        name,
+                        confirmation,
+                        expires_in_seconds,
+                    )
+                }
+            }
             // The loop intercepts this before it reaches here; the arm exists so
             // adding a shutdown path later cannot silently do nothing.
             Input::Shutdown => Vec::new(),
@@ -1492,7 +1581,7 @@ impl Daemon {
                 // whatever nobody came for. It needs no timer of its own: what
                 // it bounds is measured in minutes.
                 self.sweep_retained();
-                Vec::new()
+                self.sweep_pairing_approvals()
             }
             Input::Reconfigured(config) => self.reconfigure(config),
         };
@@ -1644,6 +1733,9 @@ impl Daemon {
                 }
                 Effect::IssuePairingCode { client, request } => {
                     self.issue_pairing_code(client, request);
+                }
+                Effect::DecidePairing { attempt, approve } => {
+                    pending.extend(self.decide_pairing(attempt, approve));
                 }
                 Effect::ClearSeenAttention => {
                     if self.attention.clear_seen() {
@@ -1806,14 +1898,23 @@ impl Daemon {
                     .duration_since(now)
                     .unwrap_or_default()
                     .as_secs();
-                if let Ok(mut held) = self.pending_pairing.lock() {
-                    *held = Some(pending);
-                }
-                ServerMessage::PairingCode {
-                    request,
-                    code,
-                    expires_in_seconds,
-                    url: self.web_url.clone(),
+                match self.pending_pairing.lock() {
+                    Ok(mut held) => {
+                        *held = Some(pending);
+                        if let Some(pairing) = self.bridge_pairing.as_ref() {
+                            pairing.send_replace(Some(code.clone()));
+                        }
+                        ServerMessage::PairingCode {
+                            request,
+                            code,
+                            expires_in_seconds,
+                            url: self.web_url.clone(),
+                        }
+                    }
+                    Err(_) => ServerMessage::Error {
+                        request: Some(request),
+                        message: "pairing state is unavailable".to_owned(),
+                    },
                 }
             }
             Err(error) => ServerMessage::Error {
@@ -1824,6 +1925,95 @@ impl Daemon {
         if let Some(outbox) = self.outboxes.get(&client) {
             let _ = outbox.send(message);
         }
+    }
+
+    fn decide_pairing(&mut self, attempt: String, approve: bool) -> Vec<Effect> {
+        let Some(pending) = self.pending_pairing_approvals.remove(&attempt) else {
+            return self.broker.pairing_decided(
+                attempt,
+                false,
+                "that device approval is no longer waiting".to_owned(),
+            );
+        };
+        if pending.expires_at <= SystemTime::now() || pending.decision.is_closed() {
+            let _ = pending
+                .decision
+                .send(Err("device approval expired".to_owned()));
+            return self.broker.pairing_decided(
+                attempt,
+                false,
+                "device approval expired".to_owned(),
+            );
+        }
+        if !approve {
+            let _ = pending
+                .decision
+                .send(Err("device approval was rejected".to_owned()));
+            return self.broker.pairing_decided(
+                attempt,
+                false,
+                format!("{} was not paired", pending.name),
+            );
+        }
+        let result = (|| {
+            let path = self
+                .config_path
+                .as_ref()
+                .context("this daemon has no configuration file to record a device in")?;
+            let token = pairing::token()?;
+            Config::add_device_file(
+                Some(path),
+                Device {
+                    name: pending.name.clone(),
+                    token_sha256: pairing::fingerprint(&token),
+                    paired_at_ms: pairing::now_ms(SystemTime::now()),
+                },
+            )?;
+            Ok::<String, anyhow::Error>(token)
+        })();
+        let (approved, message) = match result {
+            Ok(token) => {
+                let delivered = pending.decision.send(Ok(token)).is_ok();
+                (
+                    delivered,
+                    if delivered {
+                        format!("{} paired", pending.name)
+                    } else {
+                        "the browser left before approval completed".to_owned()
+                    },
+                )
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = pending.decision.send(Err(message.clone()));
+                (false, message)
+            }
+        };
+        self.broker.pairing_decided(attempt, approved, message)
+    }
+
+    fn sweep_pairing_approvals(&mut self) -> Vec<Effect> {
+        let now = SystemTime::now();
+        let expired: Vec<String> = self
+            .pending_pairing_approvals
+            .iter()
+            .filter(|(_, pending)| pending.expires_at <= now || pending.decision.is_closed())
+            .map(|(attempt, _)| attempt.clone())
+            .collect();
+        let mut effects = Vec::new();
+        for attempt in expired {
+            if let Some(pending) = self.pending_pairing_approvals.remove(&attempt) {
+                let _ = pending
+                    .decision
+                    .send(Err("device approval expired".to_owned()));
+                effects.extend(self.broker.pairing_decided(
+                    attempt,
+                    false,
+                    "device approval expired".to_owned(),
+                ));
+            }
+        }
+        effects
     }
 
     /// Report a refusal, naming which check failed. Only a missing trailer is
@@ -2657,6 +2847,7 @@ mod tests {
             // Loopback, because a test may not have any other address.
             web_address: None,
             web_url: None,
+            web_bridge: None,
         };
 
         let daemon = super::spawn_in_process(empty_config(), None, options);
@@ -2753,6 +2944,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             };
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let server = tokio::spawn(serve_until(config, None, options, async move {
@@ -3004,6 +3196,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             },
         ));
 
@@ -3278,6 +3471,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             },
         ));
 
@@ -3643,6 +3837,7 @@ mod tests {
                     web_port: None,
                     web_address: None,
                     web_url: told.clone(),
+                    web_bridge: None,
                 },
                 async move {
                     let _ = stopped.await;
@@ -3682,6 +3877,132 @@ mod tests {
             let _ = stop.send(());
             let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_typed_code_needs_matching_trusted_approval_before_it_creates_a_device() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let config = local_target_config();
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(
+            config,
+            Some(config_path.clone()),
+            DaemonOptions {
+                socket: socket.clone(),
+                attention_state: Some(directory.path().join("attention.json")),
+                refresh_interval: Duration::from_secs(3600),
+                web_port: Some(port),
+                web_address: None,
+                web_url: Some("https://super-herdr.key-value.co".to_owned()),
+                web_bridge: None,
+            },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        let mut connection = None;
+        for _ in 0..200 {
+            if let Ok(stream) = UnixStream::connect(&socket).await {
+                connection = Some(Connection {
+                    reader: BufReader::new(stream),
+                });
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut connection = connection.expect("the daemon accepts a trusted client");
+        connection.hello().await;
+        connection.send(ClientMessage::SubscribeState).await;
+        connection
+            .send(ClientMessage::RequestPairingCode { request: 1 })
+            .await;
+        let code = loop {
+            if let ServerMessage::PairingCode { code, .. } = connection
+                .receive()
+                .await
+                .expect("the daemon issues a code")
+            {
+                break code;
+            }
+        };
+
+        let body =
+            format!("{{\"code\":\"{code}\",\"name\":\"phone\",\"confirmation\":\"482193\"}}");
+        let browser = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /pair HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        let attempt = loop {
+            match connection
+                .receive()
+                .await
+                .expect("the trusted client receives an approval request")
+            {
+                ServerMessage::PairingApprovalRequired {
+                    attempt,
+                    name,
+                    confirmation,
+                    ..
+                } => {
+                    assert_eq!(name, "phone");
+                    assert_eq!(confirmation, "482193");
+                    break attempt;
+                }
+                _ => continue,
+            }
+        };
+        assert!(
+            Config::load(Some(&config_path))
+                .unwrap()
+                .0
+                .devices
+                .is_empty(),
+            "knowing the short code created a device before approval"
+        );
+
+        connection
+            .send(ClientMessage::DecidePairing {
+                attempt,
+                approve: true,
+            })
+            .await;
+        let response = tokio::time::timeout(Duration::from_secs(10), browser)
+            .await
+            .expect("the browser did not receive the decision")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+        let loaded = Config::load(Some(&config_path)).unwrap().0;
+        assert_eq!(loaded.devices.len(), 1);
+        assert_eq!(loaded.devices[0].name, "phone");
+
+        let _ = stop.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
     }
 
     /// A caller's name reaches the host, and a bad one never leaves the daemon.
@@ -4198,6 +4519,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             },
             async move {
                 let _ = stopped.await;
@@ -4275,6 +4597,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             },
             async move {
                 let _ = stopped.await;
@@ -4314,6 +4637,7 @@ mod tests {
             web_port: None,
             web_address: None,
             web_url: None,
+            web_bridge: None,
         };
         let error = serve(empty_config(), None, options)
             .await
@@ -4340,6 +4664,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             },
         ));
 

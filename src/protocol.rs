@@ -47,7 +47,7 @@ use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 /// Incremented only for a change a peer at the previous version cannot honor.
 /// A mismatch closes the connection during the handshake; it never degrades
 /// into a partially understood session.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One message may not exceed this encoded size. The largest legitimate
 /// messages are a full-screen terminal frame and a bracketed paste, and the
@@ -289,6 +289,13 @@ pub enum ClientMessage {
     /// left in a file.
     #[serde(rename = "pairing.request")]
     RequestPairingCode { request: u64 },
+    /// Approve or reject the browser whose typed code matched.
+    ///
+    /// The short code only locates this daemon. It never grants a durable
+    /// device token by itself: a client that is already trusted must compare
+    /// the browser's confirmation number and make this explicit decision.
+    #[serde(rename = "pairing.decide")]
+    DecidePairing { attempt: String, approve: bool },
     /// Drop events that have been read. History is durable and shared, so
     /// forgetting part of it is a request like any other mutation.
     #[serde(rename = "attention.clear_seen")]
@@ -377,14 +384,29 @@ pub enum ServerMessage {
         /// which fails where the person holding the phone cannot tell a wrong
         /// address from a bad camera.
         ///
-        /// A client joins this to the code as `{url}#{code}`. The fragment is
-        /// deliberate: it is never sent to a server, so the code stays out of
-        /// request lines, out of the daemon's own path, and out of any proxy in
-        /// front of it. The daemon refuses a URL that already carries one,
-        /// because the code replacing it would fail like a bad code rather than
-        /// like a bad URL.
+        /// A client opens this address without modifying it. The person types
+        /// the separately displayed code into the browser, like a device-login
+        /// flow. The daemon refuses a URL that already carries a fragment so a
+        /// configuration cannot accidentally reintroduce credentials in links.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
+    },
+    /// A browser entered the right one-time code and is waiting for a trusted
+    /// client to compare the displayed confirmation number.
+    #[serde(rename = "pairing.approval_required")]
+    PairingApprovalRequired {
+        attempt: String,
+        name: String,
+        confirmation: String,
+        expires_in_seconds: u64,
+    },
+    /// An approval request was resolved, broadcast so every trusted client
+    /// dismisses the same prompt.
+    #[serde(rename = "pairing.decision")]
+    PairingDecision {
+        attempt: String,
+        approved: bool,
+        message: String,
     },
     /// A transfer may proceed, and this is where to send from.
     ///
@@ -660,6 +682,10 @@ mod tests {
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
         round_trip_client(ClientMessage::RequestPairingCode { request: 9 });
+        round_trip_client(ClientMessage::DecidePairing {
+            attempt: "a".repeat(64),
+            approve: true,
+        });
     }
 
     #[test]
@@ -720,6 +746,17 @@ mod tests {
             expires_in_seconds: 120,
             // What a daemon nobody told sends: a code to be typed.
             url: None,
+        });
+        round_trip_server(ServerMessage::PairingApprovalRequired {
+            attempt: "b".repeat(64),
+            name: "phone".to_owned(),
+            confirmation: "482193".to_owned(),
+            expires_in_seconds: 60,
+        });
+        round_trip_server(ServerMessage::PairingDecision {
+            attempt: "b".repeat(64),
+            approved: true,
+            message: "phone paired".to_owned(),
         });
         round_trip_server(ServerMessage::Error {
             request: Some(7),

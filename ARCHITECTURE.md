@@ -371,15 +371,15 @@ crash rather than as ordinary behaviour. SIGHUP is not handled: it conventionall
 means reload, the configuration already refreshes on its own schedule, and
 exiting on it would surprise anyone who closed a terminal.
 
-Exposure is deliberately delegated. The daemon binds to loopback or a private
-interface and is not published to the public internet; reachability from
-elsewhere is a WireGuard or Tailscale concern rather than a transport
-Super-Herdr reimplements. Each device is paired out of band—the TUI presents a
-pairing code—and receives a revocable per-device token recorded in the same
-atomic TOML store that already holds targets, bound to a TLS connection. This is
-device pairing for one operator's own clients. It is deliberately not the shared
-identity, authorization, or audit system the roadmap defers, and it must not
-grow into one by accident.
+The daemon itself is not published to the public Internet. It binds loopback
+and reaches the hosted bridge with an outbound connection; explicit private,
+WireGuard, Tailscale, and operator-proxy routes remain opt-outs. Each device is
+paired out of band—the TUI presents a one-time code typed at the fixed bridge
+site. A correctly typed code produces a fresh browser-generated six-digit
+comparison number on the trusted TUI; only an explicit matching approval creates
+a revocable per-device token in the same atomic TOML store that already holds
+targets. This is device pairing for one operator's own clients, not a shared
+identity or authorization system.
 
 The frontend is a client of that daemon and hosts one inside itself, so a
 single-machine install remains one command with no socket and no service to
@@ -429,9 +429,10 @@ becomes load-bearing the moment they are separate machines: behaviour that runs
 on the daemon host — an upload that leaves nothing behind when it fails
 verification, say — is a property of the binary installed there, and no client
 can observe it. The handshake already carries the daemon's version alongside its
-protocol number for exactly this reason, but nothing yet reads it. A client
-should learn the version and be able to say what it is, so the machine in the
-middle is identifiable rather than assumed current.
+protocol number for exactly this reason. The browser reads and displays it; the
+Rust client still validates the protocol and discards the version. That client
+should surface the version when it attaches to a daemon it does not host, so the
+machine in the middle is identifiable rather than assumed current.
 
 A browser cannot open a Unix socket, so the daemon can also serve the same
 protocol over two ordinary HTTP requests: its messages arrive on a server-sent
@@ -440,9 +441,11 @@ no masking, and no handshake beyond HTTP, which is why it is a small
 hand-written server rather than a web stack. Behind both requests is one
 ordinary in-process attachment, so a browser is a client of the same daemon in
 the same way the frontend is, through the same handshake, receiving the same
-vocabulary rather than a translation of it. When the client needs to type into a
-pane, the latency of a post per keystroke will argue for a socket upgrade; while
-it only observes, it does not.
+vocabulary rather than a translation of it. When the browser holds a pane's
+control lease, its line submissions and terminal-key buttons use the same posts.
+That is sufficient for deliberate phone input; a future client offering
+continuous per-keystroke interaction would have to justify a socket upgrade
+against the extra transport and authentication surface.
 
 A stream and the posts that steer it are separate requests, joined by an
 identifier the browser generates. Without that join, a subscription posted by
@@ -450,10 +453,49 @@ one request would be made on a connection another request is reading — which
 works until a second tab is open. The identifier is only ever a map key, so it
 keeps the characters that can be one and nothing else.
 
-A paired device may reach that listener directly; anything else must forward
-the port. Pairing starts from a client that is already trusted: it asks the
-daemon for a short code, the code appears on a screen someone already has, and a
-browser exchanges it for a token. The daemon stores only the token's digest, so
+A paired device normally reaches that listener through the fixed public bridge.
+The daemon binds loopback and opens the connection outward, so NAT, lack of a
+shared LAN, and lack of a Tailscale client on the phone do not become product
+requirements. Each daemon run creates a random public route and a separate
+registration secret. The secret is memory-only, travels in the connector's
+authorization header rather than the browser URL, and is redacted from Debug.
+The relay multiplexes raw HTTP connections as bounded opaque chunks; it never
+parses daemon messages, and route count, viewers per route, frame size, and
+queues all have hard ceilings. Losing one connector closes only its browser
+connections and never stops the daemon or a Herdr session.
+
+The bridge is trusted infrastructure: HTTPS/WSS protects both network legs, but
+TLS terminates there, so this is not end-to-end encryption against the bridge
+operator. The service and its proxy must never log request bodies, response
+bodies, authorization headers, terminal content, clipboard payloads, or pairing
+material. A future untrusted relay would require browser-to-daemon authenticated
+encryption and a way to make the served browser code itself trustworthy; opaque
+forwarding alone does not make that claim.
+
+The public relay is built as the separate `super-herdr-bridge` workspace
+package. The end-user `super-herdr` binary contains only the outbound connector
+and cannot be switched into a public listener. Separating the deployment unit
+keeps the relay's public attack surface and operational lifecycle out of the
+Homebrew and Debian client interface while sharing the narrow tunnel contract
+at compile time.
+
+Pairing still starts from a client that is already trusted: it asks the daemon
+for a short code, the code appears on a screen someone already has, and the
+daemon publishes that code over its authenticated connector for at most five
+minutes. A browser opens the fixed bridge page and types the code there. The
+bridge uses it only to select the owning route and forwards the request. The
+browser generates a six-digit comparison number with Web Crypto, and the daemon
+forwards the name and number to state-subscribed trusted clients. It atomically
+spends the short code but issues no token until a trusted client approves that
+exact pending request; rejection, timeout, or loss of the browser creates no
+credential. Codes are never put in a URL. Concurrent daemons have independent
+routes and pending codes; an accidental code collision is ambiguous and routes
+neither person. The bridge also bounds pairing submissions per Cloudflare
+source, but this is flood control rather than the authority check: even a valid
+short code grants only a comparison prompt.
+The successful token cookie is scoped to the random route, so devices for two
+daemons in one browser do not overwrite or cross-send one another. The daemon
+stores only the token's digest, so
 the configuration file is not itself a set of credentials — a copy of it hands
 nobody a working device — and revoking one is deleting a line, which takes
 effect at that device's next request rather than at the next restart. A code is
@@ -461,21 +503,29 @@ spent by a match rather than by an attempt, because a wrong entry is far more
 often a typo than an attack; it survives a few of those and is discarded after
 that, so a flood cannot keep one alive.
 
-A token authenticates a device. It does not encrypt anything, and the daemon
-does not pretend otherwise: it binds loopback or a private and mesh address and
-refuses a public one. On a mesh like WireGuard or Tailscale the network already
-provides confidentiality; on the open internet it would not, and the way in from
-there stays a forwarded port, which is an explicit act rather than a flag
-somebody set once. A genuinely local request is never asked for a token, since
-anyone who can reach loopback can already read the daemon's socket — but that
-is a claim about a process, not about an address. A proxy terminating TLS on a
-network and forwarding to loopback makes every visitor look local while being
-nothing of the kind, so a request carrying forwarding headers is asked like
-anything else arriving over a network. A client can of course set those headers
-itself, which costs it the exemption rather than gaining anything.
+When the hosted bridge is disabled, an existing Tailscale Serve configuration
+is a useful exception to the rule
+that a bind cannot reveal its outside URL: its read-only JSON status explicitly
+pairs an HTTPS host and port with a loopback proxy target. When exactly one root
+route matches Super-Herdr's preferred port on either side, the daemon binds the
+target and advertises the HTTPS side. It never creates or changes Serve state,
+and it does not adopt a public Funnel route without an explicit URL. Ambiguity
+falls back to the direct private-address listener rather than guessing which
+unrelated local service belongs to Super-Herdr.
 
-The page is held in the binary and refers to nothing it is not served, because a
-forwarded port has no route to anywhere else. It shows the daemon's version,
+A token authenticates a device. It does not encrypt anything, and the daemon
+does not pretend otherwise: it binds loopback for the TLS bridge, or a private
+and mesh address for a direct route, and refuses a public bind. There is no
+loopback exemption for the browser protocol. The root page and session status
+remain reachable so a new device can pair, but event streams and commands
+always require the HttpOnly device cookie. This keeps a proxy, another local
+process, and a directly opened loopback browser on the same authorization path.
+
+The page is held in the binary and prefixes requests with the random bridge
+route when it was loaded through one; direct listeners remain rooted at `/`.
+It groups the federation as target, session, workspace, and pane, opens a pane's
+viewer on selection, and keeps its keyboard disabled until that paired client
+owns the exclusive pane lease. It also shows the daemon's version,
 which the handshake has always carried: the page ships inside that binary, so
 the client a device loads is whichever version is installed on the daemon host,
 and a browser is exactly where a stale daemon would otherwise be invisible.
@@ -497,8 +547,9 @@ encoded ANSI untouched, which is what a client owning a VT parser wants and what
 the TUI uses. `screen` carries a rendered screen instead, for a client that
 cannot carry an emulator: vendoring one into the browser page would mean a
 megabyte of third-party JavaScript inside a signed binary, in the component most
-exposed to a network, shipping input handling to a viewer that is deliberately
-read-only.
+exposed to a network. The browser's explicit control input does not change that
+rendering boundary: it sends bytes only after obtaining the lease and still
+receives a server-rendered screen.
 
 This does not weaken the rule that encoded ANSI reaches a renderer without a
 lossy intermediate model. That rule forbids a *double* parse — a middle that
@@ -552,13 +603,13 @@ however far behind it falls.
 ## File bridge
 
 Moving a file between the machine a person is holding, the daemon host, and the
-target host is currently unsupported, and once the daemon is not the machine in
-front of the person, an ad hoc multi-hop copy becomes the default. That copy is
-unverified and it bypasses every boundary the rest of this document establishes.
-The bridge instead generalizes the verified upload the clipboard broker already
+target host cannot be an ad hoc multi-hop copy: that copy is unverified and
+bypasses every boundary the rest of this document establishes. The implemented
+bridge instead generalizes the verified upload the clipboard broker already
 performs: stream bytes into a private per-target staging directory, read back a
 byte count and SHA-256 receipt, verify it against the sender's own digest, and
-use the resulting path only after it verifies.
+use the resulting path only after it verifies. The protocol carries all three
+directions; the remaining work is to expose them consistently in each client.
 
 The generalization is narrow. Content is arbitrary rather than PNG, the name is
 supplied by the caller, the ceiling is configurable and separate from the image

@@ -1,0 +1,26 @@
+[package]
+name = "super-herdr-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Public rendezvous bridge for Super-Herdr browser clients"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mikro-design/super-herdr"
+
+[features]
+default = ["server"]
+server = ["dep:clap"]
+
+[[bin]]
+name = "super-herdr-bridge"
+path = "src/main.rs"
+required-features = ["server"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"], optional = true }
+futures-util = "0.3"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

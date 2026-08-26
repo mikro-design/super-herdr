@@ -70,19 +70,13 @@ enum Commands {
         /// Also serve the browser client on this port.
         #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "8790")]
         web: Option<u16>,
-        /// Address for the browser client. Loopback by default; a private or
-        /// mesh address lets paired devices reach it directly. A public
-        /// address is refused, because a device token authenticates but does
-        /// not encrypt.
+        /// Address for an explicit direct browser route. This bypasses the
+        /// default outbound bridge. A public address is refused because a
+        /// device token authenticates but does not encrypt.
         #[arg(long, value_name = "ADDRESS", requires = "web")]
         web_address: Option<std::net::IpAddr>,
-        /// Where a device outside this machine reaches the browser client, so
-        /// a pairing code can be offered as something scannable. This cannot
-        /// be worked out from the address above: behind a proxy that
-        /// terminates TLS, such as `tailscale serve`, the host, port and
-        /// scheme a phone needs are all different from what this process
-        /// binds. Without it a pairing code is shown to be typed, which is
-        /// what happens today.
+        /// Where a device reaches an operator-managed browser proxy. This
+        /// bypasses the default public bridge.
         #[arg(long, value_name = "URL", requires = "web")]
         web_url: Option<String>,
     },
@@ -392,12 +386,21 @@ async fn run() -> Result<ExitCode> {
             // A flag overrides the file; absent, the file is what the frontend
             // and this subcommand agree on, so a machine's own address is
             // stated once rather than retyped per invocation.
-            options.web_port = web.or_else(|| config.web.served_port());
-            options.web_address = web_address.or_else(|| config.web.bind_address());
-            options.web_url = web_url
-                .or_else(|| config.web.scannable_url())
-                .map(|url| super_herdr::pairing::pairing_url(&url))
-                .transpose()?;
+            let mut web_config = config.web.clone();
+            if let Some(port) = web {
+                web_config.port = Some(port);
+            }
+            if let Some(address) = web_address {
+                web_config.address = Some(address);
+            }
+            if let Some(url) = web_url {
+                web_config.url = Some(super_herdr::pairing::pairing_url(&url)?);
+            }
+            let resolved_web = web_config.resolve().await;
+            options.web_port = resolved_web.port;
+            options.web_address = resolved_web.address;
+            options.web_url = resolved_web.url;
+            options.web_bridge = resolved_web.bridge;
             // The daemon announces itself once it is actually listening; a
             // line printed here would be a claim rather than a report.
             serve(config, Some(path), options).await?;

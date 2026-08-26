@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudflare Tunnel for the Super-Herdr bridge
+After=network-online.target super-herdr-bridge.service
+Wants=network-online.target super-herdr-bridge.service
+
+[Service]
+ExecStart=%h/.local/bin/cloudflared --no-autoupdate --config %h/.cloudflared/config.yml tunnel run
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

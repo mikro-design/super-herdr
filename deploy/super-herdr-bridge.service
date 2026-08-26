@@ -1,0 +1,19 @@
+[Unit]
+Description=Super-Herdr public rendezvous bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/super-herdr-bridge --address 127.0.0.1:8789
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

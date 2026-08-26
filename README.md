@@ -66,15 +66,18 @@ It never takes over, stops, starts, or restarts a Herdr session.
   tab, and pane lifecycle operations.
 - Right-click session, workspace, tab, and pane menus backed by those same
   qualified lifecycle actions and close confirmations.
-- Pairing a device by scanning: with `--web-url`, the TUI draws the pairing code
-  as a QR a phone can read. The code travels in the URL fragment, which is never
-  sent to a server, so it stays out of request lines and out of any proxy in
-  front of the daemon. Without that flag the code is shown to be typed, because
-  a daemon binding loopback cannot know the address a phone would use and a
-  guess would scan perfectly and reach nothing.
-- Rendered pane observation in the browser client, bounded per viewer: a client
-  acknowledges each update it paints, and one that falls behind is sent the
-  screen as it stands rather than a backlog.
+- Device-login pairing: the hosted daemon serves the browser client on loopback
+  and opens an outbound tunnel to `super-herdr.key-value.co`, so the QR works
+  without Tailscale, inbound ports, or shared Wi-Fi. The QR opens the fixed
+  site; the person types the separately displayed five-minute code there, then
+  approves the browser's matching six-digit number in the trusted TUI. The
+  short code alone never creates a device credential.
+- Rendered pane observation and explicit control in the browser client, bounded
+  per viewer: a client acknowledges each update it paints, one that falls
+  behind is sent the screen as it stands rather than a backlog, and an observer
+  must take the pane's control lease before its keyboard can send anything.
+  Targets contain collapsible sessions, sessions contain workspaces, and a pane
+  click opens its viewer immediately instead of adding another flat list.
 
 ## Recommended topology
 
@@ -119,6 +122,14 @@ provided Makefile targets.
 
 ## Install
 
+Upgrade from 0.7.13 before using the browser client. That release could put the
+pairing code in the scanned URL and did not require a separate trusted approval
+after the code was entered. 0.7.14 keeps the code out of the URL, requires it to
+be typed, shows a fresh six-digit comparison number in the browser, and creates
+the device only after that number is explicitly approved in the Super-Herdr
+TUI. Every browser route requires a paired device, including a browser reaching
+the loopback listener directly.
+
 Upgrade from 0.7.0 if you served the browser client through a reverse proxy.
 0.7.0 exempted loopback from pairing, on the reasoning that anyone who can reach
 loopback can already read the daemon's socket. A proxy that terminates TLS on a
@@ -151,7 +162,7 @@ brew install mikro-design/tap/super-herdr
 
 # Debian and Ubuntu. The version is part of the asset name, so there is no
 # stable "latest" URL; set these to a published release and your architecture.
-version=0.7.13
+version=0.7.14
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -175,7 +186,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.7.13
+tag=v0.7.14
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -229,8 +240,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.7.13`
-must be tagged `v0.7.13`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.7.14`
+must be tagged `v0.7.14`.
 
 ### macOS
 
@@ -425,26 +436,55 @@ way the path is read the way a shell reads it: backslash escapes, single or
 double quotes, a trailing space, and a leading `~` all name the file they look
 like.
 
-The browser client is served by default, on port 8790, bound to this machine's
-own private address — the LAN one, or the `100.x` a mesh like Tailscale hands
-out — which it works out for itself. Nothing has to be configured for a pairing
-code to be scannable: `Ctrl+]` then `P` draws a QR pointing at an address the
-phone in your hand can reach. The listener refuses a public address, and answers
-nothing at all to a device that has not been paired.
+The browser client is served by default on loopback port 8790. Super-Herdr
+opens an outbound WebSocket to `https://super-herdr.key-value.co`, registers an
+unguessable memory-only route, and puts the fixed bridge address in the pairing
+QR. `Ctrl+]` then `P` displays a separate one-time code. The browser opens the
+fixed site and types that code; the bridge uses its expiring code registry only
+to locate the owning route, then forwards the pairing request to that daemon.
+The browser displays a fresh six-digit confirmation number. The daemon shows
+the same number in the already trusted TUI and creates the device only after a
+person explicitly approves that match. The daemon remains the authority that
+verifies and atomically spends the short code and issues the revocable token.
+The phone therefore needs ordinary Internet access but no Tailscale client, no
+inbound port, and no route to the desktop's LAN. The bridge forwards bounded
+opaque chunks to the existing authenticated web listener; it does not interpret
+or log terminal, clipboard, or credential payloads. TLS terminates at the
+bridge, so the operated bridge is a trusted relay rather than end-to-end
+encryption.
+
+The public relay is a separate workspace package and executable,
+`super-herdr-bridge`, rather than a server mode hidden inside the end-user
+binary. It normally listens on `127.0.0.1:8789` behind Cloudflare Tunnel or
+another HTTPS proxy. This keeps operating and releasing the Internet-facing
+service separate from installing the desktop client. The relay accepts only
+random fixed-length route IDs, authorizes a daemon registration with a separate
+memory-only secret, bounds routes, viewers, frame sizes, and queues, and drops
+only the affected browser route when a connector disappears. Many people can
+pair concurrently: each pending code maps to its own authenticated daemon
+route, expires after five minutes, and is removed when used. A code collision
+is treated as ambiguous and connects nobody. Successful cookies are scoped to
+the random route, so one browser can hold devices for more than one daemon
+without one token being sent to another. Pairing submissions are limited per
+Cloudflare source at the bridge; knowledge of a valid code still grants only a
+pending number-matching prompt, never a credential by itself.
 
 The `[web]` table changes that when it needs changing:
 
 ```toml
 [web]
 port = 8790                     # 0 serves no browser client at all
-address = "192.168.1.42"        # override what the machine worked out
-url = "https://host.ts.net"     # where a phone reaches it, if that differs
+bridge = false                  # opt out of the hosted bridge
+address = "192.168.1.42"        # use a direct private/mesh listener instead
+url = "https://host.ts.net"     # or name an operator-managed proxy
 ```
 
-`url` is only needed when the address a phone uses is not the address this
-process binds, which is what a proxy terminating TLS elsewhere does — with
-`tailscale serve` in front, the host, port and scheme all differ and cannot be
-derived.
+An explicit `address` or `url` bypasses the hosted bridge. With `bridge = false`
+and neither explicit value, Super-Herdr may reuse one unambiguous existing
+Tailscale Serve route by reading `tailscale serve status --json`; it never
+creates or changes Serve/Funnel state. Otherwise it derives a private or mesh
+address. Explicit `url` with no `address` keeps the listener on loopback; set
+`port` to the proxy's local target port when it differs from the outside port.
 
 A paired device watches panes and, when it asks for control, types into them.
 Control is asked for rather than assumed — a phone in a pocket should not be
@@ -455,12 +495,13 @@ line of text and the keys a terminal needs (Enter, Tab, Esc, Ctrl-C, and the
 arrows for shell history) reach the pane. Losing the lease to another client
 takes the keyboard away again rather than leaving one that cannot type.
 
-A pairing code may name any address the daemon is willing to bind, over plain
-HTTP included. Pairing sends the code to that host over that connection whether
-it was scanned or typed, so refusing to encode a URL the browser is about to use
-anyway removed the QR without protecting the code. A public address over HTTP is
-still refused. The `daemon` subcommand's `--web`, `--web-address` and
-`--web-url` flags override the table for one run.
+The QR and printed URL never contain the pairing code. It is typed into the
+browser and sent in a bounded POST body, which the bridge and proxy must not
+log. The browser then waits while the trusted TUI shows its name and comparison
+number; approving a different number is a refusal. Browsers never inherit trust
+from reaching loopback. A public address over HTTP is refused. The `daemon`
+subcommand's `--web`, `--web-address` and `--web-url` flags override the table
+for one run.
 
 `transfers.max_bytes` is the largest transfer this daemon will accept, and it
 defaults to one gibibyte. It bounds the target host's disk rather than

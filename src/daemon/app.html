@@ -56,6 +56,20 @@
   .wait { color: var(--wait); } .work { color: var(--work); } .gone { color: var(--gone); }
   .unread { box-shadow: inset 3px 0 0 var(--wait); }
   .empty { color: var(--dim); padding: .6rem .1rem; }
+  #panes { display: grid; gap: .8rem; }
+  #panes .target-card { margin: 0; padding: 0; overflow: hidden; }
+  .target-title { display: flex; align-items: baseline; gap: .6rem; padding: .75rem .85rem; border-bottom: 1px solid var(--line); }
+  .target-title .note { margin-left: auto; }
+  .session-group { border-bottom: 1px solid var(--line); }
+  .session-group:last-child { border-bottom: 0; }
+  .session-group > summary { cursor: pointer; padding: .65rem .85rem; color: var(--accent); }
+  .session-summary { display: inline-flex; width: calc(100% - 1.2rem); gap: .5rem; align-items: baseline; }
+  .session-summary .badge { margin-left: auto; }
+  .workspace-group { padding: .35rem .75rem .7rem 1.2rem; }
+  .workspace-title { display: flex; gap: .5rem; color: var(--dim); font-size: .78rem; margin: .35rem 0; }
+  .workspace-title .where { margin-left: auto; }
+  .pane-list li { margin-bottom: .35rem; padding: .55rem .65rem; background: var(--bg); }
+  .pane-list li:last-child { margin-bottom: 0; }
   button {
     font: inherit; color: var(--accent); background: none;
     border: 1px solid var(--line); border-radius: .55rem;
@@ -79,6 +93,8 @@
   }
   #code { text-transform: uppercase; letter-spacing: .12em; font-family: ui-monospace, monospace; }
   #pair-error { color: var(--wait); min-height: 1.2em; }
+  #pair-confirmation { padding: .7rem; border: 1px solid var(--line); border-radius: .55rem; }
+  #pair-confirmation strong { display: block; color: var(--text); font: 700 1.4rem ui-monospace, monospace; letter-spacing: .16em; }
   /* The screen keeps a terminal's own dark ground in either colour scheme: a
      program chose its colours against black, and re-grounding them on white
      would misreport what the pane looks like. */
@@ -94,6 +110,10 @@
   }
   #viewing { font-family: ui-monospace, monospace; text-transform: none; letter-spacing: 0; }
   #screen-note { align-self: center; }
+  #viewer { position: fixed; inset: 0; z-index: 5; overflow: auto; padding: 1rem; background: var(--bg); }
+  #viewer[hidden] { display: none; }
+  #viewer > * { max-width: 70rem; margin-left: auto; margin-right: auto; }
+  #viewer .screen { min-height: 55vh; }
 </style>
 
 <header>
@@ -112,6 +132,10 @@
   <label>Name this device <input id="name" autocomplete="off"
     placeholder="phone"></label>
   <div class="actions"><button id="pair">Pair</button></div>
+  <p class="note" id="pair-confirmation" hidden>
+    Compare this number with Super-Herdr before approving:
+    <strong id="pair-confirmation-value"></strong>
+  </p>
   <p class="note" id="pair-error"></p>
 </section>
 <main hidden>
@@ -122,7 +146,7 @@
   <ul id="history"><li class="empty">no transitions yet</li></ul>
   <div class="actions"><button id="mark">Mark all read</button></div>
 
-  <h2>Panes</h2>
+  <h2>Targets and sessions</h2>
   <ul id="panes"><li class="empty">no panes</li></ul>
 
   <section id="viewer" hidden>
@@ -149,32 +173,31 @@
       </div>
     </div>
   </section>
-
-  <h2>Federation</h2>
-  <ul id="targets"><li class="empty">no targets</li></ul>
 </main>
 
 <script>
 // One session joins the event stream to the commands that steer it. The daemon
 // keys its attachment on this, so a second tab is a second client rather than
-// two halves of one.
 const session = (crypto.randomUUID && crypto.randomUUID() || String(Math.random()).slice(2))
   .replace(/[^a-zA-Z0-9-]/g, '');
+
+// A hosted bridge gives each daemon a path. Direct listeners still live at the
+// origin root, so one prefix function keeps every request on whichever route
+// served this page without teaching the daemon about public rendezvous IDs.
+const bridged = location.pathname.match(/^\/r\/[0-9a-fA-F]{32}(?:\/|$)/);
+const basePath = bridged ? bridged[0].replace(/\/$/, '') : '';
+const endpoint = path => `${basePath}${path}`;
 
 // The daemon's own vocabulary, mirrored here. Nothing is derived locally: the
 // federation and the attention history are what the daemon last said they were.
 const targets = new Map();
-// Named for what it holds, and not `history`: a top-level `let history` shadows
-// `window.history` for the whole script, and the code that clears a scanned
-// pairing code out of the address bar calls `history.replaceState`. That threw,
-// and it threw before the page had rendered anything.
 let attention = [];
 
 const el = id => document.getElementById(id);
 const text = value => String(value == null ? '' : value);
 
 function send(message) {
-  return fetch(`/command?session=${session}`, {
+  return fetch(endpoint(`/command?session=${session}`), {
     method: 'POST',
     body: JSON.stringify(message),
   });
@@ -256,37 +279,6 @@ function renderHistory() {
   }
 }
 
-function renderTargets() {
-  const list = el('targets');
-  list.innerHTML = '';
-  if (!targets.size) {
-    list.innerHTML = '<li class="empty">no targets</li>';
-    return;
-  }
-  for (const [key, runtime] of [...targets.entries()].sort()) {
-    const snapshot = runtime.snapshot;
-    const item = document.createElement('li');
-    item.innerHTML = `<div class="row">
-        <span class="name"></span>
-        <span class="badge"></span>
-        <span class="where"></span>
-      </div><div class="note"></div>`;
-    item.querySelector('.name').textContent = key;
-    const badge = item.querySelector('.badge');
-    const live = runtime.connection === 'live';
-    badge.textContent = typeof runtime.connection === 'string'
-      ? runtime.connection
-      : Object.keys(runtime.connection)[0];
-    badge.classList.add(live ? 'work' : 'wait');
-    item.querySelector('.where').textContent = text(runtime.endpoint);
-    const counts = snapshot && snapshot.counts;
-    item.querySelector('.note').textContent = counts
-      ? `${counts.workspaces} workspaces · ${counts.panes} panes · ${counts.agents} agents`
-      : text(runtime.last_error) || 'no snapshot yet';
-    list.append(item);
-  }
-}
-
 // The pane being watched, and the screen the daemon last described. Nothing is
 // derived locally: a diff that does not follow the update we hold is refused
 // rather than guessed at, because a grid painted from a missed update stays
@@ -296,6 +288,10 @@ let watching = null;
 // and the safe one: a viewer that could type without being asked to would be a
 // phone in a pocket sending keystrokes to somebody's shell.
 let lease = 'observe';
+// A phone permits its soft keyboard to open only while handling the tap itself.
+// The lease answer arrives later on the event stream, so remember that narrow
+// interval separately from the access the daemon has actually granted.
+let requestingControl = false;
 let screen = null;
 let cell = null;
 
@@ -429,6 +425,7 @@ function observe(pane, label) {
   // A lease belongs to a pane, not to this page: watching something else means
   // holding nothing until the daemon says otherwise.
   lease = 'observe';
+  requestingControl = false;
   renderKeyboard();
   el('viewer').hidden = false;
   el('viewing').textContent = label || `${pane.target}/${pane.session}/${pane.resource}`;
@@ -455,6 +452,12 @@ function subscribeScreen(pane) {
 // and tells whoever held it, so this never takes one silently.
 function takeControl() {
   if (!watching) return;
+  requestingControl = true;
+  renderKeyboard();
+  // This runs synchronously inside the button tap. Waiting for `pane.lease`
+  // loses mobile browsers' user activation and leaves the input visible but
+  // the phone keyboard closed.
+  el('line').focus({ preventScroll: true });
   send({ type: 'pane.take_control', pane: watching });
   el('screen-note').textContent = 'asking for control…';
 }
@@ -484,18 +487,24 @@ const KEYS = {
   down: '\x1b[B',
 };
 
-// Shown only while this page holds control, because offering a keyboard that
-// cannot type is worse than offering none.
+// Reveal the input during the tap that requests control, but enable every send
+// action only after the daemon grants the lease. This opens a phone keyboard
+// without turning an optimistic UI transition into authorization.
 function renderKeyboard() {
   const holding = Boolean(watching) && lease === 'control';
-  el('keyboard').hidden = !holding;
-  el('control').hidden = holding || !watching;
+  el('keyboard').hidden = !holding && !requestingControl;
+  el('control').hidden = holding || requestingControl || !watching;
+  el('send').disabled = !holding;
+  for (const button of document.querySelectorAll('.keys button')) {
+    button.disabled = !holding;
+  }
 }
 
 function stopWatching(why) {
   if (watching) send({ type: 'pane.unsubscribe', pane: watching });
   watching = null;
   lease = 'observe';
+  requestingControl = false;
   renderKeyboard();
   screen = null;
   cell = null;
@@ -523,41 +532,134 @@ function resync() {
 
 function renderPanes() {
   const list = el('panes');
-  const rows = [];
-  for (const runtime of targets.values()) {
-    const snapshot = runtime.snapshot;
-    if (!snapshot) continue;
-    for (const pane of snapshot.panes || []) {
-      rows.push({ pane, snapshot });
-    }
-  }
   list.innerHTML = '';
-  if (!rows.length) {
-    list.innerHTML = '<li class="empty">no panes</li>';
+  if (!targets.size) {
+    list.innerHTML = '<li class="empty">no targets</li>';
     return;
   }
-  for (const row of rows) {
-    const id = row.pane.id;
-    const item = document.createElement('li');
-    item.className = 'tap';
-    item.innerHTML = `<div class="row">
-        <span class="name"></span>
-        <span class="badge"></span>
-        <span class="where"></span>
-      </div>`;
-    const label = row.pane.label || id.resource;
-    item.querySelector('.name').textContent = label;
-    const badge = item.querySelector('.badge');
-    if (row.pane.agent_status) {
-      badge.textContent = row.pane.agent_status;
-      badge.classList.add(phase(row.pane.agent_status));
-    } else {
-      badge.remove();
+
+  const grouped = new Map();
+  for (const runtime of targets.values()) {
+    const target = text(runtime.key && runtime.key.target) || 'unknown target';
+    if (!grouped.has(target)) grouped.set(target, []);
+    grouped.get(target).push(runtime);
+  }
+
+  for (const [target, runtimes] of [...grouped.entries()].sort()) {
+    const targetCard = document.createElement('li');
+    targetCard.className = 'target-card';
+    const targetTitle = document.createElement('div');
+    targetTitle.className = 'target-title';
+    const targetName = document.createElement('span');
+    targetName.className = 'name';
+    targetName.textContent = target;
+    const targetCount = document.createElement('span');
+    targetCount.className = 'note';
+    targetCount.textContent = `${runtimes.length} session${runtimes.length === 1 ? '' : 's'}`;
+    targetTitle.append(targetName, targetCount);
+    targetCard.append(targetTitle);
+
+    runtimes.sort((left, right) =>
+      text(left.key && left.key.session).localeCompare(text(right.key && right.key.session)));
+    for (const runtime of runtimes) {
+      const session = text(runtime.key && runtime.key.session) || 'default';
+      const details = document.createElement('details');
+      details.className = 'session-group';
+      details.open = runtimes.length === 1 || Boolean(runtime.snapshot && runtime.snapshot.focused_pane);
+      const summary = document.createElement('summary');
+      const summaryRow = document.createElement('span');
+      summaryRow.className = 'session-summary';
+      const sessionName = document.createElement('span');
+      sessionName.className = 'name';
+      sessionName.textContent = session;
+      const connection = document.createElement('span');
+      connection.className = 'badge';
+      const live = runtime.connection === 'live';
+      connection.textContent = typeof runtime.connection === 'string'
+        ? runtime.connection
+        : Object.keys(runtime.connection || {})[0] || 'unknown';
+      connection.classList.add(live ? 'work' : 'wait');
+      summaryRow.append(sessionName, connection);
+      summary.append(summaryRow);
+      details.append(summary);
+
+      const snapshot = runtime.snapshot;
+      if (!snapshot) {
+        const unavailable = document.createElement('p');
+        unavailable.className = 'workspace-group note';
+        unavailable.textContent = text(runtime.last_error) || 'no snapshot yet';
+        details.append(unavailable);
+        targetCard.append(details);
+        continue;
+      }
+
+      const workspaceStates = new Map(
+        (snapshot.workspaces || []).map(workspace => [workspace.id.resource, workspace]));
+      const workspaces = new Map();
+      for (const pane of snapshot.panes || []) {
+        const workspace = pane.workspace && pane.workspace.resource || 'other';
+        if (!workspaces.has(workspace)) workspaces.set(workspace, []);
+        workspaces.get(workspace).push(pane);
+      }
+      if (!workspaces.size) {
+        const empty = document.createElement('p');
+        empty.className = 'workspace-group note';
+        empty.textContent = 'no panes';
+        details.append(empty);
+      }
+      for (const [workspaceId, panes] of [...workspaces.entries()].sort()) {
+        const workspace = workspaceStates.get(workspaceId);
+        const workspaceGroup = document.createElement('section');
+        workspaceGroup.className = 'workspace-group';
+        const workspaceTitle = document.createElement('div');
+        workspaceTitle.className = 'workspace-title';
+        const workspaceName = document.createElement('span');
+        workspaceName.className = 'name';
+        workspaceName.textContent = workspace && workspace.label || workspaceId;
+        const workspaceCount = document.createElement('span');
+        workspaceCount.className = 'where';
+        workspaceCount.textContent = `${panes.length} pane${panes.length === 1 ? '' : 's'}`;
+        workspaceTitle.append(workspaceName, workspaceCount);
+        workspaceGroup.append(workspaceTitle);
+
+        const paneList = document.createElement('ul');
+        paneList.className = 'pane-list';
+        panes.sort((left, right) => text(left.id.resource).localeCompare(text(right.id.resource)));
+        for (const pane of panes) {
+          const id = pane.id;
+          const item = document.createElement('li');
+          item.className = 'tap';
+          const row = document.createElement('div');
+          row.className = 'row';
+          const paneName = document.createElement('span');
+          paneName.className = 'name';
+          const label = pane.label || id.resource;
+          paneName.textContent = label;
+          row.append(paneName);
+          if (pane.agent_status) {
+            const badge = document.createElement('span');
+            badge.className = `badge ${phase(pane.agent_status)}`;
+            badge.textContent = pane.agent_status;
+            row.append(badge);
+          }
+          const where = document.createElement('span');
+          where.className = 'where';
+          where.textContent = pane.tab && pane.tab.resource || 'terminal';
+          row.append(where);
+          item.append(row);
+          if (sameId(id, watching)) item.classList.add('unread');
+          item.addEventListener(
+            'click',
+            () => observe(id, `${target}/${session}/${workspaceName.textContent}/${label}`),
+          );
+          paneList.append(item);
+        }
+        workspaceGroup.append(paneList);
+        details.append(workspaceGroup);
+      }
+      targetCard.append(details);
     }
-    item.querySelector('.where').textContent = qualify(id);
-    if (sameId(id, watching)) item.classList.add('unread');
-    item.addEventListener('click', () => observe(id, `${qualify(id)}/${label}`));
-    list.append(item);
+    list.append(targetCard);
   }
 }
 
@@ -581,7 +683,6 @@ function apply(message) {
       for (const runtime of message.state.targets) {
         targets.set(`${runtime.key.target}/${runtime.key.session}`, runtime);
       }
-      renderTargets();
       renderWaiting();
       renderPanes();
       break;
@@ -589,7 +690,6 @@ function apply(message) {
       const key = `${message.target.target}/${message.target.session}`;
       if (message.state) targets.set(key, message.state);
       else targets.delete(key);
-      renderTargets();
       renderWaiting();
       renderPanes();
       break;
@@ -619,6 +719,7 @@ function apply(message) {
     case 'pane.lease':
       if (sameId(message.pane, watching)) {
         lease = message.access;
+        requestingControl = false;
         // A control lease that is refused or lost arrives as a downgrade to
         // observe rather than as an error, so this is also how the keyboard
         // goes away when somebody else takes the pane.
@@ -644,7 +745,7 @@ function apply(message) {
 }
 
 function connect() {
-  const stream = new EventSource(`/events?session=${session}`);
+  const stream = new EventSource(endpoint(`/events?session=${session}`));
   stream.onopen = () => {
     el('link').textContent = 'live';
     el('link').className = 'live';
@@ -673,6 +774,7 @@ el('mark').onclick = () => send({ type: 'attention.mark_all_seen' });
 el('control').onclick = takeControl;
 el('line-form').onsubmit = event => {
   event.preventDefault();
+  if (lease !== 'control') return;
   const line = el('line').value;
   // Enter is what a shell is waiting for, so a sent line carries it. An empty
   // line is still a line — it is how somebody asks for a fresh prompt.
@@ -691,38 +793,8 @@ window.addEventListener('resize', () => {
   paint();
 });
 
-// A scanned pairing code arrives in the fragment, never in a query string. A
-// fragment is not sent to the server, so the code stays out of request lines,
-// out of any access log, and out of a reverse proxy that would otherwise see
-// every pairing attempt in clear. It is stripped from the address before
-// anything else runs, so a bookmark, a shared link or the back button cannot
-// carry a live credential.
-function codeFromFragment() {
-  const raw = (location.hash || '').replace(/^#/, '');
-  if (!raw) return '';
-  history.replaceState(null, '', location.pathname + location.search);
-  let decoded = '';
-  try {
-    decoded = decodeURIComponent(raw).trim();
-  } catch (_) {
-    return '';
-  }
-  // Bounded, not shaped. Anything can link to this page, so the fragment is
-  // attacker-supplied and this value goes straight into a form field — a length
-  // and character bound is what that needs.
-  //
-  // It deliberately does not encode what a code looks like. The daemon defines
-  // that, in one place, and already accepts a code however it was typed:
-  // `normalize_code` treats case and separators as presentation. A pattern here
-  // would be a second definition with nothing holding the two together, and the
-  // day they disagreed every scan would quietly degrade to typing with no error
-  // anywhere and a person debugging it from a phone. Whether a code is right is
-  // the daemon's to answer, and it answers in constant time.
-  return /^[A-Za-z0-9-]{1,32}$/.test(decoded) ? decoded.toUpperCase() : '';
-}
-
-// A guess the person can correct, so a device that pairs by scanning still ends
-// up with a name worth seeing in `device list` rather than an empty one.
+// A guess the person can correct, so a device still ends up with a name worth
+// seeing in `device list` rather than an empty one.
 function suggestedName() {
   const agent = navigator.userAgent || '';
   if (/iPad|Tablet/i.test(agent)) return 'iPad';
@@ -730,15 +802,21 @@ function suggestedName() {
   return 'browser';
 }
 
+function confirmationNumber() {
+  if (!globalThis.crypto || !crypto.getRandomValues) {
+    throw new Error('secure randomness is unavailable');
+  }
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  return String(random[0] % 1000000).padStart(6, '0');
+}
+
 // The version of the daemon, not of this page: the page ships inside that
 // binary, so a stale daemon is otherwise invisible from here.
 async function start() {
-  // Read first, and unconditionally, so the address is cleaned even when the
-  // device turns out to be paired already.
-  const scanned = codeFromFragment();
   let session_state = { paired: true, version: '' };
   try {
-    session_state = await (await fetch('/session')).json();
+    session_state = await (await fetch(endpoint('/session'))).json();
   } catch (_) {
     // If this cannot be reached, the stream will not connect either, and the
     // link indicator is the honest place to show that.
@@ -746,15 +824,8 @@ async function start() {
   el('version').textContent = session_state.version ? `daemon ${session_state.version}` : '';
   if (!session_state.paired) {
     el('pairing').hidden = false;
-    if (scanned) {
-      // The code is the part worth not retyping on a phone. The name is left
-      // for a person, because a device nobody named is one nobody can revoke
-      // with any confidence later.
-      el('code').value = scanned;
-      el('name').value = el('name').value || suggestedName();
-      el('name').focus();
-      el('name').select();
-    }
+    el('name').value = el('name').value || suggestedName();
+    el('code').focus();
     return;
   }
   document.querySelector('main').hidden = false;
@@ -763,17 +834,33 @@ async function start() {
 
 el('pair').onclick = async () => {
   el('pair-error').textContent = '';
-  const response = await fetch('/pair', {
-    method: 'POST',
-    body: JSON.stringify({ code: el('code').value, name: el('name').value }),
-  });
-  if (response.ok) {
-    // The token arrived as a cookie the page cannot read, so there is nothing
-    // to store here; reloading picks it up.
-    location.reload();
-    return;
+  el('pair').disabled = true;
+  try {
+    const confirmation = confirmationNumber();
+    el('pair-confirmation-value').textContent = confirmation.replace(/(...)/, '$1 ');
+    el('pair-confirmation').hidden = false;
+    el('pair-error').textContent = 'Waiting for approval in Super-Herdr…';
+    const response = await fetch(endpoint('/pair'), {
+      method: 'POST',
+      body: JSON.stringify({
+        code: el('code').value,
+        name: el('name').value,
+        confirmation,
+      }),
+    });
+    if (response.ok) {
+      // The token arrived as a cookie the page cannot read, so there is nothing
+      // to store here; reloading picks it up.
+      location.reload();
+      return;
+    }
+    el('pair-confirmation').hidden = true;
+    el('pair-error').textContent = await response.text();
+  } catch (_) {
+    el('pair-confirmation').hidden = true;
+    el('pair-error').textContent = 'Pairing could not be completed. Try again.';
   }
-  el('pair-error').textContent = await response.text();
+  el('pair').disabled = false;
 };
 
 start();

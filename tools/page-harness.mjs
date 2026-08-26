@@ -11,15 +11,29 @@ const script = html.slice(
 
 const sent = [];
 const nodes = new Map();
+let created = 0;
 const node = id => {
   if (!nodes.has(id)) {
-    nodes.set(id, {
+    const held = {
       id, hidden: false, textContent: '', innerHTML: '', value: '',
-      className: '', style: {}, dataset: {}, children: [],
-      append() {}, remove() {}, addEventListener() {},
+      className: '', style: {}, dataset: {}, children: [], disabled: false,
+      append(...children) { this.children.push(...children); },
+      remove() {},
+      addEventListener(type, listener) { this[`on${type}`] = listener; },
+      setAttribute(name, value) { this[name] = value; },
+      focus() { this.focused = true; },
       getBoundingClientRect: () => ({ width: 8, height: 16 }),
-      clientWidth: 800, appendChild() {},
-    });
+      clientWidth: 800,
+      appendChild(child) { this.children.push(child); },
+    };
+    held.classList = {
+      add(...names) {
+        held.className = [...new Set(`${held.className} ${names.join(' ')}`.trim().split(/\s+/))]
+          .filter(Boolean).join(' ');
+      },
+    };
+    held.querySelector = selector => node(`${id}-${selector}`);
+    nodes.set(id, held);
   }
   return nodes.get(id);
 };
@@ -32,15 +46,18 @@ const keyButtons = ['enter', 'tab', 'escape', 'interrupt', 'up', 'down'].map(key
 
 globalThis.document = {
   getElementById: node,
-  createElement: () => node(`created-${Math.random()}`),
+  createElement: () => node(`created-${created++}`),
   querySelector: selector => node(`sel-${selector}`),
   querySelectorAll: selector => (selector === '.keys button' ? keyButtons : []),
   body: node('body'),
   addEventListener() {},
 };
-globalThis.window = { addEventListener() {}, location: { hash: '', href: 'http://host/' } };
+const pathname = process.argv[3] || '/';
+globalThis.window = {
+  addEventListener() {},
+  location: { href: `http://host${pathname}`, pathname, search: '' },
+};
 globalThis.location = globalThis.window.location;
-globalThis.history = { replaceState() {} };
 globalThis.getComputedStyle = () => ({ lineHeight: '16px', fontSize: '16px' });
 Object.defineProperty(globalThis, 'crypto', {
   value: { randomUUID: () => 'session-under-test' },
@@ -56,7 +73,7 @@ class StubEventSource {
 }
 globalThis.EventSource = StubEventSource;
 
-const module = new Function(`${script}\nreturn { apply, observe, takeControl, el, KEYS };`);
+const module = new Function(`${script}\nreturn { apply, observe, takeControl, el, KEYS, endpoint, renderPanes };`);
 const page = module();
 
 const deliver = message => page.apply(message);
@@ -69,6 +86,43 @@ const check = (what, condition) => {
     console.log(`ok: ${what}`);
   }
 };
+
+const expectedPrefix = pathname.startsWith('/r/') ? pathname.replace(/\/$/, '') : '';
+check('requests stay on the served route', page.endpoint('/session') === `${expectedPrefix}/session`);
+
+// Navigation mirrors the identity hierarchy instead of flattening every pane.
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [
+      {
+        key: { target: 'first', session: 'main' }, connection: 'live',
+        snapshot: {
+          workspaces: [{
+            id: { target: 'first', session: 'main', resource: 'w1' },
+            label: 'compiler',
+          }],
+          panes: [{
+            id: pane,
+            workspace: { target: 'first', session: 'main', resource: 'w1' },
+            tab: { target: 'first', session: 'main', resource: 'w1:t1' },
+            label: 'shell',
+          }],
+        },
+      },
+      {
+        key: { target: 'first', session: 'other' }, connection: 'connecting',
+        snapshot: { workspaces: [], panes: [] },
+      },
+      {
+        key: { target: 'second', session: 'main' }, connection: 'live',
+        snapshot: { workspaces: [], panes: [] },
+      },
+    ],
+  },
+});
+check('groups sessions under two targets', page.el('panes').children.length === 2);
+check('keeps two sessions under the first target', page.el('panes').children[0].children.length === 3);
 
 // Watching a pane: observing, and no keyboard offered.
 page.observe(pane, 'first/main/w1:p1');
@@ -89,11 +143,22 @@ check('an observer sends no input', sent.length === 0);
 // Ask for control.
 page.takeControl();
 check('asks for control', sent.at(-1).body.type === 'pane.take_control');
+check('reveals the keyboard during the control tap', page.el('keyboard').hidden === false);
+check('focuses the line during the control tap', page.el('line').focused === true);
+check('does not enable Send before the lease arrives', page.el('send').disabled === true);
+check('does not enable terminal keys before the lease arrives', keyButtons.every(one => one.disabled));
+sent.length = 0;
+page.el('line').value = 'typed while waiting';
+page.el('line-form').onsubmit({ preventDefault() {} });
+check('sends nothing before control is granted', sent.length === 0);
+check('keeps a line typed while waiting', page.el('line').value === 'typed while waiting');
 
 // The daemon grants it.
 deliver({ type: 'pane.lease', pane, access: 'control' });
 check('the keyboard appears with control', page.el('keyboard').hidden === false);
 check('control is no longer offered', page.el('control').hidden === true);
+check('enables Send only with control', page.el('send').disabled === false);
+check('enables terminal keys only with control', keyButtons.every(one => !one.disabled));
 
 // A typed line arrives as bytes, with the Enter a shell is waiting for.
 sent.length = 0;

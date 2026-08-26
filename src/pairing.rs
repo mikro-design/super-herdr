@@ -10,7 +10,8 @@
 //! the daemon refuses to bind an address that is not loopback or a private
 //! range. On a mesh like WireGuard or Tailscale that is already true; on the
 //! open internet it would not be, and the way to reach the daemon from there is
-//! a forwarded port rather than a flag.
+//! the TLS public bridge or an operator-managed proxy rather than a public
+//! listener.
 
 use std::fs::File;
 use std::io::Read;
@@ -22,12 +23,12 @@ use sha2::{Digest, Sha256};
 /// A pairing code is read off one screen and typed into another, so it avoids
 /// the characters people confuse when doing that.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const CODE_CHARACTERS: usize = 8;
+pub const CODE_CHARACTERS: usize = super_herdr_bridge::PAIRING_CODE_CHARACTERS;
 const TOKEN_BYTES: usize = 32;
 
 /// How long a pairing code stays usable. Long enough to walk to another device,
 /// short enough that one left on a screen is not a standing invitation.
-pub const CODE_LIFETIME: Duration = Duration::from_secs(300);
+pub const CODE_LIFETIME: Duration = super_herdr_bridge::PAIRING_CODE_LIFETIME;
 
 /// Random bytes from the kernel.
 ///
@@ -62,12 +63,7 @@ pub fn pairing_code() -> Result<String> {
 
 /// Accept a code however it was typed: case and separators are presentation.
 pub fn normalize_code(entered: &str) -> String {
-    entered
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .map(|character| character.to_ascii_uppercase())
-        .take(CODE_CHARACTERS)
-        .collect()
+    super_herdr_bridge::normalize_pairing_code(entered)
 }
 
 pub fn fingerprint(token: &str) -> String {
@@ -86,10 +82,9 @@ pub fn fingerprint(token: &str) -> String {
 /// looking at a terminal.
 ///
 /// What is checked is what this can know: a scheme it makes sense to open, a
-/// host that is not empty, and no fragment — the code becomes the fragment, and
-/// one already there would be silently replaced. Whether the host resolves and
-/// whether a certificate validates are not knowable from here and are not
-/// pretended at.
+/// host that is not empty, and no fragment. Device-login codes are typed into
+/// the page and never belong in a URL. Whether the host resolves and whether a
+/// certificate validates are not knowable from here and are not pretended at.
 pub fn pairing_url(url: &str) -> Result<String> {
     let trimmed = url.trim();
     let (scheme, rest) = trimmed
@@ -114,7 +109,7 @@ pub fn pairing_url(url: &str) -> Result<String> {
         bail!("a pairing URL over http would carry the code in clear; use https");
     }
     if trimmed.contains('#') {
-        bail!("a pairing URL cannot carry a fragment; the code is the fragment");
+        bail!("a pairing URL cannot carry a fragment; device-login codes stay out of URLs");
     }
     Ok(trimmed.trim_end_matches('/').to_owned())
 }
@@ -269,7 +264,7 @@ mod tests {
             ("http://93.184.216.34:8790", "clear"),
             ("http://8.8.8.8", "clear"),
             ("https://", "host"),
-            // The code becomes the fragment; one already there would vanish.
+            // Device-login URLs are stable bases; codes never belong in them.
             ("https://host.example/#already", "fragment"),
         ] {
             let error = super::pairing_url(url)
@@ -279,7 +274,7 @@ mod tests {
         }
 
         // A trailing slash would otherwise become a double slash before the
-        // fragment.
+        // stable device-login URL.
         assert_eq!(
             super::pairing_url("https://host.example:8790/").unwrap(),
             "https://host.example:8790"

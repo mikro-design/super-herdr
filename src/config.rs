@@ -1,9 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,7 @@ impl Default for WebConfig {
             port: default_web_port(),
             address: None,
             url: None,
+            bridge: true,
         }
     }
 }
@@ -75,27 +79,26 @@ impl WebConfig {
         self == &Self::default()
     }
 
-    /// Where a device reaches the browser client, given or worked out.
+    /// Where a device reaches a direct browser listener, given or worked out.
     ///
     /// Worked out, because asking somebody to write down a URL for a listener
     /// they have already located is a question with an answer the program is
     /// holding: bound to a private address on a known port, the URL is that
     /// address on that port and nothing else.
     ///
-    /// Not derivable from loopback, which no other device can reach, and not
-    /// derivable through a proxy that terminates TLS somewhere else — that is
-    /// what `url` is for, and it stays the override.
+    /// A proxy route is resolved separately because its status, rather than its
+    /// loopback bind, is what knows the outside URL.
     pub fn scannable_url(&self) -> Option<String> {
         self.scannable_url_from(own_private_address())
     }
 
-    /// What to bind: the address given, or this machine's own if it has one.
+    /// What to bind directly: the address given, or this machine's own if it
+    /// has one. An explicit proxy URL with no address keeps this as loopback.
     ///
     /// Serving the browser client is only ever for another device, so binding
     /// somewhere no other device can reach makes the feature ornamental.
     pub fn bind_address(&self) -> Option<std::net::IpAddr> {
-        self.served_port()?;
-        self.address.or_else(own_private_address)
+        self.bind_address_from(own_private_address())
     }
 
     /// The port actually served, with zero meaning none.
@@ -118,6 +121,201 @@ impl WebConfig {
             std::net::IpAddr::V6(address) => format!("http://[{address}]:{port}"),
         })
     }
+
+    fn bind_address_from(&self, detected: Option<IpAddr>) -> Option<IpAddr> {
+        self.served_port()?;
+        // An explicit outside URL normally names a proxy whose local side is
+        // loopback. Binding a guessed mesh address as well would publish a
+        // second, unrequested route around that proxy. An explicit address can
+        // still choose otherwise.
+        self.address
+            .or_else(|| self.url.is_none().then_some(detected).flatten())
+    }
+
+    /// Resolve the listener and the URL a phone needs as one decision.
+    ///
+    /// The public bridge is the unconfigured path and keeps the listener on
+    /// loopback. An explicit URL or address is an operator's direct route. If
+    /// the bridge is disabled, a persisted Tailscale Serve route may state both
+    /// the HTTPS name a device opens and the loopback target to bind. Nothing
+    /// here creates or changes Serve or Funnel state.
+    pub async fn resolve(&self) -> ResolvedWeb {
+        let detected = own_private_address();
+        if self.served_port().is_none() || self.address.is_some() || self.url.is_some() {
+            return self.resolve_from(detected, None);
+        }
+        if self.bridge
+            && let Ok(route) = crate::bridge::Route::new(crate::bridge::DEFAULT_BRIDGE_URL)
+        {
+            return ResolvedWeb {
+                port: self.served_port(),
+                address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                url: Some(route.login_url()),
+                bridge: Some(route),
+            };
+        }
+        let status = tailscale_serve_status().await;
+        self.resolve_from(detected, status.as_deref())
+    }
+
+    fn resolve_from(&self, detected: Option<IpAddr>, status: Option<&[u8]>) -> ResolvedWeb {
+        if self.address.is_none()
+            && self.url.is_none()
+            && let (Some(port), Some(status)) = (self.served_port(), status)
+            && let Some(route) = tailscale_web_route(status, port)
+        {
+            return ResolvedWeb {
+                port: Some(route.bind.port()),
+                address: Some(route.bind.ip()),
+                url: Some(route.url),
+                bridge: None,
+            };
+        }
+        ResolvedWeb {
+            port: self.served_port(),
+            address: self.bind_address_from(detected),
+            url: self.scannable_url_from(detected),
+            bridge: None,
+        }
+    }
+}
+
+/// Both sides of the browser route, including an optional outbound connector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWeb {
+    pub port: Option<u16>,
+    pub address: Option<IpAddr>,
+    pub url: Option<String>,
+    pub bridge: Option<crate::bridge::Route>,
+}
+
+const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_TAILSCALE_STATUS_BYTES: usize = 1024 * 1024;
+
+/// Ask only for persisted status. This never invokes `serve`, `funnel`, or a
+/// command that changes Tailscale state, and every failure falls back to the
+/// direct private-address route.
+async fn tailscale_serve_status() -> Option<Vec<u8>> {
+    let mut command = tokio::process::Command::new("tailscale");
+    command
+        .args(["serve", "status", "--json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(TAILSCALE_STATUS_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    (output.status.success() && output.stdout.len() <= MAX_TAILSCALE_STATUS_BYTES)
+        .then_some(output.stdout)
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleServeStatus {
+    #[serde(rename = "TCP", default)]
+    tcp: BTreeMap<String, TailscaleTcp>,
+    #[serde(rename = "Web", default)]
+    web: BTreeMap<String, TailscaleWeb>,
+    #[serde(rename = "AllowFunnel", default)]
+    allow_funnel: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleTcp {
+    #[serde(rename = "HTTPS", default)]
+    https: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleWeb {
+    #[serde(rename = "Handlers", default)]
+    handlers: BTreeMap<String, TailscaleHandler>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleHandler {
+    #[serde(rename = "Proxy")]
+    proxy: Option<String>,
+}
+
+struct TailscaleWebRoute {
+    bind: SocketAddr,
+    url: String,
+    rank: u8,
+}
+
+/// Find one unambiguous root HTTPS proxy associated with Super-Herdr's port.
+///
+/// Matching either side covers both normal Tailscale forms: external 443 to a
+/// service on 8790, and external 8790 to a different loopback port. A tie is
+/// refused rather than choosing somebody else's service by map order.
+fn tailscale_web_route(status: &[u8], preferred_port: u16) -> Option<TailscaleWebRoute> {
+    let status: TailscaleServeStatus = serde_json::from_slice(status).ok()?;
+    let mut candidates = status
+        .web
+        .iter()
+        .filter_map(|(endpoint, web)| {
+            // Serve stays inside the tailnet. Funnel is public Internet
+            // exposure and must remain an explicit `[web].url` decision even
+            // when somebody has already configured such a route in Tailscale.
+            if status.allow_funnel.get(endpoint).copied().unwrap_or(false) {
+                return None;
+            }
+            let (host, external_port) = tailscale_endpoint(endpoint)?;
+            status
+                .tcp
+                .get(&external_port.to_string())?
+                .https
+                .then_some(())?;
+            let bind = loopback_proxy(web.handlers.get("/")?.proxy.as_deref()?)?;
+            let rank = if external_port == preferred_port {
+                2
+            } else if bind.port() == preferred_port {
+                1
+            } else {
+                return None;
+            };
+            let authority = if external_port == 443 {
+                host.to_owned()
+            } else {
+                format!("{host}:{external_port}")
+            };
+            Some(TailscaleWebRoute {
+                bind,
+                url: format!("https://{authority}"),
+                rank,
+            })
+        })
+        .collect::<Vec<_>>();
+    let best = candidates.iter().map(|candidate| candidate.rank).max()?;
+    candidates.retain(|candidate| candidate.rank == best);
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn tailscale_endpoint(endpoint: &str) -> Option<(&str, u16)> {
+    let (host, port) = endpoint.rsplit_once(':')?;
+    let lowercase = host.to_ascii_lowercase();
+    (!host.is_empty()
+        && lowercase.ends_with(".ts.net")
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
+    .then_some((host, port.parse().ok()?))
+}
+
+fn loopback_proxy(proxy: &str) -> Option<SocketAddr> {
+    let authority = proxy.strip_prefix("http://")?;
+    if authority.contains(['/', '?', '#']) {
+        return None;
+    }
+    if let Some(port) = authority.strip_prefix("localhost:") {
+        return Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port.parse().ok()?,
+        ));
+    }
+    let address: SocketAddr = authority.parse().ok()?;
+    address.ip().is_loopback().then_some(address)
 }
 
 /// This machine's own address on whatever private network it is on.
@@ -190,33 +388,33 @@ impl Default for TransportConfig {
 /// the program is normally run — hosted a daemon that served no browser client
 /// and knew no address. Pairing from there could only ever offer a code to be
 /// typed into a client that was not running, and a QR needs an address, so
-/// there was never one to show. A configuration file is where a machine's own
-/// address belongs anyway: it does not change between runs, and retyping it as
-/// a flag every time is how it ends up not being set.
+/// there was never one to show. The default is now the fixed public bridge;
+/// this table holds the deliberate opt-outs and direct-route overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebConfig {
-    /// Serve the browser client on this port.
+    /// Prefer this browser-client port.
     ///
-    /// Served by default, because a pairing code with nothing to pair to is
-    /// the state this spent its whole life in: the frontend hosted a daemon
-    /// that served no client, so the code named nothing and there was no
-    /// address to make a QR of. The listener binds a private address, refuses
-    /// a public one, and answers nothing to a device that has not been paired
-    /// — so what it costs is a port on a network somebody already trusts.
+    /// Served by default on loopback for the outbound public bridge. A direct
+    /// listener binds it too. When the bridge is disabled, an automatically
+    /// discovered Tailscale route may expose this port while forwarding to a
+    /// different loopback port, which is then what Super-Herdr binds.
     /// `port = 0` serves nothing at all.
     #[serde(default = "default_web_port")]
     pub port: Option<u16>,
-    /// What to bind. Loopback by default; a private or mesh address lets a
-    /// paired device reach it directly, and a public one is refused.
+    /// What to bind for an explicit direct route. Setting it bypasses the
+    /// bridge. A private or mesh address is accepted and a public one refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<std::net::IpAddr>,
-    /// Where a device outside this machine reaches it. Never derived from the
-    /// bind: behind a proxy that terminates TLS the host, port and scheme a
-    /// phone needs are all different from what this process listens on, and a
-    /// derived one would be a perfectly valid code for an unreachable address.
+    /// Where a device reaches an explicit operator-managed proxy. Setting it
+    /// bypasses the hosted bridge. It is never derived from the bind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Use the hosted outbound bridge when no explicit direct URL or address
+    /// is configured. Set false to use Tailscale Serve or a private address
+    /// directly instead.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub bridge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +1019,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
 const fn default_connect_timeout() -> u64 {
     10
 }
@@ -847,8 +1049,9 @@ const fn default_notification_timeout() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{Config, Device, Target};
+    use super::{Config, Device, ResolvedWeb, Target, WebConfig};
 
     #[test]
     fn a_transfer_ceiling_is_configurable_and_has_a_default() {
@@ -1122,6 +1325,155 @@ name = "local"
             None
         );
         assert_eq!(web("[web]\nport = 0").unwrap().bind_address(), None);
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_browser_uses_the_fixed_public_bridge() {
+        let resolved = WebConfig::default().resolve().await;
+        assert_eq!(resolved.port, Some(8790));
+        assert_eq!(resolved.address, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(
+            resolved.url.as_deref(),
+            Some("https://super-herdr.key-value.co")
+        );
+        assert!(resolved.bridge.is_some());
+    }
+
+    /// Tailscale already knows both halves of a reverse proxy. The outside
+    /// port is not necessarily the port the local service binds, so deriving
+    /// either half from the other is the exact bug this status avoids.
+    #[test]
+    fn an_existing_tailscale_route_supplies_its_external_url_and_loopback_target() {
+        let web = WebConfig::default();
+        let status = br#"
+        {
+          "TCP": {"8790": {"HTTPS": true}},
+          "Web": {
+            "desktop.tail123.ts.net:8790": {
+              "Handlers": {"/": {"Proxy": "http://127.0.0.1:8795"}}
+            }
+          }
+        }
+        "#;
+
+        assert_eq!(
+            web.resolve_from(Some("100.101.102.103".parse().unwrap()), Some(status)),
+            ResolvedWeb {
+                port: Some(8795),
+                address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                url: Some("https://desktop.tail123.ts.net:8790".to_owned()),
+                bridge: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_standard_https_route_can_match_the_local_service_port() {
+        let status = br#"
+        {
+          "TCP": {"443": {"HTTPS": true}},
+          "Web": {
+            "desktop.tail123.ts.net:443": {
+              "Handlers": {"/": {"Proxy": "http://localhost:8790"}}
+            }
+          }
+        }
+        "#;
+
+        assert_eq!(
+            WebConfig::default().resolve_from(None, Some(status)),
+            ResolvedWeb {
+                port: Some(8790),
+                address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                url: Some("https://desktop.tail123.ts.net".to_owned()),
+                bridge: None,
+            }
+        );
+    }
+
+    /// A map can contain many unrelated services. Port association narrows the
+    /// candidates, and ambiguity then means fall back rather than expose the
+    /// wrong service in a perfectly scannable QR.
+    #[test]
+    fn ambiguous_non_loopback_or_public_tailscale_routes_are_not_guessed() {
+        let ambiguous = br#"
+        {
+          "TCP": {"8790": {"HTTPS": true}},
+          "Web": {
+            "one.tail123.ts.net:8790": {
+              "Handlers": {"/": {"Proxy": "http://127.0.0.1:8795"}}
+            },
+            "two.tail123.ts.net:8790": {
+              "Handlers": {"/": {"Proxy": "http://127.0.0.1:8796"}}
+            }
+          }
+        }
+        "#;
+        let public_target = br#"
+        {
+          "TCP": {"8790": {"HTTPS": true}},
+          "Web": {
+            "one.tail123.ts.net:8790": {
+              "Handlers": {"/": {"Proxy": "http://192.168.1.4:8795"}}
+            }
+          }
+        }
+        "#;
+        let funnel = br#"
+        {
+          "TCP": {"8790": {"HTTPS": true}},
+          "Web": {
+            "one.tail123.ts.net:8790": {
+              "Handlers": {"/": {"Proxy": "http://127.0.0.1:8795"}}
+            }
+          },
+          "AllowFunnel": {"one.tail123.ts.net:8790": true}
+        }
+        "#;
+        let mesh: IpAddr = "100.101.102.103".parse().unwrap();
+        let direct = ResolvedWeb {
+            port: Some(8790),
+            address: Some(mesh),
+            url: Some("http://100.101.102.103:8790".to_owned()),
+            bridge: None,
+        };
+
+        assert_eq!(
+            WebConfig::default().resolve_from(Some(mesh), Some(ambiguous)),
+            direct
+        );
+        assert_eq!(
+            WebConfig::default().resolve_from(Some(mesh), Some(public_target)),
+            direct
+        );
+        assert_eq!(
+            WebConfig::default().resolve_from(Some(mesh), Some(funnel)),
+            direct
+        );
+    }
+
+    #[test]
+    fn an_explicit_external_url_keeps_the_listener_on_loopback() {
+        let web = Config::parse(
+            r#"
+            [web]
+            url = "https://desktop.tail123.ts.net"
+            [[targets]]
+            name = "development"
+            "#,
+        )
+        .unwrap()
+        .web;
+
+        assert_eq!(
+            web.resolve_from(Some("100.101.102.103".parse().unwrap()), None),
+            ResolvedWeb {
+                port: Some(8790),
+                address: None,
+                url: Some("https://desktop.tail123.ts.net".to_owned()),
+                bridge: None,
+            }
+        );
     }
 
     /// Turning the client off and then naming an address for it is a

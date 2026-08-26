@@ -5,9 +5,9 @@
 //! arrive on a server-sent event stream, and a client's messages are posted to
 //! it. That needs no framing, no masking, and no handshake beyond HTTP itself,
 //! which is why there is a hand-written server here rather than a web stack.
-//! When the client needs to type into a pane, the latency of a post per
-//! keystroke will argue for a socket upgrade; while it only observes, it does
-//! not.
+//! A paired browser posts deliberate line and terminal-key input after taking a
+//! pane's control lease. A client offering continuous per-keystroke interaction
+//! would have to justify a socket upgrade against its extra surface.
 //!
 //! What sits behind both requests is one ordinary in-process attachment, so a
 //! browser is a client of the same daemon in the same way the frontend is,
@@ -15,12 +15,11 @@
 //! interprets a protocol message; the browser is handed the vocabulary every
 //! other client receives.
 //!
-//! The listener binds loopback and nothing else. There is no authentication yet
-//! — that is device pairing, and it is deliberately a separate decision — so a
-//! device reaches this the way it reaches any other loopback service on another
-//! machine: forwarded over OpenSSH. Binding elsewhere is not offered rather
-//! than discouraged, because a flag that publishes an unauthenticated
-//! federation is the kind of thing that gets used once and regretted.
+//! The listener binds loopback, a private address, or a mesh address. The
+//! default loopback listener is reached through the daemon's outbound public
+//! bridge connector. Device pairing authenticates network requests;
+//! confidentiality belongs to the TLS bridge, a private network, or an
+//! operator-managed proxy.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,7 +30,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, encode};
 
@@ -48,11 +47,9 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// or a header.
 const MAX_SESSION_CHARS: usize = 64;
 
-/// Headers that mean a request was relayed rather than made locally.
-///
-/// A client could send these itself, which costs it the loopback exemption
-/// rather than gaining anything — the failure is toward asking for a token, so
-/// a header nobody validated cannot let anyone in.
+/// Headers that mean TLS or a private-network proxy relayed the request. They
+/// make a newly issued cookie `Secure`; spoofing one on plain HTTP only makes
+/// the browser decline that cookie and cannot grant access.
 const FORWARDING_HEADERS: &[&str] = &[
     "x-forwarded-for",
     "x-forwarded-proto",
@@ -84,6 +81,13 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
 /// has not been used in a month should ask again rather than hold a credential
 /// indefinitely.
 const COOKIE_LIFETIME_SECONDS: u64 = 60 * 60 * 24 * 30;
+
+/// A correct short code opens an approval window; it does not mint a device.
+/// Kept below common proxy request deadlines so the original pairing request
+/// can wait for the trusted TUI's answer without a second bearer cookie.
+pub const PAIRING_APPROVAL_LIFETIME: Duration = Duration::from_secs(60);
+
+pub type PairingDecision = oneshot::Receiver<std::result::Result<String, String>>;
 
 pub fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -121,8 +125,9 @@ pub type Attach = Arc<dyn Fn() -> Result<DuplexStream> + Send + Sync>;
 pub trait Devices: Send + Sync {
     /// Whether this token belongs to a paired device.
     fn admits(&self, token: &str) -> bool;
-    /// Exchange a pairing code for a new device's token, or refuse.
-    fn pair(&self, code: &str, name: &str) -> Result<String>;
+    /// Validate a pairing code and wait for an already-trusted client to
+    /// compare and approve the browser's confirmation number.
+    fn pair(&self, code: &str, name: &str, confirmation: &str) -> Result<PairingDecision>;
     /// The daemon's own version, shown to a person so a stale daemon is
     /// visible where it would otherwise be invisible.
     fn version(&self) -> String;
@@ -175,13 +180,8 @@ struct Request {
     path: String,
     session: Option<String>,
     token: Option<String>,
-    /// Whether this request reached the daemon through a proxy.
-    ///
-    /// It matters because the loopback exemption assumes a local process, and a
-    /// proxy that terminates TLS on a network and forwards to loopback breaks
-    /// that assumption without changing the peer address. A forwarded request
-    /// says so in its headers, so the daemon reads them rather than trusting
-    /// where the connection appears to come from.
+    /// Whether this request reached the daemon through a proxy, used only to
+    /// mark a newly issued browser cookie `Secure`.
     forwarded: bool,
     length: usize,
 }
@@ -199,17 +199,14 @@ async fn handle(
         return Ok(());
     };
 
-    // A genuinely local process is not asked for a token: anyone who can reach
-    // loopback can already read the daemon's socket, so requiring one would be
-    // ceremony rather than a boundary. A request forwarded to loopback by a
-    // proxy is not that, however local it looks, so it is asked like anything
-    // else arriving over a network.
-    let local = peer.ip().is_loopback() && !request.forwarded;
-    let admitted = local
-        || request
-            .token
-            .as_deref()
-            .is_some_and(|token| devices.admits(token));
+    // The browser route always uses device authentication, including on
+    // loopback. A local process may be able to reach the Unix socket, but a web
+    // origin is a different trust boundary and must not silently look paired.
+    let _ = peer;
+    let admitted = request
+        .token
+        .as_deref()
+        .is_some_and(|token| devices.admits(token));
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => write_page(&mut writer, APP).await,
@@ -228,12 +225,37 @@ async fn handle(
             let text = String::from_utf8_lossy(&body);
             let code = json_field(&text, "code").unwrap_or_default();
             let name = json_field(&text, "name").unwrap_or_default();
-            match devices.pair(&code, &name) {
-                Ok(token) => {
-                    let cookie = format!(
-                        "sh_device={token}; Path=/; Max-Age={COOKIE_LIFETIME_SECONDS}; HttpOnly; SameSite=Strict"
-                    );
-                    write_with_cookie(&mut writer, "204 No Content", &cookie).await
+            let confirmation = json_field(&text, "confirmation").unwrap_or_default();
+            match devices.pair(&code, &name, &confirmation) {
+                Ok(decision) => {
+                    match tokio::time::timeout(PAIRING_APPROVAL_LIFETIME, decision).await {
+                        Ok(Ok(Ok(token))) => {
+                            let secure = if request.forwarded { "; Secure" } else { "" };
+                            let cookie = format!(
+                                "sh_device={token}; Path=/; Max-Age={COOKIE_LIFETIME_SECONDS}; HttpOnly; SameSite=Strict{secure}"
+                            );
+                            write_with_cookie(&mut writer, "204 No Content", &cookie).await
+                        }
+                        Ok(Ok(Err(message))) => {
+                            write_status(&mut writer, "403 Forbidden", &message).await
+                        }
+                        Ok(Err(_)) => {
+                            write_status(
+                                &mut writer,
+                                "503 Service Unavailable",
+                                "the pairing decision was lost; ask for another code",
+                            )
+                            .await
+                        }
+                        Err(_) => {
+                            write_status(
+                                &mut writer,
+                                "408 Request Timeout",
+                                "approval timed out; ask for another code",
+                            )
+                            .await
+                        }
+                    }
                 }
                 // The reason is the daemon's, and says which check failed
                 // without saying anything about codes that would have worked.
@@ -562,10 +584,20 @@ mod tests {
 
     /// Stands in for the daemon's pairing policy. Loopback tests never consult
     /// it, which is itself the property the network tests check.
-    #[derive(Default)]
     struct TestDevices {
         admitted: Mutex<Vec<String>>,
         code: Mutex<Option<String>>,
+    }
+
+    const TEST_TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+    impl Default for TestDevices {
+        fn default() -> Self {
+            Self {
+                admitted: Mutex::new(vec![TEST_TOKEN.to_owned()]),
+                code: Mutex::new(None),
+            }
+        }
     }
 
     impl super::Devices for TestDevices {
@@ -576,15 +608,23 @@ mod tests {
                 .unwrap_or(false)
         }
 
-        fn pair(&self, code: &str, _name: &str) -> anyhow::Result<String> {
+        fn pair(
+            &self,
+            code: &str,
+            _name: &str,
+            confirmation: &str,
+        ) -> anyhow::Result<super::PairingDecision> {
+            anyhow::ensure!(confirmation == "482193", "confirmation number is invalid");
             let waiting = self.code.lock().ok().and_then(|mut held| held.take());
             match waiting {
                 Some(waiting) if waiting == code => {
-                    let token = "ab".repeat(32);
+                    let token = TEST_TOKEN.to_owned();
                     if let Ok(mut admitted) = self.admitted.lock() {
                         admitted.push(token.clone());
                     }
-                    Ok(token)
+                    let (decision, receiver) = tokio::sync::oneshot::channel();
+                    let _ = decision.send(Ok(token));
+                    Ok(receiver)
                 }
                 Some(_) => anyhow::bail!("that pairing code is not the one waiting"),
                 None => anyhow::bail!("no pairing code is waiting"),
@@ -650,6 +690,7 @@ mod tests {
                 web_port: None,
                 web_address: None,
                 web_url: None,
+                web_bridge: None,
             },
         );
         // Port zero so tests never collide with a daemon somebody is running.
@@ -707,7 +748,12 @@ mod tests {
                 .contains("200")
         );
         assert!(
-            request(port, "GET /nothing HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            request(
+                port,
+                &format!(
+                    "GET /nothing HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+                )
+            )
                 .await
                 .contains("404")
         );
@@ -724,7 +770,7 @@ mod tests {
         let status = request(
             port,
             &format!(
-                "POST /command?session=orphan HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{body}",
+                "POST /command?session=orphan HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len()
             ),
         )
@@ -733,7 +779,13 @@ mod tests {
 
         // And a stream without a session is refused too, since nothing could
         // ever steer it.
-        let status = request(port, "GET /events HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+        let status = request(
+            port,
+            &format!(
+                "GET /events HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await;
         assert!(status.contains("400"), "{status}");
         task.abort();
     }
@@ -743,7 +795,12 @@ mod tests {
         let (port, task, _directory, _devices) = serve_test_daemon().await;
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
-            .write_all(b"GET /events?session=one HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /events?session=one HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
             .await
             .expect("writes");
 
@@ -763,7 +820,13 @@ mod tests {
 
         // The browser is handed protocol messages, not a translation of them.
         assert!(greeting.contains("server.hello"), "{greeting}");
-        assert!(greeting.contains("\"protocol\":1"), "{greeting}");
+        assert!(
+            greeting.contains(&format!(
+                "\"protocol\":{}",
+                crate::protocol::PROTOCOL_VERSION
+            )),
+            "{greeting}"
+        );
         task.abort();
     }
 
@@ -775,7 +838,12 @@ mod tests {
         let (port, task, _directory, _devices) = serve_test_daemon().await;
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
-            .write_all(b"GET /events?session=quiet HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /events?session=quiet HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
             .await
             .expect("writes");
 
@@ -827,7 +895,12 @@ mod tests {
 
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
-            .write_all(b"GET /events?session=split HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /events?session=split HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
             .await
             .expect("writes");
         // The daemon side receives the client's hello first.
@@ -890,7 +963,12 @@ mod tests {
 
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
-            .write_all(b"GET /events?session=huge HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET /events?session=huge HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
             .await
             .expect("writes");
         let mut greeting = vec![0u8; 256];
@@ -974,22 +1052,29 @@ mod tests {
         assert!(!super::bindable("0.0.0.0".parse().unwrap()));
     }
 
-    /// The bug this prevents: a proxy terminating TLS on a network and
-    /// forwarding to loopback made every visitor look local, so the daemon
-    /// stopped asking anyone to pair. The peer address alone cannot tell those
-    /// apart; the headers can.
+    /// A web origin is never silently trusted just because its TCP peer is
+    /// loopback. The Unix socket and browser listener are separate boundaries.
     #[tokio::test]
-    async fn a_forwarded_request_is_not_a_local_one() {
+    async fn every_browser_request_requires_a_paired_device() {
         let (port, task, _directory, _devices) = serve_test_daemon().await;
 
-        // Straight from loopback: local, and admitted without a token.
+        // The page is public so it can offer pairing, but loopback does not make
+        // the browser a paired device.
         let direct = request(port, "GET /session HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
         assert!(direct.contains("200"), "{direct}");
         let body = request_body(port, "GET /session HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+        assert!(body.contains("\"paired\":false"), "{body}");
+
+        let body = request_body(
+            port,
+            &format!(
+                "GET /session HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await;
         assert!(body.contains("\"paired\":true"), "{body}");
 
-        // The same connection, carrying what a proxy adds: not local, and asked
-        // to pair like anything else off the machine.
+        // Forwarding headers cannot weaken or strengthen that rule.
         for header in [
             "x-forwarded-for: 100.64.0.1",
             "X-Forwarded-Proto: https",
@@ -1002,7 +1087,7 @@ mod tests {
             .await;
             assert!(
                 body.contains("\"paired\":false"),
-                "{header} was treated as local: {body}"
+                "{header} bypassed device pairing: {body}"
             );
         }
 
@@ -1022,7 +1107,7 @@ mod tests {
         if let Ok(mut code) = devices.code.lock() {
             *code = Some("ABCD2345".to_owned());
         }
-        let body = r#"{"code":"ABCD2345","name":"phone"}"#;
+        let body = r#"{"code":"ABCD2345","name":"phone","confirmation":"482193"}"#;
         let pair = format!(
             "POST /pair HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()

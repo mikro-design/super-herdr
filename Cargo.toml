@@ -1,11 +1,16 @@
 [package]
 name = "super-herdr"
-version = "0.7.13"
+version = "0.7.14"
 edition = "2024"
 publish = false
 description = "A multi-host federation client for Herdr sessions"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mikro-design/super-herdr"
+
+[workspace]
+members = [".", "crates/bridge"]
+default-members = [".", "crates/bridge"]
+resolver = "2"
 
 [package.metadata.deb]
 maintainer = "Mikro Design <mikrodesign@proton.me>"
@@ -44,6 +49,7 @@ ratatui = "0.30"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10"
+super-herdr-bridge = { path = "crates/bridge", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"

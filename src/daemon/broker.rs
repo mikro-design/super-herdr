@@ -161,6 +161,10 @@ pub enum Effect {
         client: ClientId,
         request: u64,
     },
+    DecidePairing {
+        attempt: String,
+        approve: bool,
+    },
     /// Send this client the durable history. The broker does not hold it, so
     /// the I/O layer fills it in.
     SendAttentionHistory {
@@ -641,6 +645,9 @@ impl Broker {
             ClientMessage::RequestPairingCode { request } => {
                 effects.push(Effect::IssuePairingCode { client, request });
             }
+            ClientMessage::DecidePairing { attempt, approve } => {
+                effects.push(Effect::DecidePairing { attempt, approve });
+            }
         }
 
         effects
@@ -973,6 +980,39 @@ impl Broker {
     pub fn attention_changed(&mut self, events: Vec<AttentionEvent>) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.broadcast_state(ServerMessage::AttentionHistory { events }, &mut effects);
+        effects
+    }
+
+    pub fn pairing_approval_required(
+        &self,
+        attempt: String,
+        name: String,
+        confirmation: String,
+        expires_in_seconds: u64,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.broadcast_state(
+            ServerMessage::PairingApprovalRequired {
+                attempt,
+                name,
+                confirmation,
+                expires_in_seconds,
+            },
+            &mut effects,
+        );
+        effects
+    }
+
+    pub fn pairing_decided(&self, attempt: String, approved: bool, message: String) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.broadcast_state(
+            ServerMessage::PairingDecision {
+                attempt,
+                approved,
+                message,
+            },
+            &mut effects,
+        );
         effects
     }
 

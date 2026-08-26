@@ -437,6 +437,10 @@ impl ClientCommands {
         request
     }
 
+    pub fn decide_pairing(&self, attempt: String, approve: bool) {
+        self.send(ClientMessage::DecidePairing { attempt, approve });
+    }
+
     pub fn mark_attention_seen(&self, pane: PaneId) {
         self.send(ClientMessage::MarkAttentionSeen { pane });
     }
@@ -503,6 +507,7 @@ mod tests {
             web_port: None,
             web_address: None,
             web_url: None,
+            web_bridge: None,
         };
         (spawn_in_process(config, None, options), directory)
     }

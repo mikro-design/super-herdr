@@ -220,6 +220,7 @@ async fn relay(
             web_port: None,
             web_address: None,
             web_url: None,
+            web_bridge: None,
         },
     );
 

@@ -55,46 +55,88 @@ Work is ordered by dependency and product risk.
 - A browser client the daemon serves over loopback HTTP, carrying the protocol
   on a server-sent event stream with commands posted back, showing the
   federation and the attention feed on a phone or tablet.
-- Device pairing: a code requested from the terminal client, exchanged by a
-  browser for a token whose digest alone is stored, revocable with immediate
-  effect, and a listener that refuses any address a token could not safely
-  authenticate over.
+- Device pairing: a code requested from the terminal client and manually typed
+  in the browser, followed by an explicit matching-number approval in the
+  trusted TUI. Only then is a token issued; its digest alone is stored and it is
+  revocable with immediate effect. Browser events and commands require that
+  token even on loopback.
+- A browser client served by both a standalone daemon and the daemon hosted by
+  the normal TUI, with a default outbound reverse tunnel to the fixed public
+  bridge and explicit direct/private/Tailscale routes as opt-outs.
+- A bounded bridge transport and standalone `super-herdr-bridge` origin:
+  random per-run routes, separately authorized daemon registration, bounded
+  routes/viewers/frames/queues, path-aware browser requests, and failure
+  isolation that never touches a Herdr session.
+- Multi-user device-login rendezvous at the fixed bridge URL: each daemon
+  publishes one expiring code, the user types it once at the bridge, collisions
+  route nobody, bridge guesses are bounded per source, and the owning daemon
+  verifies and spends it. A matching-number approval on a trusted TUI is still
+  required before the resulting HttpOnly cookie is scoped to that daemon's
+  random route.
+- Rendered browser pane observation with acknowledged, bounded updates and
+  current-screen catch-up instead of a backlog for a slow viewer. Navigation is
+  grouped by target, session, and workspace, and selecting a pane opens its
+  viewer immediately.
+- Explicit browser control takeover and terminal input: a paired device begins
+  as an observer, asks for the pane lease, and can then send a line, Enter, Tab,
+  Escape, Ctrl-C, and shell-history arrows. Losing the lease removes its input
+  surface.
+- A three-direction file bridge in the daemon protocol: resumable
+  client-to-target upload, credit-bounded target-to-client download, and
+  target-to-target movement without routing the bytes through the device.
+- Direct TUI file upload by dropping a file path onto the terminal, pasting a
+  copied file, or entering a path explicitly.
 
 ## Next
 
-1. Execute and record the full desktop matrix in `TESTING.md`. The
+Work below is acceptance-ordered. The no-Tailscale route is first because the
+browser feature is not externally reachable until its fixed bridge exists.
+
+1. Deploy the bridge origin behind TLS at `super-herdr.key-value.co` and add its
+   DNS record. Keep the origin on loopback or a private service network, proxy
+   WebSocket upgrades without buffering, apply connection/rate limits outside
+   the binary's own hard bounds, and ensure proxy/platform logs contain no
+   authorization headers, request or response bodies, terminal content,
+   clipboard payloads, pairing material, or secrets. Verify the health route,
+   a daemon's outbound registration, and one relayed page request. The domain
+   is currently absent from DNS, so this deployment is not yet qualified.
+2. Qualify the browser control path on a real phone **without Tailscale**.
+   Record the phone OS,
+   browser, network kind, Herdr version/protocol, and exact Super-Herdr commit in
+   `TESTING.md`, without recording addresses, hostnames, terminal contents, or
+   pairing material. The qualification is complete only when all of these have
+   been observed:
+   - an unconfigured installation returns
+     `https://super-herdr.key-value.co`, a phone on an unrelated network scans
+     the QR, the user types the displayed code once, compares the browser's
+     six-digit number with the trusted TUI, approves it there, and the accepted
+     browser reaches only the daemon that published it;
+   - selecting a pane begins in observe mode and sends no input;
+   - **Take control**, a Unicode line, Enter, Tab, Escape, Ctrl-C, and both
+     history arrows reach only the qualified target/session/pane selected;
+   - taking the lease from another client downgrades that client without
+     closing the Herdr session or pane, and an observer cannot send input;
+   - reloading or briefly disconnecting the phone restores federation and pane
+     state, a slow viewer catches up to the current screen without a backlog,
+     and revoking the device takes effect on its next request.
+   Run `node tools/page-harness.mjs src/daemon/app.html` during the qualification
+   and extend it for any browser defect found by the physical run.
+3. Execute and record the full desktop matrix in `TESTING.md`. The
    machine-decidable checks are automated as `scripts/qualify-desktop.sh` and
    recorded for a nested run; the macOS, Wayland, and X11 rows, and every item
    needing a pointer or a notification click, are still unrecorded.
-2. Finish the file bridge — the three directions are carried, and what is left
-   is the surface around them: no client offers a file picker or a save
-   dialogue, so every direction is reachable through the protocol and none of
-   them through the TUI or the browser. Generalize the clipboard broker's
-   verified upload into a file bridge —
-   arbitrary content, caller-supplied name, chunked and resumable, streamed at
-   every hop — covering client-to-target, target-to-client, and target-to-target
-   transfers. Client-to-target is done for content that fits one attempt: the
-   daemon relays a transfer as it arrives rather than holding it, with
-   backpressure reaching the sending client, the trailer checked against the
-   bytes actually relayed, and a refused or abandoned transfer unstaged on the
-   host. Content is arbitrary, the caller may name the file, the ceiling is
-   `transfers.max_bytes` rather than the clipboard's, and a transfer survives a
-   reconnect: an interruption keeps what arrived, a sender returns with the
-   token it was issued, and the offset comes from the host's own count. What
-   Target-to-client is done too: a client names a file on the pane's host, the
-   host describes it and sends it, credit in the protocol bounds what is in
-   flight because the queue to a client cannot push back, and the client is the
-   one that verifies. Target-to-target is the composition of the two, with the
-   daemon holding both connections so the bytes never reach the device, both
-   digests computed by the hosts and compared in the middle, and a control
-   lease required on each end.
-3. Add read-only pane observation to the browser client. Navigation and the
-   attention feed are served; rendering a terminal needs a VT implementation in
-   the page, which means vendoring one — the first third-party code the client
-   would carry, and worth deciding deliberately rather than reaching for.
-   Typing into a pane needs the socket upgrade a post-per-keystroke would
-   deserve.
-4. Add push delivery of attention events to paired devices, as a further sink
+4. Put client surfaces around the file-bridge directions the protocol already
+   carries. The TUI still needs a qualified target-to-client save flow and a
+   qualified source-to-destination move flow. The browser needs upload and
+   download controls appropriate to the platform. Each surface must preserve
+   per-pane control leases, target/session-qualified IDs, cancellation cleanup,
+   bounded transfer state, and per-target failure isolation; filenames may be
+   shown, but contents and credentials must never be logged.
+5. Stream TUI uploads from disk through the existing resumable protocol. File
+   drop and explicit-path upload currently read the file whole and inherit the
+   32 MiB clipboard ceiling; the general transfer path should instead use
+   `transfers.max_bytes`, bounded chunks, and host-reported resume offsets.
+6. Add push delivery of attention events to paired devices, as a further sink
    under the existing filters, coalescing, and rate limits. Native desktop
    delivery is not moving with it: notifying a desktop is a desktop-session
    capability and stays with the client, for the same reason reading a

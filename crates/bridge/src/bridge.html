@@ -1,0 +1,96 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Connect to Super-Herdr</title>
+<style>
+  :root { color-scheme: dark light; font-family: ui-sans-serif, -apple-system, system-ui, sans-serif; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #11131a; color: #e6e9f0; }
+  main { width: min(26rem, calc(100% - 2rem)); padding: 1.4rem; background: #171a23; border: 1px solid #262b38; border-radius: .8rem; }
+  h1 { margin: 0 0 .5rem; font-size: 1.2rem; }
+  p { color: #a8afbf; line-height: 1.45; }
+  label { display: block; margin-top: 1rem; color: #a8afbf; font-size: .84rem; }
+  input { display: block; width: 100%; box-sizing: border-box; margin-top: .3rem; padding: .7rem; font: inherit; color: inherit; background: #11131a; border: 1px solid #343b4d; border-radius: .5rem; }
+  #code { text-transform: uppercase; letter-spacing: .13em; font-family: ui-monospace, monospace; }
+  button { margin-top: 1rem; padding: .6rem .9rem; font: inherit; color: #fff; background: #2563eb; border: 0; border-radius: .5rem; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  #error { min-height: 1.4em; color: #ffb454; }
+  #confirmation { padding: .8rem; border: 1px solid #343b4d; border-radius: .5rem; }
+  #confirmation strong { display: block; margin-top: .25rem; color: inherit; font: 700 1.5rem ui-monospace, monospace; letter-spacing: .16em; }
+  @media (prefers-color-scheme: light) {
+    body { background: #f6f7fa; color: #12151c; }
+    main { background: #fff; border-color: #dfe3ec; }
+    p, label { color: #5b6376; }
+    input { background: #fff; border-color: #c7ccda; }
+  }
+</style>
+<main>
+  <h1>Connect to Super-Herdr</h1>
+  <p>Enter the one-time code shown by Super-Herdr. It expires after five minutes.</p>
+  <form id="connect">
+    <label>Code
+      <input id="code" autocomplete="one-time-code" autocapitalize="characters"
+        spellcheck="false" maxlength="16" placeholder="ABCD-2345" required autofocus>
+    </label>
+    <label>Name this device
+      <input id="name" autocomplete="off" maxlength="48" placeholder="phone">
+    </label>
+    <button id="submit" type="submit">Connect</button>
+  </form>
+  <p id="confirmation" hidden>Compare this number with Super-Herdr before approving:
+    <strong id="confirmation-value"></strong>
+  </p>
+  <p id="error" role="alert"></p>
+</main>
+<script>
+const el = id => document.getElementById(id);
+
+function confirmationNumber() {
+  if (!globalThis.crypto || !crypto.getRandomValues) {
+    throw new Error('secure randomness is unavailable');
+  }
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  return String(random[0] % 1000000).padStart(6, '0');
+}
+
+function suggestedName() {
+  const agent = navigator.userAgent || '';
+  if (/iPad|Tablet/i.test(agent)) return 'iPad';
+  if (/Android|iPhone|Mobile/i.test(agent)) return 'phone';
+  return 'browser';
+}
+
+el('name').value = suggestedName();
+el('connect').onsubmit = async event => {
+  event.preventDefault();
+  el('error').textContent = '';
+  el('submit').disabled = true;
+  try {
+    const confirmation = confirmationNumber();
+    el('confirmation-value').textContent = confirmation.replace(/(...)/, '$1 ');
+    el('confirmation').hidden = false;
+    el('error').textContent = 'Waiting for approval in Super-Herdr…';
+    const response = await fetch('/_bridge/pair', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        code: el('code').value,
+        name: el('name').value,
+        confirmation,
+      }),
+    });
+    const route = response.headers.get('x-super-herdr-route');
+    if (response.ok && route) {
+      location.replace(`${route}/`);
+      return;
+    }
+    el('confirmation').hidden = true;
+    el('error').textContent = await response.text() || 'That code was not accepted.';
+  } catch (_) {
+    el('confirmation').hidden = true;
+    el('error').textContent = 'The bridge could not be reached. Try again.';
+  }
+  el('submit').disabled = false;
+};
+</script>
