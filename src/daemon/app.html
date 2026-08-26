@@ -922,6 +922,10 @@ el('pair').onclick = async () => {
     }
     el('pair-confirmation').hidden = true;
     el('pair-error').textContent = await response.text();
+    if (response.status === 409) {
+      el('name').focus();
+      el('name').select();
+    }
   } catch (_) {
     el('pair-confirmation').hidden = true;
     el('pair-error').textContent = 'Pairing could not be completed. Try again.';

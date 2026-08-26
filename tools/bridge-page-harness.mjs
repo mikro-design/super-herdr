@@ -14,6 +14,7 @@ const node = id => {
     nodes.set(id, {
       id, value: '', textContent: '', hidden: false, disabled: false, focused: false,
       focus() { this.focused = true; },
+      select() { this.selected = true; },
     });
   }
   return nodes.get(id);
@@ -34,10 +35,20 @@ Object.defineProperty(globalThis, 'crypto', {
 });
 
 let request;
+let responseKind = 'conflict';
 globalThis.fetch = async (url, init) => {
   request = { url, body: JSON.parse(init.body) };
+  if (responseKind === 'conflict') {
+    return {
+      ok: false,
+      status: 409,
+      headers: { get: () => null },
+      text: async () => 'Choose a different device name and try this code again.',
+    };
+  }
   return {
     ok: true,
+    status: 204,
     headers: { get: name => (name === 'x-super-herdr-route' ? '/r/test-route' : null) },
     text: async () => '',
   };
@@ -72,7 +83,17 @@ page.el('code').onpaste({
 check('a complete code pastes across all boxes', page.enteredCode() === 'ABCD2345');
 check('pasting suppresses the one-field default', pastePrevented);
 
+page.el('name').value = 'phone';
 await page.el('connect').onsubmit({ preventDefault() {} });
 check('the normalized code is posted outside the URL', request.url === '/_bridge/pair');
 check('all eight characters are posted', request.body.code === 'ABCD2345');
+check('a used name keeps the browser on the pairing page', replacement === undefined);
+check('a used name explains how to retry', page.el('error').textContent.includes('different'));
+check('a used name is selected for replacement', page.el('name').focused && page.el('name').selected);
+check('the same code remains ready to retry', page.enteredCode() === 'ABCD2345');
+
+responseKind = 'success';
+page.el('name').value = 'tablet';
+await page.el('connect').onsubmit({ preventDefault() {} });
+check('the retry carries the new name', request.body.name === 'tablet');
 check('the bridge route is used only after pairing', replacement === '/r/test-route/');

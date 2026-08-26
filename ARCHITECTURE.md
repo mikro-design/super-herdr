@@ -496,6 +496,13 @@ neither person. The bridge also bounds pairing submissions per Cloudflare
 source, but this is flood control rather than the authority check: even a valid
 short code grants only a comparison prompt.
 
+A device name must remain unique because it is the human-facing revocation
+identity. The daemon checks a submitted name only after verifying the live
+code, so the public endpoint cannot enumerate paired names. A collision returns
+`409 Conflict` before the code is consumed or an approval is requested; the
+bridge preserves that rendezvous and the browser can rename and retry the same
+code.
+
 The fixed bridge URL is reserved. An old configuration may spell it explicitly
 as `web.url`; resolution still treats that exact address as the hosted outbound
 bridge. Treating it as a generic operator proxy would render the correct QR but

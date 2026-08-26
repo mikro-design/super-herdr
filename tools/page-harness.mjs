@@ -22,6 +22,7 @@ const node = id => {
       addEventListener(type, listener) { this[`on${type}`] = listener; },
       setAttribute(name, value) { this[name] = value; },
       focus() { this.focused = true; },
+      select() { this.selected = true; },
       getBoundingClientRect: () => ({ width: 8, height: 16 }),
       clientWidth: 800,
       appendChild(child) { this.children.push(child); },
@@ -65,11 +66,21 @@ globalThis.window = {
 globalThis.location = globalThis.window.location;
 globalThis.getComputedStyle = () => ({ lineHeight: '16px', fontSize: '16px' });
 Object.defineProperty(globalThis, 'crypto', {
-  value: { randomUUID: () => 'session-under-test' },
+  value: {
+    randomUUID: () => 'session-under-test',
+    getRandomValues: values => { values[0] = 123456; return values; },
+  },
   configurable: true,
 });
 globalThis.fetch = (url, init) => {
   sent.push({ url, body: JSON.parse(init.body) });
+  if (url.endsWith('/pair')) {
+    return Promise.resolve({
+      ok: false,
+      status: 409,
+      text: () => Promise.resolve('Choose a different device name and try this code again.'),
+    });
+  }
   return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
 };
 class StubEventSource {
@@ -102,6 +113,11 @@ page.el('code').onpaste({
 });
 check('a complete code pastes across all boxes', page.enteredCode() === 'ABCD2345');
 check('pasting the code suppresses the one-field default', pastePrevented);
+page.el('name').value = 'phone';
+await page.el('pair').onclick();
+check('a direct name collision explains how to retry', page.el('pair-error').textContent.includes('different'));
+check('a direct name collision selects the used name', page.el('name').focused && page.el('name').selected);
+check('a direct name collision keeps the same code', page.enteredCode() === 'ABCD2345');
 
 // Navigation mirrors the identity hierarchy instead of flattening every pane.
 deliver({

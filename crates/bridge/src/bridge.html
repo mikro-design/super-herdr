@@ -151,6 +151,10 @@ el('connect').onsubmit = async event => {
     }
     el('confirmation').hidden = true;
     el('error').textContent = await response.text() || 'That code was not accepted.';
+    if (response.status === 409) {
+      el('name').focus();
+      el('name').select();
+    }
   } catch (_) {
     el('confirmation').hidden = true;
     el('error').textContent = 'The bridge could not be reached. Try again.';

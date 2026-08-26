@@ -1099,7 +1099,7 @@ impl web::Devices for DevicePolicy {
             .any(|device| pairing::matches(&device.token_sha256, &offered))
     }
 
-    fn pair(&self, code: &str, name: &str, confirmation: &str) -> Result<web::PairingDecision> {
+    fn pair(&self, code: &str, name: &str, confirmation: &str) -> Result<web::PairingStart> {
         if self.config_path.is_none() {
             anyhow::bail!("this daemon has no configuration file to record a device in");
         }
@@ -1138,6 +1138,13 @@ impl web::Devices for DevicePolicy {
                     "that is not the code waiting; {remaining} attempt(s) left before it is discarded"
                 );
             }
+            if self.current().iter().any(|existing| existing.name == name) {
+                return Ok(web::PairingStart::RetryWithSameCode {
+                    message: format!(
+                        "A device named {name:?} is already paired. Choose a different device name and try this code again."
+                    ),
+                });
+            }
             // Matched, so it is spent: a code overheard after use opens nothing.
             *held = None;
         }
@@ -1151,7 +1158,7 @@ impl web::Devices for DevicePolicy {
                 decision,
             })
             .map_err(|_| anyhow::anyhow!("the daemon stopped before it could ask for approval"))?;
-        Ok(waiting)
+        Ok(web::PairingStart::AwaitingApproval(waiting))
     }
 
     fn version(&self) -> String {
@@ -2812,7 +2819,7 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{DaemonOptions, MAX_RETAINED_TRANSFERS, invalidated_routes, serve, serve_until};
-    use crate::config::{Config, Target};
+    use crate::config::{Config, Device, Target};
     use crate::model::PaneId;
     use crate::protocol::{
         ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage, decode, encode,
@@ -3939,8 +3946,47 @@ mod tests {
             }
         };
 
-        let body =
+        Config::add_device_file(
+            Some(&config_path),
+            Device {
+                name: "phone".to_owned(),
+                token_sha256: crate::pairing::fingerprint("already paired token"),
+                paired_at_ms: 1,
+            },
+        )
+        .unwrap();
+        let duplicate_body =
             format!("{{\"code\":\"{code}\",\"name\":\"phone\",\"confirmation\":\"482193\"}}");
+        let duplicate_response = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /pair HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{duplicate_body}",
+                        duplicate_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        })
+        .await
+        .expect("a duplicate device name waited for pointless approval");
+        assert!(
+            duplicate_response.starts_with(b"HTTP/1.1 409 Conflict"),
+            "{}",
+            String::from_utf8_lossy(&duplicate_response)
+        );
+        assert!(
+            String::from_utf8_lossy(&duplicate_response)
+                .contains("Choose a different device name and try this code again")
+        );
+
+        let body =
+            format!("{{\"code\":\"{code}\",\"name\":\"tablet\",\"confirmation\":\"482193\"}}");
         let browser = tokio::spawn(async move {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             stream
@@ -3970,7 +4016,7 @@ mod tests {
                     confirmation,
                     ..
                 } => {
-                    assert_eq!(name, "phone");
+                    assert_eq!(name, "tablet");
                     assert_eq!(confirmation, "482193");
                     break attempt;
                 }
@@ -3978,11 +4024,7 @@ mod tests {
             }
         };
         assert!(
-            Config::load(Some(&config_path))
-                .unwrap()
-                .0
-                .devices
-                .is_empty(),
+            Config::load(Some(&config_path)).unwrap().0.devices.len() == 1,
             "knowing the short code created a device before approval"
         );
 
@@ -3998,8 +4040,9 @@ mod tests {
             .unwrap();
         assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
         let loaded = Config::load(Some(&config_path)).unwrap().0;
-        assert_eq!(loaded.devices.len(), 1);
+        assert_eq!(loaded.devices.len(), 2);
         assert_eq!(loaded.devices[0].name, "phone");
+        assert_eq!(loaded.devices[1].name, "tablet");
 
         let _ = stop.send(());
         let _ = tokio::time::timeout(Duration::from_secs(10), server).await;

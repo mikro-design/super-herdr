@@ -89,6 +89,17 @@ pub const PAIRING_APPROVAL_LIFETIME: Duration = Duration::from_secs(60);
 
 pub type PairingDecision = oneshot::Receiver<std::result::Result<String, String>>;
 
+/// What happened after the daemon checked a submitted code.
+///
+/// A name collision is different from a rejected pairing attempt: the caller
+/// proved it had the live code, but must change one non-secret field before an
+/// approval is useful. Keeping that distinction lets both a direct browser and
+/// the public bridge retry without spending or republishing the code.
+pub enum PairingStart {
+    AwaitingApproval(PairingDecision),
+    RetryWithSameCode { message: String },
+}
+
 pub fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
@@ -127,7 +138,7 @@ pub trait Devices: Send + Sync {
     fn admits(&self, token: &str) -> bool;
     /// Validate a pairing code and wait for an already-trusted client to
     /// compare and approve the browser's confirmation number.
-    fn pair(&self, code: &str, name: &str, confirmation: &str) -> Result<PairingDecision>;
+    fn pair(&self, code: &str, name: &str, confirmation: &str) -> Result<PairingStart>;
     /// The daemon's own version, shown to a person so a stale daemon is
     /// visible where it would otherwise be invisible.
     fn version(&self) -> String;
@@ -227,7 +238,7 @@ async fn handle(
             let name = json_field(&text, "name").unwrap_or_default();
             let confirmation = json_field(&text, "confirmation").unwrap_or_default();
             match devices.pair(&code, &name, &confirmation) {
-                Ok(decision) => {
+                Ok(PairingStart::AwaitingApproval(decision)) => {
                     match tokio::time::timeout(PAIRING_APPROVAL_LIFETIME, decision).await {
                         Ok(Ok(Ok(token))) => {
                             let secure = if request.forwarded { "; Secure" } else { "" };
@@ -256,6 +267,9 @@ async fn handle(
                             .await
                         }
                     }
+                }
+                Ok(PairingStart::RetryWithSameCode { message }) => {
+                    write_status(&mut writer, "409 Conflict", &message).await
                 }
                 // The reason is the daemon's, and says which check failed
                 // without saying anything about codes that would have worked.
@@ -613,7 +627,7 @@ mod tests {
             code: &str,
             _name: &str,
             confirmation: &str,
-        ) -> anyhow::Result<super::PairingDecision> {
+        ) -> anyhow::Result<super::PairingStart> {
             anyhow::ensure!(confirmation == "482193", "confirmation number is invalid");
             let waiting = self.code.lock().ok().and_then(|mut held| held.take());
             match waiting {
@@ -624,7 +638,7 @@ mod tests {
                     }
                     let (decision, receiver) = tokio::sync::oneshot::channel();
                     let _ = decision.send(Ok(token));
-                    Ok(receiver)
+                    Ok(super::PairingStart::AwaitingApproval(receiver))
                 }
                 Some(_) => anyhow::bail!("that pairing code is not the one waiting"),
                 None => anyhow::bail!("no pairing code is waiting"),

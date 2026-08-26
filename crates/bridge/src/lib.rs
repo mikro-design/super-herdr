@@ -916,10 +916,12 @@ async fn pair_device(
         )
         .await;
     };
-    // An exact published code reached its daemon, which is the authority that
-    // either spent it or explained why it no longer works. Do not keep a stale
-    // rendezvous after that answer.
-    state.remove_codes(&route, live.generation);
+    // A name collision is returned only after the daemon verified the code,
+    // and explicitly means the browser may change the name and submit that
+    // same code again. Every other answer spends or invalidates the code.
+    if !response.starts_with(b"HTTP/1.1 409 Conflict\r\n") {
+        state.remove_codes(&route, live.generation);
+    }
     let response = scope_pairing_response(&response, &route).unwrap_or(response);
     tokio::time::timeout(IO_TIMEOUT, stream.write_all(&response))
         .await
@@ -1470,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typing_a_published_code_pairs_once_and_scopes_the_device_cookie() {
+    async fn a_name_collision_keeps_the_code_and_success_scopes_the_device_cookie() {
         let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bridge_address = bridge_listener.local_addr().unwrap();
         let bridge = tokio::spawn(serve_listener(bridge_listener));
@@ -1478,27 +1480,65 @@ mod tests {
         let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_address = local_listener.local_addr().unwrap();
         let local = tokio::spawn(async move {
-            let (mut stream, _) = local_listener.accept().await.unwrap();
-            let head = read_http_head(&mut stream).await.unwrap().unwrap();
-            let request = parse_request(&head).unwrap();
-            assert_eq!(request.method, "POST");
-            assert_eq!(request.path, "/pair");
-            let mut body = vec![0_u8; request.length];
-            stream.read_exact(&mut body).await.unwrap();
-            let body = String::from_utf8(body).unwrap();
-            assert!(body.contains("ABCD-2345"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 204 No Content\r\nset-cookie: sh_device=0123456789abcdef; Path=/; Max-Age=60; HttpOnly; SameSite=Strict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
+            for (name, response) in [
+                (
+                    "phone",
+                    "HTTP/1.1 409 Conflict\r\ncontent-length: 25\r\nconnection: close\r\n\r\nchoose a different device",
+                ),
+                (
+                    "tablet",
+                    "HTTP/1.1 204 No Content\r\nset-cookie: sh_device=0123456789abcdef; Path=/; Max-Age=60; HttpOnly; SameSite=Strict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                ),
+            ] {
+                let (mut stream, _) = local_listener.accept().await.unwrap();
+                let head = read_http_head(&mut stream).await.unwrap().unwrap();
+                let request = parse_request(&head).unwrap();
+                assert_eq!(request.method, "POST");
+                assert_eq!(request.path, "/pair");
+                let mut body = vec![0_u8; request.length];
+                stream.read_exact(&mut body).await.unwrap();
+                let body = String::from_utf8(body).unwrap();
+                assert!(body.contains("ABCD-2345"));
+                assert!(body.contains(name));
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
         });
 
         let route = Route::fixed(&format!("http://{bridge_address}"), ROUTE, SECRET).unwrap();
         let (_codes, pairing_codes) = watch::channel(Some("ABCD-2345".to_owned()));
         let connector = spawn_connector(route, local_address, pairing_codes);
-        let body = br#"{"code":"ABCD-2345","name":"phone"}"#;
+        let duplicate_body = br#"{"code":"ABCD-2345","name":"phone"}"#;
+        let duplicate_response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut browser = TcpStream::connect(bridge_address).await.unwrap();
+                browser
+                    .write_all(
+                        format!(
+                            "POST /_bridge/pair HTTP/1.1\r\nHost: bridge.example\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            duplicate_body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                browser.write_all(duplicate_body).await.unwrap();
+                let mut response = Vec::new();
+                browser.read_to_end(&mut response).await.unwrap();
+                if response.starts_with(b"HTTP/1.1 409 Conflict") {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the code was never published at the bridge");
+        assert!(
+            String::from_utf8(duplicate_response)
+                .unwrap()
+                .contains("choose a different device")
+        );
+
+        let body = br#"{"code":"ABCD-2345","name":"tablet"}"#;
         let response = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut browser = TcpStream::connect(bridge_address).await.unwrap();
@@ -1522,7 +1562,7 @@ mod tests {
             }
         })
         .await
-        .expect("the code was never published at the bridge");
+        .expect("the name collision discarded the published code");
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains(&format!("x-super-herdr-route: /r/{ROUTE}\r\n")));
         assert!(response.contains(&format!("Path=/r/{ROUTE};")));
