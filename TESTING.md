@@ -106,10 +106,10 @@ has already hidden a fault that shipped:
   argument.
 
   `tools/page-harness.mjs` and `tools/bridge-page-harness.mjs` load the real
-  scripts against stub DOMs and assert what the pages send, including Office
-  MIME/name carriage, chunk bytes, SHA-256 trailers, verified-path quoting, and
-  the 32 MiB phone limit, so "verified by hand" is repeatable rather than a
-  promise:
+  scripts against stub DOMs and assert what the pages send, including gated
+  one-tap replies, compact attention disclosure, Office MIME/name carriage,
+  chunk bytes, SHA-256 trailers, verified-path quoting, and the 32 MiB phone
+  limit, so "verified by hand" is repeatable rather than a promise:
 
   ```sh
   node tools/page-harness.mjs src/daemon/app.html

@@ -698,6 +698,8 @@ mod tests {
         assert!(APP.contains("type=\"file\""));
         assert!(APP.contains("type: 'upload.begin'"));
         assert!(APP.contains("crypto.subtle.digest('SHA-256'"));
+        assert_eq!(APP.matches("data-reply=").count(), 4);
+        assert!(APP.contains("class=\"keys control-strip\""));
         assert_eq!(APP.matches("id=\"attention\"").count(), 1);
         assert!(!APP.contains("id=\"waiting\""));
         assert!(!APP.contains("id=\"history\""));

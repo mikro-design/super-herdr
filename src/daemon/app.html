@@ -68,6 +68,7 @@
   #attention { padding: 0 .7rem .25rem; }
   #attention li { background: var(--bg); padding: .55rem .65rem; }
   #attention-panel .actions { padding: 0 .7rem .7rem; }
+  #mark-actions[hidden] { display: none; }
   #panes { display: grid; gap: .8rem; }
   #panes .target-card { margin: 0; padding: 0; overflow: hidden; }
   .target-group > summary { cursor: pointer; list-style-position: inside; }
@@ -95,19 +96,33 @@
     color: var(--text); background: var(--panel);
     border: 1px solid var(--line); border-radius: .4rem;
   }
-  .keys { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
-  .keys button { min-width: 3.4rem; }
-  .upload-row { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; min-width: 0; }
+  .control-strip {
+    display: flex; align-items: center; gap: .35rem; min-width: 0;
+    overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
+    padding: .05rem 0; margin-top: .35rem;
+  }
+  .control-strip::-webkit-scrollbar { display: none; }
+  .control-strip button { flex: none; min-height: 2.25rem; white-space: nowrap; }
+  .quick-replies button { color: var(--text); background: var(--bg); }
+  .quick-replies button::after { content: ' ↵'; color: var(--dim); }
+  .keys button { min-width: 2.8rem; }
+  .tool-row { display: flex; align-items: stretch; gap: .35rem; min-width: 0; margin-top: .35rem; }
+  .tool-row .control-strip { flex: 1; margin-top: 0; }
   .file-action {
     position: relative; flex: none; color: var(--accent); border: 1px solid var(--line);
-    border-radius: .55rem; padding: .4rem .7rem; cursor: pointer;
+    border-radius: .55rem; min-height: 2.25rem; padding: .35rem .7rem; cursor: pointer;
+    display: inline-flex; align-items: center; white-space: nowrap;
   }
   .file-action.disabled { color: var(--dim); cursor: default; opacity: .65; }
   #files {
     position: absolute; width: 1px; height: 1px; overflow: hidden;
     clip-path: inset(50%); white-space: nowrap;
   }
-  #upload-note { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #upload-note {
+    display: block; min-width: 0; min-height: 1.15rem; margin-top: .2rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #upload-note:empty { display: none; }
   #version { font-size: .72rem; color: var(--dim); }
   #pairing { padding: 1rem; max-width: 26rem; margin: 0 auto; }
   #pairing label { display: block; margin: .8rem 0; color: var(--dim); font-size: .82rem; }
@@ -161,25 +176,24 @@
   .viewer-head #stop { margin-left: auto; flex: none; }
   .viewer-controls { min-width: 0; }
   .viewer-controls > .actions { margin: 0; align-items: center; }
-  #keyboard { padding-top: .2rem; }
+  #keyboard { padding-top: .1rem; }
 
   @media (max-width: 640px) {
     header { padding: .65rem .75rem; }
     main { padding: .7rem; }
-    h2 { margin-top: 1.1rem; }
+    h2 { margin: .85rem 0 .4rem; }
     #panes { gap: .55rem; }
     .workspace-group { padding-left: .75rem; padding-right: .55rem; }
-    #viewer { gap: .45rem; padding: calc(.4rem + env(safe-area-inset-top)) calc(.4rem + env(safe-area-inset-right)) calc(.4rem + env(safe-area-inset-bottom)) calc(.4rem + env(safe-area-inset-left)); }
-    .viewer-head { min-height: 2.5rem; }
+    #attention-panel { margin-top: .7rem; }
+    #viewer { gap: .3rem; padding: calc(.3rem + env(safe-area-inset-top)) calc(.3rem + env(safe-area-inset-right)) calc(.3rem + env(safe-area-inset-bottom)) calc(.3rem + env(safe-area-inset-left)); }
+    .viewer-head { min-height: 2.25rem; }
     #screen-note { display: none; }
-    #viewer .screen { border-radius: .45rem; padding: .45rem .5rem; }
-    .viewer-controls { background: var(--panel); border: 1px solid var(--line); border-radius: .55rem; padding: .45rem; }
-    #control { width: 100%; min-height: 2.75rem; font-weight: 650; }
-    #line { min-height: 2.75rem; font-size: 16px; }
-    #send { min-height: 2.75rem; }
-    .keys { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .35rem; }
-    .keys button { min-width: 0; min-height: 2.65rem; padding: .3rem; }
-    .file-action { min-height: 2.65rem; display: inline-flex; align-items: center; }
+    #viewer .screen { border-radius: .45rem; padding: .4rem .45rem; }
+    .viewer-controls { background: var(--panel); border: 1px solid var(--line); border-radius: .5rem; padding: .35rem .4rem .25rem; }
+    #control { width: 100%; min-height: 2.55rem; font-weight: 650; }
+    #line { min-height: 2.55rem; font-size: 16px; }
+    #send { min-height: 2.55rem; }
+    .control-strip button, .file-action { min-height: 2.35rem; padding: .3rem .65rem; }
   }
 </style>
 
@@ -221,7 +235,7 @@
   <details id="attention-panel">
     <summary>Attention <span id="attention-count" class="badge gone">none</span></summary>
     <ul id="attention"><li class="empty">nothing needs attention</li></ul>
-    <div class="actions"><button id="mark">Mark all read</button></div>
+    <div id="mark-actions" class="actions" hidden><button id="mark">Mark all read</button></div>
   </details>
 
   <section id="viewer" hidden>
@@ -235,28 +249,34 @@
       <div class="actions"><button id="control">Take control &amp; type</button></div>
       <div id="keyboard" hidden>
         <form id="line-form" class="actions">
-          <input id="line" placeholder="Type a command" autocapitalize="off"
+          <input id="line" placeholder="Type a reply or command" autocapitalize="off"
                  autocomplete="off" autocorrect="off" spellcheck="false"
                  enterkeyhint="send">
           <button id="send" type="submit">Send</button>
         </form>
-        <div class="keys">
-          <button data-key="enter">Enter</button>
-          <button data-key="escape">Esc</button>
-          <button data-key="tab">Tab</button>
-          <button data-key="up">&uarr;</button>
-          <button data-key="down">&darr;</button>
-          <button data-key="left">&larr;</button>
-          <button data-key="right">&rarr;</button>
-          <button data-key="backspace">Back</button>
-          <button data-key="interrupt">Ctrl-C</button>
+        <div class="quick-replies control-strip" aria-label="Quick replies">
+          <button type="button" data-reply="yes" aria-label="Send y and Enter">Yes</button>
+          <button type="button" data-reply="no" aria-label="Send n and Enter">No</button>
+          <button type="button" data-reply="continue" aria-label="Send continue and Enter">Continue</button>
+          <button type="button" data-reply="retry" aria-label="Send retry and Enter">Retry</button>
         </div>
-        <div class="upload-row">
-          <label id="file-action" class="file-action" for="files">Send files
+        <div class="tool-row">
+          <div class="keys control-strip" aria-label="Terminal keys">
+            <button data-key="enter">Enter</button>
+            <button data-key="escape">Esc</button>
+            <button data-key="tab">Tab</button>
+            <button data-key="up">&uarr;</button>
+            <button data-key="down">&darr;</button>
+            <button data-key="left">&larr;</button>
+            <button data-key="right">&rarr;</button>
+            <button data-key="backspace">Back</button>
+            <button data-key="interrupt">Ctrl-C</button>
+          </div>
+          <label id="file-action" class="file-action" for="files" title="Send files up to 32 MiB">Files
             <input id="files" type="file" multiple>
           </label>
-          <span id="upload-note" class="note">PDF, Word, PowerPoint, or any file up to 32 MiB</span>
         </div>
+        <span id="upload-note" class="note" role="status"></span>
       </div>
     </div>
   </section>
@@ -279,6 +299,7 @@ const endpoint = path => `${basePath}${path}`;
 // federation and the attention history are what the daemon last said they were.
 const targets = new Map();
 let attention = [];
+let attentionAutoOpened = false;
 const openTargets = new Set();
 const openSessions = new Set();
 
@@ -339,7 +360,7 @@ const COMMAND_TIMEOUT_MS = 60_000;
 const UPLOAD_REPLY_TIMEOUT_MS = 120_000;
 const MAX_BROWSER_FILE_BYTES = 32 * 1024 * 1024;
 const UPLOAD_CHUNK_BYTES = 512 * 1024;
-const DEFAULT_UPLOAD_NOTE = 'PDF, Word, PowerPoint, or any file up to 32 MiB';
+const DEFAULT_UPLOAD_NOTE = '';
 
 // File chunks use the same command route as terminal input, but unlike a key
 // press each request is substantial. Await every bounded POST so backpressure
@@ -436,9 +457,18 @@ function renderAttention() {
   const count = el('attention-count');
   count.textContent = rows.length ? String(rows.length) : 'none';
   count.className = `badge ${rows.length ? 'wait' : 'gone'}`;
+  el('mark-actions').hidden = rows.length < 2;
   if (!rows.length) {
+    attentionAutoOpened = false;
     list.innerHTML = '<li class="empty">nothing needs attention</li>';
     return;
+  }
+  // Surface the first waiting batch without another tap. Once it has opened,
+  // a person can collapse it and subsequent state refreshes preserve that
+  // choice until the attention queue becomes empty.
+  if (!attentionAutoOpened) {
+    el('attention-panel').open = true;
+    attentionAutoOpened = true;
   }
   for (const row of rows.slice(0, 12)) {
     const item = document.createElement('li');
@@ -738,6 +768,17 @@ const KEYS = {
   backspace: '\x7f',
 };
 
+// These are deliberately short, fixed replies rather than inferred actions.
+// Reading terminal output to guess a response would be both brittle and a
+// surprising authority boundary. The arrow in the button label tells the user
+// each explicit tap sends the reply immediately with Enter.
+const QUICK_REPLIES = {
+  yes: 'y\r',
+  no: 'n\r',
+  continue: 'continue\r',
+  retry: 'retry\r',
+};
+
 // Reveal the input during the tap that requests control, but enable every send
 // action only after the daemon grants the lease. This opens a phone keyboard
 // without turning an optimistic UI transition into authorization.
@@ -749,6 +790,9 @@ function renderKeyboard() {
   el('files').disabled = !holding || uploadBusy;
   el('file-action').className = `file-action${!holding || uploadBusy ? ' disabled' : ''}`;
   for (const button of document.querySelectorAll('.keys button')) {
+    button.disabled = !holding;
+  }
+  for (const button of document.querySelectorAll('.quick-replies button')) {
     button.disabled = !holding;
   }
 }
@@ -1171,6 +1215,10 @@ for (const button of document.querySelectorAll('.keys button')) {
     sendText(KEYS[button.dataset.key] || '');
     el('line').focus();
   };
+}
+for (const button of document.querySelectorAll('.quick-replies button')) {
+  button.onpointerdown = event => event.preventDefault();
+  button.onclick = () => sendText(QUICK_REPLIES[button.dataset.reply] || '');
 }
 el('stop').onclick = () => stopWatching('');
 

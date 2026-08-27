@@ -79,11 +79,13 @@ It never takes over, stops, starts, or restarts a Herdr session.
   behind is sent the screen as it stands rather than a backlog, and an observer
   must take the pane's control lease before its keyboard can send anything.
   The phone layout puts the selected terminal first at a readable minimum size,
-  pans instead of shrinking it into illegibility, and keeps its input and
-  terminal keys above the soft keyboard. Targets and sessions are collapsible,
-  while one compact attention list opens the relevant terminal directly. With
-  control held, a file picker sends PDF, Word, PowerPoint, or any other file
-  through the same size-and-digest verified daemon upload path.
+  pans instead of shrinking it into illegibility, and keeps a compact command
+  dock above the soft keyboard. One-tap Yes, No, Continue, and Retry replies sit
+  above a scrolling terminal-key rail with a pinned file picker. Targets and
+  sessions are collapsible, while the first waiting attention batch opens its
+  relevant terminal rows directly. With control held, the picker sends PDF,
+  Word, PowerPoint, or any other file through the same size-and-digest verified
+  daemon upload path.
 
 ## Recommended topology
 
@@ -127,6 +129,11 @@ Build concurrency is capped at four jobs in `.cargo/config.toml` and in the
 provided Makefile targets.
 
 ## Install
+
+Upgrade from 0.7.18 for the compact phone command dock. 0.7.19 replaces the
+three-row terminal-key grid with visible one-tap replies and a single scrolling
+key rail, keeps the file picker pinned, gives the reclaimed height back to the
+terminal, and opens the first waiting attention batch without another tap.
 
 Upgrade from 0.7.17 to send files from the phone browser or to transfer desktop
 files whose names contain spaces, punctuation, or Unicode. 0.7.18 adds a bounded
@@ -532,13 +539,17 @@ sending keystrokes to a shell — so the browser client opens a pane as an
 observer and offers a **Take control & type** button. The daemon hands the lease
 over and tells whoever held it, so nothing is taken silently. The terminal fills
 the phone viewport and stays at least 12 CSS pixels high; wide panes scroll
-horizontally rather than becoming unreadably small. With control held, the line
-input stays above the soft keyboard and terminal keys (Enter, Tab, Esc,
-Backspace, Ctrl-C, and all four arrows) reach the pane. Losing the lease to
-another client takes the keyboard away again rather than leaving one that cannot
-type. Targets and sessions stay collapsed until opened, and the single compact
-attention section jumps directly to the terminal behind an agent or event.
-The **Send files** picker appears with control. It accepts PDF, DOC/DOCX,
+horizontally rather than becoming unreadably small. With control held, a compact
+command dock stays above the soft keyboard. Its Yes, No, Continue, and Retry
+buttons submit fixed replies with Enter, and a single horizontally scrolling
+rail carries Enter, Tab, Esc, Backspace, Ctrl-C, and all four arrows. Losing the
+lease to another client takes every send action away again rather than leaving
+controls that cannot type. Targets and sessions stay collapsed until opened,
+and the single compact attention section opens the first waiting batch and jumps
+directly to the terminal behind an agent or event. Its Mark-all action is shown
+only for an actual multi-item batch.
+
+The pinned **Files** picker appears with control. It accepts PDF, DOC/DOCX,
 PPT/PPTX, and arbitrary files up to 32 MiB, sends bounded chunks through the
 existing authenticated protocol, and waits for the daemon's verified byte count
 and SHA-256 result before pasting a shell-quoted remote path. The bridge still

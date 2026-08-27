@@ -47,6 +47,11 @@ const keyButtons = [
   button.dataset = { key };
   return button;
 });
+const quickReplyButtons = ['yes', 'no', 'continue', 'retry'].map(reply => {
+  const button = node(`reply-${reply}`);
+  button.dataset = { reply };
+  return button;
+});
 const codeBoxNodes = Array.from({ length: 8 }, (_, index) => node(`code-${index}`));
 
 globalThis.document = {
@@ -55,6 +60,7 @@ globalThis.document = {
   querySelector: selector => node(`sel-${selector}`),
   querySelectorAll: selector => {
     if (selector === '.keys button') return keyButtons;
+    if (selector === '.quick-replies button') return quickReplyButtons;
     if (selector === '.code-box') return codeBoxNodes;
     return [];
   },
@@ -97,7 +103,7 @@ class StubEventSource {
 }
 globalThis.EventSource = StubEventSource;
 
-const module = new Function(`${script}\nreturn { apply, observe, takeControl, uploadSelectedFiles, shellQuote, el, KEYS, endpoint, renderPanes, codeBoxes, enteredCode };`);
+const module = new Function(`${script}\nreturn { apply, observe, takeControl, uploadSelectedFiles, shellQuote, el, KEYS, QUICK_REPLIES, endpoint, renderPanes, codeBoxes, enteredCode };`);
 const page = module();
 
 const deliver = message => page.apply(message);
@@ -172,7 +178,20 @@ check('collapses target groups on a multi-target phone view', firstTarget.open =
 check('keeps two sessions under the first target', firstTarget.children.length === 3);
 check('shows one compact actionable attention item', page.el('attention').children.length === 1);
 check('reports the compact attention count', page.el('attention-count').textContent === '1');
+check('opens the first waiting attention batch', page.el('attention-panel').open === true);
+check('does not waste a row on mark-all for one item', page.el('mark-actions').hidden === true);
 check('attention items can open their terminal', typeof page.el('attention').children[0].onclick === 'function');
+page.el('attention-panel').open = false;
+deliver({
+  type: 'attention.event',
+  event: {
+    id: 2, unread: true, agent: 'reviewer', kind: 'needs_input', workspace: 'review',
+    pane: { target: 'first', session: 'main', resource: 'w1:p2' },
+  },
+});
+check('preserves a manual attention collapse', page.el('attention-panel').open === false);
+check('offers mark-all for a real attention batch', page.el('mark-actions').hidden === false);
+deliver({ type: 'attention.history', events: [] });
 
 // Watching a pane: observing, and no keyboard offered.
 page.observe(pane, 'first/main/w1:p1');
@@ -197,6 +216,7 @@ check('reveals the keyboard during the control tap', page.el('keyboard').hidden 
 check('focuses the line during the control tap', page.el('line').focused === true);
 check('does not enable Send before the lease arrives', page.el('send').disabled === true);
 check('does not enable terminal keys before the lease arrives', keyButtons.every(one => one.disabled));
+check('does not enable quick replies before the lease arrives', quickReplyButtons.every(one => one.disabled));
 sent.length = 0;
 page.el('line').value = 'typed while waiting';
 page.el('line-form').onsubmit({ preventDefault() {} });
@@ -209,6 +229,7 @@ check('the keyboard appears with control', page.el('keyboard').hidden === false)
 check('control is no longer offered', page.el('control').hidden === true);
 check('enables Send only with control', page.el('send').disabled === false);
 check('enables terminal keys only with control', keyButtons.every(one => !one.disabled));
+check('enables quick replies only with control', quickReplyButtons.every(one => !one.disabled));
 
 // A browser file uses the daemon's verified upload protocol. Its MIME can be
 // an Office type the clipboard-media table does not know; the name preserves
@@ -283,6 +304,17 @@ for (const [index, key] of [
   keyButtons[index].onclick();
   const bytes = Buffer.from(sent.at(-1).body.bytes, 'base64').toString('binary');
   check(`${key} sends ${JSON.stringify(page.KEYS[key])}`, bytes === page.KEYS[key]);
+}
+
+// Quick replies are explicit one-tap submissions, not text inferred from the
+// terminal screen. They include Enter and do not summon the software keyboard.
+for (const [index, reply] of ['yes', 'no', 'continue', 'retry'].entries()) {
+  sent.length = 0;
+  page.el('line').focused = false;
+  quickReplyButtons[index].onclick();
+  const bytes = Buffer.from(sent.at(-1).body.bytes, 'base64').toString('utf8');
+  check(`${reply} is submitted in one tap`, bytes === page.QUICK_REPLIES[reply]);
+  check(`${reply} does not open the software keyboard`, page.el('line').focused === false);
 }
 
 // Losing the lease takes the keyboard with it.
