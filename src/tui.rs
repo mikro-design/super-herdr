@@ -1817,9 +1817,9 @@ fn settle_upload_batch(app: &mut App, batch: u64) {
     };
     let (paths, report) = settled_batch(state);
     if !paths.is_empty() {
-        paste_verified_path(
+        paste_verified_paths(
             app,
-            &paths.join(" "),
+            &paths,
             format!(
                 "uploaded and verified {} file(s); pasted remote paths",
                 paths.len()
@@ -1836,6 +1836,30 @@ fn settle_upload_batch(app: &mut App, batch: u64) {
 }
 
 fn paste_verified_path(app: &mut App, path: &str, feedback: String) {
+    paste_verified_paths(app, &[path.to_owned()], feedback);
+}
+
+/// Quote one verified remote path as one shell word.
+///
+/// A staged filename may contain spaces, quotes, `$`, or other punctuation.
+/// The path itself is data, but it is pasted into a terminal where unquoted
+/// data becomes syntax. Single quotes make every byte inert except another
+/// single quote, which is represented by closing, escaping, and reopening.
+fn shell_quoted_path(path: &str) -> String {
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('\'');
+    for character in path.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn paste_verified_paths(app: &mut App, paths: &[String], feedback: String) {
     let Some(selected) = app.selected_pane.clone() else {
         app.message = Some("no pane is selected for the uploaded path".to_owned());
         return;
@@ -1849,7 +1873,12 @@ fn paste_verified_path(app: &mut App, path: &str, feedback: String) {
         return;
     }
     let bracketed = route.parser.screen().bracketed_paste();
-    let Ok(payload) = terminal_paste_payload(path.as_bytes(), bracketed) else {
+    let text = paths
+        .iter()
+        .map(|path| shell_quoted_path(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Ok(payload) = terminal_paste_payload(text.as_bytes(), bracketed) else {
         app.message = Some("the uploaded path could not be encoded for paste".to_owned());
         return;
     };
@@ -4920,7 +4949,9 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                     && let Some(entry) = pending.batch
                 {
                     if let Some(batch) = app.upload_batches.get_mut(&entry.batch) {
-                        batch.failures.push(pending.described);
+                        batch
+                            .failures
+                            .push(format!("{}: {message}", pending.described));
                     }
                     settle_upload_batch(app, entry.batch);
                     return;
@@ -7262,6 +7293,22 @@ mod tests {
         assert!(report.is_none(), "nothing failed, so nothing is reported");
     }
 
+    #[test]
+    fn verified_document_paths_are_quoted_as_single_shell_words() {
+        assert_eq!(
+            super::shell_quoted_path("/tmp/staged/Quarterly report (final).pptx"),
+            "'/tmp/staged/Quarterly report (final).pptx'"
+        );
+        assert_eq!(
+            super::shell_quoted_path("/tmp/staged/roadmap's figures.docx"),
+            "'/tmp/staged/roadmap'\\''s figures.docx'"
+        );
+        assert_eq!(
+            super::shell_quoted_path("/tmp/staged/$(touch nope).pdf"),
+            "'/tmp/staged/$(touch nope).pdf'"
+        );
+    }
+
     /// A file that fails does not strand the ones that arrived.
     #[test]
     fn a_batch_settles_even_when_one_file_never_arrives() {
@@ -7283,15 +7330,52 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .failures
-            .push("b.c".to_owned());
+            .push("b.c: transfer checksum did not match".to_owned());
         super::settle_upload_batch(&mut app, 1);
 
         assert!(!app.upload_batches.contains_key(&1));
         let message = app.message.clone().unwrap_or_default();
         assert!(
-            message.contains("b.c") && message.contains("1 of 2"),
-            "a missing file is named rather than passed over: {message}"
+            message.contains("b.c")
+                && message.contains("checksum did not match")
+                && message.contains("1 of 2"),
+            "a missing file keeps its exact failure: {message}"
         );
+    }
+
+    #[test]
+    fn a_copied_document_failure_keeps_the_daemons_exact_reason() {
+        let mut app = App::default();
+        app.pending_uploads.insert(
+            41,
+            super::PendingUpload {
+                described: "Quarterly report.docx".to_owned(),
+                batch: Some(super::UploadBatchEntry {
+                    batch: 9,
+                    position: 0,
+                }),
+            },
+        );
+        app.upload_batches.insert(
+            9,
+            super::UploadBatch {
+                expected: 1,
+                paths: BTreeMap::new(),
+                failures: Vec::new(),
+            },
+        );
+
+        super::handle_daemon_event(
+            crate::protocol::ServerMessage::Error {
+                request: Some(41),
+                message: "remote digest did not match".to_owned(),
+            },
+            &mut app,
+        );
+
+        let message = app.message.unwrap_or_default();
+        assert!(message.contains("Quarterly report.docx"), "{message}");
+        assert!(message.contains("remote digest did not match"), "{message}");
     }
 
     #[test]

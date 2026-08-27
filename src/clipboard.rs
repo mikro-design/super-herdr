@@ -325,7 +325,7 @@ pub const OPAQUE: ClipboardMedia = ClipboardMedia {
 /// Well under any filesystem's limit, because the point is not to fit but to
 /// stay something a person can read in a refusal and in a path pasted into a
 /// pane.
-const MAX_TRANSFER_NAME_BYTES: usize = 96;
+const MAX_TRANSFER_NAME_BYTES: usize = 240;
 
 /// What a transfer is called on the target host.
 ///
@@ -338,12 +338,13 @@ const MAX_TRANSFER_NAME_BYTES: usize = 96;
 /// place; and the script refuses a separator itself, so neither side is trusted
 /// alone.
 ///
-/// The character class stays narrow anyway, for a reason that outlives the
-/// quoting: the resulting path is pasted into a pane, where a name carrying a
-/// space, a quote, a semicolon or a `$` would be a command somebody's shell
-/// runs. Inert as text is the requirement, not merely inert as an argument.
-/// A name that does not qualify is refused rather than mangled, because
-/// silently renaming a file tells the caller it got what it asked for.
+/// The resulting verified path is shell-quoted by clients before it is pasted,
+/// so ordinary names may contain spaces, punctuation, and Unicode without
+/// becoming terminal syntax. What remains forbidden here is what cannot be one
+/// path component or cannot survive the line framing used to hand the name to
+/// the staging script. A name that does not qualify is refused rather than
+/// mangled, because silently renaming a file tells the caller it got something
+/// different.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedName(String);
 
@@ -360,22 +361,11 @@ impl StagedName {
                 requested.len()
             );
         }
-        if requested == "." || requested == ".." {
+        if requested == "." || requested == ".." || requested.contains("..") {
             bail!("a transfer cannot be named {requested:?}");
         }
-        if requested.starts_with('.') || requested.starts_with('-') {
-            // A leading dot hides the file from whoever goes looking for it; a
-            // leading dash is an option to the next command that sees the path.
-            bail!("a transfer name cannot begin with {:?}", &requested[..1]);
-        }
-        if !requested
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
-        {
-            bail!(
-                "a transfer name may use only letters, digits, dots, dashes and \
-                 underscores; {requested:?} does not"
-            );
+        if requested.contains('/') || requested.chars().any(char::is_control) {
+            bail!("a transfer name must be one printable path component");
         }
         Ok(Self(requested.to_owned()))
     }
@@ -1967,8 +1957,8 @@ async fn upload_remote_media(
 /// Hand the staging script its name, ahead of the payload it belongs to.
 ///
 /// The newline is the whole framing: the script reads one line and everything
-/// after it is the file. A name that could contain one would break that, which
-/// is among the reasons the character class is what it is.
+/// after it is the file. [`StagedName`] rejects control characters so a name
+/// cannot terminate or otherwise confuse that heading.
 async fn write_transfer_name<W>(input: &mut W, staged: &StagedName) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -2709,13 +2699,20 @@ mod tests {
 
     #[test]
     fn a_transfer_name_is_refused_rather_than_repaired() {
-        // What a caller may have. Dots, dashes and underscores are what real
-        // filenames are made of.
+        // These remain one path component, and clients quote the verified path
+        // before it is pasted into a terminal. Ordinary document names should
+        // therefore stay ordinary rather than being rejected or renamed.
         for name in [
             "report.pdf",
+            "Quarterly report (final).docx",
+            "roadmap's figures.pptx",
+            "naïve résumé.pdf",
             "build-log.txt",
             "core_dump",
             "v1.2.3-rc4.tar.gz",
+            ".hidden",
+            "-rf",
+            "$(whoami).txt",
             "a",
         ] {
             assert!(
@@ -2724,23 +2721,16 @@ mod tests {
             );
         }
 
-        // What it may not, and why. Each of these is a path that would be
-        // pasted into a pane, so the bar is inert as text rather than merely
-        // inert as an argument.
+        // What cannot be one safely framed path component is refused rather
+        // than repaired or truncated.
         for name in [
             "../etc/passwd",  // leaves the staging directory
             "sub/dir.txt",    // same, by a shorter route
             "..",             // the directory itself
             ".",              //
-            ".hidden",        // invisible to whoever goes looking for it
-            "-rf",            // an option to the next command that sees it
-            "a b.txt",        // two arguments once pasted
-            "$(whoami).txt",  // a command once pasted
-            "`id`.txt",       //
-            "a;rm -rf ~.txt", //
-            "quote\".txt",    //
+            "two..dots.docx", // resume guards reject traversal-like names too
             "new\nline.txt",  // would break the framing outright
-            "naïve.txt",      // not refused for being foreign, but for being
+            "tab\there.pptx", // would corrupt the tab-separated receipt
             "",               // outside a class narrow enough to reason about
         ] {
             assert!(
@@ -2796,6 +2786,32 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn an_office_document_keeps_its_ordinary_filename() {
+        let payload = b"opaque pptx bytes";
+        let uploaded = complete(
+            upload_stream(
+                &local_target(),
+                &TransportConfig::default(),
+                fresh(
+                    Some("Quarterly plan's (final).pptx"),
+                    OPAQUE,
+                    payload.len() as u64,
+                ),
+                payload.as_slice(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            uploaded.path.ends_with("/Quarterly plan's (final).pptx"),
+            "{}",
+            uploaded.path
+        );
+        assert_eq!(std::fs::read(&uploaded.path).unwrap(), payload);
+        discard_local_upload(std::path::Path::new(&uploaded.path));
     }
 
     #[test]

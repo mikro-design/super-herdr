@@ -42,6 +42,14 @@ const APP: &str = include_str!("app.html");
 /// hundred bytes; anything approaching this is not one.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
+/// Commands posted by one browser but not yet written to its daemon
+/// attachment. File chunks make these messages substantial, so an unbounded
+/// queue would let a fast browser consume memory while a target applies
+/// backpressure. Four mirrors the daemon relay queue and keeps one viewer's
+/// failure isolated.
+const COMMAND_QUEUE_DEPTH: usize = 4;
+const COMMAND_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A session identifier from a browser is untrusted text used only as a map
 /// key, and is bounded and restricted to characters that cannot confuse a log
 /// or a header.
@@ -153,7 +161,7 @@ pub trait Devices: Send + Sync {
 /// fails the moment a second tab is open.
 #[derive(Default)]
 struct Sessions {
-    open: Mutex<BTreeMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    open: Mutex<BTreeMap<String, mpsc::Sender<Vec<u8>>>>,
 }
 
 pub async fn bind(address: SocketAddr) -> Result<TcpListener> {
@@ -313,12 +321,16 @@ async fn handle(
             // connection.
             let forwarded = crate::protocol::decode::<ClientMessage>(body.trim_ascii())
                 .ok()
-                .and_then(|message| encode(&message).ok())
-                .is_some_and(|line| sender.send(line).is_ok());
-            if forwarded {
-                write_status(&mut writer, "204 No Content", "").await
-            } else {
-                write_status(&mut writer, "400 Bad Request", "unreadable command").await
+                .and_then(|message| encode(&message).ok());
+            let Some(line) = forwarded else {
+                return write_status(&mut writer, "400 Bad Request", "unreadable command").await;
+            };
+            match tokio::time::timeout(COMMAND_FORWARD_TIMEOUT, sender.send(line)).await {
+                Ok(Ok(())) => write_status(&mut writer, "204 No Content", "").await,
+                Ok(Err(_)) => {
+                    write_status(&mut writer, "409 Conflict", "event stream closed").await
+                }
+                Err(_) => write_status(&mut writer, "503 Service Unavailable", "client busy").await,
             }
         }
         _ => write_status(&mut writer, "404 Not Found", "no such path").await,
@@ -499,7 +511,7 @@ async fn stream_events(
     })?;
     daemon_writer.write_all(&hello).await?;
 
-    let (commands, mut posted) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (commands, mut posted) = mpsc::channel::<Vec<u8>>(COMMAND_QUEUE_DEPTH);
     if let Ok(mut open) = sessions.open.lock() {
         open.insert(session.clone(), commands);
     }
@@ -683,6 +695,9 @@ mod tests {
         assert!(APP.contains("Math.max(12"));
         assert!(!APP.contains("Math.max(7"));
         assert!(APP.contains("interactive-widget=resizes-content"));
+        assert!(APP.contains("type=\"file\""));
+        assert!(APP.contains("type: 'upload.begin'"));
+        assert!(APP.contains("crypto.subtle.digest('SHA-256'"));
         assert_eq!(APP.matches("id=\"attention\"").count(), 1);
         assert!(!APP.contains("id=\"waiting\""));
         assert!(!APP.contains("id=\"history\""));
@@ -809,6 +824,60 @@ mod tests {
         )
         .await;
         assert!(status.contains("400"), "{status}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_posted_browser_command_reaches_its_bounded_attachment() {
+        let (far, near) = tokio::io::duplex(64 * 1024);
+        let near = Arc::new(Mutex::new(Some(near)));
+        let attach: super::Attach = Arc::new(move || {
+            near.lock()
+                .ok()
+                .and_then(|mut held| held.take())
+                .ok_or_else(|| anyhow::anyhow!("attached twice"))
+        });
+        let listener = super::bind(loopback(0)).await.expect("binds loopback");
+        let port = listener.local_addr().expect("a bound address").port();
+        let devices = Arc::new(TestDevices::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices));
+
+        let mut events = TcpStream::connect(loopback(port)).await.expect("connects");
+        events
+            .write_all(
+                format!(
+                    "GET /events?session=posted HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("opens the event stream");
+
+        let mut daemon = BufReader::new(far);
+        let mut line = String::new();
+        daemon
+            .read_line(&mut line)
+            .await
+            .expect("reads the browser handshake");
+        assert!(line.contains("client.hello"), "{line}");
+
+        let body = r#"{"type":"state.subscribe"}"#;
+        let status = request(
+            port,
+            &format!(
+                "POST /command?session=posted HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(status.contains("204"), "{status}");
+
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(5), daemon.read_line(&mut line))
+            .await
+            .expect("the bounded command queue stalled")
+            .expect("reads the posted command");
+        assert!(line.contains("state.subscribe"), "{line}");
         task.abort();
     }
 

@@ -20,14 +20,16 @@ It never takes over, stops, starts, or restarts a Herdr session.
 - Local text selection, multipage edge-drag selection, and desktop clipboard copy.
 - Atomic multiline paste from the terminal or explicit desktop clipboard into a
   selected remote pane.
-- Verified clipboard file upload to the selected host with path-only injection,
+- Verified clipboard media upload to the selected host with path-only injection,
   for PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG.
 - Copying files in a file manager and pasting them into a pane. A clipboard
   holds references rather than bytes for copied files, so the references are
   followed, each file is read from local disk and sent under its own name, and
   the verified remote paths are pasted in the order they were copied — the same
-  path an image takes. A file that does not arrive is named rather than passed
-  over.
+  path an image takes. PDF, DOC, DOCX, PPT, PPTX, and other file types take this
+  format-agnostic path. Ordinary names with spaces, punctuation, and Unicode are
+  preserved and their verified paths are shell-quoted before terminal input. A
+  file that does not arrive is named together with the exact refusal.
 - Verified transfer of arbitrary content to a target through the daemon, relayed
   as it arrives rather than held, under a name the caller chooses, bounded by
   `transfers.max_bytes` and unstaged on the host if any check fails.
@@ -79,7 +81,9 @@ It never takes over, stops, starts, or restarts a Herdr session.
   The phone layout puts the selected terminal first at a readable minimum size,
   pans instead of shrinking it into illegibility, and keeps its input and
   terminal keys above the soft keyboard. Targets and sessions are collapsible,
-  while one compact attention list opens the relevant terminal directly.
+  while one compact attention list opens the relevant terminal directly. With
+  control held, a file picker sends PDF, Word, PowerPoint, or any other file
+  through the same size-and-digest verified daemon upload path.
 
 ## Recommended topology
 
@@ -123,6 +127,13 @@ Build concurrency is capped at four jobs in `.cargo/config.toml` and in the
 provided Makefile targets.
 
 ## Install
+
+Upgrade from 0.7.17 to send files from the phone browser or to transfer desktop
+files whose names contain spaces, punctuation, or Unicode. 0.7.18 adds a bounded
+32 MiB browser file picker for PDF, DOC/DOCX, PPT/PPTX, and arbitrary files,
+verifies the remote byte count and SHA-256 digest, and pastes the verified path.
+It preserves ordinary filenames safely by shell-quoting the returned paths and
+shows the daemon's exact reason when a copied file fails.
 
 Upgrade from 0.7.16 if live server discovery can change the terminal receiving
 your typing, or if you use the browser client on a phone. 0.7.17 keeps the exact
@@ -527,6 +538,11 @@ Backspace, Ctrl-C, and all four arrows) reach the pane. Losing the lease to
 another client takes the keyboard away again rather than leaving one that cannot
 type. Targets and sessions stay collapsed until opened, and the single compact
 attention section jumps directly to the terminal behind an agent or event.
+The **Send files** picker appears with control. It accepts PDF, DOC/DOCX,
+PPT/PPTX, and arbitrary files up to 32 MiB, sends bounded chunks through the
+existing authenticated protocol, and waits for the daemon's verified byte count
+and SHA-256 result before pasting a shell-quoted remote path. The bridge still
+forwards opaque bounded chunks and never interprets or logs the file payload.
 
 The QR and printed URL never contain the pairing code. It is typed into eight
 separate character boxes (a whole code can still be pasted) and sent in a
@@ -540,8 +556,9 @@ loopback. A public address over HTTP is refused. The `daemon` subcommand's
 defaults to one gibibyte. It bounds the target host's disk rather than
 Super-Herdr's memory: a transfer is relayed onto the host as it arrives rather
 than held whole, so the ceiling is a statement about the machine being written
-to. It is separate from the frontend's own 32 MiB clipboard limit, because a
-screenshot and a file are not the same question.
+to. It is separate from the desktop clipboard and phone browser's own 32 MiB
+limits, because those clients currently read one selected file into memory to
+hash and send it.
 
 Notifications are disabled by default. When enabled, the event switches select
 which transitions may reach the desktop. `minimum_interval_seconds` bounds the
@@ -828,9 +845,12 @@ silently splitting it into several messages.
 
 Explicit file upload:
 
-- covers PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG. Super-Herdr asks the desktop
+- recognizes PNG, JPEG, WebP, GIF, TIFF, PDF, and SVG clipboard media.
+  Super-Herdr asks the desktop
   which flavors the clipboard is offering and takes the first it supports,
   preferring PNG so a screenshot behaves exactly as it always has;
+- carries actual copied, dropped, prompted, or browser-picked files regardless
+  of format, including PDF, DOC/DOCX and PPT/PPTX, while preserving their names;
 - is limited to 32 MiB;
 - writes to a private temporary directory on the selected host;
 - verifies remote byte count and SHA-256 digest;
@@ -844,9 +864,11 @@ hashed on the way past so the digest attests to exactly the bytes that were
 sent, with the declared length enforced in both directions: a source that ends
 early is refused as truncated, and one that runs long is cut off rather than
 allowed to write unbounded data onto the host. Each refusal names the check that
-failed, and removes whatever reached the host. A type the table does not carry
-is uploaded with no extension at all rather than refused, because a name from
-outside would be untrusted text in a remote command. A format is recognized by byte patterns at fixed offsets, so
+failed, and removes whatever reached the host. An unnamed clipboard type the
+table does not carry is uploaded with no extension; a named file keeps its own
+last path component. The verified returned path is single-quoted before it is
+pasted, so spaces, punctuation, and Unicode cannot become shell syntax. A format
+is recognized by byte patterns at fixed offsets, so
 WebP is identified by its container tag rather than by the `RIFF` prefix it
 shares with AVI and WAV, and formats with more than one valid header, such as
 GIF and TIFF, carry every form. A flavor with no dependable signature, such as

@@ -97,6 +97,17 @@
   }
   .keys { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
   .keys button { min-width: 3.4rem; }
+  .upload-row { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; min-width: 0; }
+  .file-action {
+    position: relative; flex: none; color: var(--accent); border: 1px solid var(--line);
+    border-radius: .55rem; padding: .4rem .7rem; cursor: pointer;
+  }
+  .file-action.disabled { color: var(--dim); cursor: default; opacity: .65; }
+  #files {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip-path: inset(50%); white-space: nowrap;
+  }
+  #upload-note { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #version { font-size: .72rem; color: var(--dim); }
   #pairing { padding: 1rem; max-width: 26rem; margin: 0 auto; }
   #pairing label { display: block; margin: .8rem 0; color: var(--dim); font-size: .82rem; }
@@ -168,6 +179,7 @@
     #send { min-height: 2.75rem; }
     .keys { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .35rem; }
     .keys button { min-width: 0; min-height: 2.65rem; padding: .3rem; }
+    .file-action { min-height: 2.65rem; display: inline-flex; align-items: center; }
   }
 </style>
 
@@ -238,6 +250,12 @@
           <button data-key="right">&rarr;</button>
           <button data-key="backspace">Back</button>
           <button data-key="interrupt">Ctrl-C</button>
+        </div>
+        <div class="upload-row">
+          <label id="file-action" class="file-action" for="files">Send files
+            <input id="files" type="file" multiple>
+          </label>
+          <span id="upload-note" class="note">PDF, Word, PowerPoint, or any file up to 32 MiB</span>
         </div>
       </div>
     </div>
@@ -315,6 +333,52 @@ function send(message) {
     method: 'POST',
     body: JSON.stringify(message),
   });
+}
+
+const COMMAND_TIMEOUT_MS = 60_000;
+const UPLOAD_REPLY_TIMEOUT_MS = 120_000;
+const MAX_BROWSER_FILE_BYTES = 32 * 1024 * 1024;
+const UPLOAD_CHUNK_BYTES = 512 * 1024;
+const DEFAULT_UPLOAD_NOTE = 'PDF, Word, PowerPoint, or any file up to 32 MiB';
+
+// File chunks use the same command route as terminal input, but unlike a key
+// press each request is substantial. Await every bounded POST so backpressure
+// reaches the browser instead of building a file-sized queue in the page.
+async function postCommand(message) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), COMMAND_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint(`/command?session=${session}`), {
+      method: 'POST',
+      body: JSON.stringify(message),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(detail || `command failed (${response.status})`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function base64Bytes(bytes) {
+  let binary = '';
+  const block = 32 * 1024;
+  for (let offset = 0; offset < bytes.length; offset += block) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + block));
+  }
+  return btoa(binary);
+}
+
+async function sha256Hex(bytes) {
+  if (!crypto.subtle) throw new Error('this browser cannot verify file uploads');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function shellQuote(value) {
+  return "'" + text(value).split("'").join("'\\''") + "'";
 }
 
 function qualify(pane) {
@@ -412,6 +476,44 @@ let lease = 'observe';
 let requestingControl = false;
 let screen = null;
 let cell = null;
+let nextUploadRequest = 1;
+let uploadBusy = false;
+const uploads = new Map();
+
+function signalUpload(message) {
+  const upload = uploads.get(message.request);
+  if (!upload) return false;
+  if (upload.waiter) {
+    const waiter = upload.waiter;
+    upload.waiter = null;
+    waiter(message);
+  } else {
+    upload.events.push(message);
+  }
+  return true;
+}
+
+function nextUploadEvent(upload) {
+  if (upload.events.length) return Promise.resolve(upload.events.shift());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      upload.waiter = null;
+      reject(new Error('the daemon did not answer the file upload'));
+    }, UPLOAD_REPLY_TIMEOUT_MS);
+    upload.waiter = message => {
+      clearTimeout(timer);
+      resolve(message);
+    };
+  });
+}
+
+function uploadEventError(message) {
+  if (message.type === 'error') return new Error(message.message || 'file upload refused');
+  if (message.type === 'upload.interrupted') {
+    return new Error(`file upload stopped after ${message.staged || 0} bytes`);
+  }
+  return null;
+}
 
 function sameId(left, right) {
   return left && right
@@ -564,6 +666,7 @@ function observe(pane, label) {
   el('viewer').hidden = false;
   el('viewing').textContent = label || `${pane.target}/${pane.session}/${pane.resource}`;
   el('screen-note').textContent = 'waiting for output…';
+  if (!uploadBusy) el('upload-note').textContent = DEFAULT_UPLOAD_NOTE;
   el('screen').innerHTML = '';
   subscribeScreen(pane);
 }
@@ -643,8 +746,110 @@ function renderKeyboard() {
   el('keyboard').hidden = !holding && !requestingControl;
   el('control').hidden = holding || requestingControl || !watching;
   el('send').disabled = !holding;
+  el('files').disabled = !holding || uploadBusy;
+  el('file-action').className = `file-action${!holding || uploadBusy ? ' disabled' : ''}`;
   for (const button of document.querySelectorAll('.keys button')) {
     button.disabled = !holding;
+  }
+}
+
+async function uploadBrowserFile(file, pane) {
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength !== file.size) throw new Error(`${file.name}: the file changed while reading`);
+  const bytes = new Uint8Array(buffer);
+  const digest = await sha256Hex(bytes);
+  const request = nextUploadRequest++;
+  const upload = { request, pane, events: [], waiter: null };
+  uploads.set(request, upload);
+  let began = false;
+  try {
+    await postCommand({
+      type: 'upload.begin',
+      request,
+      pane,
+      mime: file.type || 'application/octet-stream',
+      name: file.name,
+      length: bytes.length,
+    });
+    began = true;
+    const accepted = await nextUploadEvent(upload);
+    const refused = uploadEventError(accepted);
+    if (refused) throw refused;
+    if (accepted.type !== 'upload.accepted') throw new Error('unexpected upload answer');
+
+    for (let offset = 0; offset < bytes.length; offset += UPLOAD_CHUNK_BYTES) {
+      await postCommand({
+        type: 'upload.chunk',
+        request,
+        bytes: base64Bytes(bytes.subarray(offset, offset + UPLOAD_CHUNK_BYTES)),
+      });
+      const queued = upload.events[0];
+      const failure = queued && uploadEventError(queued);
+      if (failure) {
+        upload.events.shift();
+        throw failure;
+      }
+    }
+    await postCommand({ type: 'upload.finish', request, digest });
+    const completed = await nextUploadEvent(upload);
+    const failed = uploadEventError(completed);
+    if (failed) throw failed;
+    if (completed.type !== 'upload.complete') throw new Error('unexpected upload completion');
+    return completed.path;
+  } catch (error) {
+    if (began) send({ type: 'upload.cancel', request }).catch(() => {});
+    throw error;
+  } finally {
+    uploads.delete(request);
+  }
+}
+
+function pasteUploadedPaths(pane, paths) {
+  if (!paths.length || !sameId(pane, watching) || lease !== 'control') return false;
+  sendText(paths.map(shellQuote).join(' '));
+  return true;
+}
+
+async function uploadSelectedFiles(selected) {
+  const files = [...selected];
+  if (!files.length) return;
+  if (!watching || lease !== 'control') {
+    el('upload-note').textContent = 'Take control before sending a file.';
+    return;
+  }
+  if (uploadBusy) {
+    el('upload-note').textContent = 'Another file upload is still running.';
+    return;
+  }
+  const oversized = files.find(file => file.size > MAX_BROWSER_FILE_BYTES);
+  if (oversized) {
+    el('upload-note').textContent = `${oversized.name} exceeds the 32 MiB phone limit.`;
+    return;
+  }
+
+  const pane = { ...watching };
+  const paths = [];
+  uploadBusy = true;
+  renderKeyboard();
+  try {
+    for (const [index, file] of files.entries()) {
+      el('upload-note').textContent = `Verifying and sending ${index + 1}/${files.length}: ${file.name}`;
+      paths.push(await uploadBrowserFile(file, pane));
+    }
+    const pasted = pasteUploadedPaths(pane, paths);
+    el('upload-note').textContent = pasted
+      ? `Uploaded and verified ${paths.length} file(s); remote path${paths.length === 1 ? '' : 's'} pasted.`
+      : `Uploaded and verified ${paths.length} file(s); reopen the original pane to use the remote path.`;
+  } catch (error) {
+    const pasted = pasteUploadedPaths(pane, paths);
+    const detail = error instanceof Error ? error.message : String(error);
+    el('upload-note').textContent = pasted
+      ? `${detail}; ${paths.length} earlier verified file(s) pasted.`
+      : detail;
+  } finally {
+    uploadBusy = false;
+    el('files').value = '';
+    renderKeyboard();
   }
 }
 
@@ -898,6 +1103,16 @@ function apply(message) {
     case 'pane.closed':
       if (sameId(message.pane, watching)) stopWatching('the pane closed');
       break;
+    case 'upload.accepted':
+    case 'upload.complete':
+    case 'upload.interrupted':
+      signalUpload(message);
+      break;
+    case 'error':
+      if (!signalUpload(message)) {
+        el('screen-note').textContent = message.message || 'daemon request failed';
+      }
+      break;
     case 'attention.history':
       attention = message.events;
       renderAttention();
@@ -939,6 +1154,7 @@ function connect() {
 
 el('mark').onclick = () => send({ type: 'attention.mark_all_seen' });
 el('control').onclick = takeControl;
+el('files').onchange = event => { void uploadSelectedFiles(event.target.files || []); };
 el('line-form').onsubmit = event => {
   event.preventDefault();
   if (lease !== 'control') return;

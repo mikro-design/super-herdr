@@ -93,12 +93,12 @@ has already hidden a fault that shipped:
   and nothing in the version distinguishes them.
 
 - **The browser client's own logic.** `src/daemon/app.html` is served and
-  embedded in the binary, and no automated check executes a line of it. This is
-  a decision, not an oversight: CI stays Rust-only rather than acquiring a
-  JavaScript toolchain for one file. The consequence is that the page's parser,
-  diff applier and painter are verified by hand or not at all, so **a change to
-  that file carries a stronger obligation to run the page than a change to Rust
-  does** — nothing else will. Two defects have already been found by running it
+  embedded in the binary, and the Rust-only CI does not execute it. The local
+  JavaScript harness below executes its protocol and state logic without adding
+  a browser toolchain to CI; layout and actual mobile-browser behaviour still
+  require a real browser. The consequence is that **a change to that file
+  carries a stronger obligation to run both the harness and the page than a
+  change to Rust does**. Two defects have already been found by running it
   once by hand, both invisible to reading: an explanation written into a panel
   the same function hides, and a top-level `let history` shadowing
   `window.history` so that a scanned pairing code opened a blank page. If that
@@ -106,8 +106,10 @@ has already hidden a fault that shipped:
   argument.
 
   `tools/page-harness.mjs` and `tools/bridge-page-harness.mjs` load the real
-  scripts against stub DOMs and assert what the pages send, so "verified by
-  hand" is repeatable rather than a promise:
+  scripts against stub DOMs and assert what the pages send, including Office
+  MIME/name carriage, chunk bytes, SHA-256 trailers, verified-path quoting, and
+  the 32 MiB phone limit, so "verified by hand" is repeatable rather than a
+  promise:
 
   ```sh
   node tools/page-harness.mjs src/daemon/app.html
@@ -152,6 +154,8 @@ For every applicable row, verify:
 7. Paste a long multiline prompt with the terminal's normal paste command and
    again with `Ctrl+] v`; each must appear as one editable paste and must not be
    submitted as multiple messages. PNG upload must verify size and SHA-256.
+   Copy and send `Quarterly plan's (final).docx` and a PPTX with a Unicode name;
+   each must keep its name and paste one shell-quoted verified path.
 8. Add, edit, and remove a target using only the target manager's mouse controls.
    Verify invalid and duplicate fields are rejected before save, **Test &
    discover** remains responsive while bounded by the configured timeout, and a

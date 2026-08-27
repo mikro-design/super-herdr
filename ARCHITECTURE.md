@@ -446,10 +446,12 @@ hand-written server rather than a web stack. Behind both requests is one
 ordinary in-process attachment, so a browser is a client of the same daemon in
 the same way the frontend is, through the same handshake, receiving the same
 vocabulary rather than a translation of it. When the browser holds a pane's
-control lease, its line submissions and terminal-key buttons use the same posts.
-That is sufficient for deliberate phone input; a future client offering
-continuous per-keystroke interaction would have to justify a socket upgrade
-against the extra transport and authentication surface.
+control lease, its line submissions, terminal-key buttons, and verified file
+chunks use the same posts. Browser command posts enter a bounded queue before
+the daemon attachment, so target backpressure reaches a file sender instead of
+turning a slow route into unbounded memory. A future client offering continuous
+per-keystroke interaction would have to justify a socket upgrade against the
+extra transport and authentication surface.
 
 The phone client gives the observed terminal the remaining dynamic viewport
 height and uses scrolling for panes wider than the screen. It never reduces
@@ -457,7 +459,9 @@ terminal text below a readable minimum merely to fit all columns. Control input
 and explicit terminal keys stay in the bottom control area above the soft
 keyboard. Federation state is grouped as collapsed targets and sessions, and
 agent attention is one bounded, deduplicated, actionable list rather than a
-second navigation tree.
+second navigation tree. A control holder may pick files up to 32 MiB; the page
+hashes the bytes it chunks, the daemon verifies the target's size and SHA-256
+receipt, and only then does the page paste the returned shell-quoted path.
 
 A stream and the posts that steer it are separate requests, joined by an
 identifier the browser generates. Without that join, a subscription posted by
@@ -660,14 +664,14 @@ the payload: data to that script rather than part of it, so nothing from the
 wire is ever parsed as shell. The script refuses a separator itself, which is
 the half that still holds if the daemon's check is ever widened.
 
-The character class stays narrow regardless, for a reason that outlives the
-quoting. The staged path is pasted into a pane, so a name carrying a space, a
-quote, a semicolon or a `$` would be a command somebody's shell runs — inert as
-text is the requirement, not merely inert as an argument. Letters, digits, dots,
-dashes and underscores qualify, and nothing else does. A name that does not is
-refused rather than repaired, since a silently renamed file tells its sender it
-got what it asked for. Where no name is given the flavor supplies one, which is
-the clipboard's case: a screenshot has no name to keep.
+The name must remain one printable path component because it is line-framed into
+the staging stream; separators, controls, traversal-like double dots, and names
+beyond the component limit are refused rather than repaired. Spaces, quotes,
+shell punctuation, and Unicode are otherwise preserved. They remain inert when
+the verified path reaches a terminal because each client single-quotes it as one
+shell word, escaping an embedded quote by closing, escaping, and reopening the
+quoted word. Where no name is given the flavor supplies one, which is the
+clipboard's case: a screenshot has no name to keep.
 
 Both sides stage the same way — a private directory per transfer, with the file
 inside it under its own name. Local and remote then have one shape, one cleanup,
