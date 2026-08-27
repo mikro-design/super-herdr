@@ -680,6 +680,12 @@ mod tests {
         );
         assert_eq!(APP.matches("class=\"code-box\"").count(), 8);
         assert!(APP.contains("el('code').onpaste"));
+        assert!(APP.contains("Math.max(12"));
+        assert!(!APP.contains("Math.max(7"));
+        assert!(APP.contains("interactive-widget=resizes-content"));
+        assert_eq!(APP.matches("id=\"attention\"").count(), 1);
+        assert!(!APP.contains("id=\"waiting\""));
+        assert!(!APP.contains("id=\"history\""));
     }
 
     async fn serve_test_daemon() -> (

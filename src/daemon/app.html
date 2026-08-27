@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="dark light">
 <title>Super-Herdr</title>
 <style>
@@ -56,9 +56,23 @@
   .wait { color: var(--wait); } .work { color: var(--work); } .gone { color: var(--gone); }
   .unread { box-shadow: inset 3px 0 0 var(--wait); }
   .empty { color: var(--dim); padding: .6rem .1rem; }
+  #attention-panel {
+    margin-top: 1.25rem; background: var(--panel); border: 1px solid var(--line);
+    border-radius: .7rem; overflow: hidden;
+  }
+  #attention-panel > summary {
+    display: flex; align-items: center; gap: .6rem; padding: .75rem .85rem;
+    cursor: pointer; font-weight: 560;
+  }
+  #attention-count { margin-left: auto; }
+  #attention { padding: 0 .7rem .25rem; }
+  #attention li { background: var(--bg); padding: .55rem .65rem; }
+  #attention-panel .actions { padding: 0 .7rem .7rem; }
   #panes { display: grid; gap: .8rem; }
   #panes .target-card { margin: 0; padding: 0; overflow: hidden; }
-  .target-title { display: flex; align-items: baseline; gap: .6rem; padding: .75rem .85rem; border-bottom: 1px solid var(--line); }
+  .target-group > summary { cursor: pointer; list-style-position: inside; }
+  .target-title { display: inline-flex; width: calc(100% - 1.4rem); align-items: baseline; gap: .6rem; padding: .75rem .85rem; }
+  .target-group[open] > summary { border-bottom: 1px solid var(--line); }
   .target-title .note { margin-left: auto; }
   .session-group { border-bottom: 1px solid var(--line); }
   .session-group:last-child { border-bottom: 0; }
@@ -107,21 +121,54 @@
      program chose its colours against black, and re-grounding them on white
      would misreport what the pane looks like. */
   .screen {
-    position: relative; overflow-x: auto; background: #0b0d12; color: #d6dae4;
+    position: relative; overflow: auto; background: #0b0d12; color: #d6dae4;
     border: 1px solid var(--line); border-radius: .7rem; padding: .6rem .7rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    line-height: 1.25; white-space: pre; font-size: 13px;
+    line-height: 1.3; white-space: pre; font-size: 14px;
+    overscroll-behavior: contain; touch-action: pan-x pan-y; user-select: text;
+    -webkit-overflow-scrolling: touch;
   }
   .screen .line { min-height: 1.25em; }
   .screen .cursor {
     position: absolute; background: var(--accent); opacity: .6; pointer-events: none;
   }
-  #viewing { font-family: ui-monospace, monospace; text-transform: none; letter-spacing: 0; }
-  #screen-note { align-self: center; }
-  #viewer { position: fixed; inset: 0; z-index: 5; overflow: auto; padding: 1rem; background: var(--bg); }
+  #viewing { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
+  #screen-note { color: var(--dim); font-size: .78rem; white-space: nowrap; }
+  #viewer {
+    position: fixed; top: 0; right: 0; bottom: auto; left: 0; z-index: 5;
+    height: 100dvh; overflow: hidden;
+    display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: .65rem;
+    padding: calc(.7rem + env(safe-area-inset-top))
+             calc(.7rem + env(safe-area-inset-right))
+             calc(.7rem + env(safe-area-inset-bottom))
+             calc(.7rem + env(safe-area-inset-left));
+    background: var(--bg);
+  }
   #viewer[hidden] { display: none; }
-  #viewer > * { max-width: 70rem; margin-left: auto; margin-right: auto; }
-  #viewer .screen { min-height: 55vh; }
+  #viewer > * { width: 100%; max-width: 70rem; margin-left: auto; margin-right: auto; }
+  .viewer-head { display: flex; align-items: center; gap: .6rem; min-width: 0; }
+  .viewer-head #stop { margin-left: auto; flex: none; }
+  .viewer-controls { min-width: 0; }
+  .viewer-controls > .actions { margin: 0; align-items: center; }
+  #keyboard { padding-top: .2rem; }
+
+  @media (max-width: 640px) {
+    header { padding: .65rem .75rem; }
+    main { padding: .7rem; }
+    h2 { margin-top: 1.1rem; }
+    #panes { gap: .55rem; }
+    .workspace-group { padding-left: .75rem; padding-right: .55rem; }
+    #viewer { gap: .45rem; padding: calc(.4rem + env(safe-area-inset-top)) calc(.4rem + env(safe-area-inset-right)) calc(.4rem + env(safe-area-inset-bottom)) calc(.4rem + env(safe-area-inset-left)); }
+    .viewer-head { min-height: 2.5rem; }
+    #screen-note { display: none; }
+    #viewer .screen { border-radius: .45rem; padding: .45rem .5rem; }
+    .viewer-controls { background: var(--panel); border: 1px solid var(--line); border-radius: .55rem; padding: .45rem; }
+    #control { width: 100%; min-height: 2.75rem; font-weight: 650; }
+    #line { min-height: 2.75rem; font-size: 16px; }
+    #send { min-height: 2.75rem; }
+    .keys { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .35rem; }
+    .keys button { min-width: 0; min-height: 2.65rem; padding: .3rem; }
+  }
 </style>
 
 <header>
@@ -156,37 +203,42 @@
   <p class="note" id="pair-error"></p>
 </section>
 <main hidden>
-  <h2>Waiting for you</h2>
-  <ul id="waiting"><li class="empty">nothing waiting</li></ul>
-
-  <h2>Recent</h2>
-  <ul id="history"><li class="empty">no transitions yet</li></ul>
-  <div class="actions"><button id="mark">Mark all read</button></div>
-
-  <h2>Targets and sessions</h2>
+  <h2>Terminals</h2>
   <ul id="panes"><li class="empty">no panes</li></ul>
 
+  <details id="attention-panel">
+    <summary>Attention <span id="attention-count" class="badge gone">none</span></summary>
+    <ul id="attention"><li class="empty">nothing needs attention</li></ul>
+    <div class="actions"><button id="mark">Mark all read</button></div>
+  </details>
+
   <section id="viewer" hidden>
-    <h2><span id="viewing"></span></h2>
-    <div id="screen" class="screen"></div>
-    <div class="actions">
-      <button id="stop">Stop watching</button>
-      <button id="control">Take control</button>
+    <div class="viewer-head">
+      <strong id="viewing"></strong>
       <span class="note" id="screen-note"></span>
+      <button id="stop">Done</button>
     </div>
-    <div id="keyboard" hidden>
-      <form id="line-form" class="actions">
-        <input id="line" placeholder="type a command" autocapitalize="off"
-               autocomplete="off" autocorrect="off" spellcheck="false">
-        <button id="send" type="submit">Send</button>
-      </form>
-      <div class="keys">
-        <button data-key="enter">Enter</button>
-        <button data-key="tab">Tab</button>
-        <button data-key="escape">Esc</button>
-        <button data-key="interrupt">Ctrl-C</button>
-        <button data-key="up">&uarr;</button>
-        <button data-key="down">&darr;</button>
+    <div id="screen" class="screen"></div>
+    <div class="viewer-controls">
+      <div class="actions"><button id="control">Take control &amp; type</button></div>
+      <div id="keyboard" hidden>
+        <form id="line-form" class="actions">
+          <input id="line" placeholder="Type a command" autocapitalize="off"
+                 autocomplete="off" autocorrect="off" spellcheck="false"
+                 enterkeyhint="send">
+          <button id="send" type="submit">Send</button>
+        </form>
+        <div class="keys">
+          <button data-key="enter">Enter</button>
+          <button data-key="escape">Esc</button>
+          <button data-key="tab">Tab</button>
+          <button data-key="up">&uarr;</button>
+          <button data-key="down">&darr;</button>
+          <button data-key="left">&larr;</button>
+          <button data-key="right">&rarr;</button>
+          <button data-key="backspace">Back</button>
+          <button data-key="interrupt">Ctrl-C</button>
+        </div>
       </div>
     </div>
   </section>
@@ -209,6 +261,8 @@ const endpoint = path => `${basePath}${path}`;
 // federation and the attention history are what the daemon last said they were.
 const targets = new Map();
 let attention = [];
+const openTargets = new Set();
+const openSessions = new Set();
 
 const el = id => document.getElementById(id);
 const text = value => String(value == null ? '' : value);
@@ -274,67 +328,71 @@ function phase(status) {
   return 'gone';
 }
 
-function renderWaiting() {
+function renderAttention() {
   const rows = [];
+  const represented = new Set();
   for (const runtime of targets.values()) {
     const snapshot = runtime.snapshot;
     if (!snapshot || runtime.connection !== 'live') continue;
     for (const agent of snapshot.agents || []) {
       const status = agent.status || '';
-      if (phase(status) !== 'wait' && !agent.interactive_ready) continue;
+      if ((phase(status) !== 'wait' && !agent.interactive_ready) || !agent.pane) continue;
+      const name = agent.name || agent.agent || 'agent';
+      const key = `${agent.pane.target}/${agent.pane.session}/${agent.pane.resource}/${name}`;
+      represented.add(key);
       rows.push({
-        name: agent.name || agent.agent || 'agent',
-        status,
-        where: qualify(agent.pane),
+        key,
+        pane: agent.pane,
+        name,
+        status: status || 'waiting',
+        detail: qualify(agent.pane),
+        unread: true,
       });
     }
   }
-  const list = el('waiting');
-  list.innerHTML = '';
-  if (!rows.length) {
-    list.innerHTML = '<li class="empty">nothing waiting</li>';
-    return;
+  for (const event of attention.slice().reverse()) {
+    if (!event.unread || !event.pane) continue;
+    const name = event.agent || 'agent';
+    const key = `${event.pane.target}/${event.pane.session}/${event.pane.resource}/${name}`;
+    if (represented.has(key)) continue;
+    represented.add(key);
+    rows.push({
+      key,
+      pane: event.pane,
+      name,
+      status: text(event.kind).replace(/_/g, ' '),
+      detail: `${qualify(event.pane)} · ${text(event.workspace)}`,
+      unread: true,
+    });
+    if (rows.length >= 12) break;
   }
-  for (const row of rows) {
-    const item = document.createElement('li');
-    item.innerHTML = `<div class="row">
-        <span class="name"></span>
-        <span class="badge wait"></span>
-        <span class="where"></span>
-      </div>`;
-    item.querySelector('.name').textContent = row.name;
-    item.querySelector('.badge').textContent = row.status || 'waiting';
-    item.querySelector('.where').textContent = row.where;
-    list.append(item);
-  }
-}
 
-function renderHistory() {
-  const list = el('history');
+  const list = el('attention');
   list.innerHTML = '';
-  const recent = attention.slice(-40).reverse();
-  if (!recent.length) {
-    list.innerHTML = '<li class="empty">no transitions yet</li>';
+  const count = el('attention-count');
+  count.textContent = rows.length ? String(rows.length) : 'none';
+  count.className = `badge ${rows.length ? 'wait' : 'gone'}`;
+  if (!rows.length) {
+    list.innerHTML = '<li class="empty">nothing needs attention</li>';
     return;
   }
-  for (const event of recent) {
+  for (const row of rows.slice(0, 12)) {
     const item = document.createElement('li');
-    item.className = 'tap' + (event.unread ? ' unread' : '');
+    item.className = 'tap unread';
     item.innerHTML = `<div class="row">
         <span class="name"></span>
         <span class="badge"></span>
         <span class="where"></span>
-      </div><div class="note"></div>`;
-    item.querySelector('.name').textContent = event.agent || 'agent';
+      </div>`;
+    item.querySelector('.name').textContent = row.name;
     const badge = item.querySelector('.badge');
-    badge.textContent = text(event.kind).replace(/_/g, ' ');
-    badge.classList.add(phase(event.status));
-    item.querySelector('.where').textContent = qualify(event.pane);
-    item.querySelector('.note').textContent =
-      `${text(event.workspace)} · ${text(event.status)}`;
-    // Reading it here marks it read everywhere, because the history belongs to
-    // the daemon rather than to this page.
-    item.onclick = () => send({ type: 'attention.mark_seen', pane: event.pane });
+    badge.textContent = row.status;
+    badge.classList.add(phase(row.status));
+    item.querySelector('.where').textContent = row.detail;
+    item.onclick = () => {
+      send({ type: 'attention.mark_seen', pane: row.pane });
+      observe(row.pane, `${row.detail}/${row.name}`);
+    };
     list.append(item);
   }
 }
@@ -429,11 +487,13 @@ function measure() {
 function refit() {
   const host = el('screen');
   if (!screen || !host.clientWidth) return;
-  host.style.fontSize = '13px';
+  host.style.fontSize = '14px';
   const reference = measure().width;
   const room = host.clientWidth - 2 * 0.7 * parseFloat(getComputedStyle(document.body).fontSize);
-  const wanted = 13 * (room / screen.width) / reference;
-  host.style.fontSize = `${Math.max(7, Math.min(15, wanted))}px`;
+  const wanted = 14 * (room / screen.width) / reference;
+  // Below twelve pixels an 80-column pane technically fits but is not
+  // readable on a phone. Preserve legibility and let the terminal pan instead.
+  host.style.fontSize = `${Math.max(12, Math.min(16, wanted))}px`;
   cell = measure();
 }
 
@@ -441,9 +501,12 @@ function paint() {
   const host = el('screen');
   host.innerHTML = '';
   if (!screen) return;
+  if (!cell) cell = measure();
+  const contentWidth = Math.max(1, screen.width) * cell.width;
   for (const runs of screen.rows) {
     const line = document.createElement('div');
     line.className = 'line';
+    line.style.minWidth = `${contentWidth}px`;
     for (const run of runs) {
       const span = document.createElement('span');
       // textContent, never innerHTML: this is output from someone's terminal.
@@ -454,7 +517,6 @@ function paint() {
     }
     host.append(line);
   }
-  if (!cell) cell = measure();
   // Absent when the program asked for no cursor, and then none is drawn.
   if (screen.cursor) {
     const mark = document.createElement('div');
@@ -464,6 +526,18 @@ function paint() {
     mark.style.left = `calc(.7rem + ${screen.cursor.column * cell.width}px)`;
     mark.style.top = `calc(.6rem + ${screen.cursor.row * cell.height}px)`;
     host.append(mark);
+    if (lease === 'control') {
+      const left = screen.cursor.column * cell.width;
+      const top = screen.cursor.row * cell.height;
+      const visibleRight = (host.scrollLeft || 0) + host.clientWidth - cell.width;
+      const visibleBottom = (host.scrollTop || 0) + (host.clientHeight || 0) - cell.height;
+      if (left < (host.scrollLeft || 0)) host.scrollLeft = Math.max(0, left - cell.width);
+      else if (left > visibleRight) host.scrollLeft = left - host.clientWidth + 2 * cell.width;
+      if (host.clientHeight && top < (host.scrollTop || 0)) host.scrollTop = Math.max(0, top - cell.height);
+      else if (host.clientHeight && top > visibleBottom) {
+        host.scrollTop = top - host.clientHeight + 2 * cell.height;
+      }
+    }
   }
 }
 
@@ -517,9 +591,20 @@ function takeControl() {
   // This runs synchronously inside the button tap. Waiting for `pane.lease`
   // loses mobile browsers' user activation and leaves the input visible but
   // the phone keyboard closed.
-  el('line').focus({ preventScroll: true });
+  el('line').focus();
   send({ type: 'pane.take_control', pane: watching });
   el('screen-note').textContent = 'asking for control…';
+}
+
+// `interactive-widget=resizes-content` handles the soft keyboard in browsers
+// that implement it. Safari exposes the same usable rectangle through
+// VisualViewport, so size and place the fixed viewer there as a fallback.
+function fitViewerViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  const viewer = el('viewer');
+  viewer.style.height = `${viewport.height}px`;
+  viewer.style.top = `${viewport.offsetTop}px`;
 }
 
 // One place that turns text into bytes, because a pane is a terminal and a
@@ -545,6 +630,9 @@ const KEYS = {
   interrupt: '\x03',
   up: '\x1b[A',
   down: '\x1b[B',
+  left: '\x1b[D',
+  right: '\x1b[C',
+  backspace: '\x7f',
 };
 
 // Reveal the input during the tap that requests control, but enable every send
@@ -608,6 +696,9 @@ function renderPanes() {
   for (const [target, runtimes] of [...grouped.entries()].sort()) {
     const targetCard = document.createElement('li');
     targetCard.className = 'target-card';
+    const targetDetails = document.createElement('details');
+    targetDetails.className = 'target-group';
+    const targetSummary = document.createElement('summary');
     const targetTitle = document.createElement('div');
     targetTitle.className = 'target-title';
     const targetName = document.createElement('span');
@@ -617,15 +708,30 @@ function renderPanes() {
     targetCount.className = 'note';
     targetCount.textContent = `${runtimes.length} session${runtimes.length === 1 ? '' : 's'}`;
     targetTitle.append(targetName, targetCount);
-    targetCard.append(targetTitle);
+    targetSummary.append(targetTitle);
+    targetDetails.append(targetSummary);
+    const watchesTarget = Boolean(watching && watching.target === target);
+    targetDetails.open = openTargets.has(target) || grouped.size === 1 || watchesTarget;
+    targetDetails.ontoggle = () => {
+      if (targetDetails.open) openTargets.add(target);
+      else openTargets.delete(target);
+    };
 
     runtimes.sort((left, right) =>
       text(left.key && left.key.session).localeCompare(text(right.key && right.key.session)));
     for (const runtime of runtimes) {
       const session = text(runtime.key && runtime.key.session) || 'default';
+      const sessionKey = `${target}/${session}`;
       const details = document.createElement('details');
       details.className = 'session-group';
-      details.open = runtimes.length === 1 || Boolean(runtime.snapshot && runtime.snapshot.focused_pane);
+      const watchesSession = Boolean(
+        watching && watching.target === target && watching.session === session,
+      );
+      details.open = openSessions.has(sessionKey) || runtimes.length === 1 || watchesSession;
+      details.ontoggle = () => {
+        if (details.open) openSessions.add(sessionKey);
+        else openSessions.delete(sessionKey);
+      };
       const summary = document.createElement('summary');
       const summaryRow = document.createElement('span');
       summaryRow.className = 'session-summary';
@@ -649,7 +755,7 @@ function renderPanes() {
         unavailable.className = 'workspace-group note';
         unavailable.textContent = text(runtime.last_error) || 'no snapshot yet';
         details.append(unavailable);
-        targetCard.append(details);
+        targetDetails.append(details);
         continue;
       }
 
@@ -717,8 +823,9 @@ function renderPanes() {
         workspaceGroup.append(paneList);
         details.append(workspaceGroup);
       }
-      targetCard.append(details);
+      targetDetails.append(details);
     }
+    targetCard.append(targetDetails);
     list.append(targetCard);
   }
 }
@@ -743,14 +850,14 @@ function apply(message) {
       for (const runtime of message.state.targets) {
         targets.set(`${runtime.key.target}/${runtime.key.session}`, runtime);
       }
-      renderWaiting();
+      renderAttention();
       renderPanes();
       break;
     case 'state.target': {
       const key = `${message.target.target}/${message.target.session}`;
       if (message.state) targets.set(key, message.state);
       else targets.delete(key);
-      renderWaiting();
+      renderAttention();
       renderPanes();
       break;
     }
@@ -793,13 +900,13 @@ function apply(message) {
       break;
     case 'attention.history':
       attention = message.events;
-      renderHistory();
+      renderAttention();
       break;
     case 'attention.event':
       attention = attention
         .filter(held => held.id !== message.event.id)
         .concat(message.event);
-      renderHistory();
+      renderAttention();
       break;
   }
 }
@@ -840,18 +947,29 @@ el('line-form').onsubmit = event => {
   // line is still a line — it is how somebody asks for a fresh prompt.
   sendText(`${line}\r`);
   el('line').value = '';
+  el('line').focus();
 };
 for (const button of document.querySelectorAll('.keys button')) {
-  button.onclick = () => sendText(KEYS[button.dataset.key] || '');
+  button.onpointerdown = event => event.preventDefault();
+  button.onclick = () => {
+    sendText(KEYS[button.dataset.key] || '');
+    el('line').focus();
+  };
 }
 el('stop').onclick = () => stopWatching('');
 
 // A rotation or a resize changes how much of the pane fits, not the pane.
 window.addEventListener('resize', () => {
+  fitViewerViewport();
   if (!screen) return;
   refit();
   paint();
 });
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', fitViewerViewport);
+  window.visualViewport.addEventListener('scroll', fitViewerViewport);
+}
+fitViewerViewport();
 
 // A guess the person can correct, so a device still ends up with a name worth
 // seeing in `device list` rather than an empty one.

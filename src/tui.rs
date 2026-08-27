@@ -4345,9 +4345,11 @@ fn cycle_pane(state: &FederationState, app: &mut App, direction: isize) {
     let current = app
         .selected_pane
         .as_ref()
-        .and_then(|selected| panes.iter().position(|pane| pane == selected))
-        .unwrap_or(0);
-    let next = wrapped_index(current, panes.len(), direction);
+        .and_then(|selected| panes.iter().position(|pane| pane == selected));
+    let next = current.map_or_else(
+        || if direction < 0 { panes.len() - 1 } else { 0 },
+        |current| wrapped_index(current, panes.len(), direction),
+    );
     if app.selected_pane.as_ref() != Some(&panes[next]) {
         select_pane(app, panes[next].clone());
     }
@@ -4563,20 +4565,23 @@ fn reconcile_selection(state: &FederationState, app: &mut App) {
                     return;
                 }
             }
-            Some(_) => {}
+            // Do not select some other live target while the exact persisted
+            // pane is reconnecting. It would be replaced again when this
+            // target returned, producing the same unsolicited terminal switch
+            // this restoration is meant to prevent.
+            Some(_) => return,
             None => app.restore_pending = None,
         }
     }
-    let selection_is_valid = app
-        .selected_pane
-        .as_ref()
-        .is_some_and(|selected| panes.contains(selected));
-    if selection_is_valid && app.selection_explicit {
-        return;
-    }
 
-    if !selection_is_valid {
-        app.selection_explicit = false;
+    // Federation updates never choose a different pane once one has been
+    // selected. A disconnect, reconnect, removed pane, or newly active server
+    // may make this identity temporarily unavailable, but changing it here can
+    // redirect the next byte somebody types into an unrelated shell. Explicit
+    // navigation and operations that deliberately follow server focus clear or
+    // replace the selection themselves.
+    if app.selected_pane.is_some() {
+        return;
     }
 
     let startup_pane = state
@@ -8788,7 +8793,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_selection_moves_to_the_most_active_session() {
+    fn startup_selection_stays_put_when_a_more_active_session_appears() {
         let idle_key = TargetSession::new("host-a", "default");
         let active_key = TargetSession::new("host-a", "work");
         let idle_pane = PaneId::new("host-a", "default", "w1:p1");
@@ -8825,12 +8830,78 @@ mod tests {
             ),
         );
         reconcile_selection(&state, &mut app);
-        assert_eq!(app.selected_pane, Some(active_pane));
+        assert_eq!(app.selected_pane, Some(idle_pane.clone()));
 
-        app.selected_pane = Some(idle_pane.clone());
-        app.selection_explicit = true;
+        // Explicit navigation still works; only background updates are barred
+        // from choosing a different terminal.
+        super::cycle_pane(&state, &mut app, 1);
+        assert_eq!(app.selected_pane, Some(active_pane));
+        assert!(app.selection_explicit);
+    }
+
+    #[test]
+    fn disconnecting_or_removing_the_selected_pane_never_redirects_input() {
+        let selected_key = TargetSession::new("host-a", "work");
+        let other_key = TargetSession::new("host-b", "work");
+        let selected = PaneId::new("host-a", "work", "w1:p1");
+        let other = PaneId::new("host-b", "work", "w2:p1");
+        let snapshot = |key: &TargetSession, pane: &str| {
+            NormalizedSnapshot::from_value(
+                key,
+                &json!({"panes": [{"pane_id": pane}], "focused_pane_id": pane}),
+            )
+        };
+        let mut state = FederationState::default();
+        state.targets.insert(
+            selected_key.clone(),
+            runtime(
+                selected_key.clone(),
+                TargetConnectionState::Live,
+                Some(snapshot(&selected_key, "w1:p1")),
+            ),
+        );
+        state.targets.insert(
+            other_key.clone(),
+            runtime(
+                other_key.clone(),
+                TargetConnectionState::Live,
+                Some(snapshot(&other_key, "w2:p1")),
+            ),
+        );
+        let mut app = App {
+            selected_pane: Some(selected.clone()),
+            ..App::default()
+        };
+
+        state.targets.insert(
+            selected_key.clone(),
+            runtime(
+                selected_key.clone(),
+                TargetConnectionState::Backoff { attempt: 1 },
+                None,
+            ),
+        );
         reconcile_selection(&state, &mut app);
-        assert_eq!(app.selected_pane, Some(idle_pane));
+        assert_eq!(app.selected_pane, Some(selected.clone()));
+        super::cycle_pane(&state, &mut app, 1);
+        assert_eq!(app.selected_pane, Some(other));
+
+        app.selected_pane = Some(selected.clone());
+        app.selection_explicit = false;
+
+        // A live authoritative snapshot that no longer contains the pane also
+        // leaves the stale identity selected instead of silently choosing the
+        // other live shell.
+        state.targets.insert(
+            selected_key.clone(),
+            runtime(
+                selected_key.clone(),
+                TargetConnectionState::Live,
+                Some(snapshot(&selected_key, "w9:p9")),
+            ),
+        );
+        reconcile_selection(&state, &mut app);
+        assert_eq!(app.selected_pane, Some(selected));
     }
 
     #[test]

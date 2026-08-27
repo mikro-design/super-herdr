@@ -90,7 +90,11 @@ atomic file replacement. Terminal contents, clipboard payloads, SSH material,
 connection leases, and server snapshots are never persisted. Restoration waits
 through target reconnects and succeeds only when the exact
 target/session/local-ID tuple is live; stale IDs are ignored without mutating the
-Herdr server.
+Herdr server. Once any pane is selected, federation reconciliation preserves
+that exact qualified identity even if its target enters backoff or an
+authoritative snapshot removes the pane. Only an explicit navigation action may
+replace it. This is an input-safety invariant: availability churn must never
+retarget a pending or subsequent keystroke to a different shell.
 
 Agent attention is derived only from authoritative normalized snapshots. A
 documented Herdr event causes an immediate snapshot, so status transitions appear
@@ -446,6 +450,14 @@ control lease, its line submissions and terminal-key buttons use the same posts.
 That is sufficient for deliberate phone input; a future client offering
 continuous per-keystroke interaction would have to justify a socket upgrade
 against the extra transport and authentication surface.
+
+The phone client gives the observed terminal the remaining dynamic viewport
+height and uses scrolling for panes wider than the screen. It never reduces
+terminal text below a readable minimum merely to fit all columns. Control input
+and explicit terminal keys stay in the bottom control area above the soft
+keyboard. Federation state is grouped as collapsed targets and sessions, and
+agent attention is one bounded, deduplicated, actionable list rather than a
+second navigation tree.
 
 A stream and the posts that steer it are separate requests, joined by an
 identifier the browser generates. Without that join, a subscription posted by

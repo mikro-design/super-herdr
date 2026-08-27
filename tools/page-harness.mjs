@@ -39,7 +39,9 @@ const node = id => {
   return nodes.get(id);
 };
 
-const keyButtons = ['enter', 'tab', 'escape', 'interrupt', 'up', 'down'].map(key => {
+const keyButtons = [
+  'enter', 'escape', 'tab', 'up', 'down', 'left', 'right', 'backspace', 'interrupt',
+].map(key => {
   const button = node(`key-${key}`);
   button.dataset = { key };
   return button;
@@ -137,6 +139,7 @@ deliver({
             tab: { target: 'first', session: 'main', resource: 'w1:t1' },
             label: 'shell',
           }],
+          agents: [{ name: 'builder', status: 'waiting', pane }],
         },
       },
       {
@@ -151,7 +154,12 @@ deliver({
   },
 });
 check('groups sessions under two targets', page.el('panes').children.length === 2);
-check('keeps two sessions under the first target', page.el('panes').children[0].children.length === 3);
+const firstTarget = page.el('panes').children[0].children[0];
+check('collapses target groups on a multi-target phone view', firstTarget.open === false);
+check('keeps two sessions under the first target', firstTarget.children.length === 3);
+check('shows one compact actionable attention item', page.el('attention').children.length === 1);
+check('reports the compact attention count', page.el('attention-count').textContent === '1');
+check('attention items can open their terminal', typeof page.el('attention').children[0].onclick === 'function');
 
 // Watching a pane: observing, and no keyboard offered.
 page.observe(pane, 'first/main/w1:p1');
@@ -202,7 +210,9 @@ check(
 check('clears the field', page.el('line').value === '');
 
 // The key buttons.
-for (const [index, key] of ['enter', 'tab', 'escape', 'interrupt', 'up', 'down'].entries()) {
+for (const [index, key] of [
+  'enter', 'escape', 'tab', 'up', 'down', 'left', 'right', 'backspace', 'interrupt',
+].entries()) {
   sent.length = 0;
   keyButtons[index].onclick();
   const bytes = Buffer.from(sent.at(-1).body.bytes, 'base64').toString('binary');

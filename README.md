@@ -76,8 +76,10 @@ It never takes over, stops, starts, or restarts a Herdr session.
   per viewer: a client acknowledges each update it paints, one that falls
   behind is sent the screen as it stands rather than a backlog, and an observer
   must take the pane's control lease before its keyboard can send anything.
-  Targets contain collapsible sessions, sessions contain workspaces, and a pane
-  click opens its viewer immediately instead of adding another flat list.
+  The phone layout puts the selected terminal first at a readable minimum size,
+  pans instead of shrinking it into illegibility, and keeps its input and
+  terminal keys above the soft keyboard. Targets and sessions are collapsible,
+  while one compact attention list opens the relevant terminal directly.
 
 ## Recommended topology
 
@@ -121,6 +123,14 @@ Build concurrency is capped at four jobs in `.cargo/config.toml` and in the
 provided Makefile targets.
 
 ## Install
+
+Upgrade from 0.7.16 if live server discovery can change the terminal receiving
+your typing, or if you use the browser client on a phone. 0.7.17 keeps the exact
+selected pane through disconnects, reconnects, and pane disappearance until you
+explicitly navigate elsewhere. Its phone view is terminal-first, keeps text
+readable by panning wide panes, keeps input controls available above the soft
+keyboard, and replaces the duplicate agent-state lists with one compact,
+actionable attention section.
 
 Upgrade from 0.7.15 before pairing with a device name that was used already.
 That release verified and consumed the one-time code before discovering the
@@ -508,11 +518,15 @@ local target port when it differs from the outside port.
 A paired device watches panes and, when it asks for control, types into them.
 Control is asked for rather than assumed — a phone in a pocket should not be
 sending keystrokes to a shell — so the browser client opens a pane as an
-observer and offers a **Take control** button. The daemon hands the lease over
-and tells whoever held it, so nothing is taken silently. With control held, a
-line of text and the keys a terminal needs (Enter, Tab, Esc, Ctrl-C, and the
-arrows for shell history) reach the pane. Losing the lease to another client
-takes the keyboard away again rather than leaving one that cannot type.
+observer and offers a **Take control & type** button. The daemon hands the lease
+over and tells whoever held it, so nothing is taken silently. The terminal fills
+the phone viewport and stays at least 12 CSS pixels high; wide panes scroll
+horizontally rather than becoming unreadably small. With control held, the line
+input stays above the soft keyboard and terminal keys (Enter, Tab, Esc,
+Backspace, Ctrl-C, and all four arrows) reach the pane. Losing the lease to
+another client takes the keyboard away again rather than leaving one that cannot
+type. Targets and sessions stay collapsed until opened, and the single compact
+attention section jumps directly to the terminal behind an agent or event.
 
 The QR and printed URL never contain the pairing code. It is typed into eight
 separate character boxes (a whole code can still be pasted) and sent in a
@@ -880,9 +894,13 @@ transition kind, timestamp, and unread state. It never contains terminal output,
 clipboard payloads, SSH material, or complete server snapshots.
 
 On startup, restoration waits for the corresponding target/session to reconnect
-and succeeds only if that exact qualified pane is live. Saved state never starts,
-focuses, stops, or restarts anything in Herdr. Terminal content, snapshots,
-clipboard data, SSH material, and control leases are not persisted.
+and succeeds only if that exact qualified pane is live. After a pane is selected,
+background discovery and connection changes never replace it: even a disconnected
+or removed pane remains the selected identity until explicit navigation chooses
+another live pane. This prevents server churn from redirecting the next typed
+byte into a different shell. Saved state never starts, focuses, stops, or
+restarts anything in Herdr. Terminal content, snapshots, clipboard data, SSH
+material, and control leases are not persisted.
 
 ## Safety and boundaries
 
