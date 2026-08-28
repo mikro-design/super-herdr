@@ -208,7 +208,10 @@ async fn relay(
                 discover_sessions: false,
                 session: Some(session.to_owned()),
                 socket: Some(socket.to_owned()),
-                herdr_bins: vec!["/home/veba/.local/bin/herdr".to_owned(), "herdr".to_owned()],
+                herdr_bins: vec![
+                    "/home/example/.local/bin/herdr".to_owned(),
+                    "herdr".to_owned(),
+                ],
             }],
             devices: Vec::new(),
         },

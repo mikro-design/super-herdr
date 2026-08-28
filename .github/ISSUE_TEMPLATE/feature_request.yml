@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a focused improvement
+title: "Feature: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult today, and for whom?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the user-visible result rather than a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Safety and compatibility considerations
+      description: Note effects on session ownership, target isolation, terminal control, privacy, or documented Herdr interfaces.

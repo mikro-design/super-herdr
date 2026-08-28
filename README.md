@@ -1,12 +1,40 @@
 # Super-Herdr
 
-Super-Herdr is a desktop TUI for working with persistent Herdr sessions on
-multiple machines. The frontend owns federation, rendering, navigation, and the
-desktop clipboard. Each Herdr server continues to own its shells, agents,
-workspaces, and terminal history.
+[![CI and Release](https://github.com/mikro-design/super-herdr/actions/workflows/release.yml/badge.svg)](https://github.com/mikro-design/super-herdr/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/mikro-design/super-herdr)](https://github.com/mikro-design/super-herdr/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#licensing)
+
+Super-Herdr is a multi-host control plane for persistent Herdr coding agents.
+Its desktop TUI federates sessions across machines, and an explicitly paired
+browser can observe or take a pane's control lease from a phone. Each Herdr
+server continues to own its shells, agents, workspaces, and terminal history.
 
 Super-Herdr integrates only through Herdr's documented CLI and socket interfaces.
 It never takes over, stops, starts, or restarts a Herdr session.
+
+> **Public preview:** Super-Herdr can grant remote control of a shell running as
+> your user. Read [Security](SECURITY.md), the
+> [current limitations](#current-limitations-and-next-slices), and the
+> public-bridge trust boundary before exposing it outside your own devices.
+
+## Quick start
+
+Install on the macOS or Linux desktop where the display and clipboard live:
+
+```sh
+brew install mikro-design/tap/super-herdr
+super-herdr target add development --ssh development-host --discover-sessions
+super-herdr probe
+super-herdr
+```
+
+Replace `development-host` with an alias that already works with ordinary
+OpenSSH. Add a local Herdr server with
+`super-herdr target add desktop --local --discover-sessions`.
+
+Documentation: [configuration](#configuration) · [commands](#commands) ·
+[architecture](ARCHITECTURE.md) · [testing](TESTING.md) · [roadmap](ROADMAP.md) ·
+[contributing](CONTRIBUTING.md)
 
 ## What works
 
@@ -107,7 +135,6 @@ client machine's clipboard.
 
 ## Requirements
 
-- Rust toolchain with Cargo.
 - Herdr client compatible with each target server. Herdr 0.8.0/protocol 19 is the
   currently tested version.
 - OpenSSH for remote targets. Normal SSH config, aliases, keys, host-key checking,
@@ -125,77 +152,15 @@ client machine's clipboard.
 
 - `sha256sum` on an SSH target when transferring files or clipboard media to it.
 
+A Rust toolchain with Cargo is needed only when building from source.
+
 Build concurrency is capped at four jobs in `.cargo/config.toml` and in the
 provided Makefile targets.
 
 ## Install
 
-Upgrade from 0.7.18 for the compact phone command dock. 0.7.19 replaces the
-three-row terminal-key grid with visible one-tap replies and a single scrolling
-key rail, keeps the file picker pinned, gives the reclaimed height back to the
-terminal, and opens the first waiting attention batch without another tap.
-
-Upgrade from 0.7.17 to send files from the phone browser or to transfer desktop
-files whose names contain spaces, punctuation, or Unicode. 0.7.18 adds a bounded
-32 MiB browser file picker for PDF, DOC/DOCX, PPT/PPTX, and arbitrary files,
-verifies the remote byte count and SHA-256 digest, and pastes the verified path.
-It preserves ordinary filenames safely by shell-quoting the returned paths and
-shows the daemon's exact reason when a copied file fails.
-
-Upgrade from 0.7.16 if live server discovery can change the terminal receiving
-your typing, or if you use the browser client on a phone. 0.7.17 keeps the exact
-selected pane through disconnects, reconnects, and pane disappearance until you
-explicitly navigate elsewhere. Its phone view is terminal-first, keeps text
-readable by panning wide panes, keeps input controls available above the soft
-keyboard, and replaces the duplicate agent-state lists with one compact,
-actionable attention section.
-
-Upgrade from 0.7.15 before pairing with a device name that was used already.
-That release verified and consumed the one-time code before discovering the
-name collision, so the browser could not recover. 0.7.16 reports the collision
-immediately, selects the name field, and keeps the same code valid while the
-browser chooses another name.
-
-Upgrade from 0.7.14 if `[web] url` explicitly names
-`https://super-herdr.key-value.co`, or if the fixed page reports that every code
-is missing. That release did not select a Rustls crypto provider before its
-background connector opened TLS, so the connector could terminate while the
-TUI kept running. It also mistook an explicitly written fixed address for an
-operator proxy and opened no connector at all. 0.7.15 makes the TLS choice
-explicit, recognizes the reserved URL as the hosted bridge, and presents the
-code as eight single-character boxes.
-
-Upgrade from 0.7.13 before using the browser client. That release could put the
-pairing code in the scanned URL and did not require a separate trusted approval
-after the code was entered. 0.7.14 keeps the code out of the URL, requires it to
-be typed, shows a fresh six-digit comparison number in the browser, and creates
-the device only after that number is explicitly approved in the Super-Herdr
-TUI. Every browser route requires a paired device, including a browser reaching
-the loopback listener directly.
-
-Upgrade from 0.7.0 if you served the browser client through a reverse proxy.
-0.7.0 exempted loopback from pairing, on the reasoning that anyone who can reach
-loopback can already read the daemon's socket. A proxy that terminates TLS on a
-network and forwards to loopback — `tailscale serve` is one — breaks that
-reasoning without changing anything the daemon looked at: every visitor arrived
-from 127.0.0.1, so nobody was asked for a code. 0.7.1 reads the forwarding
-headers a relayed request carries, so the question the daemon answers is whether
-a request was made locally rather than whether it appears to come from nearby.
-
-If you ran 0.7.0's browser client that way, assume every device that could reach
-that proxy had the access a paired device has. `device remove` does not undo it:
-those visitors were never asked to pair and hold no token to revoke, which is
-also why devices that simply worked before will ask for a code after upgrading.
-A daemon reached over an SSH forward of its Unix socket, or bound to loopback
-with nothing in front of it, was never exposed.
-
-Upgrade from 0.7.1 as well if any target relies on session discovery for its
-Herdr API socket — a target with `discover_sessions` and no `socket` line.
-0.7.0 and 0.7.1 decided whether an atomic paste was possible by reading the
-configuration file rather than what discovery resolved, so those targets were
-told they had no socket and a multiline paste into a pane without bracketed
-paste was refused. 0.7.2 asks the resolved sessions, which is where a
-discovered socket actually is.
+See [CHANGELOG.md](CHANGELOG.md) before upgrading, especially when upgrading
+from a browser release older than 0.7.14.
 
 ### Package managers
 
@@ -205,7 +170,7 @@ brew install mikro-design/tap/super-herdr
 
 # Debian and Ubuntu. The version is part of the asset name, so there is no
 # stable "latest" URL; set these to a published release and your architecture.
-version=0.7.16
+version=0.7.20
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -229,7 +194,7 @@ newer than GLIBC 2.28.
 
 ```sh
 # Set these to an available release and one of the targets listed above.
-tag=v0.7.16
+tag=v0.7.20
 target=aarch64-apple-darwin
 archive="super-herdr-${tag}-${target}.tar.gz"
 release_url="https://github.com/mikro-design/super-herdr/releases/download/${tag}"
@@ -283,8 +248,8 @@ download.
 
 Pull requests and manual workflow runs execute the quality gates and build all
 four archives without publishing a release. To publish, push a `v<version>` tag
-whose version exactly matches `Cargo.toml`; for example, package version `0.7.16`
-must be tagged `v0.7.16`.
+whose version exactly matches `Cargo.toml`; for example, package version `0.7.20`
+must be tagged `v0.7.20`.
 
 ### macOS
 

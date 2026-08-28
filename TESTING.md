@@ -10,8 +10,9 @@ Run with no more than four build jobs:
 
 ```sh
 cargo fmt --check
+node tools/check-docs.mjs
 cargo test -j 4
-cargo clippy -j 4 -- -D warnings
+cargo clippy -j 4 --all-targets -- -D warnings
 ```
 
 Automated coverage must include qualified multi-host IDs, target failure

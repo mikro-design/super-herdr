@@ -237,7 +237,7 @@ mod tests {
         // produces something that looks right. A QR of an unreachable address
         // scans perfectly and fails where nobody can diagnose it.
         for url in [
-            "https://onio-ws01.tail15b0b2.ts.net:8790",
+            "https://workstation.example.ts.net:8790",
             "https://host.example",
             // Loopback over http is the one plain case that is not on a wire.
             "http://127.0.0.1:8790",
@@ -249,7 +249,7 @@ mod tests {
             "http://10.0.0.4:8790",
             "http://100.101.102.103:8790",
             "http://[fd00::1]:8790",
-            "http://vemunds-macbook-pro.local:8790",
+            "http://workstation.local:8790",
         ] {
             assert!(super::pairing_url(url).is_ok(), "{url} should be accepted");
         }

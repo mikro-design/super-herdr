@@ -2494,41 +2494,43 @@ mod tests {
         let one = |path: &str| vec![PathBuf::from(path)];
 
         assert_eq!(
-            local_file_references("file:///Users/veba/Downloads/ble_rx_compliance.c"),
-            one("/Users/veba/Downloads/ble_rx_compliance.c")
+            local_file_references("file:///Users/example/Downloads/source.c"),
+            one("/Users/example/Downloads/source.c")
         );
         // What osascript answers with: the path itself.
         assert_eq!(
-            local_file_references("/Users/veba/Downloads/ble_rx_compliance.c\n"),
-            one("/Users/veba/Downloads/ble_rx_compliance.c")
+            local_file_references("/Users/example/Downloads/source.c\n"),
+            one("/Users/example/Downloads/source.c")
         );
         // Percent-encoding is undone, because a file:// URI carries it and a
         // path with a literal %20 in it is not the file anybody copied.
         assert_eq!(
-            local_file_references("file:///home/veba/two%20words.c"),
-            one("/home/veba/two words.c")
+            local_file_references("file:///home/example/two%20words.c"),
+            one("/home/example/two words.c")
         );
 
         // A selection is copied as a selection. All of it, in order.
         assert_eq!(
-            local_file_references("# comment\r\nfile:///home/veba/a.c\r\nfile:///home/veba/b.c"),
+            local_file_references(
+                "# comment\r\nfile:///home/example/a.c\r\nfile:///home/example/b.c",
+            ),
             vec![
-                PathBuf::from("/home/veba/a.c"),
-                PathBuf::from("/home/veba/b.c")
+                PathBuf::from("/home/example/a.c"),
+                PathBuf::from("/home/example/b.c")
             ]
         );
 
         // One entry that is not a local file does not cost the files beside it.
         assert_eq!(
-            local_file_references("https://example.com/thing.c\nfile:///home/veba/real.c"),
-            one("/home/veba/real.c")
+            local_file_references("https://example.com/thing.c\nfile:///home/example/real.c"),
+            one("/home/example/real.c")
         );
 
         for text in [
             // A link somebody copied is not a file on this disk.
             "https://example.com/thing.c",
             // Another machine's file, which this cannot read.
-            "file://otherhost/home/veba/a.c",
+            "file://otherhost/home/example/a.c",
             "",
             "   ",
             // Relative, so there is no way to know what it is relative to.

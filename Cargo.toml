@@ -1,9 +1,9 @@
 [package]
 name = "super-herdr"
-version = "0.7.19"
+version = "0.7.20"
 edition = "2024"
 publish = false
-description = "A multi-host federation client for Herdr sessions"
+description = "A multi-host control plane for persistent Herdr coding-agent sessions"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mikro-design/super-herdr"
 
@@ -24,10 +24,12 @@ priority = "optional"
 # architecture.
 depends = "libc6 (>= 2.28)"
 extended-description = """
-Super-Herdr is a desktop frontend that federates running Herdr sessions across several hosts into one terminal UI, with qualified identities, per-target failure isolation, agent attention tracking, and a local clipboard bridge."""
+Super-Herdr federates running Herdr sessions across several hosts into one terminal UI and an explicitly paired browser client, with qualified identities, per-target failure isolation, agent attention tracking, and verified file transfer."""
 assets = [
     ["target/release/super-herdr", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/super-herdr/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/super-herdr/CHANGELOG.md", "644"],
+    ["SECURITY.md", "usr/share/doc/super-herdr/SECURITY.md", "644"],
     ["LICENSE-MIT", "usr/share/doc/super-herdr/LICENSE-MIT", "644"],
     ["LICENSE-APACHE", "usr/share/doc/super-herdr/LICENSE-APACHE", "644"],
 ]

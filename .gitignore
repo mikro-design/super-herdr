@@ -1,2 +1,19 @@
 /target
 /config.local.toml
+
+# Local credentials and deployment state must never enter the repository.
+.env
+.env.*
+!.env.example
+.cloudflared/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Editor and operating-system state.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -51,6 +51,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Check documentation
+        run: node tools/check-docs.mjs
+
       - name: Run tests
         run: cargo test --locked --jobs 4
 
@@ -162,7 +165,7 @@ jobs:
           archive="${package}.tar.gz"
           mkdir "${package}"
           install -m 0755 "target/${{ matrix.target }}/release/super-herdr" "${package}/super-herdr"
-          install -m 0644 README.md LICENSE-MIT LICENSE-APACHE "${package}/"
+          install -m 0644 README.md CHANGELOG.md SECURITY.md LICENSE-MIT LICENSE-APACHE "${package}/"
           tar -czf "${archive}" "${package}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "archive=${archive}" >> "${GITHUB_OUTPUT}"

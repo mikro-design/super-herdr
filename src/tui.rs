@@ -7091,7 +7091,7 @@ mod tests {
     fn what_is_drawn_decodes_back_to_what_it_encodes() {
         for payload in [
             "http://100.87.78.39:8790#ABCD-2345",
-            "https://onio-ws01.tail15b0b2.ts.net:8790#ABCD-2345",
+            "https://workstation.example.ts.net:8790#ABCD-2345",
         ] {
             // Room for the glyph-free form: two cells per module, one row each.
             let large = super::qr_lines(payload, super::Rect::new(0, 0, 160, 80))
@@ -7164,7 +7164,7 @@ mod tests {
     /// does not work. Text in the same space is legible.
     #[test]
     fn a_code_that_would_be_clipped_is_refused_rather_than_drawn() {
-        let target = "https://onio-ws01.tail15b0b2.ts.net:8790#ABCD-2345";
+        let target = "https://workstation.example.ts.net:8790#ABCD-2345";
         for narrow in [
             super::Rect::new(0, 0, 20, 40),
             super::Rect::new(0, 0, 80, 6),
@@ -7192,7 +7192,7 @@ mod tests {
         for url in [
             "http://100.87.78.39:8790",
             "http://192.168.1.42:8790",
-            "https://vemunds-macbook-pro.tail15b0b2.ts.net:8790",
+            "https://workstation.example.ts.net:8790",
         ] {
             let offer = PairingOffer {
                 code: "ABCD-2345".to_owned(),
@@ -7381,15 +7381,15 @@ mod tests {
     #[test]
     fn a_discovered_socket_is_enough_for_an_atomic_paste() {
         let configured = Target {
-            name: "ws01".to_owned(),
+            name: "workstation".to_owned(),
             ssh: None,
             discover_sessions: true,
-            session: Some("rv32sim".to_owned()),
+            session: Some("example-session".to_owned()),
             // What the file says: nothing. The host reports it at runtime.
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
         };
-        let key = TargetSession::new("ws01", "rv32sim");
+        let key = TargetSession::new("workstation", "example-session");
 
         // Before discovery has answered there is genuinely nothing to use.
         let unresolved = super::resolved_targets(&Config {
@@ -7405,7 +7405,9 @@ mod tests {
         // After it has, the socket exists and the paste is available.
         let discovered = Target {
             discover_sessions: false,
-            socket: Some("/home/veba/.config/herdr/sessions/rv32sim/herdr.sock".to_owned()),
+            socket: Some(
+                "/home/example/.config/herdr/sessions/example-session/herdr.sock".to_owned(),
+            ),
             ..configured
         };
         let resolved = super::resolved_targets(&Config {
@@ -8334,7 +8336,7 @@ mod tests {
             "",
             "   ",
             // Absolute, and names nothing.
-            "/Users/veba/Downloads/not-here.c",
+            "/Users/example/Downloads/not-here.c",
             // A directory is not a file, whatever it is spelled like.
             &directory.path().display().to_string(),
             // An unclosed quote is not a drop.
@@ -8372,29 +8374,26 @@ mod tests {
 
         use super::dropped_path;
 
-        let plain = PathBuf::from("/Users/veba/Downloads/ble_rx_compliance.c");
-        assert_eq!(
-            dropped_path("/Users/veba/Downloads/ble_rx_compliance.c"),
-            plain
-        );
+        let plain = PathBuf::from("/Users/example/Downloads/source.c");
+        assert_eq!(dropped_path("/Users/example/Downloads/source.c"), plain);
         // Terminal.app escapes the spaces and leaves a trailing one behind.
         assert_eq!(
-            dropped_path("/Users/veba/Downloads/ble\\ rx\\ compliance.c "),
-            PathBuf::from("/Users/veba/Downloads/ble rx compliance.c")
+            dropped_path("/Users/example/Downloads/source\\ file.c "),
+            PathBuf::from("/Users/example/Downloads/source file.c")
         );
         // Other terminals quote the whole thing instead.
         assert_eq!(
-            dropped_path("'/Users/veba/Downloads/ble rx compliance.c'"),
-            PathBuf::from("/Users/veba/Downloads/ble rx compliance.c")
+            dropped_path("'/Users/example/Downloads/source file.c'"),
+            PathBuf::from("/Users/example/Downloads/source file.c")
         );
         assert_eq!(
-            dropped_path("\"/Users/veba/Downloads/ble rx compliance.c\""),
-            PathBuf::from("/Users/veba/Downloads/ble rx compliance.c")
+            dropped_path("\"/Users/example/Downloads/source file.c\""),
+            PathBuf::from("/Users/example/Downloads/source file.c")
         );
         // A quoted path keeps the characters a shell would have eaten.
         assert_eq!(
-            dropped_path("'/Users/veba/a$b/c`d.c'"),
-            PathBuf::from("/Users/veba/a$b/c`d.c")
+            dropped_path("'/Users/example/a$b/c`d.c'"),
+            PathBuf::from("/Users/example/a$b/c`d.c")
         );
         // A trailing backslash is a character, not the start of an escape that
         // swallows the end of the path.

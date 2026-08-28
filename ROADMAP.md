@@ -89,17 +89,17 @@ Work is ordered by dependency and product risk.
 
 ## Next
 
-Work below is acceptance-ordered. The no-Tailscale route is first because the
-browser feature is not externally reachable until its fixed bridge exists.
+Work below is acceptance-ordered. The hosted no-Tailscale route is deployed;
+real-device and operational qualification remain first because deployment alone
+does not prove that the browser path is reliable.
 
-1. Deploy the bridge origin behind TLS at `super-herdr.key-value.co` and add its
-   DNS record. Keep the origin on loopback or a private service network, proxy
-   WebSocket upgrades without buffering, apply connection/rate limits outside
-   the binary's own hard bounds, and ensure proxy/platform logs contain no
-   authorization headers, request or response bodies, terminal content,
-   clipboard payloads, pairing material, or secrets. Verify the health route,
-   a daemon's outbound registration, and one relayed page request. The domain
-   is currently absent from DNS, so this deployment is not yet qualified.
+1. Operationally qualify the deployed bridge at `super-herdr.key-value.co`.
+   Keep the origin on loopback, proxy WebSocket upgrades without buffering,
+   retain connection/rate limits outside the binary's own hard bounds, and
+   ensure proxy/platform logs contain no authorization headers, request or
+   response bodies, terminal content, clipboard payloads, pairing material, or
+   secrets. Record health, service-restart, connector-reconnect, and one relayed
+   page-request check without recording private routes or pairing material.
 2. Qualify the browser control path on a real phone **without Tailscale**.
    Record the phone OS,
    browser, network kind, Herdr version/protocol, and exact Super-Herdr commit in

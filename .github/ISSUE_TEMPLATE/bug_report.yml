@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a reproducible Super-Herdr defect
+title: "Bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here. Use the private channel in SECURITY.md.
+        Redact terminal content, pairing material, SSH details, hostnames, addresses, and usernames.
+  - type: input
+    id: super_herdr_version
+    attributes:
+      label: Super-Herdr version
+      placeholder: super-herdr 0.7.20
+    validations:
+      required: true
+  - type: input
+    id: herdr_version
+    attributes:
+      label: Herdr version and protocol
+      placeholder: herdr 0.8.0, protocol 19
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, terminal, display protocol, and local/SSH/browser connection path; redact private identifiers.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal numbered steps using non-sensitive sample data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed terminal contents, clipboard payloads, secrets, tokens, SSH material, and private machine or network identifiers.
+          required: true
