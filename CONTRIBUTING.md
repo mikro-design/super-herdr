@@ -55,4 +55,4 @@ request grants no permission to alter or stop a reviewer's running Herdr
 sessions.
 
 Contributions are accepted under the repository's dual MIT OR Apache-2.0
-license, as described in [README.md](README.md#licensing).
+license, as described in [README.md](README.md#license).

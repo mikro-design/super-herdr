@@ -35,4 +35,4 @@ credentials.
   delegated authorization, or an enterprise audit system.
 
 More detail is in [ARCHITECTURE.md](ARCHITECTURE.md) and the
-[safety section of the README](README.md#safety-and-boundaries).
+[security summary in the README](README.md#security-summary).
