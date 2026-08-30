@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::attention::AttentionEvent;
 use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
+use crate::plugin::{PluginAction, PluginRun, PluginRunId};
 use crate::screen::{Diff as ScreenDiff, Snapshot};
 use crate::state::{FederationState, TargetRuntimeState};
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
@@ -47,7 +48,7 @@ use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 /// Incremented only for a change a peer at the previous version cannot honor.
 /// A mismatch closes the connection during the handshake; it never degrades
 /// into a partially understood session.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// One message may not exceed this encoded size. The largest legitimate
 /// messages are a full-screen terminal frame and a bracketed paste, and the
@@ -151,6 +152,13 @@ pub enum ClientMessage {
     /// client, so what arrives here is already agreed to.
     #[serde(rename = "operation.run")]
     RunOperation { request: u64, operation: Operation },
+    /// Discover the enabled actions registered with one Herdr session. The
+    /// daemon strips command arrays before returning them.
+    #[serde(rename = "plugin.actions.list")]
+    ListPluginActions { request: u64, target: TargetSession },
+    /// Poll the sanitized lifecycle state of an action this client started.
+    #[serde(rename = "plugin.run.get")]
+    GetPluginRun { request: u64, run: PluginRunId },
     /// Deliver text to a pane as one atomic paste.
     ///
     /// This is not `PaneInput`: Herdr writes it in one piece through the
@@ -365,7 +373,22 @@ pub enum ServerMessage {
         request: u64,
         applied: bool,
         message: String,
+        /// Present only when this operation started a plugin command. Herdr's
+        /// command arguments and process output never cross this boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plugin_run: Option<PluginRun>,
     },
+    #[serde(rename = "plugin.actions")]
+    PluginActions {
+        request: u64,
+        target: TargetSession,
+        /// The connection generation the registry came from. A client can
+        /// discard a late answer after that target reconnects.
+        generation: u64,
+        actions: Vec<PluginAction>,
+    },
+    #[serde(rename = "plugin.run")]
+    PluginRun { request: u64, run: PluginRun },
     /// A pairing code and how long it lasts. Never persisted: a code that
     /// survived a restart would be a credential nobody knew was outstanding.
     #[serde(rename = "pairing.code")]
@@ -561,6 +584,9 @@ mod tests {
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{PaneId, TargetSession, WorkspaceId};
     use crate::operation::Operation;
+    use crate::plugin::{
+        PluginAction, PluginActionContext, PluginActionId, PluginRun, PluginRunId, PluginRunStatus,
+    };
     use crate::resource_action::SplitDirection;
     use crate::state::{
         FederationState, NormalizedSnapshot, PaneState, TargetConnectionState, TargetRuntimeState,
@@ -633,6 +659,18 @@ mod tests {
                 direction: SplitDirection::Down,
             },
         });
+        round_trip_client(ClientMessage::ListPluginActions {
+            request: 8,
+            target: TargetSession::new("development", "work"),
+        });
+        round_trip_client(ClientMessage::GetPluginRun {
+            request: 9,
+            run: PluginRunId {
+                target: TargetSession::new("development", "work"),
+                plugin_id: "herdr-workflows".to_owned(),
+                log_id: "log-1".to_owned(),
+            },
+        });
         round_trip_client(ClientMessage::PastePaneText {
             request: 3,
             pane: pane(),
@@ -703,7 +741,43 @@ mod tests {
         round_trip_server(ServerMessage::OperationResult {
             request: 7,
             applied: true,
-            message: "split pane".to_owned(),
+            message: "plugin action started".to_owned(),
+            plugin_run: Some(PluginRun {
+                id: PluginRunId {
+                    target: TargetSession::new("development", "work"),
+                    plugin_id: "herdr-workflows".to_owned(),
+                    log_id: "log-1".to_owned(),
+                },
+                action_id: Some("run".to_owned()),
+                status: PluginRunStatus::Running,
+            }),
+        });
+        round_trip_server(ServerMessage::PluginActions {
+            request: 8,
+            target: TargetSession::new("development", "work"),
+            generation: 2,
+            actions: vec![PluginAction {
+                id: PluginActionId {
+                    target: TargetSession::new("development", "work"),
+                    plugin_id: "herdr-workflows".to_owned(),
+                    action_id: "run".to_owned(),
+                },
+                title: "Run workflow".to_owned(),
+                description: None,
+                contexts: vec![PluginActionContext::Workspace],
+            }],
+        });
+        round_trip_server(ServerMessage::PluginRun {
+            request: 9,
+            run: PluginRun {
+                id: PluginRunId {
+                    target: TargetSession::new("development", "work"),
+                    plugin_id: "herdr-workflows".to_owned(),
+                    log_id: "log-1".to_owned(),
+                },
+                action_id: Some("run".to_owned()),
+                status: PluginRunStatus::Succeeded,
+            },
         });
         round_trip_server(ServerMessage::Attention {
             event: AttentionEvent {
@@ -789,8 +863,8 @@ mod tests {
         let workspace = WorkspaceId::new(&target.target, &target.session, "w1");
         let pane = PaneId::new(&target.target, &target.session, "w1:p1");
         let mut snapshot = NormalizedSnapshot {
-            server_version: Some("0.8.0".to_owned()),
-            protocol: Some(19),
+            server_version: Some("0.8.2".to_owned()),
+            protocol: Some(20),
             focused_pane: Some(pane.clone()),
             ..NormalizedSnapshot::default()
         };

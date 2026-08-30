@@ -48,6 +48,10 @@ Snapshot parsing treats optional fields as capabilities. Event and terminal
 support will be enabled only after the target advertises or successfully probes
 the corresponding operation.
 
+Plugin actions require Herdr protocol 20 or newer. Their registries are fetched
+per target with bounded socket requests, cached for one minute, invalidated by a
+target connection generation change, and never allowed to stall another target.
+
 The live state loop reconciles snapshots independently for each target, retains
 the last known state during bounded reconnect backoff, and assigns a new
 connection generation after reconnect. A configured API socket enables one
@@ -170,6 +174,26 @@ workspace, tab, or pane under the pointer; it never reconstructs identity from a
 display label. Destructive workspace, tab, and pane actions must pass through
 the same qualified confirmation path.
 
+Enabled Herdr plugin actions use that routing model too. The daemon discovers
+them with `plugin.action.list`, removes their command arrays, qualifies each
+plugin/action pair with target and session, and exposes the remaining title,
+description, and supported contexts to the frontend. Invocation uses
+`plugin.action.invoke` only after the daemon hydrates the chosen resource through
+documented `workspace.get`, `tab.get`, `pane.get`, and `pane.list` calls. That
+prevents Herdr's own local focus from replacing the pane selected in
+Super-Herdr. Selection-only actions are not exposed, and terminal selection text
+is never carried as incidental plugin context.
+
+The browser asks for the same sanitized registry and renders the actions that
+support its currently viewed pane. An invocation returns only a qualified
+plugin log ID and `running`, `succeeded`, or `failed`; polling
+`plugin.log.list` is reduced to those fields before it crosses the daemon
+boundary, so command arguments, stdout, stderr, and plugin error payloads are
+discarded in the daemon and never reach a client. Federation updates reveal
+panes created after the action.
+The browser offers those panes as explicit links and never changes the pane
+being viewed or controlled automatically.
+
 Moving a workspace is a multi-request action inside one session. Super-Herdr
 reads each source tab's split tree through the documented layout export, reduces
 it to one anchor pane plus the ordered splits that rebuild it, and replays that
@@ -179,10 +203,10 @@ identifier encodes its workspace, each later split targets the identifier the
 previous move returned. The whole sequence runs in one task behind the same
 single-action guard and reports one result, and a partial failure leaves already
 moved tabs in the destination and the remainder in the source without closing
-anything. A session is a separate server process that owns its panes, and
-protocol 19 has no cross-session transfer, so destinations are restricted to the
-source session and cross-session recreation is not silently substituted for a
-move.
+anything. A session is a separate server process that owns its panes, and the
+documented API has no cross-session transfer, so destinations are restricted to
+the source session and cross-session recreation is not silently substituted for
+a move.
 
 Crossing a session boundary is a different operation with different guarantees,
 and the two are never conflated. Recreation reads the source workspace's tabs and

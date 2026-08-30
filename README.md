@@ -127,12 +127,19 @@ cannot redirect the next byte you type.
 Common Herdr layout chords also work: use `Ctrl+B` followed by `h/j/k/l` to
 move between panes, `c` to create a tab, `v` or `-` to split, `z` to zoom, and
 `?` for help. Right-click a session, workspace, tab, or pane for actions scoped
-to that exact target and session.
+to that exact target and session. Actions from enabled Herdr plugins appear in
+the same right-click menus and searchable action palette. In the browser, open
+a pane to get the actions it supports as compact **Tools** buttons. Super-Herdr
+shows whether the plugin command is running, finished, or failed. If the action
+opens a picker, overlay, board, or another pane, an **Open** button appears;
+your current terminal never changes until you tap it.
 
 ## What is included
 
 - Concurrent discovery and supervision across local and SSH targets
 - A live, clickable TUI with tabs, split panes, search, and agent attention
+- Qualified plugin actions in the TUI and browser, with sanitized run status
+  and explicit routing to any newly opened pane
 - Explicit control leases: background panes and newly opened browser panes are
   read-only until control is granted
 - Desktop selection, clipboard paste, drag-and-drop, and verified uploads
@@ -146,7 +153,7 @@ payloads, credentials, and SSH material are never logged.
 
 ## Requirements
 
-- A compatible Herdr client on each target. Herdr 0.8.0 / protocol 19 is the
+- A compatible Herdr client on each target. Herdr 0.8.2 / protocol 20 is the
   currently tested combination.
 - OpenSSH for remote targets. Existing SSH configuration, keys, host checking,
   and proxy settings remain authoritative.

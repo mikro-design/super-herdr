@@ -700,6 +700,11 @@ mod tests {
         assert!(APP.contains("crypto.subtle.digest('SHA-256'"));
         assert_eq!(APP.matches("data-reply=").count(), 4);
         assert!(APP.contains("class=\"keys control-strip\""));
+        assert!(APP.contains("id=\"plugin-tools\""));
+        assert!(APP.contains("type: 'plugin.actions.list'"));
+        assert!(APP.contains("operation: 'invoke_plugin_action'"));
+        assert!(APP.contains("type: 'plugin.run.get'"));
+        assert!(APP.contains("Open ${paneLabel(pane)}"));
         assert_eq!(APP.matches("id=\"attention\"").count(), 1);
         assert!(!APP.contains("id=\"waiting\""));
         assert!(!APP.contains("id=\"history\""));

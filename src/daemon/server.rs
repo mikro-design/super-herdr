@@ -43,6 +43,7 @@ use crate::daemon::web;
 use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::pairing::{self, PendingPairing};
+use crate::plugin;
 use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, ServerMessage, decode, encode};
 use crate::state::{FederationState, FederationStore, SupervisorOptions, target_key};
 use crate::terminal::{
@@ -141,6 +142,7 @@ enum Input {
         request: u64,
         applied: bool,
         message: String,
+        plugin_run: Option<plugin::PluginRun>,
     },
     /// A transfer's chunks, handed over by the connection that will carry them.
     ///
@@ -964,7 +966,10 @@ async fn run(
         .unwrap_or_default();
     let attention_cursor = attention.events().next_back().map(|event| event.id);
     let mut daemon = Daemon {
-        broker: Broker::new(env!("CARGO_PKG_VERSION"), vec!["terminal".to_owned()]),
+        broker: Broker::new(
+            env!("CARGO_PKG_VERSION"),
+            vec!["terminal".to_owned(), "plugin_actions".to_owned()],
+        ),
         web_url: options.web_url.clone(),
         bridge_pairing: options.web_bridge.as_ref().map(|_| bridge_pairing.clone()),
         outboxes: BTreeMap::new(),
@@ -1511,9 +1516,10 @@ impl Daemon {
                 request,
                 applied,
                 message,
+                plugin_run,
             } => self
                 .broker
-                .operation_completed(client, request, applied, message),
+                .operation_completed(client, request, applied, message, plugin_run),
             Input::RelayFinished {
                 client,
                 request,
@@ -1669,6 +1675,16 @@ impl Daemon {
                     request,
                     operation,
                 } => self.run_operation(client, request, operation),
+                Effect::ListPluginActions {
+                    client,
+                    request,
+                    target,
+                } => self.list_plugin_actions(client, request, target),
+                Effect::GetPluginRun {
+                    client,
+                    request,
+                    run,
+                } => self.get_plugin_run(client, request, run),
                 Effect::PastePaneText {
                     client,
                     request,
@@ -2066,6 +2082,7 @@ impl Daemon {
                 request,
                 applied,
                 message,
+                plugin_run: None,
             });
         });
     }
@@ -2651,6 +2668,7 @@ impl Daemon {
                 request,
                 applied: false,
                 message: format!("{source_key} is not a configured target"),
+                plugin_run: None,
             });
             return;
         };
@@ -2660,6 +2678,7 @@ impl Daemon {
                 request,
                 applied: false,
                 message: format!("{destination_key} is not a configured target"),
+                plugin_run: None,
             });
             return;
         };
@@ -2682,16 +2701,82 @@ impl Daemon {
                 timeout,
             )
             .await;
-            let (applied, message) = match outcome {
-                Ok(detail) => (true, detail.unwrap_or(description)),
-                Err(error) => (false, error),
+            let (applied, message, plugin_run) = match outcome {
+                Ok(outcome) => (
+                    true,
+                    outcome.detail.unwrap_or(description),
+                    outcome.plugin_run,
+                ),
+                Err(error) => (false, error, None),
             };
             let _ = inputs.send(Input::OperationDone {
                 client,
                 request,
                 applied,
                 message,
+                plugin_run,
             });
+        });
+    }
+
+    /// Read one target's plugin registry off the daemon loop. The target and
+    /// generation ride back with the answer so a reconnect cannot make a late
+    /// registry look current.
+    fn list_plugin_actions(&mut self, client: ClientId, request: u64, key: TargetSession) {
+        let Some(target) = self.targets.get(&key).cloned() else {
+            self.refuse(client, request, format!("{key} is not a configured target"));
+            return;
+        };
+        let generation = self
+            .state
+            .targets
+            .get(&key)
+            .map_or(0, |runtime| runtime.connection_generation);
+        let Some(outbox) = self.outboxes.get(&client).cloned() else {
+            return;
+        };
+        let transport = self.transport.clone();
+        let request_timeout = self.command_timeout;
+        tokio::spawn(async move {
+            let message = match plugin::list(&key, &target, &transport, request_timeout).await {
+                Ok(actions) => ServerMessage::PluginActions {
+                    request,
+                    target: key,
+                    generation,
+                    actions,
+                },
+                Err(error) => ServerMessage::Error {
+                    request: Some(request),
+                    message: format!("plugin actions unavailable on {key}: {}", error.message),
+                },
+            };
+            let _ = outbox.send(message);
+        });
+    }
+
+    /// Poll lifecycle metadata for one plugin command. Herdr's log response
+    /// also contains command arguments and process output; `plugin::status`
+    /// discards those before the result can cross the daemon boundary.
+    fn get_plugin_run(&mut self, client: ClientId, request: u64, run: plugin::PluginRunId) {
+        let key = run.target.clone();
+        let Some(target) = self.targets.get(&key).cloned() else {
+            self.refuse(client, request, format!("{key} is not a configured target"));
+            return;
+        };
+        let Some(outbox) = self.outboxes.get(&client).cloned() else {
+            return;
+        };
+        let transport = self.transport.clone();
+        let request_timeout = self.command_timeout;
+        tokio::spawn(async move {
+            let message = match plugin::status(&run, &target, &transport, request_timeout).await {
+                Ok(run) => ServerMessage::PluginRun { request, run },
+                Err(error) => ServerMessage::Error {
+                    request: Some(request),
+                    message: format!("plugin run unavailable on {key}: {}", error.message),
+                },
+            };
+            let _ = outbox.send(message);
         });
     }
 
@@ -2744,7 +2829,7 @@ async fn execute(
     executable: Option<&str>,
     transport: &TransportConfig,
     timeout: Duration,
-) -> Result<Option<String>, String> {
+) -> Result<ExecutionOutcome, String> {
     match operation {
         Operation::MoveWorkspace {
             workspace,
@@ -2757,11 +2842,12 @@ async fn execute(
             timeout,
         )
         .await
-        .map(|summary| {
-            Some(format!(
+        .map(|summary| ExecutionOutcome {
+            detail: Some(format!(
                 "moved {} tab(s) and {} pane(s)",
                 summary.tabs, summary.panes
-            ))
+            )),
+            plugin_run: None,
         }),
         Operation::RecreateWorkspace {
             workspace, label, ..
@@ -2774,12 +2860,22 @@ async fn execute(
             timeout,
         )
         .await
-        .map(|summary| {
-            Some(format!(
+        .map(|summary| ExecutionOutcome {
+            detail: Some(format!(
                 "recreated {} tab(s) and {} pane(s) as {}",
                 summary.tabs, summary.panes, summary.workspace
-            ))
+            )),
+            plugin_run: None,
         }),
+        Operation::InvokePluginAction {
+            action, context, ..
+        } => plugin::invoke(action, context, source, transport, timeout)
+            .await
+            .map(|plugin_run| ExecutionOutcome {
+                detail: Some("plugin action started".to_owned()),
+                plugin_run: Some(plugin_run),
+            })
+            .map_err(|error| error.message),
         single => {
             let args = single
                 .herdr_args()
@@ -2788,10 +2884,18 @@ async fn execute(
                 executable.ok_or_else(|| "no compatible Herdr client is selected".to_owned())?;
             run_herdr_operation(source, transport, executable, &args, timeout)
                 .await
-                .map(|()| None)
+                .map(|()| ExecutionOutcome {
+                    detail: None,
+                    plugin_run: None,
+                })
                 .map_err(|error| error.message)
         }
     }
+}
+
+struct ExecutionOutcome {
+    detail: Option<String>,
+    plugin_run: Option<plugin::PluginRun>,
 }
 
 /// `Vec` has no queue-shaped pop, and effects must be applied in the order the

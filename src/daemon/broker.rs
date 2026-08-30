@@ -23,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::attention::AttentionEvent;
-use crate::model::PaneId;
+use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
+use crate::plugin::{PluginRun, PluginRunId};
 use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
 use crate::screen::{Diff as ScreenDiff, Snapshot};
 use crate::state::{FederationState, TargetConnectionState};
@@ -91,6 +92,16 @@ pub enum Effect {
         client: ClientId,
         request: u64,
         operation: Operation,
+    },
+    ListPluginActions {
+        client: ClientId,
+        request: u64,
+        target: TargetSession,
+    },
+    GetPluginRun {
+        client: ClientId,
+        request: u64,
+        run: PluginRunId,
     },
     PastePaneText {
         client: ClientId,
@@ -515,6 +526,20 @@ impl Broker {
                     client,
                     request,
                     operation,
+                });
+            }
+            ClientMessage::ListPluginActions { request, target } => {
+                effects.push(Effect::ListPluginActions {
+                    client,
+                    request,
+                    target,
+                });
+            }
+            ClientMessage::GetPluginRun { request, run } => {
+                effects.push(Effect::GetPluginRun {
+                    client,
+                    request,
+                    run,
                 });
             }
             ClientMessage::PastePaneText {
@@ -1022,6 +1047,7 @@ impl Broker {
         request: u64,
         applied: bool,
         message: impl Into<String>,
+        plugin_run: Option<PluginRun>,
     ) -> Vec<Effect> {
         if !self.clients.contains_key(&client) {
             return Vec::new();
@@ -1032,6 +1058,7 @@ impl Broker {
                 request,
                 applied,
                 message: message.into(),
+                plugin_run,
             },
         }]
     }
@@ -1347,6 +1374,7 @@ mod tests {
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{PaneId, TargetSession};
     use crate::operation::Operation;
+    use crate::plugin::PluginRunId;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
     use crate::screen::Diff as ScreenDiff;
     use crate::screen::Snapshot;
@@ -3141,7 +3169,7 @@ mod tests {
             [Effect::RunOperation { request: 4, .. }]
         ));
 
-        let effects = broker.operation_completed(asking, 4, true, "created tab");
+        let effects = broker.operation_completed(asking, 4, true, "created tab", None);
         assert!(matches!(
             messages_for(&effects, asking).as_slice(),
             [ServerMessage::OperationResult {
@@ -3151,6 +3179,58 @@ mod tests {
             }]
         ));
         assert!(messages_for(&effects, other).is_empty());
+    }
+
+    #[test]
+    fn plugin_discovery_keeps_the_target_session_qualified() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        let target = TargetSession::new("build", "work");
+
+        let effects = broker.handle(
+            client,
+            ClientMessage::ListPluginActions {
+                request: 9,
+                target: target.clone(),
+            },
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::ListPluginActions {
+                client,
+                request: 9,
+                target,
+            }]
+        );
+    }
+
+    #[test]
+    fn plugin_run_polling_keeps_the_target_session_qualified() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        let run = PluginRunId {
+            target: TargetSession::new("build", "work"),
+            plugin_id: "herdr-workflows".to_owned(),
+            log_id: "log-7".to_owned(),
+        };
+
+        let effects = broker.handle(
+            client,
+            ClientMessage::GetPluginRun {
+                request: 10,
+                run: run.clone(),
+            },
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::GetPluginRun {
+                client,
+                request: 10,
+                run,
+            }]
+        );
     }
 
     #[test]
@@ -3170,7 +3250,7 @@ mod tests {
 
         assert!(
             broker
-                .operation_completed(client, 1, true, "done")
+                .operation_completed(client, 1, true, "done", None)
                 .is_empty()
         );
     }

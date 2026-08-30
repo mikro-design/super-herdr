@@ -22,8 +22,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::daemon::server::DaemonHandle;
-use crate::model::PaneId;
+use crate::model::{PaneId, TargetSession};
 use crate::operation::Operation;
+use crate::plugin::PluginRunId;
 use crate::protocol::{
     ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, PaneRepresentation, ServerMessage, decode,
     encode,
@@ -277,6 +278,18 @@ impl ClientCommands {
     pub fn run_operation(&self, operation: Operation) -> u64 {
         let request = self.next_request();
         self.send(ClientMessage::RunOperation { request, operation });
+        request
+    }
+
+    pub fn list_plugin_actions(&self, target: TargetSession) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::ListPluginActions { request, target });
+        request
+    }
+
+    pub fn get_plugin_run(&self, run: PluginRunId) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::GetPluginRun { request, run });
         request
     }
 

@@ -90,6 +90,7 @@
     border: 1px solid var(--line); border-radius: .55rem;
     padding: .35rem .7rem; cursor: pointer;
   }
+  button:disabled { color: var(--dim); cursor: default; opacity: .6; }
   .actions { display: flex; gap: .5rem; margin-top: .7rem; }
   #line {
     flex: 1; min-width: 0; padding: .5rem .6rem; font: inherit;
@@ -176,6 +177,15 @@
   .viewer-head #stop { margin-left: auto; flex: none; }
   .viewer-controls { min-width: 0; }
   .viewer-controls > .actions { margin: 0; align-items: center; }
+  #plugin-tools { min-width: 0; margin-bottom: .35rem; }
+  #plugin-tools[hidden] { display: none; }
+  .plugin-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
+  .plugin-head .note { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #plugin-actions { margin-top: .25rem; }
+  #plugin-actions button { color: var(--text); background: var(--bg); }
+  #plugin-results { display: flex; gap: .35rem; align-items: center; min-width: 0; margin-top: .25rem; }
+  #plugin-results:empty { display: none; }
+  #plugin-results .note { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #keyboard { padding-top: .1rem; }
 
   @media (max-width: 640px) {
@@ -246,6 +256,11 @@
     </div>
     <div id="screen" class="screen"></div>
     <div class="viewer-controls">
+      <section id="plugin-tools" hidden aria-label="Plugin actions">
+        <div class="plugin-head"><strong>Tools</strong><span id="plugin-status" class="note"></span></div>
+        <div id="plugin-actions" class="control-strip"></div>
+        <div id="plugin-results"></div>
+      </section>
       <div class="actions"><button id="control">Take control &amp; type</button></div>
       <div id="keyboard" hidden>
         <form id="line-form" class="actions">
@@ -302,6 +317,16 @@ let attention = [];
 let attentionAutoOpened = false;
 const openTargets = new Set();
 const openSessions = new Set();
+
+// Plugin registries are server-local, so the browser caches one only beside
+// the exact target/session generation it came from. Runs are metadata-only;
+// commands and process output never arrive in this page.
+const pluginCatalogs = new Map();
+const pendingPluginCatalogs = new Map();
+const pendingPluginOperations = new Map();
+const pendingPluginPolls = new Map();
+let pluginActivity = null;
+let pluginPollTimer = null;
 
 const el = id => document.getElementById(id);
 const text = value => String(value == null ? '' : value);
@@ -506,7 +531,7 @@ let lease = 'observe';
 let requestingControl = false;
 let screen = null;
 let cell = null;
-let nextUploadRequest = 1;
+let nextCommandRequest = 1;
 let uploadBusy = false;
 const uploads = new Map();
 
@@ -550,6 +575,177 @@ function sameId(left, right) {
     && left.target === right.target
     && left.session === right.session
     && left.resource === right.resource;
+}
+
+function targetKey(id) {
+  return id && `${id.target}/${id.session}`;
+}
+
+function panesIn(target) {
+  const runtime = targets.get(targetKey(target));
+  return runtime && runtime.snapshot && runtime.snapshot.panes || [];
+}
+
+function paneKey(pane) {
+  return `${pane.target}/${pane.session}/${pane.resource}`;
+}
+
+function requestPluginCatalog(runtime) {
+  if (!runtime || runtime.connection !== 'live' || !runtime.snapshot
+      || Number(runtime.snapshot.protocol || 0) < 20) return;
+  const key = targetKey(runtime.key);
+  const generation = runtime.connection_generation || 0;
+  const held = pluginCatalogs.get(key);
+  if (held && held.generation === generation && Date.now() - held.loadedAt < 60_000) return;
+  for (const pending of pendingPluginCatalogs.values()) {
+    if (pending.key === key && pending.generation === generation) return;
+  }
+  const request = nextCommandRequest++;
+  pendingPluginCatalogs.set(request, { key, generation });
+  void postCommand({ type: 'plugin.actions.list', request, target: runtime.key }).catch(() => {
+    pendingPluginCatalogs.delete(request);
+    renderPluginTools();
+  });
+}
+
+function refreshPluginCatalogs() {
+  for (const runtime of targets.values()) requestPluginCatalog(runtime);
+}
+
+function supportsPane(action) {
+  const contexts = action.contexts || [];
+  if (!contexts.length) return true;
+  return contexts.some(context => ['global', 'workspace', 'tab', 'pane'].includes(context));
+}
+
+function actionsFor(pane) {
+  if (!pane) return [];
+  const runtime = targets.get(targetKey(pane));
+  const catalog = pluginCatalogs.get(targetKey(pane));
+  if (!runtime || runtime.connection !== 'live' || !catalog
+      || catalog.generation !== (runtime.connection_generation || 0)) return [];
+  return catalog.actions.filter(supportsPane);
+}
+
+function paneLabel(pane) {
+  const state = panesIn(pane).find(candidate => sameId(candidate.id, pane));
+  return state && state.label || pane.resource;
+}
+
+function updatePluginCandidates() {
+  if (!pluginActivity) return;
+  const candidates = panesIn(pluginActivity.source)
+    .filter(pane => !pluginActivity.baseline.has(paneKey(pane.id)))
+    .map(pane => pane.id);
+  pluginActivity.candidates = candidates;
+  renderPluginTools();
+}
+
+function renderPluginTools() {
+  const actions = actionsFor(watching);
+  const related = pluginActivity && watching
+    && targetKey(pluginActivity.source) === targetKey(watching);
+  const tools = el('plugin-tools');
+  tools.hidden = !actions.length && !related;
+  const buttons = el('plugin-actions');
+  buttons.innerHTML = '';
+  for (const action of actions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = action.title;
+    button.title = [action.id.plugin_id, action.description].filter(Boolean).join(' · ');
+    button.disabled = Boolean(related && pluginActivity.state === 'starting'
+      && pluginActivity.actionKey === `${action.id.plugin_id}/${action.id.action_id}`);
+    button.onclick = () => startPluginAction(action);
+    buttons.append(button);
+  }
+
+  const status = el('plugin-status');
+  const results = el('plugin-results');
+  results.innerHTML = '';
+  if (!related) {
+    status.textContent = actions.length ? `${actions.length} available` : '';
+    return;
+  }
+  const labels = {
+    starting: 'starting…', running: 'running', succeeded: 'finished',
+    failed: 'failed', unknown: 'status unavailable',
+  };
+  status.textContent = `${pluginActivity.title} · ${labels[pluginActivity.state] || pluginActivity.state}`;
+  if (pluginActivity.detail && ['failed', 'unknown'].includes(pluginActivity.state)) {
+    const note = document.createElement('span');
+    note.className = 'note';
+    note.textContent = pluginActivity.detail;
+    results.append(note);
+  }
+  for (const pane of pluginActivity.candidates.slice(0, 3)) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `Open ${paneLabel(pane)}`;
+    button.onclick = () => observe(pane, `${pane.target}/${pane.session}/${paneLabel(pane)}`);
+    results.append(button);
+  }
+  if (pluginActivity.candidates.length > 3) {
+    const note = document.createElement('span');
+    note.className = 'note';
+    note.textContent = `+${pluginActivity.candidates.length - 3} more new panes in the list`;
+    results.append(note);
+  }
+}
+
+function startPluginAction(action) {
+  if (!watching) return;
+  if (pluginPollTimer) clearTimeout(pluginPollTimer);
+  const request = nextCommandRequest++;
+  const source = { ...watching };
+  pluginActivity = {
+    request,
+    source,
+    title: action.title,
+    actionKey: `${action.id.plugin_id}/${action.id.action_id}`,
+    state: 'starting',
+    baseline: new Set(panesIn(source).map(pane => paneKey(pane.id))),
+    candidates: [],
+    run: null,
+  };
+  pendingPluginOperations.set(request, pluginActivity);
+  renderPluginTools();
+  void postCommand({
+    type: 'operation.run',
+    request,
+    operation: {
+      operation: 'invoke_plugin_action',
+      action: action.id,
+      context: { context: 'pane', pane: source },
+      title: action.title,
+    },
+  }).catch(error => {
+    const pending = pendingPluginOperations.get(request);
+    if (!pending) return;
+    pendingPluginOperations.delete(request);
+    pending.state = 'failed';
+    pending.detail = error instanceof Error ? error.message : 'the request did not reach the daemon';
+    renderPluginTools();
+  });
+}
+
+function schedulePluginPoll() {
+  if (pluginPollTimer) clearTimeout(pluginPollTimer);
+  if (!pluginActivity || !pluginActivity.run || pluginActivity.state !== 'running') return;
+  pluginPollTimer = setTimeout(() => {
+    if (!pluginActivity || !pluginActivity.run || pluginActivity.state !== 'running') return;
+    const request = nextCommandRequest++;
+    const logId = pluginActivity.run.id.log_id;
+    pendingPluginPolls.set(request, logId);
+    void postCommand({ type: 'plugin.run.get', request, run: pluginActivity.run.id }).catch(() => {
+      if (pendingPluginPolls.delete(request) && pluginActivity
+          && pluginActivity.run && pluginActivity.run.id.log_id === logId) {
+        pluginActivity.state = 'unknown';
+        pluginActivity.detail = 'The run status request did not reach the daemon.';
+        renderPluginTools();
+      }
+    });
+  }, 1000);
 }
 
 // This page's own default pair, kept in step with `.screen` in the stylesheet.
@@ -698,6 +894,7 @@ function observe(pane, label) {
   el('screen-note').textContent = 'waiting for output…';
   if (!uploadBusy) el('upload-note').textContent = DEFAULT_UPLOAD_NOTE;
   el('screen').innerHTML = '';
+  renderPluginTools();
   subscribeScreen(pane);
 }
 
@@ -802,7 +999,7 @@ async function uploadBrowserFile(file, pane) {
   if (buffer.byteLength !== file.size) throw new Error(`${file.name}: the file changed while reading`);
   const bytes = new Uint8Array(buffer);
   const digest = await sha256Hex(bytes);
-  const request = nextUploadRequest++;
+  const request = nextCommandRequest++;
   const upload = { request, pane, events: [], waiter: null };
   uploads.set(request, upload);
   let began = false;
@@ -914,6 +1111,7 @@ function stopWatching(why) {
   el('viewer').hidden = !reason;
   el('screen-note').textContent = reason;
   renderPanes();
+  renderPluginTools();
 }
 
 // A gap in the sequence means an update was missed. Resubscribing is the
@@ -1082,6 +1280,13 @@ function renderPanes() {
 function apply(message) {
   switch (message.type) {
     case 'server.hello':
+      pendingPluginCatalogs.clear();
+      pendingPluginPolls.clear();
+      if (pendingPluginOperations.size && pluginActivity && !pluginActivity.run) {
+        pluginActivity.state = 'unknown';
+        pluginActivity.detail = 'The connection changed before the daemon answered.';
+      }
+      pendingPluginOperations.clear();
       send({ type: 'state.subscribe' });
       // A reconnect is a new client to the daemon, which knows nothing about
       // what this page was watching — so what was being watched is asked for
@@ -1093,14 +1298,21 @@ function apply(message) {
         cell = null;
         subscribeScreen(watching);
       }
+      schedulePluginPoll();
       break;
     case 'state.full':
       targets.clear();
       for (const runtime of message.state.targets) {
         targets.set(`${runtime.key.target}/${runtime.key.session}`, runtime);
       }
+      for (const key of pluginCatalogs.keys()) {
+        if (!targets.has(key)) pluginCatalogs.delete(key);
+      }
       renderAttention();
       renderPanes();
+      refreshPluginCatalogs();
+      updatePluginCandidates();
+      renderPluginTools();
       break;
     case 'state.target': {
       const key = `${message.target.target}/${message.target.session}`;
@@ -1108,6 +1320,10 @@ function apply(message) {
       else targets.delete(key);
       renderAttention();
       renderPanes();
+      if (message.state) requestPluginCatalog(message.state);
+      else pluginCatalogs.delete(key);
+      updatePluginCandidates();
+      renderPluginTools();
       break;
     }
     case 'pane.screen':
@@ -1147,15 +1363,84 @@ function apply(message) {
     case 'pane.closed':
       if (sameId(message.pane, watching)) stopWatching('the pane closed');
       break;
+    case 'plugin.actions': {
+      const pending = pendingPluginCatalogs.get(message.request);
+      pendingPluginCatalogs.delete(message.request);
+      if (!pending || pending.key !== targetKey(message.target)
+          || pending.generation !== message.generation) break;
+      const runtime = targets.get(pending.key);
+      if (!runtime || runtime.connection !== 'live'
+          || (runtime.connection_generation || 0) !== message.generation) break;
+      pluginCatalogs.set(pending.key, {
+        generation: message.generation,
+        loadedAt: Date.now(),
+        actions: message.actions || [],
+      });
+      renderPluginTools();
+      break;
+    }
+    case 'operation.result': {
+      const activity = pendingPluginOperations.get(message.request);
+      if (!activity) break;
+      pendingPluginOperations.delete(message.request);
+      if (pluginActivity !== activity) break;
+      if (!message.applied) {
+        activity.state = 'failed';
+        activity.detail = message.message || 'the action was refused';
+      } else if (message.plugin_run) {
+        activity.run = message.plugin_run;
+        activity.state = message.plugin_run.status;
+      } else {
+        activity.state = 'succeeded';
+      }
+      updatePluginCandidates();
+      schedulePluginPoll();
+      break;
+    }
+    case 'plugin.run': {
+      const expected = pendingPluginPolls.get(message.request);
+      pendingPluginPolls.delete(message.request);
+      if (!expected || !pluginActivity || !pluginActivity.run
+          || expected !== message.run.id.log_id
+          || expected !== pluginActivity.run.id.log_id) break;
+      pluginActivity.run = message.run;
+      pluginActivity.state = message.run.status;
+      renderPluginTools();
+      schedulePluginPoll();
+      break;
+    }
     case 'upload.accepted':
     case 'upload.complete':
     case 'upload.interrupted':
       signalUpload(message);
       break;
     case 'error':
-      if (!signalUpload(message)) {
-        el('screen-note').textContent = message.message || 'daemon request failed';
+      if (pendingPluginCatalogs.delete(message.request)) {
+        renderPluginTools();
+        break;
       }
+      if (pendingPluginOperations.has(message.request)) {
+        const activity = pendingPluginOperations.get(message.request);
+        pendingPluginOperations.delete(message.request);
+        if (pluginActivity === activity) {
+          activity.state = 'failed';
+          activity.detail = message.message || 'the action was refused';
+          renderPluginTools();
+        }
+        break;
+      }
+      if (pendingPluginPolls.has(message.request)) {
+        const expected = pendingPluginPolls.get(message.request);
+        pendingPluginPolls.delete(message.request);
+        if (pluginActivity && pluginActivity.run
+            && pluginActivity.run.id.log_id === expected) {
+          pluginActivity.state = 'unknown';
+          pluginActivity.detail = 'Herdr stopped reporting this run.';
+          renderPluginTools();
+        }
+        break;
+      }
+      if (!signalUpload(message)) el('screen-note').textContent = message.message || 'daemon request failed';
       break;
     case 'attention.history':
       attention = message.events;
