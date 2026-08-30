@@ -8,6 +8,7 @@ pub mod model;
 pub mod notifications;
 pub mod operation;
 pub mod pairing;
+pub mod plugin;
 pub mod probe;
 pub mod protocol;
 pub mod resource_action;

@@ -6,10 +6,10 @@
 //! restarting its process. A move turns an exported tree into the ordered
 //! `pane.move` requests that rebuild the same tree in the destination workspace.
 //!
-//! Panes belong to one server process and protocol 19 has no cross-session
-//! transfer, so nothing can be moved between sessions. Crossing that boundary is
-//! offered only as a recreation, which rebuilds the structure with fresh shells
-//! and says so; it is never presented as a move.
+//! Panes belong to one server process and the documented API has no
+//! cross-session transfer, so nothing can be moved between sessions. Crossing
+//! that boundary is offered only as a recreation, which rebuilds the structure
+//! with fresh shells and says so; it is never presented as a move.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

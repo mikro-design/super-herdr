@@ -18,7 +18,7 @@ body:
     id: herdr_version
     attributes:
       label: Herdr version and protocol
-      placeholder: herdr 0.8.0, protocol 19
+      placeholder: herdr 0.8.2, protocol 20
     validations:
       required: true
   - type: textarea

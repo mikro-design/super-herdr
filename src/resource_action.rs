@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
+use crate::plugin::{PluginAction, PluginInvocationTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +94,10 @@ pub enum ResourceAction {
         pane: PaneId,
         label: String,
     },
+    InvokePluginAction {
+        action: PluginAction,
+        context: PluginInvocationTarget,
+    },
 }
 
 impl ResourceAction {
@@ -126,6 +131,7 @@ impl ResourceAction {
             | Self::RecreateWorkspace { workspace, .. }
             | Self::CreateTab { workspace } => Some(workspace.target_session()),
             Self::RenameTab { tab, .. } | Self::CloseTab { tab, .. } => Some(tab.target_session()),
+            Self::InvokePluginAction { action, .. } => Some(action.id.target.clone()),
             Self::OpenTargetManager | Self::OpenAgentNavigator | Self::OpenAttentionCenter => None,
         }
     }
@@ -155,6 +161,9 @@ impl ResourceAction {
             Self::SplitPane { direction, .. } => format!("Split pane {}", direction.label()),
             Self::TogglePaneZoom { .. } => "Toggle pane zoom".to_owned(),
             Self::ClosePane { label, .. } => format!("Close pane {label:?}"),
+            Self::InvokePluginAction { action, .. } => {
+                format!("Plugin: {}", action.title)
+            }
         }
     }
 
@@ -165,7 +174,17 @@ impl ResourceAction {
     }
 
     pub fn search_text(&self) -> String {
-        format!("{} {}", self.palette_label(), self.palette_scope())
+        let description = match self {
+            Self::InvokePluginAction { action, .. } => {
+                action.description.as_deref().unwrap_or_default()
+            }
+            _ => "",
+        };
+        format!(
+            "{} {} {description}",
+            self.palette_label(),
+            self.palette_scope()
+        )
     }
 }
 

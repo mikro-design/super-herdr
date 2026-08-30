@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
+use crate::plugin::{PluginActionId, PluginInvocationTarget};
 use crate::resource_action::SplitDirection;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +64,14 @@ pub enum Operation {
     ClosePane {
         pane: PaneId,
     },
+    /// Start an installed Herdr plugin action through the documented socket
+    /// API. Both the action and its context remain qualified until that final
+    /// hop, because plugin identifiers are server-local too.
+    InvokePluginAction {
+        action: PluginActionId,
+        context: PluginInvocationTarget,
+        title: String,
+    },
 }
 
 impl Operation {
@@ -80,6 +89,7 @@ impl Operation {
             Self::SplitPane { pane, .. }
             | Self::TogglePaneZoom { pane }
             | Self::ClosePane { pane } => pane.target_session(),
+            Self::InvokePluginAction { action, .. } => action.target.clone(),
         }
     }
 
@@ -124,6 +134,7 @@ impl Operation {
                 workspace.server_local_id().to_owned(),
             ],
             Self::MoveWorkspace { .. } | Self::RecreateWorkspace { .. } => return None,
+            Self::InvokePluginAction { .. } => return None,
             Self::CreateTab { workspace } => vec![
                 "tab".to_owned(),
                 "create".to_owned(),
@@ -196,6 +207,10 @@ impl Operation {
             }
             Self::TogglePaneZoom { pane } => format!("toggle zoom on pane {pane}"),
             Self::ClosePane { pane } => format!("close pane {pane}"),
+            Self::InvokePluginAction { action, title, .. } => format!(
+                "start plugin action {title:?} ({}/{}) on {}",
+                action.plugin_id, action.action_id, action.target
+            ),
         }
     }
 }

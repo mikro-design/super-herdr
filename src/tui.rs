@@ -32,6 +32,7 @@ use crate::daemon::server::{DaemonOptions, spawn_in_process};
 use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
 use crate::notifications::{self, NotificationDelivery, NotificationQueue};
 use crate::operation::Operation;
+use crate::plugin::{PluginAction, PluginActionContext, PluginInvocationTarget};
 use crate::protocol::ServerMessage;
 use crate::resource_action::{ResourceAction, SplitDirection};
 use crate::state::{
@@ -59,6 +60,7 @@ const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ROUTE_EVENT_DRAIN_LIMIT: usize = 64;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const PLUGIN_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -636,6 +638,17 @@ enum ContextTarget {
     Pane(PaneId),
 }
 
+impl ContextTarget {
+    fn target_session(&self) -> TargetSession {
+        match self {
+            Self::Session(target) => target.clone(),
+            Self::Workspace(workspace) => workspace.target_session(),
+            Self::Tab(tab) => tab.target_session(),
+            Self::Pane(pane) => pane.target_session(),
+        }
+    }
+}
+
 /// A pane this frontend is watching.
 ///
 /// The terminal itself lives with the daemon; what is local is the screen model
@@ -755,9 +768,23 @@ struct CommandPalette {
 struct ContextMenu {
     title: String,
     actions: Vec<ResourceAction>,
+    target: ContextTarget,
     selected: usize,
     anchor: Position,
     pressed: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PluginCatalog {
+    generation: u64,
+    actions: Vec<PluginAction>,
+    loaded_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPluginCatalog {
+    target: TargetSession,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -810,6 +837,8 @@ struct App {
     /// carries its other senders.
     client: Option<ClientCommands>,
     pending_operations: BTreeMap<u64, PendingOperation>,
+    plugin_catalogs: BTreeMap<TargetSession, PluginCatalog>,
+    pending_plugin_catalogs: BTreeMap<u64, PendingPluginCatalog>,
     pending_uploads: BTreeMap<u64, PendingUpload>,
     last_frame_area: Option<Rect>,
     last_terminal_area: Option<Rect>,
@@ -867,6 +896,8 @@ impl Default for App {
             route_retry_after: BTreeMap::new(),
             client: None,
             pending_operations: BTreeMap::new(),
+            plugin_catalogs: BTreeMap::new(),
+            pending_plugin_catalogs: BTreeMap::new(),
             pending_uploads: BTreeMap::new(),
             last_frame_area: None,
             last_terminal_area: None,
@@ -977,6 +1008,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         client: Some(client.commands()),
         ..App::default()
     };
+    ensure_plugin_catalogs(&updates.borrow(), &mut app);
     let mut should_draw = true;
 
     let result = loop {
@@ -1035,6 +1067,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 if changed.is_err() {
                     break Ok(());
                 }
+                ensure_plugin_catalogs(&updates.borrow(), &mut app);
                 should_draw = true;
             }
             refresh = config_refreshes.recv() => {
@@ -2286,7 +2319,10 @@ async fn handle_input(
                     None => app.message = Some("pairing is unavailable".to_owned()),
                 },
                 b'd' => request_workspace_close(state, app),
-                b' ' => app.command_palette = Some(CommandPalette::default()),
+                b' ' => {
+                    ensure_plugin_catalogs(state, app);
+                    app.command_palette = Some(CommandPalette::default());
+                }
                 b'1'..=b'9' => select_workspace(state, app, usize::from(key - b'1')),
                 PREFIX_KEY => {
                     if let Some(pane) = app.selected_pane.clone()
@@ -2556,6 +2592,7 @@ fn request_workspace_close(state: &FederationState, app: &mut App) {
 fn command_palette_actions(
     state: &FederationState,
     selected: Option<&PaneId>,
+    plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
 ) -> Vec<ResourceAction> {
     let mut actions = vec![
         ResourceAction::OpenTargetManager,
@@ -2695,7 +2732,126 @@ fn command_palette_actions(
             });
         }
     }
+    for (target, catalog) in plugin_catalogs {
+        if !plugin_target_available(state, target) {
+            continue;
+        }
+        let context = selected
+            .filter(|pane| pane.target_session() == *target)
+            .cloned()
+            .map_or_else(
+                || PluginInvocationTarget::Session {
+                    target: target.clone(),
+                },
+                |pane| PluginInvocationTarget::Pane { pane },
+            );
+        actions.extend(plugin_resource_actions(catalog, &context));
+    }
     actions
+}
+
+fn plugin_target_available(state: &FederationState, target: &TargetSession) -> bool {
+    state.targets.get(target).is_some_and(|runtime| {
+        runtime.connection == TargetConnectionState::Live
+            && runtime
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.protocol)
+                .is_some_and(|protocol| protocol >= 20)
+    })
+}
+
+fn plugin_resource_actions(
+    catalog: &PluginCatalog,
+    target: &PluginInvocationTarget,
+) -> Vec<ResourceAction> {
+    catalog
+        .actions
+        .iter()
+        .filter(|action| action.id.target == target.target_session())
+        .filter(|action| match target {
+            PluginInvocationTarget::Session { .. } => action.supports(PluginActionContext::Global),
+            PluginInvocationTarget::Workspace { .. } => {
+                action.supports(PluginActionContext::Global)
+                    || action.supports(PluginActionContext::Workspace)
+            }
+            PluginInvocationTarget::Tab { .. } => {
+                action.supports(PluginActionContext::Global)
+                    || action.supports(PluginActionContext::Workspace)
+                    || action.supports(PluginActionContext::Tab)
+            }
+            PluginInvocationTarget::Pane { .. } => {
+                action.supports(PluginActionContext::Global)
+                    || action.supports(PluginActionContext::Workspace)
+                    || action.supports(PluginActionContext::Tab)
+                    || action.supports(PluginActionContext::Pane)
+            }
+        })
+        .cloned()
+        .map(|action| ResourceAction::InvokePluginAction {
+            action,
+            context: target.clone(),
+        })
+        .collect()
+}
+
+fn insert_plugin_actions(
+    actions: &mut Vec<ResourceAction>,
+    catalog: &PluginCatalog,
+    target: &PluginInvocationTarget,
+) {
+    let plugins = plugin_resource_actions(catalog, target);
+    let before_destructive = actions
+        .iter()
+        .position(ResourceAction::is_destructive)
+        .unwrap_or(actions.len());
+    actions.splice(before_destructive..before_destructive, plugins);
+}
+
+fn ensure_plugin_catalogs(state: &FederationState, app: &mut App) {
+    app.plugin_catalogs
+        .retain(|target, _| state.targets.contains_key(target));
+    let targets = state.targets.keys().cloned().collect::<Vec<_>>();
+    for target in targets {
+        ensure_plugin_catalog(state, &target, app);
+    }
+}
+
+fn ensure_plugin_catalog(state: &FederationState, target: &TargetSession, app: &mut App) {
+    let Some(runtime) = state.targets.get(target) else {
+        return;
+    };
+    if runtime.connection != TargetConnectionState::Live
+        || runtime
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.protocol)
+            .is_none_or(|protocol| protocol < 20)
+    {
+        return;
+    }
+    let generation = runtime.connection_generation;
+    if app.plugin_catalogs.get(target).is_some_and(|catalog| {
+        catalog.generation == generation
+            && catalog.loaded_at.elapsed() < PLUGIN_CATALOG_REFRESH_INTERVAL
+    }) || app
+        .pending_plugin_catalogs
+        .values()
+        .any(|pending| pending.target == *target && pending.generation == generation)
+    {
+        return;
+    }
+    let Some(client) = app.client.as_ref() else {
+        return;
+    };
+    let request = client.list_plugin_actions(target.clone());
+    app.pending_plugin_catalogs.insert(
+        request,
+        PendingPluginCatalog {
+            target: target.clone(),
+            generation,
+        },
+    );
 }
 
 /// A context menu is not scrollable, so it lists at most this many move
@@ -2764,18 +2920,24 @@ fn context_menu_for_target(
     state: &FederationState,
     target: ContextTarget,
     anchor: Position,
+    plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
 ) -> Option<ContextMenu> {
-    let (title, actions) = match target {
+    let (title, mut actions, invocation_target) = match &target {
         ContextTarget::Session(target) => {
-            actionable_snapshot(state, &target)?;
+            actionable_snapshot(state, target)?;
             (
                 format!("session {target}"),
-                vec![ResourceAction::CreateWorkspace { target }],
+                vec![ResourceAction::CreateWorkspace {
+                    target: target.clone(),
+                }],
+                PluginInvocationTarget::Session {
+                    target: target.clone(),
+                },
             )
         }
         ContextTarget::Workspace(workspace) => {
             let snapshot = actionable_snapshot(state, &workspace.target_session())?;
-            let resource = snapshot.workspaces.get(&workspace)?;
+            let resource = snapshot.workspaces.get(workspace)?;
             let label = display_label(&resource.id.resource, resource.label.as_deref());
             let mut actions = vec![
                 ResourceAction::CreateTab {
@@ -2787,22 +2949,31 @@ fn context_menu_for_target(
                 },
             ];
             actions.extend(
-                workspace_move_actions(snapshot, &workspace)
+                workspace_move_actions(snapshot, workspace)
                     .into_iter()
                     .take(MAX_CONTEXT_MENU_MOVE_DESTINATIONS),
             );
             actions.extend(
-                workspace_recreate_actions(state, snapshot, &workspace)
+                workspace_recreate_actions(state, snapshot, workspace)
                     .into_iter()
                     .take(MAX_CONTEXT_MENU_MOVE_DESTINATIONS),
             );
             let title = format!("workspace {label} · {}", workspace.target_session());
-            actions.push(ResourceAction::CloseWorkspace { workspace, label });
-            (title, actions)
+            actions.push(ResourceAction::CloseWorkspace {
+                workspace: workspace.clone(),
+                label,
+            });
+            (
+                title,
+                actions,
+                PluginInvocationTarget::Workspace {
+                    workspace: workspace.clone(),
+                },
+            )
         }
         ContextTarget::Tab(tab) => {
             let snapshot = actionable_snapshot(state, &tab.target_session())?;
-            let resource = snapshot.tabs.get(&tab)?;
+            let resource = snapshot.tabs.get(tab)?;
             let label = display_label(&resource.id.resource, resource.label.as_deref());
             (
                 format!("tab {label} · {}", tab.target_session()),
@@ -2811,13 +2982,17 @@ fn context_menu_for_target(
                         tab: tab.clone(),
                         current_label: label.clone(),
                     },
-                    ResourceAction::CloseTab { tab, label },
+                    ResourceAction::CloseTab {
+                        tab: tab.clone(),
+                        label,
+                    },
                 ],
+                PluginInvocationTarget::Tab { tab: tab.clone() },
             )
         }
         ContextTarget::Pane(pane) => {
             let snapshot = actionable_snapshot(state, &pane.target_session())?;
-            let resource = snapshot.panes.get(&pane)?;
+            let resource = snapshot.panes.get(pane)?;
             let label = display_label(&resource.id.resource, resource.label.as_deref());
             (
                 format!("pane {label} · {}", pane.target_session()),
@@ -2831,14 +3006,22 @@ fn context_menu_for_target(
                         direction: SplitDirection::Down,
                     },
                     ResourceAction::TogglePaneZoom { pane: pane.clone() },
-                    ResourceAction::ClosePane { pane, label },
+                    ResourceAction::ClosePane {
+                        pane: pane.clone(),
+                        label,
+                    },
                 ],
+                PluginInvocationTarget::Pane { pane: pane.clone() },
             )
         }
     };
+    if let Some(catalog) = plugin_catalogs.get(&invocation_target.target_session()) {
+        insert_plugin_actions(&mut actions, catalog, &invocation_target);
+    }
     Some(ContextMenu {
         title,
         actions,
+        target,
         selected: 0,
         anchor,
         pressed: None,
@@ -2863,7 +3046,8 @@ fn open_context_menu(
 ) {
     app.selection = None;
     app.selection_autoscroll = None;
-    if let Some(menu) = context_menu_for_target(state, target, anchor) {
+    ensure_plugin_catalog(state, &target.target_session(), app);
+    if let Some(menu) = context_menu_for_target(state, target, anchor, &app.plugin_catalogs) {
         app.context_menu = Some(menu);
         app.message = None;
     } else {
@@ -2901,8 +3085,9 @@ fn filtered_palette_actions(
     state: &FederationState,
     selected: Option<&PaneId>,
     query: &str,
+    plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
 ) -> Vec<ResourceAction> {
-    let mut actions = command_palette_actions(state, selected)
+    let mut actions = command_palette_actions(state, selected, plugin_catalogs)
         .into_iter()
         .filter_map(|action| fuzzy_score(&action.search_text(), query).map(|score| (score, action)))
         .collect::<Vec<_>>();
@@ -2919,7 +3104,12 @@ fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App)
     let Some(mut palette) = app.command_palette.take() else {
         return Ok(false);
     };
-    let actions = filtered_palette_actions(state, app.selected_pane.as_ref(), &palette.query);
+    let actions = filtered_palette_actions(
+        state,
+        app.selected_pane.as_ref(),
+        &palette.query,
+        &app.plugin_catalogs,
+    );
     match key {
         0x1b => return Ok(false),
         b'\r' | b'\n' => {
@@ -2952,7 +3142,13 @@ fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App)
         }
         _ => {}
     }
-    let count = filtered_palette_actions(state, app.selected_pane.as_ref(), &palette.query).len();
+    let count = filtered_palette_actions(
+        state,
+        app.selected_pane.as_ref(),
+        &palette.query,
+        &app.plugin_catalogs,
+    )
+    .len();
     palette.selected = palette.selected.min(count.saturating_sub(1));
     app.command_palette = Some(palette);
     Ok(false)
@@ -3146,6 +3342,20 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
                 app,
                 Operation::TogglePaneZoom { pane },
                 format!("toggled pane zoom on {target_session}"),
+                false,
+            );
+        }
+        ResourceAction::InvokePluginAction { action, context } => {
+            let title = action.title.clone();
+            let target = action.id.target.clone();
+            run_operation(
+                app,
+                Operation::InvokePluginAction {
+                    action: action.id,
+                    context,
+                    title: title.clone(),
+                },
+                format!("started plugin action {title:?} on {target}"),
                 false,
             );
         }
@@ -4819,6 +5029,7 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
             request,
             applied,
             message,
+            ..
         } => {
             app.herdr_action_inflight = false;
             let pending = app.pending_operations.remove(&request);
@@ -4850,6 +5061,59 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
             } else {
                 app.message = Some(format!("Herdr action failed: {message}"));
             }
+        }
+        ServerMessage::PluginActions {
+            request,
+            target,
+            generation,
+            mut actions,
+        } => {
+            let Some(pending) = app.pending_plugin_catalogs.remove(&request) else {
+                return;
+            };
+            if pending.target != target || pending.generation != generation {
+                return;
+            }
+            actions.retain(|action| action.id.target == target);
+            let catalog = PluginCatalog {
+                generation,
+                actions,
+                loaded_at: Instant::now(),
+            };
+            if app
+                .plugin_catalogs
+                .get(&target)
+                .is_some_and(|current| current.generation > generation)
+                || app
+                    .pending_plugin_catalogs
+                    .values()
+                    .any(|newer| newer.target == target && newer.generation > generation)
+            {
+                return;
+            }
+            if let Some(menu) = app
+                .context_menu
+                .as_mut()
+                .filter(|menu| menu.target.target_session() == target)
+            {
+                menu.actions
+                    .retain(|action| !matches!(action, ResourceAction::InvokePluginAction { .. }));
+                let invocation = match &menu.target {
+                    ContextTarget::Session(target) => PluginInvocationTarget::Session {
+                        target: target.clone(),
+                    },
+                    ContextTarget::Workspace(workspace) => PluginInvocationTarget::Workspace {
+                        workspace: workspace.clone(),
+                    },
+                    ContextTarget::Tab(tab) => PluginInvocationTarget::Tab { tab: tab.clone() },
+                    ContextTarget::Pane(pane) => {
+                        PluginInvocationTarget::Pane { pane: pane.clone() }
+                    }
+                };
+                insert_plugin_actions(&mut menu.actions, &catalog, &invocation);
+                menu.selected = menu.selected.min(menu.actions.len().saturating_sub(1));
+            }
+            app.plugin_catalogs.insert(target, catalog);
         }
         // The frontend uploads what a clipboard held, in one attempt, over a
         // socket it shares a machine with. It has nothing to resume from and
@@ -4943,6 +5207,35 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
             // A refusal ends whatever asked for it, so a failed transfer does
             // not leave the frontend waiting on a result that will not come.
             if let Some(request) = request {
+                if let Some(pending) = app.pending_plugin_catalogs.remove(&request) {
+                    let is_stale = app
+                        .plugin_catalogs
+                        .get(&pending.target)
+                        .is_some_and(|current| current.generation > pending.generation)
+                        || app.pending_plugin_catalogs.values().any(|newer| {
+                            newer.target == pending.target && newer.generation > pending.generation
+                        });
+                    if is_stale {
+                        return;
+                    }
+                    app.plugin_catalogs.insert(
+                        pending.target.clone(),
+                        PluginCatalog {
+                            generation: pending.generation,
+                            actions: Vec::new(),
+                            loaded_at: Instant::now(),
+                        },
+                    );
+                    if app.command_palette.is_some()
+                        || app
+                            .context_menu
+                            .as_ref()
+                            .is_some_and(|menu| menu.target.target_session() == pending.target)
+                    {
+                        app.message = Some(message);
+                    }
+                    return;
+                }
                 // A file that failed still has to settle its batch, or the
                 // files that did arrive wait forever for one that never will.
                 if let Some(pending) = app.pending_uploads.remove(&request)
@@ -4972,7 +5265,8 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         }
         ServerMessage::Hello { .. }
         | ServerMessage::FederationState { .. }
-        | ServerMessage::TargetState { .. } => {}
+        | ServerMessage::TargetState { .. }
+        | ServerMessage::PluginRun { .. } => {}
     }
 }
 
@@ -5062,7 +5356,13 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
     } else if let Some(menu) = app.context_menu.as_ref() {
         render_context_menu(frame, menu);
     } else if let Some(palette) = app.command_palette.as_ref() {
-        render_command_palette(frame, state, app.selected_pane.as_ref(), palette);
+        render_command_palette(
+            frame,
+            state,
+            app.selected_pane.as_ref(),
+            palette,
+            &app.plugin_catalogs,
+        );
     } else if let Some(prompt) = app.text_prompt.as_ref() {
         render_text_prompt(frame, prompt);
     } else if let Some(confirmation) = app.close_confirmation.as_ref() {
@@ -5166,6 +5466,7 @@ fn render_command_palette(
     state: &FederationState,
     selected: Option<&PaneId>,
     palette: &CommandPalette,
+    plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
 ) {
     let area = centered_popup(frame.area(), 82, 22);
     frame.render_widget(Clear, area);
@@ -5176,7 +5477,7 @@ fn render_command_palette(
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = filtered_palette_actions(state, selected, &palette.query);
+    let actions = filtered_palette_actions(state, selected, &palette.query, plugin_catalogs);
     let mut lines = vec![
         Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
@@ -7431,7 +7732,7 @@ mod tests {
         AgentFilter, AgentNavigator, App, AttentionCenter, AttentionIndex, CellPosition,
         ClipboardFeedback, ContextTarget, DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode,
         MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS, MOUSE_CAPTURE_ENABLE, MouseInput,
-        PREFIX_KEY, PaneDirection, SIDEBAR_WIDTH, SelectionAutoscroll,
+        PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH, SelectionAutoscroll,
         SelectionAutoscrollDirection, SelectionFinish, TargetForm, TargetManager,
         TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
         TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
@@ -7450,6 +7751,7 @@ mod tests {
     };
     use crate::config::{Config, Target};
     use crate::model::{PaneId, TargetSession, WorkspaceId};
+    use crate::plugin::{PluginAction, PluginActionContext, PluginActionId};
     use crate::resource_action::ResourceAction;
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
@@ -7614,7 +7916,12 @@ mod tests {
         assert!(app.close_confirmation.is_none());
         assert!(!app.herdr_action_inflight);
 
-        let actions = filtered_palette_actions(&state, app.selected_pane.as_ref(), "jump second");
+        let actions = filtered_palette_actions(
+            &state,
+            app.selected_pane.as_ref(),
+            "jump second",
+            &app.plugin_catalogs,
+        );
         assert_eq!(actions.len(), 1);
         let ResourceAction::JumpToPane { pane, .. } = &actions[0] else {
             panic!("expected a jump action");
@@ -7626,6 +7933,59 @@ mod tests {
     fn command_palette_search_is_case_insensitive_and_fuzzy() {
         assert!(fuzzy_score("Close workspace Simulator", "CWSim").is_some());
         assert!(fuzzy_score("Open agent navigator", "target remove").is_none());
+    }
+
+    #[test]
+    fn plugin_actions_are_qualified_and_selection_only_actions_stay_hidden() {
+        let target = TargetSession::new("host-b", "work");
+        let pane = PaneId::new("host-b", "work", "w1:p1");
+        let action = |action_id: &str, context| PluginAction {
+            id: PluginActionId {
+                target: target.clone(),
+                plugin_id: "herdr-workflows".to_owned(),
+                action_id: action_id.to_owned(),
+            },
+            title: format!("Run {action_id}"),
+            description: None,
+            contexts: vec![context],
+        };
+        let catalogs = BTreeMap::from([(
+            target.clone(),
+            PluginCatalog {
+                generation: 3,
+                actions: vec![
+                    action("workflow", PluginActionContext::Pane),
+                    action("translate-selection", PluginActionContext::Selection),
+                ],
+                loaded_at: Instant::now(),
+            },
+        )]);
+
+        let mut state = FederationState::default();
+        let snapshot = NormalizedSnapshot {
+            protocol: Some(20),
+            ..NormalizedSnapshot::default()
+        };
+        state.targets.insert(
+            target.clone(),
+            runtime(target, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let actions = command_palette_actions(&state, Some(&pane), &catalogs);
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                ResourceAction::InvokePluginAction { action, .. }
+                    if action.id.action_id == "workflow"
+                        && action.id.target == pane.target_session()
+            )
+        }));
+        assert!(!actions.iter().any(|action| {
+            matches!(
+                action,
+                ResourceAction::InvokePluginAction { action, .. }
+                    if action.id.action_id == "translate-selection"
+            )
+        }));
     }
 
     #[test]
@@ -7650,6 +8010,7 @@ mod tests {
             &state,
             ContextTarget::Workspace(workspace.clone()),
             ratatui::layout::Position::new(4, 5),
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -7701,6 +8062,7 @@ mod tests {
             &state,
             ContextTarget::Workspace(workspace.clone()),
             ratatui::layout::Position::new(4, 5),
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -7815,6 +8177,7 @@ mod tests {
             &state,
             ContextTarget::Workspace(workspace.clone()),
             ratatui::layout::Position::new(4, 5),
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -7861,6 +8224,7 @@ mod tests {
             &state,
             ContextTarget::Workspace(WorkspaceId::new("host-b", "work", "w1")),
             ratatui::layout::Position::new(0, 0),
+            &BTreeMap::new(),
         )
         .unwrap();
         let menu_moves = menu
@@ -7870,8 +8234,11 @@ mod tests {
             .count();
         assert_eq!(menu_moves, MAX_CONTEXT_MENU_MOVE_DESTINATIONS);
 
-        let palette =
-            command_palette_actions(&state, Some(&PaneId::new("host-b", "work", "w1:p1")));
+        let palette = command_palette_actions(
+            &state,
+            Some(&PaneId::new("host-b", "work", "w1:p1")),
+            &BTreeMap::new(),
+        );
         let palette_moves = palette
             .iter()
             .filter(|action| matches!(action, ResourceAction::MoveWorkspace { .. }))
