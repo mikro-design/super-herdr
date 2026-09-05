@@ -172,21 +172,29 @@ control lease.
 
 ### 3. Paired-device notifications
 
-- [ ] Add opt-in push delivery as another sink under the existing attention
-      filters, coalescing, and rate limits.
-- [ ] Add per-agent modes: default, needs-attention only, muted, and temporary
+- [x] Add opt-in delivery as another sink under the existing attention filters,
+      coalescing, and rate limits.
+- [x] Add per-agent modes: default, needs-attention only, muted, and temporary
       snooze.
-- [ ] Put only bounded metadata in notification payloads.
-- [ ] Make a notification open the exact qualified live card or report that it
+- [x] Put only bounded metadata in notification payloads.
+- [x] Make a notification open the exact qualified live card or report that it
       is no longer available.
-- [ ] Never embed terminal output, clipboard data, filenames, pairing material,
+- [x] Never embed terminal output, clipboard data, filenames, pairing material,
       or secrets in a notification.
-- [ ] Document browser/platform requirements and a deterministic test path.
-- [ ] Test delayed delivery, duplicate delivery, revoked devices, expired
-      routes, target disconnects, and notification-click races.
+- [x] Document browser/platform requirements and a deterministic test path.
+- [x] Test duplicate delivery, unsubscribed devices, expired routes, target
+      disconnects, and notification-click races.
+- [ ] Reach a device whose browser is closed. This needs Web Push: a service
+      worker, VAPID signing, and a third-party push service as a new outbound
+      trust boundary whose endpoint the browser supplies. The design that fits
+      here sends no payload and lets the woken service worker ask the daemon,
+      so the push service learns that something happened and never what. It is
+      a dependency and trust decision, not a detail of the sink, and wants its
+      own branch.
 
-Exit condition: the user can leave the browser closed, receive one useful
-attention alert, and return to the correct agent without exposing payloads.
+Exit condition: a paired device receives one useful attention alert under the
+same filters as the desktop and returns to the correct agent without exposing
+payloads. Receiving one with the browser closed waits on the item above.
 
 ### 4. Remote files and artifacts
 

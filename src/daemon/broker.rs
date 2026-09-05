@@ -249,6 +249,7 @@ struct Client {
     greeted: bool,
     state_subscribed: bool,
     agent_cards_subscribed: bool,
+    notifications_subscribed: bool,
     panes: BTreeMap<PaneId, PaneSubscription>,
 }
 
@@ -258,6 +259,7 @@ impl Client {
             greeted: false,
             state_subscribed: false,
             agent_cards_subscribed: false,
+            notifications_subscribed: false,
             panes: BTreeMap::new(),
         }
     }
@@ -487,6 +489,19 @@ impl Broker {
                 agent,
                 mark,
             }),
+            ClientMessage::SubscribeNotifications => {
+                if let Some(session) = self.clients.get_mut(&client) {
+                    session.notifications_subscribed = true;
+                }
+                // Nothing is replayed. An alert is about a moment, and one
+                // delivered late enough to have been asked for afterwards is
+                // an interruption about something already over.
+            }
+            ClientMessage::UnsubscribeNotifications => {
+                if let Some(session) = self.clients.get_mut(&client) {
+                    session.notifications_subscribed = false;
+                }
+            }
             ClientMessage::SubscribeAgentCards => {
                 if let Some(session) = self.clients.get_mut(&client) {
                     session.agent_cards_subscribed = true;
@@ -1071,6 +1086,22 @@ impl Broker {
             });
         }
         effects
+    }
+
+    /// Send one coalesced alert to every device that asked for them.
+    ///
+    /// Only to subscribers, and only ever forward: a device that connects
+    /// after the fact is not caught up, because an alert is an interruption
+    /// and one about a finished moment is only noise.
+    pub fn notify_devices(&mut self, notification: ServerMessage) -> Vec<Effect> {
+        self.clients
+            .iter()
+            .filter(|(_, session)| session.notifications_subscribed)
+            .map(|(client, _)| Effect::Send {
+                client: *client,
+                message: notification.clone(),
+            })
+            .collect()
     }
 
     pub fn attention_observed(&mut self, event: AttentionEvent) -> Vec<Effect> {
@@ -3442,6 +3473,63 @@ mod tests {
 
         assert!(broker.agent_cards_updated(projection(1)).is_empty());
         assert!(!broker.agent_cards_updated(projection(2)).is_empty());
+    }
+
+    #[test]
+    fn an_alert_reaches_only_devices_that_asked_to_be_interrupted() {
+        let mut broker = broker();
+        let subscriber = greet(&mut broker);
+        let watcher = greet(&mut broker);
+        // Rendering the inbox is not asking to be interrupted by it.
+        broker.handle(watcher, ClientMessage::SubscribeAgentCards);
+        broker.handle(subscriber, ClientMessage::SubscribeNotifications);
+
+        let effects = broker.notify_devices(alert());
+
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                client: subscriber,
+                message: alert(),
+            }]
+        );
+    }
+
+    #[test]
+    fn turning_alerts_off_stops_them_arriving() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        broker.handle(client, ClientMessage::SubscribeNotifications);
+        assert!(!broker.notify_devices(alert()).is_empty());
+
+        broker.handle(client, ClientMessage::UnsubscribeNotifications);
+
+        assert!(broker.notify_devices(alert()).is_empty());
+    }
+
+    #[test]
+    fn a_device_that_subscribes_late_is_not_caught_up() {
+        let mut broker = broker();
+        let early = greet(&mut broker);
+        broker.handle(early, ClientMessage::SubscribeNotifications);
+        broker.notify_devices(alert());
+
+        let late = greet(&mut broker);
+
+        assert!(
+            broker
+                .handle(late, ClientMessage::SubscribeNotifications)
+                .is_empty(),
+            "an interruption about a finished moment is only noise"
+        );
+    }
+
+    fn alert() -> ServerMessage {
+        ServerMessage::Notification {
+            agent: AgentId::new("first", "main", "w1:p1"),
+            title: "Agent needs attention".to_owned(),
+            body: "reviewer · compiler".to_owned(),
+        }
     }
 
     #[test]

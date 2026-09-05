@@ -103,6 +103,22 @@ globalThis.fetch = (url, init) => {
   }
   return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
 };
+// A notification the page raised, and the permission it was raised under.
+const alerts = [];
+class StubNotification {
+  constructor(title, options) {
+    this.title = title;
+    this.options = options;
+    alerts.push(this);
+  }
+}
+StubNotification.permission = 'default';
+StubNotification.requestPermission = () => {
+  StubNotification.permission = StubNotification.granting ? 'granted' : 'denied';
+  return Promise.resolve(StubNotification.permission);
+};
+globalThis.Notification = StubNotification;
+
 class StubEventSource {
   constructor() { StubEventSource.latest = this; }
   close() {}
@@ -580,3 +596,81 @@ check('an older daemon hides the inbox', page.el('inbox').hidden === true);
 check('an older daemon opens the hierarchy instead', page.el('hierarchy').open === true);
 deliver({ type: 'server.hello', protocol: 3, server_version: '0.7.20', features: ['terminal', 'agent_cards'] });
 page.el('inbox').hidden = false;
+
+// Alerts are two permissions, granted at different moments: the browser's, and
+// this page's subscription to the daemon. Rendering the inbox is neither.
+StubNotification.granting = false;
+alerts.length = 0;
+sent.length = 0;
+await page.el('alerts').onclick();
+check('a refused browser permission subscribes to nothing',
+  sent.every(one => one.body.type !== 'notifications.subscribe'));
+check('a refused browser permission says so', page.el('alert-note').textContent.includes('not allowing'));
+check('a refused permission leaves the toggle off', page.el('alerts')['aria-pressed'] === 'false');
+
+StubNotification.granting = true;
+sent.length = 0;
+await page.el('alerts').onclick();
+check('a granted permission subscribes',
+  sent.some(one => one.body.type === 'notifications.subscribe'));
+check('a granted permission shows the toggle on', page.el('alerts')['aria-pressed'] === 'true');
+
+// An alert carries bounded metadata and replaces its own agent's last one.
+deliver(projection({ needs_you: [card('p1', { unread: true })] }));
+alerts.length = 0;
+deliver({
+  type: 'notification',
+  agent: { target: 'first', session: 'main', resource: 'p1' },
+  title: 'Agent needs attention',
+  body: 'reviewer · compiler',
+});
+check('an alert is raised', alerts.length === 1);
+check('an alert carries the daemon title', alerts[0].title === 'Agent needs attention');
+check('an alert is tagged by its agent', alerts[0].options.tag === 'first/main/p1');
+
+// Tapping it opens the agent it names, against the inbox as it is now.
+sent.length = 0;
+alerts[0].onclick();
+check(
+  'tapping an alert opens the agent it names',
+  sent.some(one => one.body.type === 'pane.subscribe' && one.body.pane.resource === 'p1'),
+);
+check('an opened alert clears the note', page.el('alert-note').textContent === '');
+
+// The race the exit condition names: the agent went away between the alert
+// being sent and the tap landing.
+deliver(projection({ needs_you: [] }));
+sent.length = 0;
+alerts[0].onclick();
+check('a tap on a departed agent opens nothing',
+  sent.every(one => one.body.type !== 'pane.subscribe'));
+check('a tap on a departed agent says so',
+  page.el('alert-note').textContent === 'That agent is no longer running.');
+
+// An agent still listed but not reachable — its host dropped — is a different
+// sentence, because the agent has not ended.
+deliver(projection({
+  needs_you: [card('p1', { actionable: false, stale: true })],
+}));
+sent.length = 0;
+alerts[0].onclick();
+check('a tap on an unreachable agent opens nothing',
+  sent.every(one => one.body.type !== 'pane.subscribe'));
+check('a tap on an unreachable agent distinguishes the host',
+  page.el('alert-note').textContent === 'That agent is no longer reachable.');
+
+// Turning them off ends the daemon's side, and a stray alert is ignored.
+sent.length = 0;
+await page.el('alerts').onclick();
+check('turning alerts off unsubscribes',
+  sent.some(one => one.body.type === 'notifications.unsubscribe'));
+alerts.length = 0;
+deliver({
+  type: 'notification',
+  agent: { target: 'first', session: 'main', resource: 'p1' },
+  title: 'Agent needs attention',
+  body: 'reviewer · compiler',
+});
+check('an alert after turning them off raises nothing', alerts.length === 0);
+StubNotification.granting = true;
+await page.el('alerts').onclick();

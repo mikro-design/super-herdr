@@ -576,6 +576,32 @@ impl AgentCardIndex {
     }
 }
 
+/// The identity of whichever agent is in this pane right now, or the identity
+/// a pane-keyed agent there would have.
+///
+/// Used where something holds a pane and needs the identity that names it — an
+/// attention event, for instance, which records where a transition happened.
+/// The fallback is not a guess: it is exactly the key an agent without a
+/// reported session gets, so an identity derived here and one derived from the
+/// snapshot agree.
+pub fn agent_key_for_pane(state: &FederationState, pane: &PaneId) -> AgentId {
+    state
+        .targets
+        .get(&pane.target_session())
+        .and_then(|target| target.snapshot.as_deref())
+        .and_then(|snapshot| snapshot.agents.get(pane))
+        .map(agent_key)
+        .unwrap_or_else(|| pane_agent_key(pane))
+}
+
+fn pane_agent_key(pane: &PaneId) -> AgentId {
+    AgentId::new(
+        &pane.target,
+        &pane.session,
+        &format!("pane{AGENT_KEY_SEPARATOR}{}", pane.resource),
+    )
+}
+
 /// The identity of one agent, qualified by target and Herdr session.
 ///
 /// Herdr reports an optional `agent_session` for a pane, and where it is
@@ -596,7 +622,7 @@ pub fn agent_key(agent: &AgentState) -> AgentId {
             "session{separator}{}{separator}{}{separator}{}{separator}{}",
             session.kind, session.value, session.source, session.agent
         ),
-        None => format!("pane{separator}{}", agent.pane.resource),
+        None => return pane_agent_key(&agent.pane),
     };
     AgentId::new(&agent.pane.target, &agent.pane.session, &resource)
 }

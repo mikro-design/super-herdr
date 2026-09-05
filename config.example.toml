@@ -17,6 +17,13 @@ completed = true
 disappeared = true
 working = false
 status_changed = false
+# Also alert paired devices, under the same filters, coalescing and rate limit.
+# Separate from `enabled`, which is this machine's own desktop notifications:
+# wanting alerts on a phone is not the same request as wanting them on the
+# laptop you are sitting at. A device still has to grant its browser's
+# notification permission and turn Alerts on in the page, and today it is
+# alerted while that page is running — see ARCHITECTURE.md.
+devices = false
 minimum_interval_seconds = 5
 command_timeout_seconds = 5
 

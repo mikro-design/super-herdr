@@ -618,6 +618,53 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_title_never_becomes_attention_metadata() {
+        // Herdr reports `terminal_title` on panes and agents, and it is
+        // derived from what the terminal drew — an agent's current sentence,
+        // often a paraphrase of somebody's prompt. Attention events are what a
+        // notification is built from, so anything that reached one would end
+        // up on a lock screen.
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w1", "label": "compiler"}],
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "agent": "builder",
+                    "agent_status": "blocked",
+                    "terminal_title": "Deleting the production database"
+                }],
+                "agents": [{
+                    "pane_id": "w1:p1",
+                    "name": "builder",
+                    "agent_status": "blocked",
+                    "terminal_title": "Deleting the production database",
+                    "terminal_title_stripped": "Deleting the production database"
+                }]
+            }),
+        );
+        let mut index = AttentionIndex::default();
+        // A first sighting is a baseline, not a transition, so the agent is
+        // observed working before it blocks.
+        index.observe(&state_with_agent("working", false));
+        assert!(index.observe(&state_with_snapshot(
+            key,
+            TargetConnectionState::Live,
+            snapshot
+        )));
+
+        let event = index.events().next().unwrap();
+        for field in [&event.agent, &event.workspace, &event.status] {
+            assert!(
+                !field.contains("production"),
+                "terminal contents must not reach an attention event: {field:?}"
+            );
+        }
+    }
+
+    #[test]
     fn atomically_round_trips_metadata_only_attention_state() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attention-state.json");

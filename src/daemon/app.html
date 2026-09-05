@@ -268,7 +268,9 @@
     <div class="inbox-head">
       <h2>Agents</h2>
       <span id="inbox-count" class="note"></span>
+      <button id="alerts" type="button" class="chip" aria-pressed="false" hidden>Alerts</button>
     </div>
+    <p id="alert-note" class="note" role="status"></p>
     <div id="inbox-filters" class="chips" role="group" aria-label="Filter agents"></div>
     <div id="inbox-sections"></div>
     <p id="inbox-empty" class="empty">waiting for the daemon…</p>
@@ -1218,6 +1220,76 @@ function resync() {
   subscribeScreen(pane);
 }
 
+// Whether this device has been asked to be interrupted, and has agreed.
+//
+// Two separate permissions that a person grants at different moments: the
+// browser's own notification permission, and this page's subscription to the
+// daemon. Neither implies the other, and rendering the inbox implies neither —
+// showing somebody their agents is not the same as interrupting them about one.
+let alertsOn = false;
+
+function alertsAvailable() {
+  return typeof Notification === 'function';
+}
+
+function renderAlerts() {
+  const button = el('alerts');
+  button.hidden = !alertsAvailable();
+  button.setAttribute('aria-pressed', alertsOn ? 'true' : 'false');
+  button.textContent = alertsOn ? 'Alerts on' : 'Alerts';
+}
+
+async function toggleAlerts() {
+  if (!alertsAvailable()) return;
+  if (alertsOn) {
+    // The browser keeps its permission; what this turns off is the daemon
+    // sending anything, which is the part this page controls.
+    alertsOn = false;
+    send({ type: 'notifications.unsubscribe' });
+    renderAlerts();
+    return;
+  }
+  const permission = Notification.permission === 'granted'
+    ? 'granted'
+    : await Notification.requestPermission();
+  alertsOn = permission === 'granted';
+  if (alertsOn) send({ type: 'notifications.subscribe' });
+  else el('alert-note').textContent = 'This browser is not allowing notifications.';
+  renderAlerts();
+}
+
+function showAlert(message) {
+  // Belt and braces: the daemon sends these only to a subscriber, and a page
+  // that has turned them off ignores one that arrives anyway rather than
+  // interrupting somebody who asked it not to.
+  if (!alertsOn || !alertsAvailable()) return;
+  const alert = new Notification(text(message.title), {
+    body: text(message.body),
+    // One agent replaces its own previous alert instead of stacking: a phone
+    // holding six notices about one agent is a phone somebody stops reading.
+    tag: paneKey(message.agent),
+  });
+  alert.onclick = () => openAgentFromAlert(message.agent);
+}
+
+// A tap on an alert is acted on against the inbox as it is now, not as it was
+// when the alert was sent. An agent that has since gone is reported rather than
+// approximated: there is no nearby pane that will do.
+function openAgentFromAlert(agent) {
+  if (typeof window.focus === 'function') window.focus();
+  const wanted = paneKey(agent);
+  const card = inboxCards().find(one => one.agent && paneKey(one.agent) === wanted);
+  if (card && card.actionable && card.pane) {
+    el('alert-note').textContent = '';
+    if (card.unread) send({ type: 'attention.mark_seen', pane: card.pane });
+    observe(card.pane, `${qualify(card.pane)}/${text(card.title)}`);
+    return;
+  }
+  el('alert-note').textContent = card
+    ? 'That agent is no longer reachable.'
+    : 'That agent is no longer running.';
+}
+
 // The inbox exactly as the daemon built it. This page renders that answer and
 // never derives a second one: sections and ordering are the daemon's, so a
 // person moving between the TUI and this phone reads one inbox rather than two
@@ -1625,7 +1697,17 @@ function apply(message) {
       }
       quickReplies = Array.isArray(message.quick_replies) ? message.quick_replies : [];
       renderQuickReplies();
+      // A reconnect is a new client to the daemon, which is not holding this
+      // page's subscription any more. Permission already granted is not asked
+      // for again; the subscription is.
+      if (alertsAvailable() && Notification.permission === 'granted' && alertsOn) {
+        send({ type: 'notifications.subscribe' });
+      }
+      renderAlerts();
       schedulePluginPoll();
+      break;
+    case 'notification':
+      showAlert(message);
       break;
     case 'agents.cards':
       inbox = message.projection;
@@ -1832,6 +1914,7 @@ for (const button of document.querySelectorAll('.keys button')) {
     el('line').focus();
   };
 }
+el('alerts').onclick = () => { void toggleAlerts(); };
 el('stop').onclick = () => stopWatching('');
 
 // A rotation or a resize changes how much of the pane fits, not the pane.

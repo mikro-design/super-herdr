@@ -35,14 +35,15 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::agent_card::AgentCardIndex;
+use crate::agent_card::{AgentCardIndex, agent_key_for_pane};
 use crate::agent_marks::{AgentMarkStore, AgentMarks};
-use crate::attention::{AttentionIndex, AttentionStore, unix_time_ms};
+use crate::attention::{AttentionEventKind, AttentionIndex, AttentionStore, unix_time_ms};
 use crate::clipboard;
 use crate::config::{Config, Device, Target, TransportConfig};
 use crate::daemon::broker::{Broker, ClientId, Effect};
 use crate::daemon::web;
 use crate::model::{PaneId, TargetSession};
+use crate::notifications::NotificationQueue;
 use crate::operation::Operation;
 use crate::pairing::{self, PendingPairing};
 use crate::plugin;
@@ -61,6 +62,11 @@ use crate::workspace_move;
 /// discovery. This matches the frontend's own refresh cadence, because both are
 /// bounded reads of the same durable file.
 pub const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the device sink looks for a delivery whose coalescing window has
+/// closed. The window is half a second, so an alert waits at most one tick
+/// past the moment it became due.
+const NOTIFICATION_TICK: Duration = Duration::from_millis(500);
 const MAX_PENDING_PAIRING_APPROVALS: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -120,6 +126,8 @@ impl DaemonOptions {
 /// Everything the broker loop reacts to, from clients and from the federation
 /// alike, so ordering is decided in one place.
 enum Input {
+    /// A coalescing window may have closed.
+    NotificationsDue,
     Connected {
         outbox: mpsc::UnboundedSender<ServerMessage>,
         reply: oneshot::Sender<ClientId>,
@@ -697,6 +705,11 @@ struct Daemon {
     agent_cards: AgentCardIndex,
     agent_marks: AgentMarks,
     agent_mark_store: Option<AgentMarkStore>,
+    /// Alerts for paired devices. A second sink beside the desktop's own,
+    /// which the frontend runs against its attention mirror — this one lives
+    /// here because the point of it is a phone learning that an agent is
+    /// waiting while the desktop is asleep.
+    device_notifications: NotificationQueue,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
     /// Queues handed over by connections, waiting for the broker to say whether
@@ -985,6 +998,12 @@ async fn run(
         .as_ref()
         .and_then(|store| store.load().ok())
         .unwrap_or_default();
+    // The device sink borrows the desktop's filters, coalescing and rate
+    // limits, and is switched on separately: wanting alerts on a phone is not
+    // the same request as wanting them on the laptop being sat at.
+    let mut device_notifications = active.notifications.clone();
+    device_notifications.enabled = device_notifications.devices;
+    let notify_devices = device_notifications.enabled;
     let mut daemon = Daemon {
         broker: Broker::new(
             env!("CARGO_PKG_VERSION"),
@@ -1011,6 +1030,7 @@ async fn run(
         agent_cards: AgentCardIndex::default(),
         agent_marks,
         agent_mark_store,
+        device_notifications: NotificationQueue::new(device_notifications, None),
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
         offers: BTreeMap::new(),
@@ -1038,6 +1058,23 @@ async fn run(
             loop {
                 ticks.tick().await;
                 if inputs.send(Input::RefreshDue).is_err() {
+                    return;
+                }
+            }
+        })
+    });
+
+    // Coalescing means a delivery becomes due after the event that started it,
+    // so something has to come back and look. Spawned only when the sink is on,
+    // so a daemon nobody asked to notify has no timer at all.
+    let notifying = notify_devices.then(|| {
+        let inputs = inputs.clone();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(NOTIFICATION_TICK);
+            ticks.tick().await;
+            loop {
+                ticks.tick().await;
+                if inputs.send(Input::NotificationsDue).is_err() {
                     return;
                 }
             }
@@ -1077,6 +1114,9 @@ async fn run(
         accepting.abort();
     }
     signalled.abort();
+    if let Some(notifying) = notifying {
+        notifying.abort();
+    }
     if let Some(refreshing) = refreshing {
         refreshing.abort();
     }
@@ -1520,6 +1560,7 @@ impl Daemon {
                 self.offers.insert((client, request), chunks);
                 Vec::new()
             }
+            Input::NotificationsDue => self.device_alerts(),
             Input::Federation(state) => {
                 self.state = state.clone();
                 let mut effects = self.broker.federation_updated(state);
@@ -2857,6 +2898,24 @@ impl Daemon {
         if let Some(newest) = fresh.last() {
             self.attention_cursor = Some(newest.id);
         }
+        // Each fresh event is offered to the device sink before it is
+        // broadcast. The per-agent mark decides: an agent somebody muted or
+        // snoozed to get it out of their inbox has not asked to keep hearing
+        // from it on a phone, and one set to needs-you-only has asked for
+        // exactly one kind of interruption.
+        let now_ms = unix_time_ms();
+        let at = Instant::now();
+        for event in &fresh {
+            let agent = agent_key_for_pane(&self.state, &event.pane);
+            let needs_attention = event.kind == AttentionEventKind::NeedsAttention;
+            if self
+                .agent_marks
+                .state(&agent)
+                .may_notify(needs_attention, now_ms)
+            {
+                self.device_notifications.enqueue(event, at);
+            }
+        }
         fresh
             .into_iter()
             .flat_map(|event| self.broker.attention_observed(event))
@@ -2882,6 +2941,25 @@ impl Daemon {
     /// federation and the attention index, both of which already survive a
     /// restart on their own terms. Rebuilding it is cheap and keeps one
     /// authority for each fact.
+    /// Hand one coalesced alert to every subscribed device, if one is due.
+    fn device_alerts(&mut self) -> Vec<Effect> {
+        let Some(delivery) = self.device_notifications.take_ready(Instant::now()) else {
+            return Vec::new();
+        };
+        let Some(pane) = delivery.pane().cloned() else {
+            return Vec::new();
+        };
+        self.broker.notify_devices(ServerMessage::Notification {
+            // Resolved now rather than when the event was recorded: the
+            // identity a person taps should name the agent as it currently is,
+            // and if it has gone the tap is refused rather than delivered
+            // somewhere else.
+            agent: agent_key_for_pane(&self.state, &pane),
+            title: delivery.title().to_owned(),
+            body: delivery.body().to_owned(),
+        })
+    }
+
     fn project_agent_cards(&mut self) -> Vec<Effect> {
         let now_ms = unix_time_ms();
         // A snooze that has run out stops being carried before anything is

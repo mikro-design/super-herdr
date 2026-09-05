@@ -523,6 +523,12 @@ pub struct NotificationsConfig {
     pub working: bool,
     #[serde(default)]
     pub status_changed: bool,
+    /// Also deliver to paired devices. Off by default and separate from
+    /// `enabled`, which turns on this machine's own desktop notifications: a
+    /// person who wants alerts on their phone has not thereby asked for them
+    /// on the laptop they are sitting at, or the other way round.
+    #[serde(default)]
+    pub devices: bool,
     #[serde(default = "default_notification_interval")]
     pub minimum_interval_seconds: u64,
     #[serde(default = "default_notification_timeout")]
@@ -538,6 +544,7 @@ impl Default for NotificationsConfig {
             disappeared: true,
             working: false,
             status_changed: false,
+            devices: false,
             minimum_interval_seconds: default_notification_interval(),
             command_timeout_seconds: default_notification_timeout(),
         }
