@@ -22,6 +22,9 @@ minimal reproduction. Redact terminal contents, clipboard payloads, pairing
 codes, device tokens, SSH material, hostnames, addresses, usernames, and other
 credentials.
 
+A proposed feature with its own written threat model, not yet implemented, is
+the [remote development preview](REMOTE_PREVIEW.md).
+
 ## Trust boundaries
 
 - A paired browser can observe terminal output and, after taking a control

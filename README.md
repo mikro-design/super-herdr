@@ -291,6 +291,7 @@ Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.m
 - [Security policy](SECURITY.md)
 - [Roadmap and current limitations](ROADMAP.md)
 - [Community-informed product backlog](PRODUCT_BACKLOG.md)
+- [Remote preview threat model](REMOTE_PREVIEW.md)
 - [Release test matrix](TESTING.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
