@@ -171,6 +171,12 @@ so a reconnect can never redirect your next keystroke.
 - Explicit control leases: background panes and newly opened browser panes are
   read-only until control is granted
 - Desktop selection, clipboard paste, drag-and-drop, and verified uploads
+- Browser file fetch from a target: size, source and digest shown before any
+  byte moves, verified on arrival, with text and image previews
+- A bounded remote file picker over directories you configure, with literal or
+  opt-in pattern search that never leaves those roots
+- Desktop save from a target and host-to-host transfer that never touches this
+  machine, both from the same right-click menus
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer

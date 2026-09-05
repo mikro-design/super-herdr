@@ -520,6 +520,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
         }
     }
 
@@ -607,6 +608,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
         }]);
         let _ = directory;
 

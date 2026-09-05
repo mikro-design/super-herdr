@@ -31,6 +31,7 @@ use crate::client::{Client, ClientCommands};
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
 use crate::daemon::server::{DaemonOptions, spawn_in_process};
+use crate::file_save::{self, FileSave, SaveProgress};
 use crate::model::{AgentId, PaneId, TabId, TargetSession, WorkspaceId};
 use crate::notifications::{self, NotificationDelivery, NotificationQueue};
 use crate::operation::Operation;
@@ -401,6 +402,9 @@ struct TargetForm {
     discover_sessions: bool,
     socket: Option<String>,
     herdr_bins: Vec<String>,
+    /// Carried, never edited: a browsing bound belongs in configuration, and a
+    /// form that dropped it would quietly empty a picker on the next save.
+    roots: Vec<String>,
     field: TargetFormField,
     error: Option<String>,
     test_state: TargetTestState,
@@ -419,6 +423,7 @@ impl TargetForm {
             discover_sessions: true,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
             field: TargetFormField::Name,
             error: None,
             test_state: TargetTestState::Untested,
@@ -437,6 +442,7 @@ impl TargetForm {
             discover_sessions: target.discover_sessions,
             socket: target.socket.clone(),
             herdr_bins: target.herdr_bins.clone(),
+            roots: target.roots.clone(),
             field: TargetFormField::Name,
             error: None,
             test_state: TargetTestState::Untested,
@@ -454,6 +460,11 @@ impl TargetForm {
             session: (!self.session.is_empty()).then(|| self.session.clone()),
             socket: self.socket.clone(),
             herdr_bins: self.herdr_bins.clone(),
+            // The target form does not edit roots. They are a browsing bound
+            // somebody writes in configuration, not a field to fill in while
+            // adding a machine, and a form that dropped them would quietly
+            // empty a picker on the next save.
+            roots: self.roots.clone(),
         }
     }
 
@@ -792,6 +803,15 @@ struct PendingPluginCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TextPromptAction {
+    /// The path on a target to fetch onto this machine.
+    SaveFile {
+        pane: PaneId,
+    },
+    /// The path on one target to move to another.
+    TransferFile {
+        source: PaneId,
+        destination: PaneId,
+    },
     /// Send a file named by path rather than by clipboard, which is what a file
     /// dragged onto a terminal amounts to.
     SendFile {
@@ -846,6 +866,11 @@ struct App {
     /// actually available rather than both halves of it; the daemon remains
     /// the authority, and this is a mirror of its answer.
     agent_marks: BTreeMap<AgentId, AgentMarkState>,
+    /// The file being written onto this machine, and the request it answers.
+    /// The request is held separately because it is known from the moment the
+    /// download is asked for, and the save itself only from the offer.
+    file_save: Option<FileSave>,
+    file_save_request: Option<u64>,
     pending_plugin_catalogs: BTreeMap<u64, PendingPluginCatalog>,
     pending_uploads: BTreeMap<u64, PendingUpload>,
     last_frame_area: Option<Rect>,
@@ -906,6 +931,8 @@ impl Default for App {
             pending_operations: BTreeMap::new(),
             plugin_catalogs: BTreeMap::new(),
             agent_marks: BTreeMap::new(),
+            file_save: None,
+            file_save_request: None,
             pending_plugin_catalogs: BTreeMap::new(),
             pending_uploads: BTreeMap::new(),
             last_frame_area: None,
@@ -2604,12 +2631,18 @@ fn command_palette_actions(
     selected: Option<&PaneId>,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
     agent_marks: &BTreeMap<AgentId, AgentMarkState>,
+    transferring: bool,
 ) -> Vec<ResourceAction> {
     let mut actions = vec![
         ResourceAction::OpenTargetManager,
         ResourceAction::OpenAgentNavigator,
         ResourceAction::OpenAttentionCenter,
     ];
+    // Offered only while there is one to cancel. An entry that answers "there
+    // is nothing to do" is one more line to read past every other time.
+    if transferring {
+        actions.push(ResourceAction::CancelFileTransfer);
+    }
 
     let selected_is_actionable = selected.is_some_and(|pane| {
         state
@@ -2672,6 +2705,11 @@ fn command_palette_actions(
                 label: pane_label.clone(),
             },
         ]);
+        actions.push(ResourceAction::SaveFileFromPane {
+            pane: pane.id.clone(),
+            label: pane_label.clone(),
+        });
+        actions.extend(transfer_destinations(state, &pane.id));
         actions.extend(agent_mark_actions(
             snapshot,
             &pane.id,
@@ -2938,6 +2976,60 @@ fn workspace_recreate_actions(
 /// the choice is worth.
 const TUI_SNOOZE_MINUTES: u32 = 60;
 
+/// Where a file on this pane's host could be sent.
+///
+/// One destination per other live target session, not one per pane: the choice
+/// that matters is which machine, and a menu listing every pane on every host
+/// is the hierarchy this is meant to save somebody from walking. The
+/// destination pane is the one the daemon will stage through, so it has to be
+/// a real one.
+fn transfer_destinations(state: &FederationState, source: &PaneId) -> Vec<ResourceAction> {
+    let source_session = source.target_session();
+    let label = |snapshot: &NormalizedSnapshot, pane: &PaneId| {
+        snapshot
+            .panes
+            .get(pane)
+            .map(|held| display_label(&held.id.resource, held.label.as_deref()))
+            .unwrap_or_else(|| pane.resource.clone())
+    };
+    let mut destinations = Vec::new();
+    for runtime in state.targets.values() {
+        if runtime.key == source_session || runtime.connection != TargetConnectionState::Live {
+            continue;
+        }
+        let Some(snapshot) = runtime.snapshot.as_deref() else {
+            continue;
+        };
+        let Some(destination) = snapshot.panes.keys().next().cloned() else {
+            continue;
+        };
+        destinations.push(ResourceAction::TransferFileBetween {
+            source: source.clone(),
+            label: label(snapshot, source),
+            destination_label: runtime.key.to_string(),
+            destination,
+        });
+    }
+    destinations
+}
+
+/// Abandon a save this client is receiving.
+///
+/// The daemon is told, because it is reading a file on somebody's host to feed
+/// it and should stop. Whatever arrived is dropped with the temporary file it
+/// was going into.
+fn cancel_file_save(app: &mut App) {
+    let Some(request) = app.file_save_request.take() else {
+        app.message = Some("no file transfer to cancel".to_owned());
+        return;
+    };
+    if let Some(client) = app.client.as_ref() {
+        client.cancel_download(request);
+    }
+    app.file_save = None;
+    app.message = Some("file transfer cancelled".to_owned());
+}
+
 /// The marks a person can put on the agent in one pane.
 ///
 /// Offered only where there is an agent to mark: a pane running a shell has
@@ -3080,6 +3172,15 @@ fn context_menu_for_target(
                     label: label.clone(),
                 },
             ];
+            actions.push(ResourceAction::SaveFileFromPane {
+                pane: pane.clone(),
+                label: label.clone(),
+            });
+            actions.extend(
+                transfer_destinations(state, pane)
+                    .into_iter()
+                    .take(MAX_CONTEXT_MENU_MOVE_DESTINATIONS),
+            );
             actions.extend(agent_mark_actions(snapshot, pane, &label, agent_marks));
             (
                 format!("pane {label} · {}", pane.target_session()),
@@ -3166,11 +3267,15 @@ fn filtered_palette_actions(
     query: &str,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
     agent_marks: &BTreeMap<AgentId, AgentMarkState>,
+    transferring: bool,
 ) -> Vec<ResourceAction> {
-    let mut actions = command_palette_actions(state, selected, plugin_catalogs, agent_marks)
-        .into_iter()
-        .filter_map(|action| fuzzy_score(&action.search_text(), query).map(|score| (score, action)))
-        .collect::<Vec<_>>();
+    let mut actions =
+        command_palette_actions(state, selected, plugin_catalogs, agent_marks, transferring)
+            .into_iter()
+            .filter_map(|action| {
+                fuzzy_score(&action.search_text(), query).map(|score| (score, action))
+            })
+            .collect::<Vec<_>>();
     actions.sort_by(|(left_score, left), (right_score, right)| {
         left_score
             .cmp(right_score)
@@ -3190,6 +3295,7 @@ fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App)
         &palette.query,
         &app.plugin_catalogs,
         &app.agent_marks,
+        app.file_save_request.is_some(),
     );
     match key {
         0x1b => return Ok(false),
@@ -3229,6 +3335,7 @@ fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App)
         &palette.query,
         &app.plugin_catalogs,
         &app.agent_marks,
+        app.file_save_request.is_some(),
     )
     .len();
     palette.selected = palette.selected.min(count.saturating_sub(1));
@@ -3418,6 +3525,35 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
                 true,
             );
         }
+        ResourceAction::SaveFileFromPane { pane, label } => {
+            app.text_prompt = Some(TextPrompt {
+                title: format!("save a file from {label}"),
+                label: format!("path on {}", pane.target_session()),
+                value: String::new(),
+                action: TextPromptAction::SaveFile { pane },
+                error: None,
+                partial: Vec::new(),
+            });
+        }
+        ResourceAction::TransferFileBetween {
+            source,
+            destination,
+            destination_label,
+            ..
+        } => {
+            app.text_prompt = Some(TextPrompt {
+                title: format!("send a file to {destination_label}"),
+                label: format!("path on {}", source.target_session()),
+                value: String::new(),
+                action: TextPromptAction::TransferFile {
+                    source,
+                    destination,
+                },
+                error: None,
+                partial: Vec::new(),
+            });
+        }
+        ResourceAction::CancelFileTransfer => cancel_file_save(app),
         ResourceAction::MarkAgent { agent, mark, .. } => {
             // No confirmation and no Herdr operation: a mark changes what this
             // inbox shows and nothing on the host, and the daemon answers by
@@ -3620,14 +3756,62 @@ fn handle_text_prompt_input(key: u8, state: &FederationState, app: &mut App) -> 
                 app.text_prompt = Some(prompt);
                 return Ok(false);
             }
+            if let TextPromptAction::SaveFile { pane } = &prompt.action {
+                match (value.is_empty(), app.client.clone()) {
+                    (true, _) => prompt.error = Some("A path is required".to_owned()),
+                    (_, None) => prompt.error = Some("file routing is unavailable".to_owned()),
+                    (_, Some(client)) => {
+                        // One at a time, and said so rather than silently
+                        // replacing a transfer somebody is waiting on.
+                        if app.file_save.is_some() {
+                            prompt.error = Some("a file is already being saved".to_owned());
+                        } else {
+                            app.file_save_request =
+                                Some(client.begin_download(pane.clone(), value));
+                            app.message = Some("asking for the file…".to_owned());
+                            return Ok(false);
+                        }
+                    }
+                }
+                app.text_prompt = Some(prompt);
+                return Ok(false);
+            }
+            if let TextPromptAction::TransferFile {
+                source,
+                destination,
+            } = &prompt.action
+            {
+                match (value.is_empty(), app.client.clone()) {
+                    (true, _) => prompt.error = Some("A path is required".to_owned()),
+                    (_, None) => prompt.error = Some("file routing is unavailable".to_owned()),
+                    (_, Some(client)) => {
+                        client.transfer_between(
+                            source.clone(),
+                            value.clone(),
+                            destination.clone(),
+                            None,
+                        );
+                        app.message = Some(format!(
+                            "sending {value:?} to {}…",
+                            destination.target_session()
+                        ));
+                        return Ok(false);
+                    }
+                }
+                app.text_prompt = Some(prompt);
+                return Ok(false);
+            }
             if value.is_empty() {
                 prompt.error = Some("A non-empty label is required".to_owned());
             } else {
                 // The prompt is where an intent becomes an operation: the label
                 // the person typed is now part of what the daemon is asked to do.
                 let (operation, description, follow_server_focus) = match prompt.action {
-                    // Handled above: a file is sent rather than operated on.
-                    TextPromptAction::SendFile { .. } => return Ok(false),
+                    // Handled above: these move a file rather than operate on
+                    // a Herdr resource.
+                    TextPromptAction::SendFile { .. }
+                    | TextPromptAction::SaveFile { .. }
+                    | TextPromptAction::TransferFile { .. } => return Ok(false),
                     TextPromptAction::CreateWorkspace { target } => (
                         Operation::CreateWorkspace {
                             target: target.clone(),
@@ -5213,9 +5397,83 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         // The frontend does not ask for files off a host: it has a shell on
         // one, and somewhere to put what it reads is a question about this
         // machine's filesystem that no key in the TUI currently asks.
-        ServerMessage::DownloadOffer { .. }
-        | ServerMessage::DownloadChunk { .. }
-        | ServerMessage::DownloadFinished { .. } => {}
+        ServerMessage::DownloadOffer {
+            request,
+            name,
+            length,
+            digest,
+        } => {
+            if app.file_save_request != Some(request) {
+                return;
+            }
+            let directory = file_save::default_directory();
+            match FileSave::begin(request, &directory, &name, length, digest) {
+                Ok(mut save) => {
+                    if let (SaveProgress::Pull(chunks), Some(client)) =
+                        (save.start(), app.client.as_ref())
+                    {
+                        client.pull_download(request, chunks);
+                    }
+                    app.message = Some(format!(
+                        "saving {} ({} bytes) to {}…",
+                        name,
+                        length,
+                        save.destination().display()
+                    ));
+                    app.file_save = Some(save);
+                }
+                Err(error) => {
+                    // Refused before anything is asked for, so the daemon
+                    // stops reading the file on somebody's host as well.
+                    if let Some(client) = app.client.as_ref() {
+                        client.cancel_download(request);
+                    }
+                    app.file_save_request = None;
+                    app.message = Some(format!("cannot save that file: {error}"));
+                }
+            }
+        }
+        ServerMessage::DownloadChunk { request, bytes } => {
+            let Some(save) = app
+                .file_save
+                .as_mut()
+                .filter(|save| save.request() == request)
+            else {
+                return;
+            };
+            match save.chunk(&bytes) {
+                Ok(SaveProgress::Pull(chunks)) => {
+                    if let Some(client) = app.client.as_ref() {
+                        client.pull_download(request, chunks);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if let Some(client) = app.client.as_ref() {
+                        client.cancel_download(request);
+                    }
+                    app.file_save = None;
+                    app.file_save_request = None;
+                    app.message = Some(format!("that transfer was refused: {error}"));
+                }
+            }
+        }
+        ServerMessage::DownloadFinished { request } => {
+            let Some(save) = app
+                .file_save
+                .take()
+                .filter(|save| save.request() == request)
+            else {
+                return;
+            };
+            app.file_save_request = None;
+            app.message = Some(match save.finish() {
+                Ok(path) => format!("saved {}", path.display()),
+                // The temporary file went with the failure, so there is
+                // nothing on disk pretending to be the file that was asked for.
+                Err(error) => format!("that file was not saved: {error}"),
+            });
+        }
         ServerMessage::UploadComplete {
             request,
             path,
@@ -5362,6 +5620,9 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         // sitting at. It does not subscribe to the device sink and is never
         // sent one.
         ServerMessage::Notification { .. } => {}
+        // The picker is a small-screen affordance. The TUI has a shell in
+        // every pane and a person who would rather use it.
+        ServerMessage::RemoteFiles { .. } => {}
         ServerMessage::AgentCards { projection } => {
             app.agent_marks = projection
                 .cards()
@@ -5468,6 +5729,7 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
             palette,
             &app.plugin_catalogs,
             &app.agent_marks,
+            app.file_save_request.is_some(),
         );
     } else if let Some(prompt) = app.text_prompt.as_ref() {
         render_text_prompt(frame, prompt);
@@ -5574,6 +5836,7 @@ fn render_command_palette(
     palette: &CommandPalette,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
     agent_marks: &BTreeMap<AgentId, AgentMarkState>,
+    transferring: bool,
 ) {
     let area = centered_popup(frame.area(), 82, 22);
     frame.render_widget(Clear, area);
@@ -5590,6 +5853,7 @@ fn render_command_palette(
         &palette.query,
         plugin_catalogs,
         agent_marks,
+        transferring,
     );
     let mut lines = vec![
         Line::from(vec![
@@ -7802,6 +8066,7 @@ mod tests {
             // What the file says: nothing. The host reports it at runtime.
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         let key = TargetSession::new("workstation", "example-session");
 
@@ -8039,6 +8304,7 @@ mod tests {
             "jump second",
             &app.plugin_catalogs,
             &app.agent_marks,
+            false,
         );
         assert_eq!(actions.len(), 1);
         let ResourceAction::JumpToPane { pane, .. } = &actions[0] else {
@@ -8088,7 +8354,8 @@ mod tests {
             target.clone(),
             runtime(target, TargetConnectionState::Live, Some(snapshot)),
         );
-        let actions = command_palette_actions(&state, Some(&pane), &catalogs, &BTreeMap::new());
+        let actions =
+            command_palette_actions(&state, Some(&pane), &catalogs, &BTreeMap::new(), false);
         assert!(actions.iter().any(|action| {
             matches!(
                 action,
@@ -8171,6 +8438,120 @@ mod tests {
                 .filter(|action| matches!(action, ResourceAction::MarkAgent { .. }))
                 .all(|action| !action.mutates_herdr()),
             "a mark is Super-Herdr's own inbox state and must not reach the host"
+        );
+    }
+
+    #[test]
+    fn a_pane_can_be_saved_from_and_sent_from_to_every_other_host() {
+        let mut state = FederationState::default();
+        for host in ["host-a", "host-b", "host-c"] {
+            let key = TargetSession::new(host, "work");
+            let snapshot = NormalizedSnapshot::from_value(
+                &key,
+                &json!({
+                    "workspaces": [{"workspace_id": "w1"}],
+                    "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                    "panes": [{
+                        "pane_id": "w1:p1", "workspace_id": "w1",
+                        "tab_id": "w1:t1", "label": "shell"
+                    }]
+                }),
+            );
+            state.targets.insert(
+                key.clone(),
+                runtime(key, TargetConnectionState::Live, Some(snapshot)),
+            );
+        }
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Pane(PaneId::new("host-a", "work", "w1:p1")),
+            ratatui::layout::Position::new(1, 1),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            menu.actions.iter().any(|action| matches!(
+                action,
+                ResourceAction::SaveFileFromPane { pane, .. }
+                    if pane == &PaneId::new("host-a", "work", "w1:p1")
+            )),
+            "a pane can be read from"
+        );
+        let destinations = menu
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ResourceAction::TransferFileBetween { destination, .. } => {
+                    Some(destination.target.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            destinations,
+            ["host-b", "host-c"],
+            "one destination per other host, and never back to the source"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_host_is_not_offered_as_a_destination() {
+        let mut state = FederationState::default();
+        for (host, connection) in [
+            ("host-a", TargetConnectionState::Live),
+            ("host-b", TargetConnectionState::Backoff { attempt: 1 }),
+        ] {
+            let key = TargetSession::new(host, "work");
+            let snapshot = NormalizedSnapshot::from_value(
+                &key,
+                &json!({
+                    "workspaces": [{"workspace_id": "w1"}],
+                    "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                    "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"}]
+                }),
+            );
+            state
+                .targets
+                .insert(key.clone(), runtime(key, connection, Some(snapshot)));
+        }
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Pane(PaneId::new("host-a", "work", "w1:p1")),
+            ratatui::layout::Position::new(1, 1),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            !menu
+                .actions
+                .iter()
+                .any(|action| matches!(action, ResourceAction::TransferFileBetween { .. })),
+            "a host that cannot be reached cannot be sent to"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_transfer_is_offered_only_while_there_is_one() {
+        let state = FederationState::default();
+
+        let idle = command_palette_actions(&state, None, &BTreeMap::new(), &BTreeMap::new(), false);
+        let busy = command_palette_actions(&state, None, &BTreeMap::new(), &BTreeMap::new(), true);
+
+        assert!(
+            !idle
+                .iter()
+                .any(|action| matches!(action, ResourceAction::CancelFileTransfer)),
+            "an entry that answers 'there is nothing to do' is one more line to read past"
+        );
+        assert!(
+            busy.iter()
+                .any(|action| matches!(action, ResourceAction::CancelFileTransfer))
         );
     }
 
@@ -8512,6 +8893,7 @@ mod tests {
             Some(&PaneId::new("host-b", "work", "w1:p1")),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            false,
         );
         let palette_moves = palette
             .iter()
@@ -8609,6 +8991,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         Config::add_target_file(Some(&path), existing.clone()).unwrap();
         let mut app = App {
@@ -8647,6 +9030,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         let mut duplicate = TargetForm::add();
         duplicate.name = "existing".to_owned();
@@ -8762,6 +9146,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
         let mut app = App {
@@ -10080,6 +10465,7 @@ mod tests {
             event_error: None,
             connection_generation: 1,
             selected_herdr_bin: Some("herdr".to_owned()),
+            roots: Vec::new(),
             snapshot: snapshot.map(Arc::new),
             last_error: None,
             last_success: None,

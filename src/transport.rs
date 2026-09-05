@@ -152,6 +152,7 @@ fn targets_for_discovered_sessions(
             session: Some(session.name),
             socket: Some(session.socket_path),
             herdr_bins: target.herdr_bins.clone(),
+            roots: target.roots.clone(),
         })
         .collect()
 }
@@ -947,6 +948,7 @@ mod tests {
             session: Some("work".to_owned()),
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
 
         assert_eq!(
@@ -989,6 +991,7 @@ mod tests {
             session: Some("fallback".to_owned()),
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
 
         assert!(targets_for_discovered_sessions(&target, Vec::new()).is_empty());

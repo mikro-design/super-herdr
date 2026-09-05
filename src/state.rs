@@ -284,6 +284,11 @@ pub struct TargetRuntimeState {
     pub event_error: Option<String>,
     pub connection_generation: u64,
     pub selected_herdr_bin: Option<String>,
+    /// Directories this target's file picker may look inside, from
+    /// configuration. Carried in the federation because it is what a client
+    /// needs to offer the picker at all, and it is not a secret: it is the
+    /// list somebody wrote down as the places worth browsing.
+    pub roots: Vec<String>,
     pub snapshot: Option<Arc<NormalizedSnapshot>>,
     pub last_error: Option<String>,
     pub last_success: Option<SystemTime>,
@@ -300,6 +305,7 @@ impl TargetRuntimeState {
             event_error: None,
             connection_generation: 0,
             selected_herdr_bin: None,
+            roots: target.roots.clone(),
             snapshot: None,
             last_error: None,
             last_success: None,

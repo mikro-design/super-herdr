@@ -20,6 +20,7 @@ const node = id => {
       className: '', style: {}, dataset: {}, children: [], disabled: false,
       append(...children) { this.children.push(...children); },
       remove() {},
+      removeAttribute(name) { delete this[name]; },
       addEventListener(type, listener) { this[`on${type}`] = listener; },
       setAttribute(name, value) { this[name] = value; },
       focus() { this.focused = true; },
@@ -124,8 +125,21 @@ class StubEventSource {
   close() {}
 }
 globalThis.EventSource = StubEventSource;
+// Object URLs are a browser thing; the page revokes what it creates, so the
+// stub counts both to catch a blob left behind.
+let objectUrls = 0;
+globalThis.URL = class extends URL {
+  static createObjectURL() {
+    objectUrls++;
+    return `blob:stub/${objectUrls}`;
+  }
 
-const module = new Function(`${script}\nreturn { apply, observe, takeControl, uploadSelectedFiles, shellQuote, el, KEYS, endpoint, renderPanes, codeBoxes, enteredCode };`);
+  static revokeObjectURL() {
+    objectUrls--;
+  }
+};
+
+const module = new Function(`${script}\nreturn { apply, observe, takeControl, uploadSelectedFiles, shellQuote, el, KEYS, endpoint, renderPanes, codeBoxes, enteredCode, stopWatching };`);
 const page = module();
 
 const deliver = message => page.apply(message);
@@ -674,3 +688,277 @@ deliver({
 check('an alert after turning them off raises nothing', alerts.length === 0);
 StubNotification.granting = true;
 await page.el('alerts').onclick();
+
+// Fetching a file off a target. Two steps: the daemon says what the file is,
+// and nothing crosses the link until a person accepts it.
+const digestOf = async bytes => Buffer.from(
+  await crypto.subtle.digest('SHA-256', bytes),
+).toString('hex');
+// The request number is remembered rather than re-read, because the tests
+// clear `sent` between steps the way a real client forgets nothing.
+let fetchRequest = 0;
+const askFor = path => {
+  page.el('fetch-path').value = path;
+  page.el('fetch-form').onsubmit({ preventDefault() {} });
+  fetchRequest = sent.find(one => one.body.type === 'download.begin').body.request;
+};
+const offer = (name, length, digest) => deliver({
+  type: 'download.offer', request: fetchRequest, name, length, digest,
+});
+const arrive = bytes => deliver({
+  type: 'download.chunk', request: fetchRequest, bytes: bytes.toString('base64'),
+});
+const finish = () => deliver({ type: 'download.finished', request: fetchRequest });
+
+page.observe(pane, 'first/main/w1:p1');
+sent.length = 0;
+askFor('/srv/build/report.txt');
+const begun = sent.find(one => one.body.type === 'download.begin');
+check('asking for a file names the pane and the typed path',
+  begun.body.pane.resource === 'w1:p1' && begun.body.path === '/srv/build/report.txt');
+check('asking for a file pulls nothing yet',
+  sent.every(one => one.body.type !== 'download.pull'));
+
+const body = Buffer.from('line one\nline two\n');
+const digest = await digestOf(body);
+offer('report.txt', body.length, digest);
+check('the offer is shown before any bytes move', page.el('fetch-offer').hidden === false);
+check('the offer names the file', page.el('fetch-name').textContent === 'report.txt');
+check('the offer gives the size', page.el('fetch-size').textContent === '18 B');
+check('the offer names the source', page.el('fetch-where').textContent === 'first/main · /srv/build/report.txt');
+check('the offer shows the host digest', page.el('fetch-digest').textContent.startsWith('sha256 '));
+check('an unaccepted offer has pulled nothing',
+  sent.every(one => one.body.type !== 'download.pull'));
+
+sent.length = 0;
+page.el('fetch-accept').onclick();
+check('accepting pulls a bounded window',
+  sent.some(one => one.body.type === 'download.pull' && one.body.chunks === 4));
+arrive(body);
+finish();
+// The digest is verified asynchronously, so wait for the verdict rather than
+// for a flag the stub starts out holding.
+await waitFor(() => page.el('fetch-note').textContent.includes('verified'));
+check('a verified file is offered for saving', page.el('fetch-save')['download'] === 'report.txt');
+check('a verified file says so', page.el('fetch-note').textContent.includes('verified'));
+check('a text file is previewed as text',
+  page.el('fetch-text').hidden === false
+    && page.el('fetch-text').textContent === 'line one\nline two\n');
+check('a text preview is not an image', page.el('fetch-image').hidden === true);
+page.el('fetch-discard').onclick();
+check('discarding releases the object URL', objectUrls === 0);
+
+// An image is shown as an image, decided from the name because a download
+// carries no declared type. A name matching nothing is saved and not previewed.
+sent.length = 0;
+askFor('/srv/build/shot.png');
+const image = Buffer.from('89504e470d0a1a0a', 'hex');
+offer('shot.png', image.length, await digestOf(image));
+page.el('fetch-accept').onclick();
+arrive(image);
+finish();
+await waitFor(() => page.el('fetch-note').textContent.includes('verified'));
+check('an image is previewed as an image', page.el('fetch-image').hidden === false);
+check('an image preview is not text', page.el('fetch-text').hidden === true);
+page.el('fetch-discard').onclick();
+
+sent.length = 0;
+askFor('/srv/build/archive.tar.zst');
+offer('archive.tar.zst', body.length, digest);
+page.el('fetch-accept').onclick();
+arrive(body);
+finish();
+await waitFor(() => page.el('fetch-note').textContent.includes('verified'));
+check('an unrecognised type is saved and not previewed',
+  page.el('fetch-text').hidden === true && page.el('fetch-image').hidden === true);
+check('an unrecognised type is still offered for saving',
+  page.el('fetch-save')['download'] === 'archive.tar.zst');
+page.el('fetch-discard').onclick();
+
+// A file that does not match what its host attested is discarded, not offered
+// with a warning.
+sent.length = 0;
+askFor('/srv/build/report.txt');
+offer('report.txt', body.length, 'f'.repeat(64));
+page.el('fetch-accept').onclick();
+arrive(body);
+finish();
+await waitFor(() => page.el('fetch-note').textContent.includes('digest'));
+check('a file failing its digest is discarded', page.el('fetch-result').hidden === true);
+check('a file failing its digest says why',
+  page.el('fetch-note').textContent.includes('did not match'));
+check('a discarded file leaves no object URL', objectUrls === 0);
+
+// A transfer that stops short is distinguishable from one still arriving,
+// which is what the declared length is for.
+sent.length = 0;
+askFor('/srv/build/report.txt');
+offer('report.txt', body.length, digest);
+page.el('fetch-accept').onclick();
+arrive(body.subarray(0, 4));
+finish();
+await waitFor(() => page.el('fetch-note').textContent.includes('stopped'));
+check('a short transfer is reported, not saved', page.el('fetch-result').hidden === true);
+
+// Too large to hold is refused before a byte moves.
+sent.length = 0;
+askFor('/srv/build/core.dump');
+offer('core.dump', 64 * 1024 * 1024, digest);
+check('an oversized file cannot be accepted', page.el('fetch-accept').disabled === true);
+check('an oversized file says why', page.el('fetch-note').textContent.includes('Too large'));
+check('an oversized file pulls nothing',
+  sent.every(one => one.body.type !== 'download.pull'));
+page.el('fetch-refuse').onclick();
+check('refusing an offer cancels it',
+  sent.some(one => one.body.type === 'download.cancel'));
+
+// A fetch belongs to the pane it was asked for.
+sent.length = 0;
+askFor('/srv/build/report.txt');
+offer('report.txt', body.length, digest);
+sent.length = 0;
+page.observe({ target: 'first', session: 'main', resource: 'w1:p2' }, 'other');
+check('watching another pane cancels a fetch',
+  sent.some(one => one.body.type === 'download.cancel'));
+check('an abandoned fetch clears its offer', page.el('fetch-offer').hidden === true);
+
+// A reconnect leaves the daemon holding no such request, so this end forgets
+// it rather than cancelling a number that now means something else.
+page.observe(pane, 'first/main/w1:p1');
+sent.length = 0;
+askFor('/srv/build/report.txt');
+offer('report.txt', body.length, digest);
+sent.length = 0;
+deliver({
+  type: 'server.hello', protocol: 3, server_version: '0.7.20',
+  features: ['terminal', 'agent_cards'], quick_replies: [],
+});
+check('a reconnect does not cancel a request the daemon has forgotten',
+  sent.every(one => one.body.type !== 'download.cancel'));
+check('a reconnect reports the ended transfer',
+  page.el('fetch-note').textContent.includes('connection'));
+
+// The picker looks only where the configuration says it may, and produces a
+// path for the fetch rather than fetching anything itself.
+const entries = () => page.el('picker-entries').children;
+const rootChips = () => page.el('picker-roots').children;
+const listing = (request, held) => deliver({
+  type: 'files.listing',
+  request,
+  target: { target: 'first', session: 'main' },
+  listing: held,
+});
+const lastRequest = type => sent.filter(one => one.body.type === type).at(-1).body.request;
+
+// A target that declares no roots offers no picker.
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'first', session: 'main' }, connection: 'live', roots: [],
+      snapshot: { workspaces: [], panes: [{ id: pane }], agents: [] },
+    }],
+  },
+});
+page.observe(pane, 'first/main/w1:p1');
+check('no configured roots offers no picker', page.el('picker').hidden === true);
+
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'first', session: 'main' }, connection: 'live',
+      roots: ['/srv/build', '/home/example/work'],
+      snapshot: { workspaces: [], panes: [{ id: pane }], agents: [] },
+    }],
+  },
+});
+page.observe(pane, 'first/main/w1:p1');
+check('configured roots offer a picker', page.el('picker').hidden === false);
+check('every configured root is offered', rootChips().length === 2);
+check('a root chip names its root', rootChips()[0].dataset.root === '/srv/build');
+
+sent.length = 0;
+rootChips()[0].onclick();
+const listed = sent.find(one => one.body.type === 'files.list');
+check('choosing a root asks for its own listing',
+  listed.body.root === '/srv/build' && listed.body.path === '');
+check('a listing names the qualified target',
+  listed.body.target.target === 'first' && listed.body.target.session === 'main');
+
+listing(listed.body.request, {
+  root: '/srv/build',
+  path: '',
+  entries: [
+    { kind: 'directory', name: 'reports' },
+    { kind: 'file', name: 'build.log' },
+    { kind: 'other', name: 'runner.sock' },
+  ],
+  truncated: false,
+});
+check('a listing shows every entry', entries().length === 3);
+check('a directory is marked as one', entries()[0].dataset.kind === 'directory');
+check('a directory is shown with a separator', entries()[0].children[0].textContent === 'reports/');
+check('a socket is listed and not offered', entries()[2].children[0].disabled === true);
+
+// Descending stays inside the root, and the way back up is built from the path
+// the daemon described rather than from wherever the page has been.
+sent.length = 0;
+entries()[0].children[0].onclick();
+check('descending asks for the subdirectory',
+  sent.find(one => one.body.type === 'files.list').body.path === 'reports');
+listing(lastRequest('files.list'), {
+  root: '/srv/build', path: 'reports',
+  entries: [{ kind: 'file', name: 'weekly.txt' }],
+  truncated: false,
+});
+check('a subdirectory offers a way back up', entries()[0].children[0].textContent === '../');
+check('the path is shown', page.el('picker-where').textContent === '/srv/build/reports');
+
+// Choosing a file fills the fetch path and fetches nothing.
+sent.length = 0;
+entries()[1].children[0].onclick();
+check('choosing a file fills the path',
+  page.el('fetch-path').value === '/srv/build/reports/weekly.txt');
+check('choosing a file fetches nothing',
+  sent.every(one => one.body.type !== 'download.begin'));
+
+sent.length = 0;
+entries()[0].children[0].onclick();
+check('going back up asks for the root again',
+  sent.find(one => one.body.type === 'files.list').body.path === '');
+
+// Search is scoped to the root, and a pattern is opt-in.
+sent.length = 0;
+page.el('picker-query').value = 'weekly';
+page.el('picker-search-form').onsubmit({ preventDefault() {} });
+const searched = sent.find(one => one.body.type === 'files.search');
+check('a search names its root and query',
+  searched.body.root === '/srv/build' && searched.body.query === 'weekly');
+check('a search is literal text by default', searched.body.glob === false);
+page.el('picker-glob').onclick();
+check('the pattern toggle reports itself', page.el('picker-glob')['aria-pressed'] === 'true');
+sent.length = 0;
+page.el('picker-query').value = '*.log';
+page.el('picker-search-form').onsubmit({ preventDefault() {} });
+check('a pattern search says so',
+  sent.find(one => one.body.type === 'files.search').body.glob === true);
+
+listing(lastRequest('files.search'), {
+  root: '/srv/build', path: '',
+  entries: [{ kind: 'file', name: 'reports/weekly.log' }],
+  truncated: true,
+});
+check('a search result keeps its path under the root',
+  entries()[0].children[0].textContent === 'reports/weekly.log');
+check('a search offers no way up', entries().length === 1);
+check('a truncated answer says so',
+  page.el('picker-note').textContent.includes('more than this list can show'));
+sent.length = 0;
+entries()[0].children[0].onclick();
+check('choosing a search result fills the whole path',
+  page.el('fetch-path').value === '/srv/build/reports/weekly.log');
+
+// The picker belongs to the pane being watched.
+page.observe({ target: 'first', session: 'main', resource: 'w1:p2' }, 'other');
+check('watching another pane clears the picker', entries().length === 0);

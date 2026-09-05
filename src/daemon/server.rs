@@ -48,6 +48,7 @@ use crate::operation::Operation;
 use crate::pairing::{self, PendingPairing};
 use crate::plugin;
 use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, ServerMessage, decode, encode};
+use crate::remote_files;
 use crate::state::{FederationState, FederationStore, SupervisorOptions, target_key};
 use crate::terminal::{
     TerminalAccess, TerminalEvent, parse_terminal_event, spawn_terminal, terminal_input_command,
@@ -1820,6 +1821,28 @@ impl Daemon {
                     destination,
                     name,
                 } => self.begin_between(client, request, source, path, destination, name),
+                Effect::ListRemoteDirectory {
+                    client,
+                    request,
+                    target,
+                    root,
+                    path,
+                } => self.browse(client, request, target, root, None, path),
+                Effect::SearchRemoteFiles {
+                    client,
+                    request,
+                    target,
+                    root,
+                    query,
+                    glob,
+                } => self.browse(
+                    client,
+                    request,
+                    target,
+                    root,
+                    Some((query, glob)),
+                    String::new(),
+                ),
                 Effect::MarkAgent {
                     client,
                     request,
@@ -2941,6 +2964,49 @@ impl Daemon {
     /// federation and the attention index, both of which already survive a
     /// restart on their own terms. Rebuilding it is cheap and keeps one
     /// authority for each fact.
+    /// Look inside one of a target's configured roots, off the event loop.
+    ///
+    /// Spawned rather than awaited, and per request: a slow or wedged host
+    /// must not stop the daemon serving every other target, which is the same
+    /// isolation every other command path here already has.
+    fn browse(
+        &mut self,
+        client: ClientId,
+        request: u64,
+        key: TargetSession,
+        root: String,
+        search: Option<(String, bool)>,
+        path: String,
+    ) {
+        let Some(target) = self.targets.get(&key).cloned() else {
+            self.refuse(client, request, "no such target".to_owned());
+            return;
+        };
+        let Some(outbox) = self.outboxes.get(&client).cloned() else {
+            return;
+        };
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            let listing = match search {
+                Some((query, glob)) => {
+                    remote_files::search(&target, &transport, &root, &query, glob).await
+                }
+                None => remote_files::list(&target, &transport, &root, &path).await,
+            };
+            let _ = outbox.send(match listing {
+                Ok(listing) => ServerMessage::RemoteFiles {
+                    request,
+                    target: key,
+                    listing,
+                },
+                Err(error) => ServerMessage::Error {
+                    request: Some(request),
+                    message: error.to_string(),
+                },
+            });
+        });
+    }
+
     /// Hand one coalesced alert to every subscribed device, if one is due.
     fn device_alerts(&mut self) -> Vec<Effect> {
         let Some(delivery) = self.device_notifications.take_ready(Instant::now()) else {
@@ -3192,6 +3258,7 @@ mod tests {
                 session: None,
                 socket: None,
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+                roots: Vec::new(),
             }],
             ..empty_config()
         }
@@ -3209,6 +3276,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
         });
         config
     }
@@ -3400,6 +3468,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
         }
     }
 
@@ -3744,6 +3813,7 @@ mod tests {
                 session: None,
                 socket: None,
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+                roots: Vec::new(),
             }],
             devices: Vec::new(),
             quick_replies: None,
@@ -4644,6 +4714,7 @@ mod tests {
                 session: None,
                 socket: None,
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+                roots: Vec::new(),
             },
             &Default::default(),
             crate::clipboard::OPAQUE,
@@ -4661,6 +4732,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
         };
         let error = super::accept_copy(
             &destination,

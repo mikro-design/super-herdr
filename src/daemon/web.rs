@@ -704,6 +704,14 @@ mod tests {
         assert!(APP.contains("id=\"quick-replies\""));
         assert!(!APP.contains("data-reply=\""));
         assert!(APP.contains("message.quick_replies"));
+        // The download surface takes a typed path. Nothing in the page derives
+        // one from the terminal, which is what a search for a screen-reading
+        // helper here would catch.
+        assert!(APP.contains("type: 'download.begin'"));
+        assert!(APP.contains("type: 'download.pull'"));
+        assert!(APP.contains("type: 'download.cancel'"));
+        assert!(APP.contains("id=\"fetch-path\""));
+        assert!(APP.contains("crypto.subtle.digest('SHA-256'"));
         assert!(APP.contains("class=\"keys control-strip\""));
         assert!(APP.contains("id=\"plugin-tools\""));
         assert!(APP.contains("type: 'plugin.actions.list'"));

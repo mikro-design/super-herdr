@@ -507,6 +507,10 @@ fn run_target_command(
                 } else {
                     herdr_bins
                 },
+                // Not offered on the command line. A browsing bound is a
+                // considered decision about a host, written where it can be
+                // read back, rather than a flag typed once while adding one.
+                roots: Vec::new(),
             };
             let path = Config::add_target_file(config_path, target)?;
             stdout_line(format_args!("added target {name:?} to {}", path.display()))?;

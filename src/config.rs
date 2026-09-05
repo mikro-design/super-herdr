@@ -39,6 +39,10 @@ pub struct Config {
 /// They share one row on a phone. Past this the row wraps into something a
 /// person scans rather than taps, which is the opposite of the point.
 const MAX_QUICK_REPLIES: usize = 8;
+
+/// How many places one target may offer to look in. A picker with a screenful
+/// of roots is a hierarchy again, which is the thing it exists to avoid.
+const MAX_TARGET_ROOTS: usize = 8;
 const MAX_QUICK_REPLY_LABEL_CHARACTERS: usize = 24;
 const MAX_QUICK_REPLY_SEND_BYTES: usize = 256;
 
@@ -574,6 +578,15 @@ pub struct Target {
     /// Ordered client candidates. A protocol mismatch advances to the next one.
     #[serde(default = "default_herdr_bins")]
     pub herdr_bins: Vec<String>,
+    /// Directories the remote file picker may look inside on this host.
+    ///
+    /// Empty means the picker offers nothing for this target, which is the
+    /// default: a browsing surface that starts at `/` is one nobody asked for.
+    /// This bounds browsing and searching, and deliberately not reading — a
+    /// paired device already holds pane control and can read anything its user
+    /// can, so a root here is a place to look rather than a permission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
 }
 
 impl Target {
@@ -806,6 +819,23 @@ impl Config {
                     .any(|binary| binary.trim().is_empty())
             {
                 bail!("target {:?} has an empty herdr_bins entry", target.name);
+            }
+            if target.roots.len() > MAX_TARGET_ROOTS {
+                bail!(
+                    "target {:?} declares more than {MAX_TARGET_ROOTS} roots",
+                    target.name
+                );
+            }
+            for root in &target.roots {
+                if !root.starts_with('/')
+                    || root.chars().any(char::is_control)
+                    || root.split('/').any(|part| part == "..")
+                {
+                    bail!(
+                        "target {:?} has a root that is not an absolute path without '..'",
+                        target.name
+                    );
+                }
             }
             if let Some(destination) = &target.ssh
                 && (destination.is_empty()
@@ -1299,6 +1329,47 @@ send = ""
     }
 
     #[test]
+    fn a_target_root_must_be_an_absolute_path_without_a_climb() {
+        let good = Config::parse(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+roots = ["/srv/build", "/home/example/work"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(good.targets[0].roots.len(), 2);
+
+        for bad in ["\"srv/build\"", "\"/srv/../etc\"", "\"\""] {
+            assert!(
+                Config::parse(&format!(
+                    "\n[[targets]]\nname = \"one\"\nssh = \"host\"\nroots = [{bad}]\n"
+                ))
+                .is_err(),
+                "a picker root must be somewhere it cannot climb out of: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_offers_no_roots_by_default() {
+        let config = Config::parse(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config.targets[0].roots.is_empty(),
+            "a browsing surface that starts at / is one nobody asked for"
+        );
+    }
+
+    #[test]
     fn a_transfer_ceiling_is_configurable_and_has_a_default() {
         // Absent is the common case, and it must not mean zero: a missing
         // section that refused every transfer would be a silent outage.
@@ -1461,6 +1532,7 @@ name = "local"
                 session: None,
                 socket: None,
                 herdr_bins: vec!["herdr".to_owned()],
+                roots: Vec::new(),
             },
         )
         .unwrap();
@@ -1832,6 +1904,7 @@ name = "local"
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         Config::add_target_file(Some(&path), first).unwrap();
 
@@ -1846,6 +1919,7 @@ name = "local"
             session: Some("toolchains".to_owned()),
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         Config::add_target_file(Some(&path), second).unwrap();
 
@@ -1867,6 +1941,7 @@ name = "local"
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         Config::add_target_file(Some(&path), target.clone()).unwrap();
         let before = fs::read(&path).unwrap();
@@ -1904,6 +1979,7 @@ ssh = "build-host"
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
 
         Config::replace_target_file(Some(&path), "development", replacement).unwrap();
@@ -2028,6 +2104,7 @@ ssh = "build-host"
                 session: None,
                 socket: None,
                 herdr_bins: vec!["herdr".to_owned()],
+                roots: Vec::new(),
             },
         )
         .unwrap();

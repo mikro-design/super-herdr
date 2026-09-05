@@ -175,6 +175,24 @@ pub enum Effect {
         agent: AgentId,
         mark: AgentMarkRequest,
     },
+    /// Look inside one of a target's configured roots. The broker routes it
+    /// and checks nothing: which roots exist is configuration the daemon
+    /// holds, and deciding here would be a second copy of that answer.
+    ListRemoteDirectory {
+        client: ClientId,
+        request: u64,
+        target: TargetSession,
+        root: String,
+        path: String,
+    },
+    SearchRemoteFiles {
+        client: ClientId,
+        request: u64,
+        target: TargetSession,
+        root: String,
+        query: String,
+        glob: bool,
+    },
     MarkAttentionSeen {
         pane: PaneId,
     },
@@ -497,6 +515,32 @@ impl Broker {
                 // delivered late enough to have been asked for afterwards is
                 // an interruption about something already over.
             }
+            ClientMessage::ListRemoteDirectory {
+                request,
+                target,
+                root,
+                path,
+            } => effects.push(Effect::ListRemoteDirectory {
+                client,
+                request,
+                target,
+                root,
+                path,
+            }),
+            ClientMessage::SearchRemoteFiles {
+                request,
+                target,
+                root,
+                query,
+                glob,
+            } => effects.push(Effect::SearchRemoteFiles {
+                client,
+                request,
+                target,
+                root,
+                query,
+                glob,
+            }),
             ClientMessage::UnsubscribeNotifications => {
                 if let Some(session) = self.clients.get_mut(&client) {
                     session.notifications_subscribed = false;
@@ -1566,6 +1610,7 @@ mod tests {
             event_error: None,
             connection_generation: 1,
             selected_herdr_bin: Some("herdr".to_owned()),
+            roots: Vec::new(),
             snapshot: Some(Arc::new(snapshot)),
             last_error: None,
             last_success: None,

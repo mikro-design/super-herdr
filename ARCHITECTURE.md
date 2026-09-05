@@ -580,6 +580,86 @@ fit here sends no payload at all and lets the woken service worker ask the
 daemon, so the push service learns that something happened and never what. That
 is a separate decision about dependencies and trust, not a detail of this sink.
 
+The desktop reaches the same two directions from its own menus. Right-clicking
+a pane offers to save a file from that host onto this machine, and to send one
+from that host to each other live host — one destination per host rather than
+one per pane, because the choice that matters is which machine, and a menu
+listing every pane on every host is the hierarchy this is meant to save
+somebody from walking. A host that is not connected is not offered as a
+destination.
+
+Saving writes nowhere a person would look for a finished file until it is
+finished. Bytes go to a temporary file beside the destination and are renamed
+into place only once the length and the digest both check out, so an
+interrupted transfer leaves nothing rather than something that looks complete,
+and a failed digest takes the temporary file with it. The host's name for the
+file is reduced to its last component before it is used: the protocol promises
+a name rather than a path, and this is the place where trusting that promise
+would cost somebody a file written outside the directory they chose. An
+existing file is refused rather than renamed around, because a download that
+quietly became `report (2).txt` is one somebody opens the old copy of.
+
+Finding the file is a separate surface from fetching it, and a narrower one. A
+target declares the directories its picker may look inside; a target that
+declares none offers no picker, because a browser starting at `/` is one nobody
+asked for. A client names a root rather than describing one — it must be a path
+the configuration wrote down, compared exactly — so asking about a parent or a
+deeper path does not widen what a client may see.
+
+Nothing is interpolated into a shell. Every parameter travels on the remote
+script's stdin and is read into a variable, exactly as the file read already
+works, so a path containing a quote, a semicolon or a newline is a path rather
+than a command. Containment is checked on the host by comparing `pwd -P` — the
+physical path, symlinks resolved — against the root's own physical path, which
+is what makes a symlink pointing out of the tree a refusal rather than a
+shortcut; search does not follow symlinks at all. Output is NUL-framed, so a
+file name may contain anything a file name may contain, and a record cut in
+half by the byte cap is dropped rather than half-read.
+
+Everything is bounded: how many roots a target may declare, how deep a search
+descends, how many entries return, how long a query may be, and how many bytes
+the remote may produce. A listing that stopped short says so, because a list
+silently missing the file somebody is looking for is worse than one that admits
+it stopped. Entries carry a name and a kind and no size — size is what the
+transfer offer reports at the moment it matters, and collecting it here would
+mean reading every file in a directory to answer a question the next step
+answers for free.
+
+The roots bound browsing, and deliberately not reading. A paired device already
+holds pane control and can read anything its user can, so a root is a place
+worth looking rather than a permission boundary; saying otherwise would claim a
+guarantee this does not make.
+
+Fetching a file to a paired device is two steps, and the split is the point.
+The daemon answers `download.begin` with what the file is — its own last path
+component, its length, and the digest the host computed — and then sends
+nothing until it is pulled. So a person sees the size and the source before a
+byte crosses the link, and a path that turned out to name a core dump is
+refused rather than discovered halfway through. What the browser will hold is
+bounded by the same ceiling as an upload, and an offer above it cannot be
+accepted at all.
+
+The digest is verified at the receiving end, which is the only end that can:
+the daemon carries the host's attestation without checking it, exactly as it
+carries a client's in the other direction. A file that does not match is
+discarded rather than offered with a warning, because a Save button beside a
+warning is a Save button people press.
+
+The path is typed. Nothing reads the terminal to work out which file an agent
+was looking at — a path inferred from what a screen happened to show is a
+guess, and fetching whatever that guess named is a worse failure than asking.
+The same rule is why previews are decided by name and kept narrow: text is
+decoded and shown as text, an image is shown as an image, and anything else is
+saved without being rendered. A PDF is saved rather than previewed, because
+rendering one means handing a file off somebody's host to the browser's
+scripted viewer inside this page; that is a decision worth taking deliberately
+rather than as a side effect of adding a file picker.
+
+A transfer belongs to the pane it was asked for. Watching another pane abandons
+it rather than letting bytes from one host arrive under another host's heading,
+and a reconnect forgets it rather than cancelling a request number the daemon
+has since given to somebody else.
+
 Delivering a notification is a separate question from owning the index, and it
 divides the way the clipboard does. Native desktop delivery is a desktop-session
 capability: it belongs to the client, because a daemon on another machine
