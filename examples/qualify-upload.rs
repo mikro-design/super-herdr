@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         socket: None,
         herdr_bins: vec!["herdr".to_owned()],
         roots: Vec::new(),
+        tags: Vec::new(),
     };
 
     let payload = png(64 * 1024);
@@ -214,6 +215,7 @@ async fn relay(
                     "herdr".to_owned(),
                 ],
                 roots: Vec::new(),
+                tags: Vec::new(),
             }],
             devices: Vec::new(),
             quick_replies: None,

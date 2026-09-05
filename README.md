@@ -209,6 +209,7 @@ same metadata for a support bundle.
   install plan that runs nothing
 - Local names, favourites and jump slots that never rename a Herdr resource and
   are never trusted onto a reused id
+- OpenSSH config import with a preview, per-host probing, and local tags
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer
@@ -245,10 +246,32 @@ super-herdr clipboard check
 super-herdr notifications check
 ```
 
+If your machines are already in `~/.ssh/config`, `super-herdr target import`
+lists them and adds nothing. Name the ones you want with `--add`, and each is
+probed on its own before it is written — one host being unreachable says
+nothing about the others, and an alias that did not answer is reported rather
+than added. `--tag work` groups what a run adds.
+
 See [config.example.toml](config.example.toml) for manual TOML configuration.
-The browser route can use the hosted bridge, a private address, Tailscale Serve,
-or an operator-managed proxy. See the [architecture](ARCHITECTURE.md) for those
-trust boundaries and the [bridge guide](crates/bridge/README.md) for self-hosting.
+
+### Choosing how a phone reaches you
+
+These are peers, not a ladder. Pick the trust boundary you want:
+
+| Route | What it needs | Who can see the traffic |
+| --- | --- | --- |
+| **Hosted bridge** (default) | Nothing. Works from any network. | TLS terminates at the relay, so it is a trusted relay rather than end-to-end encryption. It carries bounded opaque traffic and holds no device tokens, but it is a third party in the path. |
+| **Direct address** | The phone and the daemon on one network. | Nobody in between. Refused on a public address: a device token authenticates but does not encrypt. |
+| **Tailscale, NetBird, or another WireGuard-style network** | That network on both devices. | Nobody in between; the tunnel is theirs, not Super-Herdr's. Point `web.address` at the interface it gives you. |
+| **Your own proxy** | A TLS terminator you run. | You, wherever you terminate. Set `web.url` to where the phone reaches it. |
+
+The default is the bridge because it works with no setup from a hotel network,
+and being clear about it matters more than defending it: it needs no Tailscale,
+and it is a relay you are trusting. If that is the wrong trade for your machines,
+the other three rows are one configuration key each.
+
+See the [architecture](ARCHITECTURE.md) for those trust boundaries and the
+[bridge guide](crates/bridge/README.md) for self-hosting.
 
 ## Security summary
 

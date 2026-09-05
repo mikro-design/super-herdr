@@ -5,6 +5,45 @@ Work is ordered by dependency and product risk.
 The community-informed product epics that follow these qualification gates are
 specified as checkable work in [PRODUCT_BACKLOG.md](PRODUCT_BACKLOG.md).
 
+## Investigation: a native Windows control plane
+
+Asked in `PRODUCT_BACKLOG.md` step 8, and answered here rather than started,
+because the answer changes what would be worth building.
+
+What was checked, in this tree:
+
+- **File permissions** are already portable. Every `std::os::unix` use is a
+  `PermissionsExt` call behind a `cfg(target_family = "unix")` gate with a
+  no-op sibling, across `config`, `attention`, `ui_state`, `aliases`,
+  `notifications` and `doctor`. Nothing here blocks a Windows build.
+- **Unix domain sockets are the real coupling.** `UnixStream` appears in
+  `transport`, `client` and `daemon::server` — twenty uses in total — on two
+  distinct paths: the daemon's own client socket, and the socket Herdr exposes
+  on a target. The first is ours and could be a named pipe or a loopback
+  listener. The second is not: it is how Herdr's documented API is reached, and
+  it lives on the *target*, where SSH already carries it. A Windows control
+  plane talking to Linux and macOS targets over SSH never needs AF_UNIX
+  locally for it.
+- **Local command execution** assumes `/bin/sh` in two places, both for
+  commands run on *this* machine rather than on a target. Both would need a
+  Windows equivalent or a documented refusal.
+- **The TUI** is `crossterm`, which supports Windows already.
+- **Clipboard and notifications** are the widest gap: both are built around
+  platform tools this tree knows how to find on Linux and macOS, and neither
+  has a Windows path.
+
+The conclusion is that a native Windows build is plausible as a *control plane
+for SSH targets* — supervising, browsing, transferring, and serving the browser
+client — and is not plausible as a host that runs Herdr itself, which
+Super-Herdr should not claim either way since it does not implement Herdr. The
+work is a local-socket abstraction, a shell abstraction, and Windows clipboard
+and notification backends. None of it requires importing anything from Herdr,
+which was the constraint the question was really asking about.
+
+It is not scheduled. WSL2 remains the documented Windows path until somebody
+has a Windows machine to qualify a native build on, because a platform nobody
+can test is a platform that is broken and does not know it.
+
 ## Completed foundation
 
 - Persistent multi-host federation with qualified target/session IDs.

@@ -20,6 +20,7 @@ pub mod protocol;
 pub mod remote_files;
 pub mod resource_action;
 pub mod screen;
+pub mod ssh_config;
 pub mod state;
 pub mod terminal;
 pub mod transport;

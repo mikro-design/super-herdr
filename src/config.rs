@@ -43,6 +43,11 @@ const MAX_QUICK_REPLIES: usize = 8;
 /// How many places one target may offer to look in. A picker with a screenful
 /// of roots is a hierarchy again, which is the thing it exists to avoid.
 const MAX_TARGET_ROOTS: usize = 8;
+
+/// How many groupings one target may carry. Past a handful a tag stops
+/// narrowing anything, which is the only thing a tag is for.
+const MAX_TARGET_TAGS: usize = 8;
+const MAX_TAG_CHARACTERS: usize = 24;
 const MAX_QUICK_REPLY_LABEL_CHARACTERS: usize = 24;
 const MAX_QUICK_REPLY_SEND_BYTES: usize = 256;
 
@@ -578,6 +583,12 @@ pub struct Target {
     /// Ordered client candidates. A protocol mismatch advances to the next one.
     #[serde(default = "default_herdr_bins")]
     pub herdr_bins: Vec<String>,
+    /// Local groupings — work, home, lab, a pod name. Super-Herdr's own
+    /// labels for filtering and nothing else: a tag never reaches a host and
+    /// never takes part in identity, so two hosts tagged "work" are still two
+    /// entirely separate targets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Directories the remote file picker may look inside on this host.
     ///
     /// Empty means the picker offers nothing for this target, which is the
@@ -819,6 +830,26 @@ impl Config {
                     .any(|binary| binary.trim().is_empty())
             {
                 bail!("target {:?} has an empty herdr_bins entry", target.name);
+            }
+            if target.tags.len() > MAX_TARGET_TAGS {
+                bail!(
+                    "target {:?} carries more than {MAX_TARGET_TAGS} tags",
+                    target.name
+                );
+            }
+            for tag in &target.tags {
+                if tag.is_empty()
+                    || tag.chars().count() > MAX_TAG_CHARACTERS
+                    || tag.chars().any(|character| {
+                        character.is_control() || character.is_whitespace() || character == ','
+                    })
+                {
+                    bail!(
+                        "target {:?} has a tag that is not 1 to {MAX_TAG_CHARACTERS} \
+                         characters without spaces or commas",
+                        target.name
+                    );
+                }
             }
             if target.roots.len() > MAX_TARGET_ROOTS {
                 bail!(
@@ -1353,6 +1384,30 @@ roots = ["/srv/build", "/home/example/work"]
     }
 
     #[test]
+    fn a_tag_is_a_short_word_without_spaces_or_commas() {
+        let good = Config::parse(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+tags = ["work", "lab"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(good.targets[0].tags, ["work", "lab"]);
+
+        for bad in ["\"two words\"", "\"with,comma\"", "\"\""] {
+            assert!(
+                Config::parse(&format!(
+                    "\n[[targets]]\nname = \"one\"\nssh = \"host\"\ntags = [{bad}]\n"
+                ))
+                .is_err(),
+                "a tag that cannot be typed as one word is not a grouping: {bad}"
+            );
+        }
+    }
+
+    #[test]
     fn a_target_offers_no_roots_by_default() {
         let config = Config::parse(
             r#"
@@ -1533,6 +1588,7 @@ name = "local"
                 socket: None,
                 herdr_bins: vec!["herdr".to_owned()],
                 roots: Vec::new(),
+                tags: Vec::new(),
             },
         )
         .unwrap();
@@ -1905,6 +1961,7 @@ name = "local"
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
         Config::add_target_file(Some(&path), first).unwrap();
 
@@ -1920,6 +1977,7 @@ name = "local"
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
         Config::add_target_file(Some(&path), second).unwrap();
 
@@ -1942,6 +2000,7 @@ name = "local"
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
         Config::add_target_file(Some(&path), target.clone()).unwrap();
         let before = fs::read(&path).unwrap();
@@ -1980,6 +2039,7 @@ ssh = "build-host"
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
 
         Config::replace_target_file(Some(&path), "development", replacement).unwrap();
@@ -2105,6 +2165,7 @@ ssh = "build-host"
                 socket: None,
                 herdr_bins: vec!["herdr".to_owned()],
                 roots: Vec::new(),
+                tags: Vec::new(),
             },
         )
         .unwrap();

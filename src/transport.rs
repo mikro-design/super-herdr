@@ -153,6 +153,9 @@ fn targets_for_discovered_sessions(
             socket: Some(session.socket_path),
             herdr_bins: target.herdr_bins.clone(),
             roots: target.roots.clone(),
+            // Discovery splits one configured target into one per session.
+            // They are the same machine, so they carry the same groupings.
+            tags: target.tags.clone(),
         })
         .collect()
 }
@@ -949,6 +952,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
 
         assert_eq!(
@@ -992,6 +996,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
 
         assert!(targets_for_discovered_sessions(&target, Vec::new()).is_empty());

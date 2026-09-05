@@ -286,19 +286,22 @@ all operations remain bound to qualified live identities.
 
 ### 8. Multi-host onboarding and network choices
 
-- [ ] Offer an OpenSSH-config alias importer with a preview and explicit target
+- [x] Offer an OpenSSH-config alias importer with a preview and explicit target
       selection.
-- [ ] Support adding and probing several targets in one wizard with independent
-      results and timeouts.
-- [ ] Add local tags and groups such as work, home, lab, and pods.
-- [ ] Explain hosted bridge, direct LAN, Tailscale, NetBird/WireGuard-style
+- [x] Support adding and probing several targets in one wizard with independent
+      results and timeouts. The wizard is the `target import` command rather
+      than a TUI screen; the TUI already has its own add-and-test form.
+- [x] Add local tags and groups such as work, home, lab, and pods.
+- [x] Explain hosted bridge, direct LAN, Tailscale, NetBird/WireGuard-style
       private routes, and an operator-managed proxy as peer choices.
-- [ ] Make the default hosted route clear: it needs no Tailscale but remains a
+- [x] Make the default hosted route clear: it needs no Tailscale but remains a
       trusted relay because TLS terminates there.
-- [ ] Investigate a native Windows control-plane build that can supervise SSH
+- [x] Investigate a native Windows control-plane build that can supervise SSH
       targets without claiming native Herdr support or depending on Herdr
-      internals.
-- [ ] Keep WSL2 as the documented Windows fallback until the native matrix is
+      internals. Written up in `ROADMAP.md`: plausible as a control plane,
+      blocked mainly on a local-socket abstraction, a shell abstraction, and
+      Windows clipboard and notification backends. Not scheduled.
+- [x] Keep WSL2 as the documented Windows fallback until the native matrix is
       complete.
 
 Exit condition: a new user with several existing SSH hosts can add them without
