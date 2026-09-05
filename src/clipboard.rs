@@ -1133,11 +1133,20 @@ async fn finish_attempt(
 /// shell. It is refused unless it names a readable regular file, so a directory
 /// or a device does not become a stream with no end.
 const DOWNLOAD_SCRIPT: &str = r#"set -eu
+super_herdr_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
 IFS= read -r source_file
 [ -f "$source_file" ] || exit 1
 [ -r "$source_file" ] || exit 1
 source_size=$(wc -c < "$source_file" | tr -d '[:space:]')
-source_digest=$(sha256sum "$source_file" | awk '{print $1}')
+source_digest=$(super_herdr_digest "$source_file")
 printf '%s\t%s\n' "$source_size" "$source_digest"
 cat "$source_file"
 "#;
@@ -1847,6 +1856,15 @@ struct RemoteUploadReceipt {
 /// matters at the end is the file, and a transfer made of several attempts has
 /// no other way to be verified as one thing.
 const RESUME_SCRIPT: &str = r#"set -eu
+super_herdr_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
 umask 077
 IFS= read -r staged_file
 case "$staged_file" in
@@ -1859,7 +1877,7 @@ esac
 [ -f "$staged_file" ] || exit 1
 cat >> "$staged_file"
 staged_size=$(wc -c < "$staged_file" | tr -d '[:space:]')
-staged_digest=$(sha256sum "$staged_file" | awk '{print $1}')
+staged_digest=$(super_herdr_digest "$staged_file")
 printf '%s\t%s\t%s\n' "$staged_file" "$staged_size" "$staged_digest"
 "#;
 
@@ -1883,6 +1901,15 @@ wc -c < "$staged_file" | tr -d '[:space:]'
 "#;
 
 const UPLOAD_SCRIPT: &str = r#"set -eu
+super_herdr_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
 umask 077
 IFS= read -r transfer_name
 case "$transfer_name" in
@@ -1894,7 +1921,7 @@ staging_dir=$(mktemp -d "$staging_base/super-herdr-clipboard.XXXXXXXX")
 staged_file="$staging_dir/$transfer_name"
 cat > "$staged_file"
 staged_size=$(wc -c < "$staged_file" | tr -d '[:space:]')
-staged_digest=$(sha256sum "$staged_file" | awk '{print $1}')
+staged_digest=$(super_herdr_digest "$staged_file")
 printf '%s\t%s\t%s\n' "$staged_file" "$staged_size" "$staged_digest"
 "#;
 
