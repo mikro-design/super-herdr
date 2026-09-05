@@ -5,6 +5,52 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.21
+
+- Fixed file transfers to and from hosts without GNU coreutils. Every transfer
+  script hashed with `sha256sum`, which a stock macOS does not have, so
+  transfers failed there with an error about a shell script rather than about a
+  missing program. The scripts now try `sha256sum`, `shasum -a 256`, then
+  `openssl`.
+- Added an agent inbox: a daemon-owned projection of agents into needs-you,
+  working and recent, keyed by qualified agent identity and re-resolved against
+  the live federation before anything is sent. The browser opens on it with the
+  full hierarchy one tap away, and agents can be pinned, muted or snoozed.
+- Agent identity now prefers the agent session Herdr reports where one is
+  present, so an agent that moves pane keeps its card, its place in the queue
+  and any pin. The field is optional and absent at protocol 19, so panes remain
+  the fallback.
+- Browser quick replies are configured rather than inferred. Herdr's documented
+  API does not describe what a blocked agent is asking, so semantic response
+  buttons remain deliberately unavailable rather than guessed from terminal
+  contents. Configure them with `[[quick_replies]]`.
+- Added opt-in paired-device attention alerts under the desktop's existing
+  filters, coalescing and rate limits, with per-agent needs-you-only, mute and
+  snooze modes. Alerts carry bounded metadata only and reach a device while its
+  page is running; waking a closed browser needs Web Push and is not built.
+- Added file transfer surfaces that the protocol has carried since it was
+  written but no client offered: browser fetch from a target with size, source
+  and digest shown before any byte moves, a bounded remote file picker over
+  configured roots, and desktop save and host-to-host transfer from the same
+  right-click menus.
+- Added `super-herdr doctor`, a read-only pass over configuration, targets, the
+  daemon socket, the browser route, pairing, clipboard, notifications and
+  transfer dependencies. It reports corrective commands without running them and
+  redacts host names, destinations, paths and URLs so its output can be shared.
+- Added `super-herdr plugins`, showing what is installed on every host and what
+  differs. Plugins are matched by the source they were installed from rather
+  than by the server-local id a host gave them. Produces a pinned lockfile and
+  an install plan; it runs nothing.
+- Added local names, favourites and numbered jump slots that never rename a
+  Herdr resource. A name is suspended rather than applied when the host calls
+  the resource something else, because a reused id must not inherit a name.
+- Added `super-herdr target import`, which lists the hosts in an OpenSSH
+  configuration and adds only the aliases named explicitly, probing each on its
+  own first. Targets can carry local tags.
+- Documented the four ways a paired device can reach a daemon as peer choices,
+  and added a threat model for the proposed remote development preview, which
+  remains unimplemented.
+
 ## 0.7.20
 
 - Prepared the repository for public contributions with a security policy,
