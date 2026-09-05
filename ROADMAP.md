@@ -2,6 +2,9 @@
 
 Work is ordered by dependency and product risk.
 
+The community-informed product epics that follow these qualification gates are
+specified as checkable work in [PRODUCT_BACKLOG.md](PRODUCT_BACKLOG.md).
+
 ## Completed foundation
 
 - Persistent multi-host federation with qualified target/session IDs.

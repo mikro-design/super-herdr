@@ -200,6 +200,7 @@ Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.m
 - [Architecture and protocol boundaries](ARCHITECTURE.md)
 - [Security policy](SECURITY.md)
 - [Roadmap and current limitations](ROADMAP.md)
+- [Community-informed product backlog](PRODUCT_BACKLOG.md)
 - [Release test matrix](TESTING.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
