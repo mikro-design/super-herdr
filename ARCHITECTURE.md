@@ -580,6 +580,25 @@ fit here sends no payload at all and lets the woken service worker ask the
 daemon, so the push service learns that something happened and never what. That
 is a separate decision about dependencies and trust, not a detail of this sink.
 
+The desktop reaches the same two directions from its own menus. Right-clicking
+a pane offers to save a file from that host onto this machine, and to send one
+from that host to each other live host — one destination per host rather than
+one per pane, because the choice that matters is which machine, and a menu
+listing every pane on every host is the hierarchy this is meant to save
+somebody from walking. A host that is not connected is not offered as a
+destination.
+
+Saving writes nowhere a person would look for a finished file until it is
+finished. Bytes go to a temporary file beside the destination and are renamed
+into place only once the length and the digest both check out, so an
+interrupted transfer leaves nothing rather than something that looks complete,
+and a failed digest takes the temporary file with it. The host's name for the
+file is reduced to its last component before it is used: the protocol promises
+a name rather than a path, and this is the place where trusting that promise
+would cost somebody a file written outside the directory they chose. An
+existing file is refused rather than renamed around, because a download that
+quietly became `report (2).txt` is one somebody opens the old copy of.
+
 Finding the file is a separate surface from fetching it, and a narrower one. A
 target declares the directories its picker may look inside; a target that
 declares none offers no picker, because a browser starting at `/` is one nobody

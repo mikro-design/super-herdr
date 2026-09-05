@@ -99,6 +99,23 @@ pub enum ResourceAction {
         action: PluginAction,
         context: PluginInvocationTarget,
     },
+    /// Fetch a file off a target and write it onto this machine.
+    SaveFileFromPane {
+        pane: PaneId,
+        label: String,
+    },
+    /// Move a file from one target to another without it touching this device.
+    ///
+    /// Only the daemon holds live connections to both hosts, so this is the
+    /// one direction a desktop-bound design could not express at all.
+    TransferFileBetween {
+        source: PaneId,
+        destination: PaneId,
+        label: String,
+        destination_label: String,
+    },
+    /// Abandon the transfer this client is receiving.
+    CancelFileTransfer,
     /// Pin, mute, or snooze one agent in Super-Herdr's own inbox.
     ///
     /// Listed among the Herdr actions because that is where a person looks for
@@ -120,6 +137,10 @@ impl ResourceAction {
                 | Self::OpenAgentNavigator
                 | Self::OpenAttentionCenter
                 | Self::MarkAgent { .. }
+                // Reading a file changes nothing on the host, and cancelling a
+                // transfer this client is receiving changes nothing anywhere.
+                | Self::SaveFileFromPane { .. }
+                | Self::CancelFileTransfer
         )
     }
 
@@ -145,6 +166,9 @@ impl ResourceAction {
             Self::RenameTab { tab, .. } | Self::CloseTab { tab, .. } => Some(tab.target_session()),
             Self::InvokePluginAction { action, .. } => Some(action.id.target.clone()),
             Self::MarkAgent { agent, .. } => Some(agent.target_session()),
+            Self::SaveFileFromPane { pane, .. } => Some(pane.target_session()),
+            Self::TransferFileBetween { source, .. } => Some(source.target_session()),
+            Self::CancelFileTransfer => None,
             Self::OpenTargetManager | Self::OpenAgentNavigator | Self::OpenAttentionCenter => None,
         }
     }
@@ -177,6 +201,13 @@ impl ResourceAction {
             Self::InvokePluginAction { action, .. } => {
                 format!("Plugin: {}", action.title)
             }
+            Self::SaveFileFromPane { label, .. } => format!("Save a file from {label:?}"),
+            Self::TransferFileBetween {
+                label,
+                destination_label,
+                ..
+            } => format!("Send a file from {label:?} to {destination_label:?}"),
+            Self::CancelFileTransfer => "Cancel the file transfer".to_owned(),
             Self::MarkAgent { mark, label, .. } => match mark {
                 AgentMarkRequest::Pin { pinned: true } => format!("Pin agent {label:?}"),
                 AgentMarkRequest::Pin { pinned: false } => format!("Unpin agent {label:?}"),
@@ -282,6 +313,38 @@ mod tests {
             "Snooze agent \"reviewer\" for 60 minutes"
         );
         assert!(action.search_text().contains("build/toolchains"));
+    }
+
+    #[test]
+    fn reading_a_file_is_not_a_herdr_mutation_but_moving_one_is() {
+        let save = ResourceAction::SaveFileFromPane {
+            pane: PaneId::new("build", "toolchains", "w2:p1"),
+            label: "shell".to_owned(),
+        };
+        let send = ResourceAction::TransferFileBetween {
+            source: PaneId::new("build", "toolchains", "w2:p1"),
+            destination: PaneId::new("development", "work", "w1:p1"),
+            label: "shell".to_owned(),
+            destination_label: "development/work".to_owned(),
+        };
+
+        assert!(!save.mutates_herdr(), "reading changes nothing on the host");
+        assert!(send.mutates_herdr(), "writing a file to a host changes it");
+        assert!(!save.is_destructive() && !send.is_destructive());
+        assert_eq!(
+            save.target_session(),
+            Some(TargetSession::new("build", "toolchains"))
+        );
+        assert_eq!(
+            send.target_session(),
+            Some(TargetSession::new("build", "toolchains")),
+            "a transfer is scoped to where it reads from"
+        );
+        assert_eq!(
+            send.palette_label(),
+            "Send a file from \"shell\" to \"development/work\""
+        );
+        assert_eq!(ResourceAction::CancelFileTransfer.target_session(), None);
     }
 
     #[test]

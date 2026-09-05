@@ -175,6 +175,8 @@ so a reconnect can never redirect your next keystroke.
   byte moves, verified on arrival, with text and image previews
 - A bounded remote file picker over directories you configure, with literal or
   opt-in pattern search that never leaves those roots
+- Desktop save from a target and host-to-host transfer that never touches this
+  machine, both from the same right-click menus
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer

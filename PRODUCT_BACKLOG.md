@@ -200,7 +200,7 @@ payloads. Receiving one with the browser closed waits on the item above.
 
 - [x] Finish browser upload and target-to-device download surfaces on the
       existing transfer protocol.
-- [ ] Finish TUI target-to-client save and target-to-target transfer surfaces.
+- [x] Finish TUI target-to-client save and target-to-target transfer surfaces.
 - [x] Add an explicit, bounded remote-path picker scoped to one qualified
       target and session.
 - [x] Support bounded filename, substring, and opt-in glob search without
@@ -213,9 +213,7 @@ payloads. Receiving one with the browser closed waits on the item above.
       browser's scripted viewer inside this page, which wants its own decision.
 - [ ] Route Git diff, source browsing, Office rendering, and richer review
       experiences through plugin actions rather than duplicating an IDE.
-- [ ] Add cancellation and cleanup tests for every transfer direction. The
-      browser download direction is covered; TUI save and target-to-target
-      still need their surfaces first.
+- [x] Add cancellation and cleanup tests for every transfer direction.
 - [x] Never discover "files the agent read" by parsing transcripts or terminal
       contents; require an explicit path or structured plugin result.
 
