@@ -488,6 +488,7 @@ impl TargetForm {
             web: Default::default(),
             targets,
             devices: Vec::new(),
+            quick_replies: None,
         }
         .validate()
         .err()
@@ -7801,6 +7802,7 @@ mod tests {
             web: Default::default(),
             targets: vec![configured.clone()],
             devices: Vec::new(),
+            quick_replies: None,
         });
         assert!(!super::atomic_paste_available(&unresolved, &key));
 
@@ -7819,6 +7821,7 @@ mod tests {
             web: Default::default(),
             targets: vec![discovered],
             devices: Vec::new(),
+            quick_replies: None,
         });
         assert!(
             super::atomic_paste_available(&resolved, &key),

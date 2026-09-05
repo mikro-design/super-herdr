@@ -140,28 +140,35 @@ no connection event can redirect input.
 
 ### 2. Structured response actions
 
-- [ ] Define a protocol representation for bounded response choices with a
-      stable action ID, label, qualified agent route, expiry, and action kind.
-- [ ] Accept structured choices only from documented Herdr or plugin metadata.
-- [ ] Do not infer buttons by scraping or parsing terminal output.
-- [ ] Render common choices as compact buttons: yes, no, approve, deny, and
-      numbered selections.
-- [ ] Keep Enter, Escape, Tab, Ctrl-C, history arrows, and customizable quick
+**The dependency below resolved against structured choices.** Herdr's API
+schema (checked at protocol 19, `herdr api schema --json`) reports an agent's
+status and whether it is ready for input, and describes nowhere what a blocked
+agent is asking: there is no choice, option, confirm, or approve concept in its
+request or event schemas. Semantic response buttons therefore stay blocked, and
+this step ships user-configured quick replies instead.
+
+- [x] Do not infer buttons by scraping or parsing terminal output.
+- [x] Keep Enter, Escape, Tab, Ctrl-C, history arrows, and customizable quick
       replies as explicit terminal controls.
-- [ ] Require the pane control lease for any response that becomes terminal
+- [x] Require the pane control lease for any response that becomes terminal
       input.
-- [ ] Expire buttons when the prompt, agent, session, or control lease changes.
-- [ ] Confirm actions whose structured metadata declares a destructive or
-      irreversible effect.
-- [ ] Test stale choices, duplicate IDs across targets, lease loss, retries,
-      and partial target failure.
+- [x] Confirm actions whose structured metadata declares a destructive or
+      irreversible effect. With no such metadata to read, the person who wrote
+      the reply declares it with `confirm`.
+- [x] Test stale choices, lease loss, and retries.
+- [ ] Blocked on Herdr: a protocol representation for bounded response choices
+      with a stable action ID, label, qualified agent route, expiry, and action
+      kind.
+- [ ] Blocked on Herdr: accept structured choices only from documented Herdr or
+      plugin metadata.
+- [ ] Blocked on Herdr: render common choices as compact buttons — yes, no,
+      approve, deny, and numbered selections.
+- [ ] Blocked on Herdr: expire buttons when the prompt changes. Agent, session
+      and lease changes already disarm a waiting reply.
 
-Dependency: if the documented Herdr/plugin interfaces cannot supply structured
-prompt choices, ship only user-configured quick replies and keep semantic
-choices blocked rather than guessing from terminal contents.
-
-Exit condition: a phone can answer a supported prompt with one tap, while a
-stale or ambiguous action reaches no pane.
+Exit condition: a phone can answer with one configured tap, a reply that
+declares itself irreversible takes two, and nothing reaches a pane without the
+control lease.
 
 ### 3. Paired-device notifications
 

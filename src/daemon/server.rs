@@ -993,6 +993,10 @@ async fn run(
                 "plugin_actions".to_owned(),
                 "agent_cards".to_owned(),
             ],
+            active
+                .quick_replies
+                .clone()
+                .unwrap_or_else(crate::config::default_quick_replies),
         ),
         web_url: options.web_url.clone(),
         bridge_pairing: options.web_bridge.as_ref().map(|_| bridge_pairing.clone()),
@@ -3088,6 +3092,7 @@ mod tests {
             web: Default::default(),
             targets: Vec::new(),
             devices: Vec::new(),
+            quick_replies: None,
         }
     }
 
@@ -3663,6 +3668,7 @@ mod tests {
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             }],
             devices: Vec::new(),
+            quick_replies: None,
         };
         let server = tokio::spawn(serve(
             config,

@@ -26,6 +26,23 @@ command_timeout_seconds = 5
 [transfers]
 max_bytes = 1073741824
 
+# One-tap replies offered on a paired device.
+#
+# These are replies you decided you send often, not choices read off a screen.
+# Herdr's API reports that an agent is ready for input, never what it is
+# asking, so Super-Herdr will not show a Yes button because a terminal looked
+# like a yes/no prompt — that would be a keystroke sent on a pattern match.
+#
+# Leaving this out offers Yes, No, Continue and Retry. An empty list
+# (quick_replies = []) offers none. At most eight, each sending 1 to 256 bytes
+# of text with no control characters: Enter, Escape, Tab and Ctrl-C are their
+# own keys, and `submit` is what appends the Enter.
+#[[quick_replies]]
+#label = "Approve"
+#send = "approve"
+#submit = true      # append Enter; on by default
+#confirm = false    # ask for a second tap before sending
+
 [[targets]]
 name = "development"
 ssh = "development-host"

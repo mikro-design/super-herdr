@@ -532,6 +532,7 @@ mod tests {
             web: Default::default(),
             targets,
             devices: Vec::new(),
+            quick_replies: None,
         };
         let options = DaemonOptions {
             // No socket is bound in this mode; the path is never used.

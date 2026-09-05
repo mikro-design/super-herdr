@@ -162,7 +162,8 @@ so a reconnect can never redirect your next keystroke.
 - Explicit control leases: background panes and newly opened browser panes are
   read-only until control is granted
 - Desktop selection, clipboard paste, drag-and-drop, and verified uploads
-- Browser quick replies, terminal keys, a soft-keyboard dock, and a file picker
+- Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
+  a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer
 - Bounded reconnects and per-target failure isolation
 

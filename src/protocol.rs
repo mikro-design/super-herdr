@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent_card::AgentCardProjection;
 use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
+use crate::config::QuickReply;
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginRun, PluginRunId};
@@ -344,6 +345,17 @@ pub enum ServerMessage {
         protocol: u32,
         server_version: String,
         features: Vec<String>,
+        /// The one-tap replies this daemon is configured to offer.
+        ///
+        /// Sent here because they are constant for the process and a client
+        /// needs them before it can draw its controls. They are *replies*, not
+        /// choices: Herdr's documented API says whether an agent is ready for
+        /// input, never what it is asking, so there is nothing to derive a
+        /// semantic button from and this daemon will not read a terminal to
+        /// guess one. A client renders exactly this list and invents nothing
+        /// when it is empty.
+        #[serde(default)]
+        quick_replies: Vec<QuickReply>,
     },
     /// The whole federation, sent once per state subscription.
     #[serde(rename = "state.full")]
@@ -788,6 +800,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             server_version: "0.3.1".to_owned(),
             features: vec!["terminal".to_owned()],
+            quick_replies: crate::config::default_quick_replies(),
         });
         round_trip_server(ServerMessage::AgentCards {
             projection: AgentCardProjection {

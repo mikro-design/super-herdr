@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::agent_card::AgentCardProjection;
 use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
+use crate::config::QuickReply;
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginRun, PluginRunId};
@@ -300,6 +301,7 @@ struct Rendered {
 pub struct Broker {
     server_version: String,
     features: Vec<String>,
+    quick_replies: Vec<QuickReply>,
     clients: BTreeMap<ClientId, Client>,
     routes: BTreeMap<PaneId, Route>,
     screens: BTreeMap<PaneId, ScreenState>,
@@ -358,10 +360,15 @@ impl ScreenState {
 }
 
 impl Broker {
-    pub fn new(server_version: impl Into<String>, features: Vec<String>) -> Self {
+    pub fn new(
+        server_version: impl Into<String>,
+        features: Vec<String>,
+        quick_replies: Vec<QuickReply>,
+    ) -> Self {
         Self {
             server_version: server_version.into(),
             features,
+            quick_replies,
             clients: BTreeMap::new(),
             routes: BTreeMap::new(),
             screens: BTreeMap::new(),
@@ -412,6 +419,7 @@ impl Broker {
                             protocol: PROTOCOL_VERSION,
                             server_version: self.server_version.clone(),
                             features: self.features.clone(),
+                            quick_replies: self.quick_replies.clone(),
                         },
                     });
                 }
@@ -1446,6 +1454,7 @@ mod tests {
     use crate::agent_card::{AGENT_CARD_PROJECTION_VERSION, AgentCardProjection};
     use crate::agent_marks::AgentMarkRequest;
     use crate::attention::{AttentionEvent, AttentionEventKind};
+    use crate::config::QuickReply;
     use crate::model::{AgentId, PaneId, TargetSession};
     use crate::operation::Operation;
     use crate::plugin::PluginRunId;
@@ -1459,7 +1468,11 @@ mod tests {
     use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 
     fn broker() -> Broker {
-        Broker::new("0.3.1", vec!["terminal".to_owned()])
+        Broker::new(
+            "0.3.1",
+            vec!["terminal".to_owned()],
+            crate::config::default_quick_replies(),
+        )
     }
 
     /// Every test starts from a completed handshake, because nothing else is
@@ -3429,6 +3442,43 @@ mod tests {
 
         assert!(broker.agent_cards_updated(projection(1)).is_empty());
         assert!(!broker.agent_cards_updated(projection(2)).is_empty());
+    }
+
+    #[test]
+    fn the_handshake_carries_the_replies_this_daemon_offers() {
+        let mut broker = Broker::new(
+            "0.3.1",
+            vec!["terminal".to_owned()],
+            vec![QuickReply {
+                label: "Approve".to_owned(),
+                send: "approve".to_owned(),
+                submit: true,
+                confirm: true,
+            }],
+        );
+        let client = broker.connect();
+
+        let effects = broker.handle(
+            client,
+            ClientMessage::Hello {
+                protocol: PROTOCOL_VERSION,
+                client: "test".to_owned(),
+            },
+        );
+
+        let Some(Effect::Send {
+            message: ServerMessage::Hello { quick_replies, .. },
+            ..
+        }) = effects.first()
+        else {
+            panic!("expected a hello");
+        };
+        assert_eq!(quick_replies.len(), 1);
+        assert_eq!(quick_replies[0].label, "Approve");
+        assert!(
+            quick_replies[0].confirm,
+            "a reply's own configuration is what says it needs confirming"
+        );
     }
 
     #[test]

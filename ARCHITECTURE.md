@@ -512,6 +512,33 @@ without another clock in the process to keep correct. The file is bounded in
 every direction — how many agents may be marked, how large it may be, how far a
 snooze may reach — because it is written by a request from a paired device.
 
+One-tap replies on a paired device are configuration, not interpretation. The
+distinction is forced by what Herdr documents: its API reports an agent's
+status and whether it is ready for input, and nothing anywhere in its request
+or event schemas describes the options a blocked agent is offering. There is
+therefore no structured prompt metadata to render a semantic Yes, No, Approve
+or numbered-choice button from, and the only way to produce one would be to
+read the terminal and guess. Super-Herdr does not: a button that types `y`
+because the screen looked like a yes/no prompt is a keystroke sent on the
+strength of a pattern match, and the person holding the phone cannot see the
+match that produced it.
+
+So the replies are what somebody wrote down in their own configuration. The
+daemon sends the list in the handshake, because it is constant for the process
+and a client needs it before it can draw controls, and a client renders exactly
+that list — an empty one draws no buttons rather than falling back to a guess.
+Each reply carries its own text, whether Enter follows it, and whether it wants
+confirming; with no structured metadata to learn that a response is
+irreversible from, the person who wrote the reply is the one who declares it,
+and confirming is a second tap on the button rather than a dialog a phone
+dismisses by reflex. Control characters are refused in a reply's text, so a
+configuration cannot smuggle an escape sequence into a pane: Enter, Escape, Tab
+and Ctrl-C are separate, explicitly labelled keys.
+
+A reply becomes terminal input like any other, which means it needs the pane's
+control lease and is refused by the daemon without one. An armed confirmation
+belongs to the moment it was armed in, so losing the lease disarms it.
+
 Delivering a notification is a separate question from owning the index, and it
 divides the way the clipboard does. Native desktop delivery is a desktop-session
 capability: it belongs to the client, because a daemon on another machine
