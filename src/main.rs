@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use super_herdr::clipboard;
 use super_herdr::config::{Config, Target};
 use super_herdr::daemon::{DaemonOptions, serve};
+use super_herdr::doctor;
 use super_herdr::notifications;
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
@@ -57,6 +58,15 @@ enum Commands {
         #[arg(long, requires = "json")]
         snapshots: bool,
         /// Override the configured command timeout.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
+    /// Report which layer is broken, without changing anything.
+    Doctor {
+        /// Emit one machine-readable report of metadata only.
+        #[arg(long)]
+        json: bool,
+        /// Override the per-check network timeout.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
@@ -304,6 +314,40 @@ async fn run() -> Result<ExitCode> {
                 ))?;
             }
             Ok(ExitCode::SUCCESS)
+        }
+        Commands::Doctor { json, timeout } => {
+            let socket = DaemonOptions::discover().ok().map(|options| options.socket);
+            let mut checks = doctor::local_checks(&config, &path, socket.as_deref());
+            let expanded = expand_discovered_sessions(config).await;
+            let timeout = timeout.map(Duration::from_secs);
+            checks.extend(doctor::probe_targets(&expanded, timeout).await);
+            for target in &expanded.targets {
+                let tools = doctor::digest_tools(target, &expanded.transport).await;
+                checks.push(doctor::transfer_tools_check(
+                    &target.name,
+                    &tools.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+            }
+            for line in clipboard::diagnostic_lines(None).await {
+                checks.push(doctor::Check::note("clipboard", line));
+            }
+            for line in notifications::diagnostic_lines(&expanded.notifications).await {
+                checks.push(doctor::Check::note("notifications", line));
+            }
+
+            let report = doctor::Report { checks };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render());
+            }
+            // A failing check is an exit code, so this can sit in a script
+            // without anybody parsing the text.
+            Ok(if report.failed() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Commands::Probe {
             json,
