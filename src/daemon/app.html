@@ -1695,6 +1695,34 @@ function openAgentFromAlert(agent) {
 // person moving between the TUI and this phone reads one inbox rather than two
 // views that disagree the moment a snapshot is a refresh apart.
 let inbox = null;
+// Filters and the landing view are remembered per browser, not per daemon.
+// They are one person's habit on one device — the phone that only ever wants
+// "needs you" and the laptop that wants everything — so they belong where that
+// device keeps its own preferences. Storage can be unavailable or refused, and
+// a page that cannot remember a filter still has to render one.
+const VIEW_KEY = 'super-herdr.view';
+
+function rememberedView() {
+  try {
+    return JSON.parse(localStorage.getItem(VIEW_KEY)) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function rememberView() {
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify({
+      state: filters.state,
+      target: filters.target,
+      provider: filters.provider,
+      hierarchy: el('hierarchy').open === true,
+    }));
+  } catch (_) {
+    // A browser that will not remember is not a reason to stop rendering.
+  }
+}
+
 // What is being shown of it. A filter is a view, never a different request:
 // hiding a card here does not change what the daemon sends or what it holds,
 // so a filtered-out agent that starts waiting is still one chip away.
@@ -1736,6 +1764,7 @@ function chip(label, group, value, container) {
   button.setAttribute('aria-pressed', filters[group] === value ? 'true' : 'false');
   button.onclick = () => {
     filters[group] = value;
+    rememberView();
     renderInbox();
   };
   container.append(button);
@@ -1813,12 +1842,21 @@ function renderCard(card, section) {
   row.className = 'row';
   const name = document.createElement('span');
   name.className = 'name';
-  name.textContent = text(card.title) || 'agent';
+  // The local name when there is one that still fits, and the host's own word
+  // underneath it. Never instead of the identity, which the meta line carries.
+  name.textContent = text(card.alias) || text(card.title) || 'agent';
   const badge = document.createElement('span');
   badge.className = 'badge';
   badge.textContent = text(card.status) || 'unknown';
   badge.classList.add(card.stale ? 'gone' : phase(text(card.status)));
   row.append(name, badge);
+  if (card.favourite) {
+    const star = document.createElement('span');
+    star.className = 'badge';
+    star.textContent = '★';
+    star.setAttribute('aria-label', 'favourite');
+    row.append(star);
+  }
   const meta = document.createElement('div');
   meta.className = 'card-meta';
   const where = document.createElement('span');
@@ -1835,6 +1873,18 @@ function renderCard(card, section) {
   open.append(row, meta);
   item.append(open);
 
+  if (card.alias || card.alias_suspended) {
+    const note = document.createElement('div');
+    note.className = 'card-meta';
+    // A suspended name is neither shown as the name nor dropped: the host
+    // calls this something else now, and nothing here can tell a rename from
+    // an id that came back as a different agent.
+    note.textContent = card.alias_suspended
+      ? 'your name for this may be out of date'
+      : `host calls it ${text(card.title)}`;
+    item.append(note);
+  }
+
   const marks = card.marks || {};
   // A gone agent has nothing left to pin, mute or snooze, and storing a mark
   // against an identity that no longer exists would only keep it alive in a
@@ -1843,6 +1893,18 @@ function renderCard(card, section) {
     const strip = document.createElement('div');
     strip.className = 'card-marks';
     markChip(card, 'pin', marks.pinned ? 'Pinned' : 'Pin', Boolean(marks.pinned), strip);
+    const favourite = document.createElement('button');
+    favourite.className = 'chip';
+    favourite.type = 'button';
+    favourite.dataset.mark = 'favourite';
+    favourite.textContent = card.favourite ? 'Favourite' : 'Add favourite';
+    favourite.setAttribute('aria-pressed', card.favourite ? 'true' : 'false');
+    favourite.onclick = () => send({
+      type: 'local.favourite',
+      request: nextCommandRequest++,
+      resource: { kind: 'agent', ...card.agent },
+    });
+    strip.append(favourite);
     markChip(card, 'mute', marks.muted ? 'Muted' : 'Mute', Boolean(marks.muted), strip);
     markChip(
       card, 'snooze', marks.snoozed_until_ms ? 'Snoozed' : 'Snooze',
@@ -1871,7 +1933,20 @@ function renderCard(card, section) {
   return item;
 }
 
+let viewRestored = false;
+
+function restoreView() {
+  if (viewRestored) return;
+  viewRestored = true;
+  const held = rememberedView();
+  for (const group of ['state', 'target', 'provider']) {
+    if (typeof held[group] === 'string') filters[group] = held[group];
+  }
+  if (held.hierarchy === true) el('hierarchy').open = true;
+}
+
 function renderInbox() {
+  restoreView();
   const container = el('inbox-sections');
   container.innerHTML = '';
   if (!inbox) {
@@ -2330,6 +2405,7 @@ for (const button of document.querySelectorAll('.keys button')) {
     el('line').focus();
   };
 }
+el('hierarchy').ontoggle = () => rememberView();
 el('picker-search-form').onsubmit = event => {
   event.preventDefault();
   searchPicker();

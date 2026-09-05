@@ -267,15 +267,18 @@ across machines while one failing target leaves every other target usable.
 
 ### 7. Aliases, favourites, and saved views
 
-- [ ] Add Super-Herdr-local display aliases for qualified agents, workspaces,
-      panes, sessions, and targets.
-- [ ] Never use an alias as routing identity.
-- [ ] Add pinned workspaces and favourite qualified destinations.
-- [ ] Add optional numbered jump slots without renaming Herdr resources.
-- [ ] Save inbox filters and the preferred landing view per client.
-- [ ] Surface an explicit Herdr rename action separately when the documented
-      interface supports it; never rename automatically.
-- [ ] Handle deleted, moved, and duplicate-looking resources without silently
+- [x] Add Super-Herdr-local display aliases for qualified agents, workspaces,
+      panes, sessions, and targets. Stored and settable for every kind; the
+      browser renders them on agent cards, and the TUI's hierarchy still shows
+      Herdr's own labels.
+- [x] Never use an alias as routing identity.
+- [x] Add pinned workspaces and favourite qualified destinations.
+- [x] Add optional numbered jump slots without renaming Herdr resources.
+- [x] Save inbox filters and the preferred landing view per client.
+- [x] Surface an explicit Herdr rename action separately when the documented
+      interface supports it; never rename automatically. Herdr's rename was
+      already its own context-menu action and stays one; nothing local calls it.
+- [x] Handle deleted, moved, and duplicate-looking resources without silently
       retargeting an alias.
 
 Exit condition: frequently used projects and agents are one action away while

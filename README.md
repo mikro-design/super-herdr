@@ -156,6 +156,15 @@ A card whose host has disconnected, or whose agent has ended, is shown and not
 offered — Super-Herdr resolves the live pane again before it routes anything,
 so a reconnect can never redirect your next keystroke.
 
+Give an agent, workspace, pane, session or host a name of your own, mark the
+ones you keep coming back to as favourites, and put the busiest in numbered
+jump slots. These are Super-Herdr's own labels: nothing about them reaches a
+host or renames a Herdr resource. If the host later calls something else by
+that id, the name is suspended and shown as needing confirmation rather than
+applied to whatever turned up — Super-Herdr cannot tell a rename from a reused
+id, so it asks. Your inbox filters and landing view are remembered by the
+browser you use them in.
+
 `super-herdr plugins list` shows what is installed on every host and what
 differs — missing plugins, version drift, and the same version built from
 different commits. Plugins are matched by where they were installed from
@@ -198,6 +207,8 @@ same metadata for a support bundle.
   output and the command to run for anything broken
 - Cross-host plugin inventory, drift, a pinned lockfile, and a printed
   install plan that runs nothing
+- Local names, favourites and jump slots that never rename a Herdr resource and
+  are never trusted onto a reused id
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer

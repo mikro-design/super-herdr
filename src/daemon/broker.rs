@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::agent_card::AgentCardProjection;
 use crate::agent_marks::AgentMarkRequest;
+use crate::aliases::ResourceRef;
 use crate::attention::AttentionEvent;
 use crate::config::QuickReply;
 use crate::model::{AgentId, PaneId, TargetSession};
@@ -42,6 +43,27 @@ pub struct ClientId(u64);
 
 /// Work the I/O layer must perform. Route effects are addressed to a pane
 /// rather than a client, because a route is shared.
+/// One change to this installation's own names, favourites and slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalChange {
+    Name {
+        resource: ResourceRef,
+        label: Option<String>,
+        observed: String,
+    },
+    ConfirmName {
+        resource: ResourceRef,
+        observed: String,
+    },
+    Favourite {
+        resource: ResourceRef,
+    },
+    Slot {
+        slot: u8,
+        resource: Option<ResourceRef>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Send {
@@ -174,6 +196,14 @@ pub enum Effect {
         request: u64,
         agent: AgentId,
         mark: AgentMarkRequest,
+    },
+    /// Name, favourite or slot one resource locally. Routed and not decided:
+    /// the daemon owns the durable list, for the same reason it owns attention
+    /// history — two writers would overwrite each other's file.
+    LocalNaming {
+        client: ClientId,
+        request: u64,
+        change: LocalChange,
     },
     /// Look inside one of a target's configured roots. The broker routes it
     /// and checks nothing: which roots exist is configuration the daemon
@@ -515,6 +545,45 @@ impl Broker {
                 // delivered late enough to have been asked for afterwards is
                 // an interruption about something already over.
             }
+            ClientMessage::NameResource {
+                request,
+                resource,
+                label,
+                observed,
+            } => effects.push(Effect::LocalNaming {
+                client,
+                request,
+                change: LocalChange::Name {
+                    resource,
+                    label,
+                    observed,
+                },
+            }),
+            ClientMessage::ConfirmResourceName {
+                request,
+                resource,
+                observed,
+            } => effects.push(Effect::LocalNaming {
+                client,
+                request,
+                change: LocalChange::ConfirmName { resource, observed },
+            }),
+            ClientMessage::FavouriteResource { request, resource } => {
+                effects.push(Effect::LocalNaming {
+                    client,
+                    request,
+                    change: LocalChange::Favourite { resource },
+                })
+            }
+            ClientMessage::SetJumpSlot {
+                request,
+                slot,
+                resource,
+            } => effects.push(Effect::LocalNaming {
+                client,
+                request,
+                change: LocalChange::Slot { slot, resource },
+            }),
             ClientMessage::ListRemoteDirectory {
                 request,
                 target,

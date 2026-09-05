@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_card::AgentCardProjection;
 use crate::agent_marks::AgentMarkRequest;
+use crate::aliases::ResourceRef;
 use crate::attention::AttentionEvent;
 use crate::config::QuickReply;
 use crate::model::{AgentId, PaneId, TargetSession};
@@ -365,6 +366,39 @@ pub enum ClientMessage {
     ///
     /// `glob` is what makes the query a pattern; without it the query matches
     /// as literal text, so somebody searching for `[` finds a file called `[`.
+    /// Name, favourite, or slot one qualified resource locally.
+    ///
+    /// None of this reaches a host. A local name sits over Herdr's own label
+    /// and leaves it alone; renaming on the host is a separate, explicit
+    /// action, because it changes what everybody using that host sees.
+    #[serde(rename = "local.name")]
+    NameResource {
+        request: u64,
+        resource: ResourceRef,
+        /// Absent clears the name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// What the host calls it now, as the client is currently showing it.
+        /// Recorded so an id the host later reuses cannot inherit the name.
+        observed: String,
+    },
+    /// Accept that a suspended name still belongs to this resource.
+    #[serde(rename = "local.confirm_name")]
+    ConfirmResourceName {
+        request: u64,
+        resource: ResourceRef,
+        observed: String,
+    },
+    #[serde(rename = "local.favourite")]
+    FavouriteResource { request: u64, resource: ResourceRef },
+    /// Put a resource in a numbered jump slot, or clear the slot.
+    #[serde(rename = "local.slot")]
+    SetJumpSlot {
+        request: u64,
+        slot: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<ResourceRef>,
+    },
     #[serde(rename = "files.search")]
     SearchRemoteFiles {
         request: u64,
@@ -702,6 +736,7 @@ mod tests {
         AgentCardSection,
     };
     use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
+    use crate::aliases::ResourceRef;
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::operation::Operation;
@@ -843,6 +878,26 @@ mod tests {
         round_trip_client(ClientMessage::ClearSeenAttention);
         round_trip_client(ClientMessage::SubscribeAgentCards);
         round_trip_client(ClientMessage::SubscribeNotifications);
+        round_trip_client(ClientMessage::NameResource {
+            request: 16,
+            resource: ResourceRef::Workspace(WorkspaceId::new("first", "default", "w1")),
+            label: Some("compiler".to_owned()),
+            observed: "w1".to_owned(),
+        });
+        round_trip_client(ClientMessage::ConfirmResourceName {
+            request: 17,
+            resource: ResourceRef::Agent(AgentId::new("first", "default", "a1")),
+            observed: "reviewer".to_owned(),
+        });
+        round_trip_client(ClientMessage::FavouriteResource {
+            request: 18,
+            resource: ResourceRef::Pane(pane()),
+        });
+        round_trip_client(ClientMessage::SetJumpSlot {
+            request: 19,
+            slot: 3,
+            resource: Some(ResourceRef::Target(TargetSession::new("first", "default"))),
+        });
         round_trip_client(ClientMessage::UnsubscribeNotifications);
         round_trip_client(ClientMessage::ListRemoteDirectory {
             request: 14,
@@ -906,6 +961,9 @@ mod tests {
                     stale: false,
                     actionable: true,
                     last_change_ms: Some(1_700_000_000_000),
+                    alias: Some("reviewer".to_owned()),
+                    alias_suspended: false,
+                    favourite: true,
                     marks: AgentMarkState {
                         pinned: true,
                         muted: false,

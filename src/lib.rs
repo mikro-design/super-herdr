@@ -1,5 +1,6 @@
 pub mod agent_card;
 pub mod agent_marks;
+pub mod aliases;
 pub mod attention;
 pub use super_herdr_bridge as bridge;
 pub mod client;
