@@ -82,8 +82,9 @@ it?" while the inbox answers "what needs me now?"
 - [ ] Complete the deployed-bridge and real-phone qualification in
       `ROADMAP.md` before treating the hosted path as dependable.
 - [ ] Run the required release checks on the merged plugin-action build.
-- [ ] Publish the next tagged release so Homebrew, Debian, and archive users
-      receive the plugin actions already merged after `v0.7.20`.
+- [x] Publish the next tagged release so Homebrew, Debian, and archive users
+      receive the plugin actions already merged after `v0.7.20`. Released as
+      `v0.7.21`.
 - [ ] Verify the Homebrew formula and every published binary from the release.
 - [ ] Record the exact released commit and phone/browser matrix in
       `TESTING.md`.

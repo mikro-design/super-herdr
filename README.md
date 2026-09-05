@@ -37,7 +37,7 @@ brew install mikro-design/tap/super-herdr
 Debian and Ubuntu packages are published for amd64 and arm64:
 
 ```sh
-version=0.7.20
+version=0.7.21
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -47,7 +47,7 @@ sudo dpkg -i "./${package}"
 Other Linux users can install a prebuilt archive:
 
 ```sh
-tag=v0.7.20
+tag=v0.7.21
 target=x86_64-unknown-linux-gnu # or aarch64-unknown-linux-gnu
 archive="super-herdr-${tag}-${target}.tar.gz"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/${tag}/${archive}"
