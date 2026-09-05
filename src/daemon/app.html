@@ -116,6 +116,11 @@
   .card-marks .chip { padding: .25rem .6rem; font-size: .76rem; min-height: 1.9rem; }
   .card[aria-disabled="true"] { color: var(--dim); }
   .card-meta { display: flex; gap: .4rem; color: var(--dim); font-size: .78rem; margin-top: .25rem; }
+  #fetch-form { flex-wrap: wrap; }
+  #fetch-path { flex: 1 1 12rem; min-width: 0; }
+  #fetch-text { max-height: 40vh; white-space: pre-wrap; word-break: break-word; }
+  #fetch-image { max-height: 40vh; border-radius: .4rem; }
+  #fetch-note:empty, #fetch-digest:empty { display: none; }
   .actions { display: flex; gap: .5rem; margin-top: .7rem; }
   #line {
     flex: 1; min-width: 0; padding: .5rem .6rem; font: inherit;
@@ -326,6 +331,32 @@
           </label>
         </div>
         <span id="upload-note" class="note" role="status"></span>
+        <form id="fetch-form" class="actions">
+          <input id="fetch-path" class="field-input" placeholder="Path on this host"
+                 autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
+          <button id="fetch" type="submit">Get file</button>
+        </form>
+        <div id="fetch-offer" class="card" hidden>
+          <div class="row">
+            <span id="fetch-name" class="name"></span>
+            <span id="fetch-size" class="badge"></span>
+          </div>
+          <div class="card-meta"><span id="fetch-where"></span></div>
+          <div class="card-meta"><span id="fetch-digest"></span></div>
+          <div class="actions">
+            <button id="fetch-accept" type="button">Fetch</button>
+            <button id="fetch-refuse" type="button">Cancel</button>
+          </div>
+        </div>
+        <div id="fetch-result" hidden>
+          <div class="actions">
+            <a id="fetch-save" class="file-action" download>Save</a>
+            <button id="fetch-discard" type="button">Discard</button>
+          </div>
+          <pre id="fetch-text" class="screen" hidden></pre>
+          <img id="fetch-image" alt="Downloaded image" hidden>
+        </div>
+        <span id="fetch-note" class="note" role="status"></span>
       </div>
     </div>
   </section>
@@ -914,7 +945,13 @@ function acknowledge() {
 }
 
 function observe(pane, label) {
-  if (watching && !sameId(pane, watching)) send({ type: 'pane.unsubscribe', pane: watching });
+  // A fetch belongs to the pane it was asked for. Watching something else
+  // abandons it rather than letting bytes from one host arrive under another
+  // host's heading.
+  if (watching && !sameId(pane, watching)) {
+    cancelFetch('');
+    send({ type: 'pane.unsubscribe', pane: watching });
+  }
   watching = pane;
   screen = null;
   cell = null;
@@ -1089,6 +1126,214 @@ function renderKeyboard() {
   if (!holding && armedReply !== null) armReply(null);
 }
 
+// Fetching a file off a target.
+//
+// Two steps on purpose. The daemon answers `download.begin` with what the file
+// is — its own last path component, its length, and the digest the host
+// computed — and then sends nothing until it is asked to. So a person sees the
+// size and the source before a byte crosses the link, and a path that turned
+// out to name a 4 GiB core dump is refused rather than discovered halfway
+// through.
+//
+// The path is typed. Nothing here reads the terminal to work out which file an
+// agent was looking at: a path inferred from what a screen happened to show is
+// a guess, and acting on it would fetch whatever that guess named.
+let fetching = null;
+
+// The window this page will let the daemon fill. Downloads are flow-controlled
+// the other way from uploads — the daemon is the sender and its queue to a
+// client is unbounded — so peak memory here is this many chunks, not a file.
+const FETCH_WINDOW_CHUNKS = 4;
+
+function fetchNote(message) {
+  el('fetch-note').textContent = message;
+}
+
+function resetFetch(note) {
+  if (fetching && fetching.url) URL.revokeObjectURL(fetching.url);
+  fetching = null;
+  el('fetch-offer').hidden = true;
+  el('fetch-result').hidden = true;
+  el('fetch-text').hidden = true;
+  el('fetch-image').hidden = true;
+  el('fetch-text').textContent = '';
+  el('fetch-image').removeAttribute('src');
+  fetchNote(note || '');
+}
+
+function startFetch() {
+  const path = el('fetch-path').value.trim();
+  if (!watching || !path) return;
+  if (fetching) {
+    fetchNote('One file at a time.');
+    return;
+  }
+  fetching = {
+    request: nextCommandRequest++,
+    pane: watching,
+    path,
+    parts: [],
+    received: 0,
+    outstanding: 0,
+    offer: null,
+    url: null,
+  };
+  fetchNote('asking…');
+  send({ type: 'download.begin', request: fetching.request, pane: watching, path });
+}
+
+function offerFetch(message) {
+  if (!fetching || message.request !== fetching.request) return;
+  fetching.offer = message;
+  el('fetch-name').textContent = text(message.name);
+  el('fetch-size').textContent = readableBytes(message.length);
+  el('fetch-where').textContent = `${qualify(fetching.pane)} · ${text(fetching.path)}`;
+  // Shown before the transfer, because it is what the receiving end will check
+  // the bytes against afterwards. The daemon carries the host's digest without
+  // checking it; verifying is this end's job.
+  el('fetch-digest').textContent = message.digest
+    ? `sha256 ${text(message.digest).slice(0, 16)}…`
+    : 'no digest offered';
+  el('fetch-offer').hidden = false;
+  if (message.length > MAX_BROWSER_FILE_BYTES) {
+    el('fetch-accept').disabled = true;
+    fetchNote(`Too large for a browser to hold (${readableBytes(MAX_BROWSER_FILE_BYTES)} limit).`);
+    return;
+  }
+  el('fetch-accept').disabled = false;
+  fetchNote('');
+}
+
+function acceptFetch() {
+  if (!fetching || !fetching.offer) return;
+  el('fetch-offer').hidden = true;
+  fetchNote('fetching…');
+  pullFetch();
+}
+
+function pullFetch() {
+  if (!fetching || fetching.outstanding > 0) return;
+  fetching.outstanding = FETCH_WINDOW_CHUNKS;
+  send({
+    type: 'download.pull',
+    request: fetching.request,
+    chunks: FETCH_WINDOW_CHUNKS,
+  });
+}
+
+function fetchChunk(message) {
+  if (!fetching || message.request !== fetching.request) return;
+  const bytes = decodeBase64(message.bytes);
+  fetching.parts.push(bytes);
+  fetching.received += bytes.length;
+  fetching.outstanding = Math.max(0, fetching.outstanding - 1);
+  const length = Number(fetching.offer.length) || 0;
+  fetchNote(`fetching… ${readableBytes(fetching.received)} of ${readableBytes(length)}`);
+  if (fetching.received < length) pullFetch();
+}
+
+async function finishFetch(message) {
+  if (!fetching || message.request !== fetching.request) return;
+  const held = fetching;
+  const length = Number(held.offer.length) || 0;
+  if (held.received !== length) {
+    // The offer said how long the file was, which is what makes a transfer
+    // that stopped short distinguishable from one still arriving.
+    resetFetch(`That transfer stopped after ${readableBytes(held.received)} of ${readableBytes(length)}.`);
+    return;
+  }
+  const bytes = joinBytes(held.parts, held.received);
+  if (held.offer.digest) {
+    const digest = await sha256Hex(bytes);
+    if (digest !== held.offer.digest) {
+      // Discarded rather than offered with a warning. A file that does not
+      // match what the host attested is not a file this page should hand
+      // somebody a Save button for.
+      resetFetch('That file did not match the digest its host reported, so it was discarded.');
+      return;
+    }
+  }
+  if (fetching !== held) return;
+  held.parts = [];
+  presentFetch(held, bytes);
+}
+
+function presentFetch(held, bytes) {
+  const name = text(held.offer.name) || 'download';
+  held.url = URL.createObjectURL(new Blob([bytes]));
+  el('fetch-save').href = held.url;
+  el('fetch-save').setAttribute('download', name);
+  el('fetch-result').hidden = false;
+  fetchNote(`${name} · ${readableBytes(bytes.length)} · verified`);
+
+  // Previewed only where a preview is plainly safe. Text is decoded and shown
+  // as text; an image is shown as an image. A PDF is saved rather than
+  // rendered, because rendering one means handing a file off somebody's host
+  // to the browser's scripted viewer inside this page.
+  // Both are hidden first. A preview left over from the last file would sit
+  // under the name of this one.
+  el('fetch-text').hidden = true;
+  el('fetch-image').hidden = true;
+  const kind = previewKind(name);
+  if (kind === 'text') {
+    const preview = bytes.length > MAX_TEXT_PREVIEW_BYTES
+      ? bytes.subarray(0, MAX_TEXT_PREVIEW_BYTES)
+      : bytes;
+    el('fetch-text').textContent = new TextDecoder('utf-8').decode(preview)
+      + (preview.length < bytes.length ? '\n…' : '');
+    el('fetch-text').hidden = false;
+  } else if (kind === 'image') {
+    el('fetch-image').src = held.url;
+    el('fetch-image').hidden = false;
+  }
+}
+
+const MAX_TEXT_PREVIEW_BYTES = 256 * 1024;
+const TEXT_SUFFIXES = [
+  '.txt', '.log', '.md', '.json', '.toml', '.yaml', '.yml', '.csv', '.rs', '.js',
+  '.ts', '.py', '.go', '.c', '.h', '.cpp', '.sh', '.diff', '.patch', '.html', '.css',
+];
+const IMAGE_SUFFIXES = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp'];
+
+// Decided from the name, because a download carries no declared type. A name
+// that matches nothing is saved and not previewed, which is the safe default.
+function previewKind(name) {
+  const lower = name.toLowerCase();
+  if (TEXT_SUFFIXES.some(suffix => lower.endsWith(suffix))) return 'text';
+  if (IMAGE_SUFFIXES.some(suffix => lower.endsWith(suffix))) return 'image';
+  return 'none';
+}
+
+function decodeBase64(value) {
+  const binary = atob(text(value));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function joinBytes(parts, length) {
+  const joined = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.length;
+  }
+  return joined;
+}
+
+function readableBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function cancelFetch(note) {
+  if (!fetching) return;
+  send({ type: 'download.cancel', request: fetching.request });
+  resetFetch(note);
+}
+
 async function uploadBrowserFile(file, pane) {
   const buffer = await file.arrayBuffer();
   if (buffer.byteLength !== file.size) throw new Error(`${file.name}: the file changed while reading`);
@@ -1190,6 +1435,7 @@ async function uploadSelectedFiles(selected) {
 }
 
 function stopWatching(why) {
+  cancelFetch('');
   if (watching) send({ type: 'pane.unsubscribe', pane: watching });
   watching = null;
   lease = 'observe';
@@ -1695,6 +1941,10 @@ function apply(message) {
         cell = null;
         subscribeScreen(watching);
       }
+      // A reconnect is a new client to the daemon, which is not holding the
+      // request a fetch in flight was numbered by. Cancelling it there would
+      // name somebody else's request, so this end simply forgets it.
+      if (fetching) resetFetch('That transfer ended when the connection did.');
       quickReplies = Array.isArray(message.quick_replies) ? message.quick_replies : [];
       renderQuickReplies();
       // A reconnect is a new client to the daemon, which is not holding this
@@ -1705,6 +1955,15 @@ function apply(message) {
       }
       renderAlerts();
       schedulePluginPoll();
+      break;
+    case 'download.offer':
+      offerFetch(message);
+      break;
+    case 'download.chunk':
+      fetchChunk(message);
+      break;
+    case 'download.finished':
+      void finishFetch(message);
       break;
     case 'notification':
       showAlert(message);
@@ -1914,6 +2173,13 @@ for (const button of document.querySelectorAll('.keys button')) {
     el('line').focus();
   };
 }
+el('fetch-form').onsubmit = event => {
+  event.preventDefault();
+  startFetch();
+};
+el('fetch-accept').onclick = () => acceptFetch();
+el('fetch-refuse').onclick = () => cancelFetch('');
+el('fetch-discard').onclick = () => resetFetch('');
 el('alerts').onclick = () => { void toggleAlerts(); };
 el('stop').onclick = () => stopWatching('');
 

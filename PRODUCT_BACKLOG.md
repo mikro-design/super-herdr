@@ -198,21 +198,25 @@ payloads. Receiving one with the browser closed waits on the item above.
 
 ### 4. Remote files and artifacts
 
-- [ ] Finish browser upload and target-to-device download surfaces on the
+- [x] Finish browser upload and target-to-device download surfaces on the
       existing transfer protocol.
 - [ ] Finish TUI target-to-client save and target-to-target transfer surfaces.
 - [ ] Add an explicit, bounded remote-path picker scoped to one qualified
       target and session.
 - [ ] Support bounded filename, substring, and opt-in glob search without
       traversing beyond configured roots.
-- [ ] Show metadata before transfer: name, type, size, source target, and
+- [x] Show metadata before transfer: name, type, size, source target, and
       digest when available.
-- [ ] Add safe client-side previews for text, images, and PDF files after the
-      normal bounded transfer and digest verification.
+- [x] Add safe client-side previews for text and images after the normal
+      bounded transfer and digest verification. A PDF is saved rather than
+      rendered: previewing one hands a file off somebody's host to the
+      browser's scripted viewer inside this page, which wants its own decision.
 - [ ] Route Git diff, source browsing, Office rendering, and richer review
       experiences through plugin actions rather than duplicating an IDE.
-- [ ] Add cancellation and cleanup tests for every transfer direction.
-- [ ] Never discover "files the agent read" by parsing transcripts or terminal
+- [ ] Add cancellation and cleanup tests for every transfer direction. The
+      browser download direction is covered; TUI save and target-to-target
+      still need their surfaces first.
+- [x] Never discover "files the agent read" by parsing transcripts or terminal
       contents; require an explicit path or structured plugin result.
 
 Exit condition: a phone user can find a permitted remote file, verify its

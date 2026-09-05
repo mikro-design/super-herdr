@@ -580,6 +580,36 @@ fit here sends no payload at all and lets the woken service worker ask the
 daemon, so the push service learns that something happened and never what. That
 is a separate decision about dependencies and trust, not a detail of this sink.
 
+Fetching a file to a paired device is two steps, and the split is the point.
+The daemon answers `download.begin` with what the file is — its own last path
+component, its length, and the digest the host computed — and then sends
+nothing until it is pulled. So a person sees the size and the source before a
+byte crosses the link, and a path that turned out to name a core dump is
+refused rather than discovered halfway through. What the browser will hold is
+bounded by the same ceiling as an upload, and an offer above it cannot be
+accepted at all.
+
+The digest is verified at the receiving end, which is the only end that can:
+the daemon carries the host's attestation without checking it, exactly as it
+carries a client's in the other direction. A file that does not match is
+discarded rather than offered with a warning, because a Save button beside a
+warning is a Save button people press.
+
+The path is typed. Nothing reads the terminal to work out which file an agent
+was looking at — a path inferred from what a screen happened to show is a
+guess, and fetching whatever that guess named is a worse failure than asking.
+The same rule is why previews are decided by name and kept narrow: text is
+decoded and shown as text, an image is shown as an image, and anything else is
+saved without being rendered. A PDF is saved rather than previewed, because
+rendering one means handing a file off somebody's host to the browser's
+scripted viewer inside this page; that is a decision worth taking deliberately
+rather than as a side effect of adding a file picker.
+
+A transfer belongs to the pane it was asked for. Watching another pane abandons
+it rather than letting bytes from one host arrive under another host's heading,
+and a reconnect forgets it rather than cancelling a request number the daemon
+has since given to somebody else.
+
 Delivering a notification is a separate question from owning the index, and it
 divides the way the clipboard does. Native desktop delivery is a desktop-session
 capability: it belongs to the client, because a daemon on another machine
