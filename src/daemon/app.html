@@ -116,6 +116,16 @@
   .card-marks .chip { padding: .25rem .6rem; font-size: .76rem; min-height: 1.9rem; }
   .card[aria-disabled="true"] { color: var(--dim); }
   .card-meta { display: flex; gap: .4rem; color: var(--dim); font-size: .78rem; margin-top: .25rem; }
+  #picker { margin-top: .7rem; }
+  #picker-search-form { flex-wrap: wrap; }
+  #picker-query { flex: 1 1 10rem; min-width: 0; }
+  #picker-entries { list-style: none; margin: .35rem 0 0; padding: 0; max-height: 32vh; overflow-y: auto; }
+  #picker-entries li { border-bottom: 1px solid var(--line); }
+  #picker-entries button {
+    display: block; width: 100%; text-align: left; background: none; border: 0;
+    color: inherit; padding: .5rem .2rem; min-height: 2.4rem;
+  }
+  #picker-note:empty, #picker-where:empty { display: none; }
   #fetch-form { flex-wrap: wrap; }
   #fetch-path { flex: 1 1 12rem; min-width: 0; }
   #fetch-text { max-height: 40vh; white-space: pre-wrap; word-break: break-word; }
@@ -331,6 +341,19 @@
           </label>
         </div>
         <span id="upload-note" class="note" role="status"></span>
+        <div id="picker" hidden>
+          <div id="picker-roots" class="chips" role="group" aria-label="Places to look"></div>
+          <form id="picker-search-form" class="actions">
+            <input id="picker-query" class="field-input" placeholder="Find by name"
+                   autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+            <button id="picker-glob" type="button" class="chip" aria-pressed="false"
+                    title="Treat the search as a pattern">Pattern</button>
+            <button id="picker-search" type="submit">Find</button>
+          </form>
+          <div id="picker-where" class="card-meta"></div>
+          <ul id="picker-entries"></ul>
+          <p id="picker-note" class="note" role="status"></p>
+        </div>
         <form id="fetch-form" class="actions">
           <input id="fetch-path" class="field-input" placeholder="Path on this host"
                  autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
@@ -966,6 +989,11 @@ function observe(pane, label) {
   if (!uploadBusy) el('upload-note').textContent = DEFAULT_UPLOAD_NOTE;
   el('screen').innerHTML = '';
   renderPluginTools();
+  picker = null;
+  el('picker-entries').innerHTML = '';
+  el('picker-where').textContent = '';
+  el('picker-note').textContent = '';
+  renderPicker();
   subscribeScreen(pane);
 }
 
@@ -1124,6 +1152,132 @@ function renderKeyboard() {
   // A reply waiting for its second tap is a decision that belonged to the
   // moment it was armed in. Losing the lease ends that moment.
   if (!holding && armedReply !== null) armReply(null);
+}
+
+// Looking for a file, inside the places somebody configured.
+//
+// A picker rather than a file manager: it lists one directory and searches for
+// names under one root, and what it produces is a path for the fetch below it.
+// The roots come from the daemon's configuration and are the only places it
+// will look; a target that declares none offers no picker at all, because a
+// browser starting at / is one nobody asked for.
+let picker = null;
+let pickerGlob = false;
+
+function pickerTarget() {
+  if (!watching) return null;
+  const runtime = targets.get(targetKey(watching));
+  const roots = runtime && Array.isArray(runtime.roots) ? runtime.roots : [];
+  return roots.length ? { key: targetKey(watching), roots } : null;
+}
+
+function renderPicker() {
+  const held = pickerTarget();
+  el('picker').hidden = !held;
+  if (!held) return;
+  const strip = el('picker-roots');
+  strip.innerHTML = '';
+  for (const root of held.roots) {
+    const button = document.createElement('button');
+    button.className = 'chip';
+    button.type = 'button';
+    button.dataset.root = root;
+    button.textContent = root;
+    button.setAttribute('aria-pressed', picker && picker.root === root ? 'true' : 'false');
+    button.onclick = () => browse(root, '');
+    strip.append(button);
+  }
+  el('picker-glob').setAttribute('aria-pressed', pickerGlob ? 'true' : 'false');
+}
+
+function browse(root, path) {
+  if (!watching) return;
+  picker = { root, path, request: nextCommandRequest++, searching: false };
+  el('picker-note').textContent = 'looking…';
+  send({
+    type: 'files.list',
+    request: picker.request,
+    target: { target: watching.target, session: watching.session },
+    root,
+    path,
+  });
+  renderPicker();
+}
+
+function searchPicker() {
+  const query = el('picker-query').value.trim();
+  const held = pickerTarget();
+  if (!held || !query) return;
+  const root = (picker && picker.root) || held.roots[0];
+  picker = { root, path: '', request: nextCommandRequest++, searching: true };
+  el('picker-note').textContent = 'searching…';
+  send({
+    type: 'files.search',
+    request: picker.request,
+    target: { target: watching.target, session: watching.session },
+    root,
+    query,
+    glob: pickerGlob,
+  });
+  renderPicker();
+}
+
+function showListing(message) {
+  if (!picker || message.request !== picker.request) return;
+  const listing = message.listing || {};
+  picker.root = text(listing.root);
+  picker.path = text(listing.path);
+  const list = el('picker-entries');
+  list.innerHTML = '';
+  el('picker-where').textContent = picker.searching
+    ? `found under ${picker.root}`
+    : `${picker.root}${picker.path ? `/${picker.path}` : ''}`;
+
+  // A way back up, offered only where there is somewhere to go. Built from the
+  // path this listing describes rather than from wherever the page has been,
+  // so it cannot walk out of the root by accident.
+  if (!picker.searching && picker.path) {
+    const parent = picker.path.includes('/')
+      ? picker.path.slice(0, picker.path.lastIndexOf('/'))
+      : '';
+    list.append(entryRow('directory', '..', () => browse(picker.root, parent)));
+  }
+
+  for (const entry of listing.entries || []) {
+    const name = text(entry.name);
+    if (entry.kind === 'directory' && !picker.searching) {
+      const next = picker.path ? `${picker.path}/${name}` : name;
+      list.append(entryRow('directory', name, () => browse(picker.root, next)));
+    } else if (entry.kind === 'file') {
+      const relative = picker.searching ? name : (picker.path ? `${picker.path}/${name}` : name);
+      list.append(entryRow('file', name, () => {
+        // Choosing a file fills the path and stops. Fetching is a separate
+        // decision, and the offer that follows it is where the size and the
+        // digest get looked at.
+        el('fetch-path').value = `${picker.root}/${relative}`;
+        el('picker-note').textContent = 'ready to fetch';
+      }));
+    } else {
+      // Listed so a person can see it is there, and not offered: a socket or a
+      // device is not something to fetch.
+      list.append(entryRow('other', name, null));
+    }
+  }
+  el('picker-note').textContent = listing.truncated
+    ? 'There were more than this list can show; narrow it with a search.'
+    : ((listing.entries || []).length ? '' : 'nothing here');
+}
+
+function entryRow(kind, name, chosen) {
+  const item = document.createElement('li');
+  item.dataset.kind = kind;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = kind === 'directory' ? `${name}/` : name;
+  if (chosen) button.onclick = chosen;
+  else button.disabled = true;
+  item.append(button);
+  return item;
 }
 
 // Fetching a file off a target.
@@ -1956,6 +2110,9 @@ function apply(message) {
       renderAlerts();
       schedulePluginPoll();
       break;
+    case 'files.listing':
+      showListing(message);
+      break;
     case 'download.offer':
       offerFetch(message);
       break;
@@ -2173,6 +2330,14 @@ for (const button of document.querySelectorAll('.keys button')) {
     el('line').focus();
   };
 }
+el('picker-search-form').onsubmit = event => {
+  event.preventDefault();
+  searchPicker();
+};
+el('picker-glob').onclick = () => {
+  pickerGlob = !pickerGlob;
+  renderPicker();
+};
 el('fetch-form').onsubmit = event => {
   event.preventDefault();
   startFetch();

@@ -837,3 +837,128 @@ check('a reconnect does not cancel a request the daemon has forgotten',
   sent.every(one => one.body.type !== 'download.cancel'));
 check('a reconnect reports the ended transfer',
   page.el('fetch-note').textContent.includes('connection'));
+
+// The picker looks only where the configuration says it may, and produces a
+// path for the fetch rather than fetching anything itself.
+const entries = () => page.el('picker-entries').children;
+const rootChips = () => page.el('picker-roots').children;
+const listing = (request, held) => deliver({
+  type: 'files.listing',
+  request,
+  target: { target: 'first', session: 'main' },
+  listing: held,
+});
+const lastRequest = type => sent.filter(one => one.body.type === type).at(-1).body.request;
+
+// A target that declares no roots offers no picker.
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'first', session: 'main' }, connection: 'live', roots: [],
+      snapshot: { workspaces: [], panes: [{ id: pane }], agents: [] },
+    }],
+  },
+});
+page.observe(pane, 'first/main/w1:p1');
+check('no configured roots offers no picker', page.el('picker').hidden === true);
+
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'first', session: 'main' }, connection: 'live',
+      roots: ['/srv/build', '/home/example/work'],
+      snapshot: { workspaces: [], panes: [{ id: pane }], agents: [] },
+    }],
+  },
+});
+page.observe(pane, 'first/main/w1:p1');
+check('configured roots offer a picker', page.el('picker').hidden === false);
+check('every configured root is offered', rootChips().length === 2);
+check('a root chip names its root', rootChips()[0].dataset.root === '/srv/build');
+
+sent.length = 0;
+rootChips()[0].onclick();
+const listed = sent.find(one => one.body.type === 'files.list');
+check('choosing a root asks for its own listing',
+  listed.body.root === '/srv/build' && listed.body.path === '');
+check('a listing names the qualified target',
+  listed.body.target.target === 'first' && listed.body.target.session === 'main');
+
+listing(listed.body.request, {
+  root: '/srv/build',
+  path: '',
+  entries: [
+    { kind: 'directory', name: 'reports' },
+    { kind: 'file', name: 'build.log' },
+    { kind: 'other', name: 'runner.sock' },
+  ],
+  truncated: false,
+});
+check('a listing shows every entry', entries().length === 3);
+check('a directory is marked as one', entries()[0].dataset.kind === 'directory');
+check('a directory is shown with a separator', entries()[0].children[0].textContent === 'reports/');
+check('a socket is listed and not offered', entries()[2].children[0].disabled === true);
+
+// Descending stays inside the root, and the way back up is built from the path
+// the daemon described rather than from wherever the page has been.
+sent.length = 0;
+entries()[0].children[0].onclick();
+check('descending asks for the subdirectory',
+  sent.find(one => one.body.type === 'files.list').body.path === 'reports');
+listing(lastRequest('files.list'), {
+  root: '/srv/build', path: 'reports',
+  entries: [{ kind: 'file', name: 'weekly.txt' }],
+  truncated: false,
+});
+check('a subdirectory offers a way back up', entries()[0].children[0].textContent === '../');
+check('the path is shown', page.el('picker-where').textContent === '/srv/build/reports');
+
+// Choosing a file fills the fetch path and fetches nothing.
+sent.length = 0;
+entries()[1].children[0].onclick();
+check('choosing a file fills the path',
+  page.el('fetch-path').value === '/srv/build/reports/weekly.txt');
+check('choosing a file fetches nothing',
+  sent.every(one => one.body.type !== 'download.begin'));
+
+sent.length = 0;
+entries()[0].children[0].onclick();
+check('going back up asks for the root again',
+  sent.find(one => one.body.type === 'files.list').body.path === '');
+
+// Search is scoped to the root, and a pattern is opt-in.
+sent.length = 0;
+page.el('picker-query').value = 'weekly';
+page.el('picker-search-form').onsubmit({ preventDefault() {} });
+const searched = sent.find(one => one.body.type === 'files.search');
+check('a search names its root and query',
+  searched.body.root === '/srv/build' && searched.body.query === 'weekly');
+check('a search is literal text by default', searched.body.glob === false);
+page.el('picker-glob').onclick();
+check('the pattern toggle reports itself', page.el('picker-glob')['aria-pressed'] === 'true');
+sent.length = 0;
+page.el('picker-query').value = '*.log';
+page.el('picker-search-form').onsubmit({ preventDefault() {} });
+check('a pattern search says so',
+  sent.find(one => one.body.type === 'files.search').body.glob === true);
+
+listing(lastRequest('files.search'), {
+  root: '/srv/build', path: '',
+  entries: [{ kind: 'file', name: 'reports/weekly.log' }],
+  truncated: true,
+});
+check('a search result keeps its path under the root',
+  entries()[0].children[0].textContent === 'reports/weekly.log');
+check('a search offers no way up', entries().length === 1);
+check('a truncated answer says so',
+  page.el('picker-note').textContent.includes('more than this list can show'));
+sent.length = 0;
+entries()[0].children[0].onclick();
+check('choosing a search result fills the whole path',
+  page.el('fetch-path').value === '/srv/build/reports/weekly.log');
+
+// The picker belongs to the pane being watched.
+page.observe({ target: 'first', session: 'main', resource: 'w1:p2' }, 'other');
+check('watching another pane clears the picker', entries().length === 0);

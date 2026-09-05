@@ -44,6 +44,7 @@ use crate::config::QuickReply;
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginRun, PluginRunId};
+use crate::remote_files::RemoteListing;
 use crate::screen::{Diff as ScreenDiff, Snapshot};
 use crate::state::{FederationState, TargetRuntimeState};
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
@@ -347,6 +348,32 @@ pub enum ClientMessage {
     /// daemon sending anything to this connection.
     #[serde(rename = "notifications.unsubscribe")]
     UnsubscribeNotifications,
+    /// List one directory inside one of a target's configured roots.
+    ///
+    /// The root is named rather than described: it must be one of the paths
+    /// the configuration declares, compared exactly, so a client cannot widen
+    /// its own bounds by asking about a parent.
+    #[serde(rename = "files.list")]
+    ListRemoteDirectory {
+        request: u64,
+        target: TargetSession,
+        root: String,
+        /// Where inside the root. Empty is the root itself.
+        path: String,
+    },
+    /// Find files by name under one of a target's configured roots.
+    ///
+    /// `glob` is what makes the query a pattern; without it the query matches
+    /// as literal text, so somebody searching for `[` finds a file called `[`.
+    #[serde(rename = "files.search")]
+    SearchRemoteFiles {
+        request: u64,
+        target: TargetSession,
+        root: String,
+        query: String,
+        #[serde(default)]
+        glob: bool,
+    },
 }
 
 /// Sent by the daemon.
@@ -449,6 +476,18 @@ pub enum ServerMessage {
     /// this projection exists to prevent.
     #[serde(rename = "agents.cards")]
     AgentCards { projection: AgentCardProjection },
+    /// What one directory holds, or what a search found.
+    ///
+    /// Names only, with a kind. A size is what the transfer offer already
+    /// reports at the moment it matters — before any byte moves — and
+    /// collecting one per entry here would mean reading every file in a
+    /// directory to answer a question the next step answers for free.
+    #[serde(rename = "files.listing")]
+    RemoteFiles {
+        request: u64,
+        target: TargetSession,
+        listing: RemoteListing,
+    },
     /// One coalesced attention alert for a paired device.
     ///
     /// Bounded metadata only, and by construction rather than by filtering
@@ -669,6 +708,7 @@ mod tests {
     use crate::plugin::{
         PluginAction, PluginActionContext, PluginActionId, PluginRun, PluginRunId, PluginRunStatus,
     };
+    use crate::remote_files::{RemoteEntry, RemoteEntryKind, RemoteListing};
     use crate::resource_action::SplitDirection;
     use crate::state::{
         FederationState, NormalizedSnapshot, PaneState, TargetConnectionState, TargetRuntimeState,
@@ -804,6 +844,19 @@ mod tests {
         round_trip_client(ClientMessage::SubscribeAgentCards);
         round_trip_client(ClientMessage::SubscribeNotifications);
         round_trip_client(ClientMessage::UnsubscribeNotifications);
+        round_trip_client(ClientMessage::ListRemoteDirectory {
+            request: 14,
+            target: TargetSession::new("first", "default"),
+            root: "/srv/build".to_owned(),
+            path: "reports".to_owned(),
+        });
+        round_trip_client(ClientMessage::SearchRemoteFiles {
+            request: 15,
+            target: TargetSession::new("first", "default"),
+            root: "/srv/build".to_owned(),
+            query: "report".to_owned(),
+            glob: false,
+        });
         round_trip_client(ClientMessage::MarkAgent {
             request: 11,
             agent: AgentId::new("first", "default", "w1:p1"),
@@ -868,6 +921,19 @@ mod tests {
             agent: AgentId::new("first", "default", "w1:p1"),
             title: "Agent needs attention".to_owned(),
             body: "reviewer · compiler".to_owned(),
+        });
+        round_trip_server(ServerMessage::RemoteFiles {
+            request: 14,
+            target: TargetSession::new("first", "default"),
+            listing: RemoteListing {
+                root: "/srv/build".to_owned(),
+                path: "reports".to_owned(),
+                entries: vec![RemoteEntry {
+                    kind: RemoteEntryKind::File,
+                    name: "report.txt".to_owned(),
+                }],
+                truncated: false,
+            },
         });
         round_trip_server(ServerMessage::PaneClosed { pane: pane() });
         round_trip_server(ServerMessage::PaneLease {
@@ -1037,6 +1103,7 @@ mod tests {
             event_error: None,
             connection_generation: 5,
             selected_herdr_bin: Some("herdr".to_owned()),
+            roots: Vec::new(),
             snapshot: Some(Arc::new(snapshot)),
             last_error: Some("connection reset".to_owned()),
             last_success: None,

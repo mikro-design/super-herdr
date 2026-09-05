@@ -201,9 +201,9 @@ payloads. Receiving one with the browser closed waits on the item above.
 - [x] Finish browser upload and target-to-device download surfaces on the
       existing transfer protocol.
 - [ ] Finish TUI target-to-client save and target-to-target transfer surfaces.
-- [ ] Add an explicit, bounded remote-path picker scoped to one qualified
+- [x] Add an explicit, bounded remote-path picker scoped to one qualified
       target and session.
-- [ ] Support bounded filename, substring, and opt-in glob search without
+- [x] Support bounded filename, substring, and opt-in glob search without
       traversing beyond configured roots.
 - [x] Show metadata before transfer: name, type, size, source target, and
       digest when available.

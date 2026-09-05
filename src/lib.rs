@@ -13,6 +13,7 @@ pub mod pairing;
 pub mod plugin;
 pub mod probe;
 pub mod protocol;
+pub mod remote_files;
 pub mod resource_action;
 pub mod screen;
 pub mod state;

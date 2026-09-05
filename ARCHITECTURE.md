@@ -580,6 +580,37 @@ fit here sends no payload at all and lets the woken service worker ask the
 daemon, so the push service learns that something happened and never what. That
 is a separate decision about dependencies and trust, not a detail of this sink.
 
+Finding the file is a separate surface from fetching it, and a narrower one. A
+target declares the directories its picker may look inside; a target that
+declares none offers no picker, because a browser starting at `/` is one nobody
+asked for. A client names a root rather than describing one — it must be a path
+the configuration wrote down, compared exactly — so asking about a parent or a
+deeper path does not widen what a client may see.
+
+Nothing is interpolated into a shell. Every parameter travels on the remote
+script's stdin and is read into a variable, exactly as the file read already
+works, so a path containing a quote, a semicolon or a newline is a path rather
+than a command. Containment is checked on the host by comparing `pwd -P` — the
+physical path, symlinks resolved — against the root's own physical path, which
+is what makes a symlink pointing out of the tree a refusal rather than a
+shortcut; search does not follow symlinks at all. Output is NUL-framed, so a
+file name may contain anything a file name may contain, and a record cut in
+half by the byte cap is dropped rather than half-read.
+
+Everything is bounded: how many roots a target may declare, how deep a search
+descends, how many entries return, how long a query may be, and how many bytes
+the remote may produce. A listing that stopped short says so, because a list
+silently missing the file somebody is looking for is worse than one that admits
+it stopped. Entries carry a name and a kind and no size — size is what the
+transfer offer reports at the moment it matters, and collecting it here would
+mean reading every file in a directory to answer a question the next step
+answers for free.
+
+The roots bound browsing, and deliberately not reading. A paired device already
+holds pane control and can read anything its user can, so a root is a place
+worth looking rather than a permission boundary; saying otherwise would claim a
+guarantee this does not make.
+
 Fetching a file to a paired device is two steps, and the split is the point.
 The daemon answers `download.begin` with what the file is — its own last path
 component, its length, and the digest the host computed — and then sends

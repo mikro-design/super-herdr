@@ -54,6 +54,13 @@ max_bytes = 1073741824
 name = "development"
 ssh = "development-host"
 discover_sessions = true
+# Places the browser's file picker may look on this host. Absent means it
+# offers nothing for this target, which is the default: a browsing surface that
+# starts at / is one nobody asked for. At most eight, each an absolute path
+# with no '..'. This bounds browsing and searching and deliberately not
+# reading — a paired device already holds pane control and can read anything
+# its user can, so a root is a place to look rather than a permission.
+#roots = ["/srv/build", "/home/example/work"]
 # Optional overrides:
 #session = "default"
 #socket = "/absolute/path/to/herdr.sock"

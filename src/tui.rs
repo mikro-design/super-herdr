@@ -401,6 +401,9 @@ struct TargetForm {
     discover_sessions: bool,
     socket: Option<String>,
     herdr_bins: Vec<String>,
+    /// Carried, never edited: a browsing bound belongs in configuration, and a
+    /// form that dropped it would quietly empty a picker on the next save.
+    roots: Vec<String>,
     field: TargetFormField,
     error: Option<String>,
     test_state: TargetTestState,
@@ -419,6 +422,7 @@ impl TargetForm {
             discover_sessions: true,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
             field: TargetFormField::Name,
             error: None,
             test_state: TargetTestState::Untested,
@@ -437,6 +441,7 @@ impl TargetForm {
             discover_sessions: target.discover_sessions,
             socket: target.socket.clone(),
             herdr_bins: target.herdr_bins.clone(),
+            roots: target.roots.clone(),
             field: TargetFormField::Name,
             error: None,
             test_state: TargetTestState::Untested,
@@ -454,6 +459,11 @@ impl TargetForm {
             session: (!self.session.is_empty()).then(|| self.session.clone()),
             socket: self.socket.clone(),
             herdr_bins: self.herdr_bins.clone(),
+            // The target form does not edit roots. They are a browsing bound
+            // somebody writes in configuration, not a field to fill in while
+            // adding a machine, and a form that dropped them would quietly
+            // empty a picker on the next save.
+            roots: self.roots.clone(),
         }
     }
 
@@ -5362,6 +5372,9 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         // sitting at. It does not subscribe to the device sink and is never
         // sent one.
         ServerMessage::Notification { .. } => {}
+        // The picker is a small-screen affordance. The TUI has a shell in
+        // every pane and a person who would rather use it.
+        ServerMessage::RemoteFiles { .. } => {}
         ServerMessage::AgentCards { projection } => {
             app.agent_marks = projection
                 .cards()
@@ -7802,6 +7815,7 @@ mod tests {
             // What the file says: nothing. The host reports it at runtime.
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         let key = TargetSession::new("workstation", "example-session");
 
@@ -8609,6 +8623,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         Config::add_target_file(Some(&path), existing.clone()).unwrap();
         let mut app = App {
@@ -8647,6 +8662,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         let mut duplicate = TargetForm::add();
         duplicate.name = "existing".to_owned();
@@ -8762,6 +8778,7 @@ mod tests {
             session: None,
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
+            roots: Vec::new(),
         };
         let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
         let mut app = App {
@@ -10080,6 +10097,7 @@ mod tests {
             event_error: None,
             connection_generation: 1,
             selected_herdr_bin: Some("herdr".to_owned()),
+            roots: Vec::new(),
             snapshot: snapshot.map(Arc::new),
             last_error: None,
             last_success: None,
