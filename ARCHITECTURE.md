@@ -451,10 +451,26 @@ deriving sections independently would disagree the moment their snapshots
 differed by a refresh, and a person moving between the TUI and a phone would be
 reading two different inboxes of the same federation.
 
-A card is keyed by a qualified agent identity, which is the pane it occupies
-carried with its target and Herdr session, because that is the only identity
-Herdr's documented snapshot gives an agent. Two hosts that both name a pane
-`w1:p1` produce two cards that never collapse. Ordering is by section entry
+A card is keyed by a qualified agent identity: the agent session Herdr reports
+where it reports one, and otherwise the pane the agent occupies, in both cases
+carried with its target and Herdr session. Two hosts that both name a pane
+`w1:p1` produce two cards that never collapse. The session is preferred because
+it survives the agent moving to another pane, which a pane id cannot express —
+a move would otherwise read as one agent dying and another being born, taking
+the card's place in the queue and any pin on it along with it. It is optional
+in Herdr's schema and absent in practice at protocol 19, so nothing depends on
+having one, and the two forms are tagged rather than merged so that a session
+value which happened to equal a pane id cannot name the same card as a
+different agent. A reference missing any of its four fields, or carrying the
+separator the key is built from, is treated as no reference at all: a partial
+key is one two different sessions could share.
+
+Because the identity is not the route, resolution asks the current snapshot
+which agent answers to a key rather than taking the key apart. Two agents
+answering to one identity is therefore a case that can happen and is refused —
+both cards stay visible, because a person should be able to see that it
+happened, and neither is offered, because the daemon cannot say which pane an
+action would mean. Ordering is by section entry
 rather than by first sighting, so the agent blocked longest is at the top, and
 an unrelated target connecting, disconnecting, or refreshing does not renumber
 anything: the projection republishes only when the cards actually differ.

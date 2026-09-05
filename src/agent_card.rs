@@ -31,19 +31,21 @@
 //! output are not summarised, indexed or persisted here — the inbox tells a
 //! person which agent to open, and opening it is what shows them a terminal.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::agent_marks::{AgentMarkState, AgentMarks};
 use crate::attention::{AgentPhase, AttentionIndex, agent_phase, bounded_metadata};
 use crate::model::{AgentId, PaneId};
-use crate::state::{AgentState, FederationState, NormalizedSnapshot, TargetConnectionState};
+use crate::state::{
+    AGENT_KEY_SEPARATOR, AgentState, FederationState, NormalizedSnapshot, TargetConnectionState,
+};
 
 /// Incremented when a card's meaning changes in a way an older renderer would
 /// get wrong. Added fields do not bump it: unknown fields are ignored on this
 /// wire, so a newer daemon can describe more without breaking an older client.
-pub const AGENT_CARD_PROJECTION_VERSION: u32 = 1;
+pub const AGENT_CARD_PROJECTION_VERSION: u32 = 2;
 
 /// How many vanished agents stay visible in `recent`.
 ///
@@ -269,15 +271,28 @@ impl AgentCardIndex {
         now_ms: u64,
     ) -> AgentCardProjection {
         let mut seen = BTreeMap::new();
+        let mut ambiguous = BTreeSet::new();
         for target in state.targets.values() {
             let Some(snapshot) = target.snapshot.as_deref() else {
                 continue;
             };
             let live = target.connection == TargetConnectionState::Live;
             for agent in snapshot.agents.values() {
-                let id = agent_id(&agent.pane);
+                let id = agent_key(agent);
                 let card = self.build_card(agent, snapshot, attention, live, marks, now_ms);
-                seen.insert(id, card);
+                if seen.insert(id.clone(), card).is_some() {
+                    // Two agents on one target answering to one identity. Both
+                    // cards stay visible — a person should be able to see that
+                    // it happened — but neither is offered, because the daemon
+                    // could not say which pane an action meant.
+                    ambiguous.insert(id);
+                }
+            }
+        }
+
+        for id in &ambiguous {
+            if let Some(card) = seen.get_mut(id) {
+                card.actionable = false;
             }
         }
 
@@ -391,22 +406,26 @@ impl AgentCardIndex {
             .snapshot
             .as_deref()
             .ok_or(CardRouteError::TargetUnavailable)?;
-        let pane = pane_id(agent);
-        let observed = snapshot
+        // Derived by asking the current snapshot which agent answers to this
+        // key, rather than by taking the key apart. An agent identified by its
+        // session may be in a different pane than it was when the card was
+        // built, and that is the whole reason to prefer that identity.
+        let mut matches = snapshot
             .agents
-            .get(&pane)
-            .ok_or(CardRouteError::AgentGone)?;
-        // The snapshot keys agents by pane, so this can only fail if a target
-        // sent a record that disagrees with its own index. Refuse rather than
-        // pick one of the two answers.
-        if observed.pane != pane {
+            .values()
+            .filter(|held| &agent_key(held) == agent);
+        let found = matches.next().ok_or(CardRouteError::AgentGone)?;
+        if matches.next().is_some() {
+            // Two agents answering to one identity. Refusing is the only safe
+            // answer: picking either would deliver a person's keystroke to a
+            // pane chosen by iteration order.
             return Err(CardRouteError::Ambiguous);
         }
-        if !snapshot.panes.contains_key(&pane) {
+        if !snapshot.panes.contains_key(&found.pane) {
             return Err(CardRouteError::PaneMissing);
         }
         Ok(CardRoute {
-            pane,
+            pane: found.pane.clone(),
             generation: target.connection_generation,
         })
     }
@@ -478,7 +497,8 @@ impl AgentCardIndex {
             &status,
             agent.interactive_ready.unwrap_or(false),
         ));
-        let marked = marks.state(&agent_id(&agent.pane));
+        let key = agent_key(agent);
+        let marked = marks.state(&key);
         // A muted or snoozed agent keeps its activity — it is still blocked,
         // and saying otherwise would be a lie a person could act on — but it
         // stops competing for the top of the inbox. Coming back is re-entering
@@ -516,7 +536,7 @@ impl AgentCardIndex {
             })
             .unwrap_or("unassigned");
         AgentCard {
-            agent: agent_id(&agent.pane),
+            agent: key,
             pane: Some(agent.pane.clone()),
             title: bounded_metadata(
                 agent
@@ -556,15 +576,29 @@ impl AgentCardIndex {
     }
 }
 
-/// An agent is identified by the pane it occupies, because that is the only
-/// identity Herdr's documented snapshot gives one. Both halves of the
-/// conversion keep the target and session, so the qualification survives.
-fn agent_id(pane: &PaneId) -> AgentId {
-    AgentId::new(&pane.target, &pane.session, &pane.resource)
-}
-
-fn pane_id(agent: &AgentId) -> PaneId {
-    PaneId::new(&agent.target, &agent.session, &agent.resource)
+/// The identity of one agent, qualified by target and Herdr session.
+///
+/// Herdr reports an optional `agent_session` for a pane, and where it is
+/// present it is the better identity: it survives the agent moving to another
+/// pane, which a pane id cannot express — a move would otherwise read as one
+/// agent dying and another being born, taking the card's place in the queue
+/// and any pin on it with it.
+///
+/// It is optional in the schema and, at protocol 19, absent in practice, so
+/// the pane remains the identity whenever there is no session to use. The two
+/// forms are tagged rather than merged, because an agent-session value that
+/// happened to equal a pane id would otherwise name the same card as a
+/// different agent.
+pub fn agent_key(agent: &AgentState) -> AgentId {
+    let separator = AGENT_KEY_SEPARATOR;
+    let resource = match agent.session.as_ref() {
+        Some(session) => format!(
+            "session{separator}{}{separator}{}{separator}{}{separator}{}",
+            session.kind, session.value, session.source, session.agent
+        ),
+        None => format!("pane{separator}{}", agent.pane.resource),
+    };
+    AgentId::new(&agent.pane.target, &agent.pane.session, &resource)
 }
 
 #[cfg(test)]
@@ -580,8 +614,8 @@ mod tests {
     use crate::attention::AttentionIndex;
     use crate::model::{AgentId, TargetSession};
     use crate::state::{
-        FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
-        TargetUpdateMode,
+        AGENT_KEY_SEPARATOR, FederationState, NormalizedSnapshot, TargetConnectionState,
+        TargetRuntimeState, TargetUpdateMode,
     };
 
     /// A fixed clock. The projection reads one only to decide whether a
@@ -717,7 +751,7 @@ mod tests {
         let before = index.project(&first, &attention, &AgentMarks::default(), NOW);
         assert_eq!(
             order(&before.needs_you),
-            ["host-a/work/p1", "host-b/work/p9"]
+            [pane_key("host-a", "p1"), pane_key("host-b", "p9")]
         );
 
         // host-c arrives, and host-b's snapshot is refreshed without changing
@@ -735,7 +769,11 @@ mod tests {
 
         assert_eq!(
             order(&after.needs_you),
-            ["host-a/work/p1", "host-b/work/p9", "host-c/work/p1"],
+            [
+                pane_key("host-a", "p1"),
+                pane_key("host-b", "p9"),
+                pane_key("host-c", "p1")
+            ],
             "an arriving target appends and never reorders what was there"
         );
         assert_eq!(
@@ -774,7 +812,7 @@ mod tests {
 
         assert_eq!(
             order(&projection.needs_you),
-            ["host-a/work/p2", "host-a/work/p1"]
+            [pane_key("host-a", "p2"), pane_key("host-a", "p1")]
         );
     }
 
@@ -826,9 +864,9 @@ mod tests {
         )]);
         let projection = index.project(&after_move, &attention, &AgentMarks::default(), NOW);
 
-        assert_eq!(order(&projection.needs_you), ["host-a/work/p2"]);
+        assert_eq!(order(&projection.needs_you), [pane_key("host-a", "p2")]);
         assert_eq!(projection.recent.len(), 1);
-        let stale_card = AgentId::new("host-a", "work", "p1");
+        let stale_card = pane_agent("host-a", "p1");
         assert_eq!(
             AgentCardIndex::resolve(&stale_card, &after_move),
             Err(CardRouteError::AgentGone),
@@ -959,10 +997,7 @@ mod tests {
     #[test]
     fn refuses_a_card_for_a_target_that_is_not_in_the_federation() {
         assert_eq!(
-            AgentCardIndex::resolve(
-                &AgentId::new("host-gone", "work", "p1"),
-                &FederationState::default()
-            ),
+            AgentCardIndex::resolve(&pane_agent("host-gone", "p1"), &FederationState::default()),
             Err(CardRouteError::UnknownTarget)
         );
     }
@@ -977,9 +1012,11 @@ mod tests {
         let key = TargetSession::new("host-a", "work");
         state.targets.get_mut(&key).unwrap().connection_generation = 7;
 
-        let route = AgentCardIndex::resolve(&AgentId::new("host-a", "work", "p1"), &state).unwrap();
+        let route = AgentCardIndex::resolve(&pane_agent("host-a", "p1"), &state).unwrap();
 
         assert_eq!(route.generation, 7);
+        // The route is a pane, not an agent key: the identity is what the card
+        // carries, and the pane is what the daemon resolved it to now.
         assert_eq!(route.pane.to_string(), "host-a/work/p1");
     }
 
@@ -1046,7 +1083,7 @@ mod tests {
         assert_eq!(projection.recent.len(), MAX_HISTORY_CARDS);
         assert_eq!(
             projection.recent[0].agent.resource,
-            format!("p{}", MAX_HISTORY_CARDS + 9),
+            format!("pane{AGENT_KEY_SEPARATOR}p{}", MAX_HISTORY_CARDS + 9),
             "the newest departure is the first one a person sees"
         );
     }
@@ -1089,7 +1126,7 @@ mod tests {
 
         let mut marks = AgentMarks::default();
         marks.apply(
-            &AgentId::new("host-a", "work", "p2"),
+            &pane_agent("host-a", "p2"),
             AgentMarkRequest::Pin { pinned: true },
             NOW,
         );
@@ -1097,7 +1134,7 @@ mod tests {
 
         assert_eq!(
             order(&projection.needs_you),
-            ["host-a/work/p2", "host-a/work/p1"],
+            [pane_key("host-a", "p2"), pane_key("host-a", "p1")],
             "a pin is the one reorder a person actually asked for"
         );
         assert!(projection.needs_you[0].marks.pinned);
@@ -1113,7 +1150,7 @@ mod tests {
         )]);
         let mut marks = AgentMarks::default();
         marks.apply(
-            &AgentId::new("host-a", "work", "p1"),
+            &pane_agent("host-a", "p1"),
             AgentMarkRequest::Mute { muted: true },
             NOW,
         );
@@ -1147,21 +1184,223 @@ mod tests {
 
         let mut marks = AgentMarks::default();
         marks.apply(
-            &AgentId::new("host-a", "work", "p1"),
+            &pane_agent("host-a", "p1"),
             AgentMarkRequest::Snooze { minutes: Some(10) },
             NOW,
         );
         let quiet = index.project(&state, &attention, &marks, NOW);
-        assert_eq!(order(&quiet.needs_you), ["host-a/work/p2"]);
+        assert_eq!(order(&quiet.needs_you), [pane_key("host-a", "p2")]);
 
         marks.expire(NOW + 10 * 60_000);
         let awake = index.project(&state, &attention, &marks, NOW + 10 * 60_000);
 
         assert_eq!(
             order(&awake.needs_you),
-            ["host-a/work/p2", "host-a/work/p1"],
+            [pane_key("host-a", "p2"), pane_key("host-a", "p1")],
             "coming back is re-entering the queue, not reclaiming a place in it"
         );
+    }
+
+    #[test]
+    fn an_agent_that_reports_a_session_keeps_its_card_across_a_pane_move() {
+        let mut index = AgentCardIndex::default();
+        let attention = AttentionIndex::default();
+        let before = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(session_snapshot("p1", "abc123")),
+        )]);
+        let first = index.project(&before, &attention, &AgentMarks::default(), NOW);
+        let identity = first.needs_you[0].agent.clone();
+
+        let after = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(session_snapshot("p2", "abc123")),
+        )]);
+        let moved = index.project(&after, &attention, &AgentMarks::default(), NOW);
+
+        assert_eq!(
+            moved
+                .needs_you
+                .iter()
+                .map(|card| &card.agent)
+                .collect::<Vec<_>>(),
+            vec![&identity],
+            "a move is the same agent somewhere else, not a death and a birth"
+        );
+        assert!(moved.recent.is_empty(), "nothing was retired");
+        let route = AgentCardIndex::resolve(&identity, &after).unwrap();
+        assert_eq!(
+            route.pane.resource, "p2",
+            "the identity resolves to where the agent is now"
+        );
+    }
+
+    #[test]
+    fn a_pin_follows_an_agent_that_moves_pane() {
+        let mut index = AgentCardIndex::default();
+        let attention = AttentionIndex::default();
+        let before = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(session_snapshot("p1", "abc123")),
+        )]);
+        let identity = index
+            .project(&before, &attention, &AgentMarks::default(), NOW)
+            .needs_you[0]
+            .agent
+            .clone();
+        let mut marks = AgentMarks::default();
+        marks.apply(&identity, AgentMarkRequest::Pin { pinned: true }, NOW);
+
+        let after = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(session_snapshot("p2", "abc123")),
+        )]);
+        let moved = index.project(&after, &attention, &marks, NOW);
+
+        assert!(
+            moved.needs_you[0].marks.pinned,
+            "a pin belongs to the agent, not to the pane it happened to be in"
+        );
+    }
+
+    #[test]
+    fn two_agents_answering_to_one_identity_are_shown_and_not_offered() {
+        let mut index = AgentCardIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(json!({
+                "workspaces": [],
+                "panes": [{"pane_id": "p1"}, {"pane_id": "p2"}],
+                "agents": [
+                    {"pane_id": "p1", "agent_status": "blocked", "agent_session": session("abc123")},
+                    {"pane_id": "p2", "agent_status": "blocked", "agent_session": session("abc123")}
+                ]
+            })),
+        )]);
+
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
+
+        assert_eq!(projection.needs_you.len(), 1, "one identity is one card");
+        assert!(
+            !projection.needs_you[0].actionable,
+            "the daemon cannot say which pane an action would mean"
+        );
+        assert_eq!(
+            AgentCardIndex::resolve(&projection.needs_you[0].agent, &state),
+            Err(CardRouteError::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn a_session_identity_never_collides_with_a_pane_of_the_same_name() {
+        let mut index = AgentCardIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(json!({
+                "workspaces": [],
+                "panes": [{"pane_id": "p1"}, {"pane_id": "p2"}],
+                "agents": [
+                    {"pane_id": "p1", "agent_status": "blocked"},
+                    {"pane_id": "p2", "agent_status": "blocked", "agent_session": session("p1")}
+                ]
+            })),
+        )]);
+
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
+
+        assert_eq!(projection.needs_you.len(), 2);
+        assert!(
+            projection.needs_you.iter().all(|card| card.actionable),
+            "a session value that reads like a pane id is still a different agent"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_or_unsafe_session_reference_falls_back_to_the_pane() {
+        let mut index = AgentCardIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(json!({
+                "workspaces": [],
+                "panes": [{"pane_id": "p1"}, {"pane_id": "p2"}],
+                "agents": [
+                    {
+                        "pane_id": "p1",
+                        "agent_status": "blocked",
+                        "agent_session": {"kind": "id", "value": "abc123"}
+                    },
+                    {
+                        "pane_id": "p2",
+                        "agent_status": "blocked",
+                        "agent_session": {
+                            "source": "herdr", "agent": "claude", "kind": "id",
+                            "value": "a\u{1f}b"
+                        }
+                    }
+                ]
+            })),
+        )]);
+
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
+
+        assert_eq!(
+            order(&projection.needs_you),
+            vec![pane_key("host-a", "p1"), pane_key("host-a", "p2")],
+            "a partial record, or one carrying the key separator, is no record"
+        );
+    }
+
+    fn session(value: &str) -> Value {
+        json!({"source": "herdr", "agent": "claude", "kind": "id", "value": value})
+    }
+
+    fn session_snapshot(pane: &str, value: &str) -> Value {
+        json!({
+            "workspaces": [],
+            "panes": [{"pane_id": pane}],
+            "agents": [{
+                "pane_id": pane,
+                "agent_status": "blocked",
+                "agent_session": session(value)
+            }]
+        })
+    }
+
+    /// The identity a pane-keyed agent gets. Written out here rather than
+    /// hidden behind the production helper, so a test that asserts on identity
+    /// would notice the format changing under it.
+    fn pane_agent(target: &str, resource: &str) -> AgentId {
+        AgentId::new(
+            target,
+            "work",
+            &format!("pane{AGENT_KEY_SEPARATOR}{resource}"),
+        )
+    }
+
+    fn pane_key(target: &str, resource: &str) -> String {
+        pane_agent(target, resource).to_string()
     }
 
     fn titles(cards: &[super::AgentCard]) -> Vec<&str> {

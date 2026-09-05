@@ -31,7 +31,12 @@ use serde::{Deserialize, Serialize};
 use crate::attention::{set_directory_permissions, set_file_permissions};
 use crate::model::AgentId;
 
-const AGENT_MARKS_VERSION: u32 = 1;
+/// Bumped with the agent key format. A mark is stored against an identity, so
+/// a file written before the keys changed names agents that no longer exist —
+/// silently keeping it would leave pins attached to nothing and no way to see
+/// why. Refusing it starts from nothing marked instead, which is recoverable
+/// in one tap.
+const AGENT_MARKS_VERSION: u32 = 2;
 const MAX_AGENT_MARKS_BYTES: u64 = 256 * 1024;
 
 /// How many agents may carry a mark at once.

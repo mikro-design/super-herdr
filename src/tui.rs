@@ -24,6 +24,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep_until};
 
+use crate::agent_card::agent_key;
 use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
 use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex};
 use crate::client::{Client, ClientCommands};
@@ -2949,10 +2950,13 @@ fn agent_mark_actions(
     label: &str,
     agent_marks: &BTreeMap<AgentId, AgentMarkState>,
 ) -> Vec<ResourceAction> {
-    if !snapshot.agents.contains_key(pane) {
+    let Some(state) = snapshot.agents.get(pane) else {
         return Vec::new();
-    }
-    let agent = AgentId::new(&pane.target, &pane.session, &pane.resource);
+    };
+    // The one key builder, so a menu entry names the same agent the daemon's
+    // projection does. Deriving it here from the pane would silently miss an
+    // agent that reports a session and disagree with every card.
+    let agent = agent_key(state);
     let marked = agent_marks.get(&agent).copied().unwrap_or_default();
     let mark = |mark| ResourceAction::MarkAgent {
         agent: agent.clone(),
@@ -7851,6 +7855,7 @@ mod tests {
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::plugin::{PluginAction, PluginActionContext, PluginActionId};
     use crate::resource_action::ResourceAction;
+    use crate::state::AGENT_KEY_SEPARATOR;
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
     };
@@ -8118,6 +8123,7 @@ mod tests {
         )
         .unwrap();
 
+        let expected = AgentId::new("host-b", "work", &format!("pane{AGENT_KEY_SEPARATOR}w2:p1"));
         let marks = menu
             .actions
             .iter()
@@ -8129,16 +8135,10 @@ mod tests {
         assert_eq!(
             marks,
             vec![
+                (expected.clone(), AgentMarkRequest::Pin { pinned: true }),
+                (expected.clone(), AgentMarkRequest::Mute { muted: true }),
                 (
-                    AgentId::new("host-b", "work", "w2:p1"),
-                    AgentMarkRequest::Pin { pinned: true }
-                ),
-                (
-                    AgentId::new("host-b", "work", "w2:p1"),
-                    AgentMarkRequest::Mute { muted: true }
-                ),
-                (
-                    AgentId::new("host-b", "work", "w2:p1"),
+                    expected,
                     AgentMarkRequest::Snooze {
                         minutes: Some(TUI_SNOOZE_MINUTES)
                     }
@@ -8208,7 +8208,7 @@ mod tests {
             runtime(key, TargetConnectionState::Live, Some(snapshot)),
         );
         let marks = BTreeMap::from([(
-            AgentId::new("host-b", "work", "w2:p1"),
+            AgentId::new("host-b", "work", &format!("pane{AGENT_KEY_SEPARATOR}w2:p1")),
             AgentMarkState {
                 pinned: true,
                 muted: false,
