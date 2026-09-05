@@ -36,7 +36,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::agent_card::AgentCardIndex;
-use crate::attention::{AttentionIndex, AttentionStore};
+use crate::agent_marks::{AgentMarkStore, AgentMarks};
+use crate::attention::{AttentionIndex, AttentionStore, unix_time_ms};
 use crate::clipboard;
 use crate::config::{Config, Device, Target, TransportConfig};
 use crate::daemon::broker::{Broker, ClientId, Effect};
@@ -65,6 +66,9 @@ const MAX_PENDING_PAIRING_APPROVALS: usize = 16;
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     pub socket: PathBuf,
+    /// Where the durable agent marks live. `None` discovers the standard
+    /// location; a test points this somewhere disposable.
+    pub agent_marks: Option<PathBuf>,
     /// Where the durable attention index lives. `None` discovers the standard
     /// state path.
     pub attention_state: Option<PathBuf>,
@@ -102,6 +106,7 @@ impl DaemonOptions {
         };
         Ok(Self {
             socket: root.join("super-herdr/daemon.sock"),
+            agent_marks: None,
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
             web_port: None,
@@ -690,6 +695,8 @@ struct Daemon {
     /// reads from it, and beside the federation state because it summarises
     /// it — the one place in the process that holds both.
     agent_cards: AgentCardIndex,
+    agent_marks: AgentMarks,
+    agent_mark_store: Option<AgentMarkStore>,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
     /// Queues handed over by connections, waiting for the broker to say whether
@@ -970,6 +977,14 @@ async fn run(
         .and_then(|store| store.load().ok())
         .unwrap_or_default();
     let attention_cursor = attention.events().next_back().map(|event| event.id);
+    let agent_mark_store = match options.agent_marks.clone() {
+        Some(path) => Some(AgentMarkStore::at(path)),
+        None => AgentMarkStore::discover().ok(),
+    };
+    let agent_marks = agent_mark_store
+        .as_ref()
+        .and_then(|store| store.load().ok())
+        .unwrap_or_default();
     let mut daemon = Daemon {
         broker: Broker::new(
             env!("CARGO_PKG_VERSION"),
@@ -990,6 +1005,8 @@ async fn run(
         attention_store,
         attention_cursor,
         agent_cards: AgentCardIndex::default(),
+        agent_marks,
+        agent_mark_store,
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
         offers: BTreeMap::new(),
@@ -1758,6 +1775,29 @@ impl Daemon {
                     destination,
                     name,
                 } => self.begin_between(client, request, source, path, destination, name),
+                Effect::MarkAgent {
+                    client,
+                    request,
+                    agent,
+                    mark,
+                } => {
+                    let changed = self.agent_marks.apply(&agent, mark, unix_time_ms());
+                    if changed {
+                        self.persist_agent_marks();
+                        pending.extend(self.project_agent_cards());
+                    }
+                    // Answered either way. A mark that was already set is not
+                    // a failure, and a client that heard nothing back could
+                    // not tell that from a request that never arrived.
+                    if let Some(outbox) = self.outboxes.get(&client) {
+                        let _ = outbox.send(ServerMessage::OperationResult {
+                            request,
+                            applied: true,
+                            message: String::new(),
+                            plugin_run: None,
+                        });
+                    }
+                }
                 Effect::MarkAttentionSeen { pane } => {
                     if self.attention.mark_seen_for_pane(&pane) {
                         pending.extend(self.attention_changed());
@@ -2839,8 +2879,27 @@ impl Daemon {
     /// restart on their own terms. Rebuilding it is cheap and keeps one
     /// authority for each fact.
     fn project_agent_cards(&mut self) -> Vec<Effect> {
-        let projection = self.agent_cards.project(&self.state, &self.attention);
+        let now_ms = unix_time_ms();
+        // A snooze that has run out stops being carried before anything is
+        // built from it. This runs on the projection path rather than on a
+        // timer of its own: the federation refreshes on a bounded interval
+        // anyway, so an expiry surfaces within one refresh without another
+        // clock in the process to keep correct.
+        if self.agent_marks.expire(now_ms) {
+            self.persist_agent_marks();
+        }
+        let projection =
+            self.agent_cards
+                .project(&self.state, &self.attention, &self.agent_marks, now_ms);
         self.broker.agent_cards_updated(projection)
+    }
+
+    fn persist_agent_marks(&self) {
+        if let Some(store) = self.agent_mark_store.as_ref() {
+            // As with attention: a failed write costs the next restart these
+            // marks and nothing else, and must not interrupt supervision.
+            let _ = store.save(&self.agent_marks);
+        }
     }
 
     fn persist_attention(&self) {
@@ -2982,6 +3041,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let options = DaemonOptions {
             socket: directory.path().join("daemon.sock"),
+            agent_marks: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: Some(port),
@@ -3079,6 +3139,7 @@ mod tests {
             let directory = tempfile::tempdir().expect("a temporary directory");
             let options = DaemonOptions {
                 socket: directory.path().join("daemon.sock"),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
@@ -3332,6 +3393,7 @@ mod tests {
             Some(path.clone()),
             DaemonOptions {
                 socket: socket.clone(),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
                 web_port: None,
@@ -3607,6 +3669,7 @@ mod tests {
             None,
             DaemonOptions {
                 socket: socket.clone(),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -3973,6 +4036,7 @@ mod tests {
                 None,
                 DaemonOptions {
                     socket: socket.clone(),
+                    agent_marks: None,
                     attention_state: Some(directory.path().join("attention.json")),
                     refresh_interval: Duration::from_secs(3600),
                     web_port: None,
@@ -4042,6 +4106,7 @@ mod tests {
             Some(config_path.clone()),
             DaemonOptions {
                 socket: socket.clone(),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: Some(port),
@@ -4691,6 +4756,7 @@ mod tests {
             None,
             DaemonOptions {
                 socket: socket.clone(),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -4769,6 +4835,7 @@ mod tests {
             None,
             DaemonOptions {
                 socket: socket.clone(),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -4809,6 +4876,7 @@ mod tests {
 
         let options = DaemonOptions {
             socket: harness.socket(),
+            agent_marks: None,
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
@@ -4836,6 +4904,7 @@ mod tests {
             None,
             DaemonOptions {
                 socket: socket.clone(),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,

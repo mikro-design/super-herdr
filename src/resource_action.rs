@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
+use crate::agent_marks::AgentMarkRequest;
+use crate::model::{AgentId, PaneId, TabId, TargetSession, WorkspaceId};
 use crate::plugin::{PluginAction, PluginInvocationTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +99,16 @@ pub enum ResourceAction {
         action: PluginAction,
         context: PluginInvocationTarget,
     },
+    /// Pin, mute, or snooze one agent in Super-Herdr's own inbox.
+    ///
+    /// Listed among the Herdr actions because that is where a person looks for
+    /// something to do to an agent, and deliberately not one of them: it
+    /// changes nothing on the host. See [`ResourceAction::mutates_herdr`].
+    MarkAgent {
+        agent: AgentId,
+        mark: AgentMarkRequest,
+        label: String,
+    },
 }
 
 impl ResourceAction {
@@ -108,6 +119,7 @@ impl ResourceAction {
                 | Self::OpenTargetManager
                 | Self::OpenAgentNavigator
                 | Self::OpenAttentionCenter
+                | Self::MarkAgent { .. }
         )
     }
 
@@ -132,6 +144,7 @@ impl ResourceAction {
             | Self::CreateTab { workspace } => Some(workspace.target_session()),
             Self::RenameTab { tab, .. } | Self::CloseTab { tab, .. } => Some(tab.target_session()),
             Self::InvokePluginAction { action, .. } => Some(action.id.target.clone()),
+            Self::MarkAgent { agent, .. } => Some(agent.target_session()),
             Self::OpenTargetManager | Self::OpenAgentNavigator | Self::OpenAttentionCenter => None,
         }
     }
@@ -164,6 +177,16 @@ impl ResourceAction {
             Self::InvokePluginAction { action, .. } => {
                 format!("Plugin: {}", action.title)
             }
+            Self::MarkAgent { mark, label, .. } => match mark {
+                AgentMarkRequest::Pin { pinned: true } => format!("Pin agent {label:?}"),
+                AgentMarkRequest::Pin { pinned: false } => format!("Unpin agent {label:?}"),
+                AgentMarkRequest::Mute { muted: true } => format!("Mute agent {label:?}"),
+                AgentMarkRequest::Mute { muted: false } => format!("Unmute agent {label:?}"),
+                AgentMarkRequest::Snooze {
+                    minutes: Some(minutes),
+                } => format!("Snooze agent {label:?} for {minutes} minutes"),
+                AgentMarkRequest::Snooze { minutes: None } => format!("Wake agent {label:?}"),
+            },
         }
     }
 
@@ -191,7 +214,8 @@ impl ResourceAction {
 #[cfg(test)]
 mod tests {
     use super::{ResourceAction, SplitDirection};
-    use crate::model::{PaneId, TargetSession, WorkspaceId};
+    use crate::agent_marks::AgentMarkRequest;
+    use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
 
     #[test]
     fn actions_keep_server_local_ids_qualified() {
@@ -228,6 +252,30 @@ mod tests {
             action.palette_label(),
             "Move workspace \"compiler\" into \"archive\""
         );
+    }
+
+    #[test]
+    fn a_mark_is_qualified_and_never_a_herdr_mutation() {
+        let action = ResourceAction::MarkAgent {
+            agent: AgentId::new("build", "toolchains", "w2:p1"),
+            mark: AgentMarkRequest::Snooze { minutes: Some(60) },
+            label: "reviewer".to_owned(),
+        };
+
+        assert_eq!(
+            action.target_session(),
+            Some(TargetSession::new("build", "toolchains"))
+        );
+        assert!(
+            !action.mutates_herdr(),
+            "pinning, muting and snoozing are this inbox's opinions, not the host's"
+        );
+        assert!(!action.is_destructive());
+        assert_eq!(
+            action.palette_label(),
+            "Snooze agent \"reviewer\" for 60 minutes"
+        );
+        assert!(action.search_text().contains("build/toolchains"));
     }
 
     #[test]

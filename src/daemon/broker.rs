@@ -23,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::agent_card::AgentCardProjection;
+use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
-use crate::model::{PaneId, TargetSession};
+use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginRun, PluginRunId};
 use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
@@ -163,6 +164,15 @@ pub enum Effect {
         path: String,
         destination: PaneId,
         name: Option<String>,
+    },
+    /// Pin, mute, or snooze one agent. The daemon owns the durable marks, for
+    /// the same reason it owns attention history: two writers would overwrite
+    /// each other's file.
+    MarkAgent {
+        client: ClientId,
+        request: u64,
+        agent: AgentId,
+        mark: AgentMarkRequest,
     },
     MarkAttentionSeen {
         pane: PaneId,
@@ -459,6 +469,16 @@ impl Broker {
                 // history before the next event rather than after it.
                 effects.push(Effect::SendAttentionHistory { client });
             }
+            ClientMessage::MarkAgent {
+                request,
+                agent,
+                mark,
+            } => effects.push(Effect::MarkAgent {
+                client,
+                request,
+                agent,
+                mark,
+            }),
             ClientMessage::SubscribeAgentCards => {
                 if let Some(session) = self.clients.get_mut(&client) {
                     session.agent_cards_subscribed = true;
@@ -1424,8 +1444,9 @@ mod tests {
         Broker, ClientId, Effect, MAX_OUTSTANDING_SCREEN_UPDATES, PaneSubscription, Rendered,
     };
     use crate::agent_card::{AGENT_CARD_PROJECTION_VERSION, AgentCardProjection};
+    use crate::agent_marks::AgentMarkRequest;
     use crate::attention::{AttentionEvent, AttentionEventKind};
-    use crate::model::{PaneId, TargetSession};
+    use crate::model::{AgentId, PaneId, TargetSession};
     use crate::operation::Operation;
     use crate::plugin::PluginRunId;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
@@ -3408,6 +3429,33 @@ mod tests {
 
         assert!(broker.agent_cards_updated(projection(1)).is_empty());
         assert!(!broker.agent_cards_updated(projection(2)).is_empty());
+    }
+
+    #[test]
+    fn a_mark_is_carried_to_the_daemon_with_its_qualified_agent() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        let agent = AgentId::new("first", "main", "w1:p1");
+
+        let effects = broker.handle(
+            client,
+            ClientMessage::MarkAgent {
+                request: 3,
+                agent: agent.clone(),
+                mark: AgentMarkRequest::Snooze { minutes: Some(30) },
+            },
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::MarkAgent {
+                client,
+                request: 3,
+                agent,
+                mark: AgentMarkRequest::Snooze { minutes: Some(30) },
+            }],
+            "the broker routes a mark and never decides one"
+        );
     }
 
     fn projection(revision: u64) -> AgentCardProjection {

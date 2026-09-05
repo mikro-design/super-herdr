@@ -471,6 +471,31 @@ indexed, or persisted, and the projection itself is derived rather than stored,
 because the federation state and attention index it reads already survive a
 restart on their own terms.
 
+Pins, mutes and snoozes are Super-Herdr's own opinions about that inbox, and
+deliberately not Herdr's. Pinning an agent does not rename, move, or focus the
+pane it runs in; muting one does not stop it working or change what its target
+reports. Nothing in a mark crosses back to a host, so a mark can never be the
+reason a session behaves differently — which is why the TUI files them among
+the Herdr actions a person reaches for while excluding them from the actions
+that mutate Herdr.
+
+They are keyed by the same qualified agent identity the cards use, so pinning
+an agent on one host cannot silence a same-named agent on another. A pin is the
+one reorder a person actually asked for and so is allowed to win over section
+entry; a mute or a snooze moves a card out of the way without denying what it
+is, because an agent that is still blocked is still blocked and a card claiming
+otherwise is one a person could act on wrongly. Coming back from either is
+re-entering the queue rather than reclaiming a former place in it.
+
+A snooze is stored as a deadline the daemon computed from a duration the client
+asked for. A client never names a moment: a phone with a wrong clock would
+otherwise be able to silence an agent until next year, and the daemon has no
+way to tell that from a deliberate request. Expiry is checked on the projection
+path rather than by a timer, so it surfaces within one federation refresh
+without another clock in the process to keep correct. The file is bounded in
+every direction — how many agents may be marked, how large it may be, how far a
+snooze may reach — because it is written by a request from a paired device.
+
 Delivering a notification is a separate question from owning the index, and it
 divides the way the clipboard does. Native desktop delivery is a desktop-session
 capability: it belongs to the client, because a daemon on another machine

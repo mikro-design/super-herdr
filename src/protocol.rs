@@ -38,8 +38,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::agent_card::AgentCardProjection;
+use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
-use crate::model::{PaneId, TargetSession};
+use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginRun, PluginRunId};
 use crate::screen::{Diff as ScreenDiff, Snapshot};
@@ -318,6 +319,20 @@ pub enum ClientMessage {
     /// to be sent every layout rectangle in the federation.
     #[serde(rename = "agents.subscribe")]
     SubscribeAgentCards,
+    /// Pin, mute, or snooze one agent.
+    ///
+    /// A mark is Super-Herdr's own opinion about a person's inbox and never
+    /// reaches the host: nothing here renames, focuses, stops, or otherwise
+    /// touches a Herdr object. A snooze asks for a duration rather than a
+    /// moment, because the daemon owns the clock — a phone whose clock is
+    /// wrong would otherwise silence an agent until next year, and the daemon
+    /// could not tell that from a deliberate request.
+    #[serde(rename = "agents.mark")]
+    MarkAgent {
+        request: u64,
+        agent: AgentId,
+        mark: AgentMarkRequest,
+    },
 }
 
 /// Sent by the daemon.
@@ -605,6 +620,7 @@ mod tests {
         AGENT_CARD_PROJECTION_VERSION, AgentActivity, AgentCard, AgentCardProjection,
         AgentCardSection,
     };
+    use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::operation::Operation;
@@ -744,6 +760,21 @@ mod tests {
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
         round_trip_client(ClientMessage::SubscribeAgentCards);
+        round_trip_client(ClientMessage::MarkAgent {
+            request: 11,
+            agent: AgentId::new("first", "default", "w1:p1"),
+            mark: AgentMarkRequest::Pin { pinned: true },
+        });
+        round_trip_client(ClientMessage::MarkAgent {
+            request: 12,
+            agent: AgentId::new("first", "default", "w1:p1"),
+            mark: AgentMarkRequest::Snooze { minutes: Some(60) },
+        });
+        round_trip_client(ClientMessage::MarkAgent {
+            request: 13,
+            agent: AgentId::new("first", "default", "w1:p1"),
+            mark: AgentMarkRequest::Mute { muted: false },
+        });
         round_trip_client(ClientMessage::RequestPairingCode { request: 9 });
         round_trip_client(ClientMessage::DecidePairing {
             attempt: "a".repeat(64),
@@ -777,6 +808,11 @@ mod tests {
                     stale: false,
                     actionable: true,
                     last_change_ms: Some(1_700_000_000_000),
+                    marks: AgentMarkState {
+                        pinned: true,
+                        muted: false,
+                        snoozed_until_ms: None,
+                    },
                 }],
                 working: Vec::new(),
                 recent: Vec::new(),

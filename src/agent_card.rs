@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent_marks::{AgentMarkState, AgentMarks};
 use crate::attention::{AgentPhase, AttentionIndex, agent_phase, bounded_metadata};
 use crate::model::{AgentId, PaneId};
 use crate::state::{AgentState, FederationState, NormalizedSnapshot, TargetConnectionState};
@@ -137,6 +138,10 @@ pub struct AgentCard {
     /// the agent has not changed since the daemon started watching it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_ms: Option<u64>,
+    /// What a person marked on this card. Super-Herdr's own opinion, never
+    /// something that reached the host: see [`crate::agent_marks`].
+    #[serde(default)]
+    pub marks: AgentMarkState,
 }
 
 /// The whole inbox, in the order it should be rendered.
@@ -260,6 +265,8 @@ impl AgentCardIndex {
         &mut self,
         state: &FederationState,
         attention: &AttentionIndex,
+        marks: &AgentMarks,
+        now_ms: u64,
     ) -> AgentCardProjection {
         let mut seen = BTreeMap::new();
         for target in state.targets.values() {
@@ -269,7 +276,7 @@ impl AgentCardIndex {
             let live = target.connection == TargetConnectionState::Live;
             for agent in snapshot.agents.values() {
                 let id = agent_id(&agent.pane);
-                let card = self.build_card(agent, snapshot, attention, live);
+                let card = self.build_card(agent, snapshot, attention, live, marks, now_ms);
                 seen.insert(id, card);
             }
         }
@@ -414,13 +421,19 @@ impl AgentCardIndex {
             .values()
             .filter(|tracked| tracked.section == section)
             .collect::<Vec<_>>();
-        // The rank orders the section; the identity only breaks a tie, which
-        // two cards can reach when they entered in the same projection. Both
-        // keys are total, so the result is one order rather than whichever one
-        // the map happened to yield.
+        // Pinned first, then the rank, then the identity. Ordering by rank is
+        // what holds a card in place while unrelated targets churn; a pin is
+        // the one reorder a person actually asked for, so it is allowed to
+        // win. The identity only breaks a tie, which two cards reach when they
+        // entered in the same projection. All three keys are total, so the
+        // result is one order rather than whichever the map happened to yield.
         cards.sort_by(|left, right| {
-            left.rank
-                .cmp(&right.rank)
+            right
+                .card
+                .marks
+                .pinned
+                .cmp(&left.card.marks.pinned)
+                .then_with(|| left.rank.cmp(&right.rank))
                 .then_with(|| left.card.agent.cmp(&right.card.agent))
         });
         cards
@@ -449,6 +462,8 @@ impl AgentCardIndex {
         snapshot: &NormalizedSnapshot,
         attention: &AttentionIndex,
         live: bool,
+        marks: &AgentMarks,
+        now_ms: u64,
     ) -> AgentCard {
         let pane = snapshot.panes.get(&agent.pane);
         let status = bounded_metadata(
@@ -463,11 +478,21 @@ impl AgentCardIndex {
             &status,
             agent.interactive_ready.unwrap_or(false),
         ));
-        let section = match activity {
-            AgentActivity::NeedsInput => AgentCardSection::NeedsYou,
-            AgentActivity::Working => AgentCardSection::Working,
-            AgentActivity::Idle | AgentActivity::Unknown | AgentActivity::Gone => {
-                AgentCardSection::Recent
+        let marked = marks.state(&agent_id(&agent.pane));
+        // A muted or snoozed agent keeps its activity — it is still blocked,
+        // and saying otherwise would be a lie a person could act on — but it
+        // stops competing for the top of the inbox. Coming back is re-entering
+        // the queue: it takes a fresh place in the section rather than
+        // reclaiming the one it held before it was quieted.
+        let section = if marked.quiet_at(now_ms) {
+            AgentCardSection::Recent
+        } else {
+            match activity {
+                AgentActivity::NeedsInput => AgentCardSection::NeedsYou,
+                AgentActivity::Working => AgentCardSection::Working,
+                AgentActivity::Idle | AgentActivity::Unknown | AgentActivity::Gone => {
+                    AgentCardSection::Recent
+                }
             }
         };
         let workspace = pane
@@ -526,6 +551,7 @@ impl AgentCardIndex {
                 .rev()
                 .find(|event| event.pane == agent.pane)
                 .map(|event| event.occurred_at_ms),
+            marks: marked,
         }
     }
 }
@@ -550,12 +576,18 @@ mod tests {
     use super::{
         AgentActivity, AgentCardIndex, AgentCardSection, CardRouteError, MAX_HISTORY_CARDS,
     };
+    use crate::agent_marks::{AgentMarkRequest, AgentMarks};
     use crate::attention::AttentionIndex;
     use crate::model::{AgentId, TargetSession};
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
         TargetUpdateMode,
     };
+
+    /// A fixed clock. The projection reads one only to decide whether a
+    /// snooze has run out, so a test that is not about snoozing can hold it
+    /// still and stay a statement about the cards.
+    const NOW: u64 = 1_700_000_000_000;
 
     #[test]
     fn separates_the_agent_that_is_blocked_from_the_one_that_is_busy() {
@@ -577,7 +609,12 @@ mod tests {
             })),
         )]);
 
-        let projection = index.project(&state, &AttentionIndex::default());
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
 
         assert_eq!(titles(&projection.needs_you), ["reviewer"]);
         assert_eq!(titles(&projection.working), ["builder"]);
@@ -602,7 +639,12 @@ mod tests {
             Some(agents_snapshot(&[("p1", "idle"), ("p2", "meditating")])),
         )]);
 
-        let projection = index.project(&state, &AttentionIndex::default());
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
 
         assert!(projection.needs_you.is_empty());
         assert!(projection.working.is_empty());
@@ -633,7 +675,12 @@ mod tests {
             ),
         ]);
 
-        let projection = index.project(&state, &AttentionIndex::default());
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
 
         assert_eq!(projection.needs_you.len(), 2);
         let targets = projection
@@ -667,7 +714,7 @@ mod tests {
                 Some(agents_snapshot(&[("p9", "blocked")])),
             ),
         ]);
-        let before = index.project(&first, &attention);
+        let before = index.project(&first, &attention, &AgentMarks::default(), NOW);
         assert_eq!(
             order(&before.needs_you),
             ["host-a/work/p1", "host-b/work/p9"]
@@ -684,7 +731,7 @@ mod tests {
                 Some(agents_snapshot(&[("p1", "blocked")])),
             ),
         );
-        let after = index.project(&second, &attention);
+        let after = index.project(&second, &attention, &AgentMarks::default(), NOW);
 
         assert_eq!(
             order(&after.needs_you),
@@ -698,7 +745,7 @@ mod tests {
         );
 
         // A refresh that changes nothing at all publishes nothing at all.
-        let unchanged = index.project(&second, &attention);
+        let unchanged = index.project(&second, &attention, &AgentMarks::default(), NOW);
         assert_eq!(unchanged.revision, after.revision);
         assert_eq!(unchanged.needs_you, after.needs_you);
     }
@@ -712,7 +759,7 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked"), ("p2", "blocked")])),
         )]);
-        index.project(&blocked_pair, &attention);
+        index.project(&blocked_pair, &attention, &AgentMarks::default(), NOW);
 
         // p1 is answered and starts working, then blocks again. It is now the
         // most recently blocked agent, so it queues behind p2 rather than
@@ -722,8 +769,8 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "working"), ("p2", "blocked")])),
         )]);
-        index.project(&answered, &attention);
-        let projection = index.project(&blocked_pair, &attention);
+        index.project(&answered, &attention, &AgentMarks::default(), NOW);
+        let projection = index.project(&blocked_pair, &attention, &AgentMarks::default(), NOW);
 
         assert_eq!(
             order(&projection.needs_you),
@@ -740,14 +787,14 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        index.project(&running, &attention);
+        index.project(&running, &attention, &AgentMarks::default(), NOW);
 
         let ended = federation(vec![(
             "host-a",
             TargetConnectionState::Live,
             Some(agents_snapshot(&[])),
         )]);
-        let projection = index.project(&ended, &attention);
+        let projection = index.project(&ended, &attention, &AgentMarks::default(), NOW);
 
         assert!(projection.needs_you.is_empty());
         assert_eq!(projection.recent.len(), 1);
@@ -770,14 +817,14 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        index.project(&before, &attention);
+        index.project(&before, &attention, &AgentMarks::default(), NOW);
 
         let after_move = federation(vec![(
             "host-a",
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p2", "blocked")])),
         )]);
-        let projection = index.project(&after_move, &attention);
+        let projection = index.project(&after_move, &attention, &AgentMarks::default(), NOW);
 
         assert_eq!(order(&projection.needs_you), ["host-a/work/p2"]);
         assert_eq!(projection.recent.len(), 1);
@@ -800,7 +847,7 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        index.project(&live, &attention);
+        index.project(&live, &attention, &AgentMarks::default(), NOW);
 
         // Disconnected, but the last snapshot is retained: the agent is
         // probably still there, and emptying the inbox on a flapping link
@@ -810,7 +857,7 @@ mod tests {
             TargetConnectionState::Backoff { attempt: 1 },
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        let projection = index.project(&dropped, &attention);
+        let projection = index.project(&dropped, &attention, &AgentMarks::default(), NOW);
 
         assert_eq!(projection.needs_you.len(), 1);
         let card = &projection.needs_you[0];
@@ -837,11 +884,15 @@ mod tests {
                 Some(agents_snapshot(&[("p1", "blocked")])),
             )]),
             &attention,
+            &AgentMarks::default(),
+            NOW,
         );
 
         let projection = index.project(
             &federation(vec![("host-a", TargetConnectionState::Connecting, None)]),
             &attention,
+            &AgentMarks::default(),
+            NOW,
         );
 
         assert_eq!(projection.needs_you.len(), 1);
@@ -860,9 +911,16 @@ mod tests {
                 Some(agents_snapshot(&[("p1", "blocked")])),
             )]),
             &attention,
+            &AgentMarks::default(),
+            NOW,
         );
 
-        let projection = index.project(&FederationState::default(), &attention);
+        let projection = index.project(
+            &FederationState::default(),
+            &attention,
+            &AgentMarks::default(),
+            NOW,
+        );
 
         assert!(
             projection.is_empty(),
@@ -883,7 +941,12 @@ mod tests {
             })),
         )]);
 
-        let projection = index.project(&state, &AttentionIndex::default());
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
 
         assert_eq!(projection.needs_you.len(), 1);
         assert!(!projection.needs_you[0].actionable);
@@ -938,7 +1001,12 @@ mod tests {
             })),
         )]);
 
-        let projection = index.project(&state, &AttentionIndex::default());
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            &AgentMarks::default(),
+            NOW,
+        );
         let card = projection.cards().next().unwrap();
 
         assert_eq!(card.title.chars().count(), 128);
@@ -960,6 +1028,8 @@ mod tests {
                     Some(agents_snapshot(&[(name.as_str(), "blocked")])),
                 )]),
                 &attention,
+                &AgentMarks::default(),
+                NOW,
             );
         }
         let projection = index.project(
@@ -969,6 +1039,8 @@ mod tests {
                 Some(agents_snapshot(&[])),
             )]),
             &attention,
+            &AgentMarks::default(),
+            NOW,
         );
 
         assert_eq!(projection.recent.len(), MAX_HISTORY_CARDS);
@@ -995,12 +1067,101 @@ mod tests {
         )]);
         attention.observe(&blocked);
 
-        let projection = AgentCardIndex::default().project(&blocked, &attention);
+        let projection =
+            AgentCardIndex::default().project(&blocked, &attention, &AgentMarks::default(), NOW);
 
         assert!(projection.needs_you[0].unread);
         assert!(projection.needs_you[0].last_change_ms.is_some());
         assert!(!projection.recent[0].unread);
         assert!(projection.recent[0].last_change_ms.is_none());
+    }
+
+    #[test]
+    fn a_pin_lifts_a_card_to_the_top_of_its_section() {
+        let mut index = AgentCardIndex::default();
+        let attention = AttentionIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(agents_snapshot(&[("p1", "blocked"), ("p2", "blocked")])),
+        )]);
+        index.project(&state, &attention, &AgentMarks::default(), NOW);
+
+        let mut marks = AgentMarks::default();
+        marks.apply(
+            &AgentId::new("host-a", "work", "p2"),
+            AgentMarkRequest::Pin { pinned: true },
+            NOW,
+        );
+        let projection = index.project(&state, &attention, &marks, NOW);
+
+        assert_eq!(
+            order(&projection.needs_you),
+            ["host-a/work/p2", "host-a/work/p1"],
+            "a pin is the one reorder a person actually asked for"
+        );
+        assert!(projection.needs_you[0].marks.pinned);
+    }
+
+    #[test]
+    fn a_mute_stops_an_agent_competing_for_the_top_without_denying_it_is_blocked() {
+        let mut index = AgentCardIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(agents_snapshot(&[("p1", "blocked")])),
+        )]);
+        let mut marks = AgentMarks::default();
+        marks.apply(
+            &AgentId::new("host-a", "work", "p1"),
+            AgentMarkRequest::Mute { muted: true },
+            NOW,
+        );
+
+        let projection = index.project(&state, &AttentionIndex::default(), &marks, NOW);
+
+        assert!(projection.needs_you.is_empty());
+        assert_eq!(projection.recent.len(), 1);
+        assert_eq!(
+            projection.recent[0].activity,
+            AgentActivity::NeedsInput,
+            "the agent is still blocked, and saying otherwise would be a lie"
+        );
+        assert!(projection.recent[0].marks.muted);
+        assert!(
+            projection.recent[0].actionable,
+            "a muted agent is quiet, not unreachable"
+        );
+    }
+
+    #[test]
+    fn a_snooze_quiets_an_agent_until_it_runs_out() {
+        let mut index = AgentCardIndex::default();
+        let attention = AttentionIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(agents_snapshot(&[("p1", "blocked"), ("p2", "blocked")])),
+        )]);
+        index.project(&state, &attention, &AgentMarks::default(), NOW);
+
+        let mut marks = AgentMarks::default();
+        marks.apply(
+            &AgentId::new("host-a", "work", "p1"),
+            AgentMarkRequest::Snooze { minutes: Some(10) },
+            NOW,
+        );
+        let quiet = index.project(&state, &attention, &marks, NOW);
+        assert_eq!(order(&quiet.needs_you), ["host-a/work/p2"]);
+
+        marks.expire(NOW + 10 * 60_000);
+        let awake = index.project(&state, &attention, &marks, NOW + 10 * 60_000);
+
+        assert_eq!(
+            order(&awake.needs_you),
+            ["host-a/work/p2", "host-a/work/p1"],
+            "coming back is re-entering the queue, not reclaiming a place in it"
+        );
     }
 
     fn titles(cards: &[super::AgentCard]) -> Vec<&str> {

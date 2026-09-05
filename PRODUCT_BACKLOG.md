@@ -105,7 +105,7 @@ the exact selected route while targets connect or disconnect.
 - [ ] Resolve the live pane again before every card action and fail closed on a
       missing or ambiguous route. The resolver and its refusals exist; this
       closes when a card action calls it.
-- [ ] Add persistence for pins, mutes, and snoozes using qualified identities.
+- [x] Add persistence for pins, mutes, and snoozes using qualified identities.
 - [x] Keep historical cards non-actionable after their agent disappears.
 - [x] Add protocol and daemon tests for duplicate server-local IDs, target
       churn, agent moves, and stale cards.
@@ -114,9 +114,8 @@ the exact selected route while targets connect or disconnect.
 
 - [x] Make the inbox the default paired-device screen.
 - [x] Give each card one primary action: open the live pane.
-- [ ] Add compact filters for needs-attention, active, pinned, target, and
-      provider. State, target, and provider chips ship; pinned waits on the
-      pin store.
+- [x] Add compact filters for needs-attention, active, pinned, target, and
+      provider.
 - [x] Add a clear path back to the full infrastructure hierarchy.
 - [ ] Add an optional pinned-agent grid for monitoring several panes.
 - [x] Keep cards readable and controls reachable at narrow phone widths.
@@ -127,10 +126,12 @@ the exact selected route while targets connect or disconnect.
 
 #### TUI
 
-- [ ] Reuse the daemon projection in the existing agent navigator.
-- [ ] Show pin, mute, and snooze actions in qualified context menus and the
+- [ ] Reuse the daemon projection in the existing agent navigator. The TUI
+      subscribes and mirrors each agent's marks; the navigator still derives
+      its own list from federation state.
+- [x] Show pin, mute, and snooze actions in qualified context menus and the
       searchable action palette.
-- [ ] Keep the full hierarchy available; do not replace expert navigation with
+- [x] Keep the full hierarchy available; do not replace expert navigation with
       the inbox.
 
 Exit condition: a person with agents across several machines can identify and

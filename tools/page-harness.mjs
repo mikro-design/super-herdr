@@ -368,6 +368,12 @@ const projection = overrides => ({
   },
 });
 const sections = () => page.el('inbox-sections').children;
+// A card is a container: the primary action first, then the marks a person can
+// put on it. Reaching through it here keeps the assertions about behaviour
+// rather than about which element happens to carry the handler.
+const openOf = one => one.children[0];
+const marksOf = one => (one.children[1] ? one.children[1].children : []);
+const markChip = (one, kind) => marksOf(one).find(chip => chip.dataset.mark === kind);
 const cardsIn = index => sections()[index].children.slice(1);
 const chipFor = (group, value) => page.el('inbox-filters').children
   .find(one => one.dataset.group === group && one.dataset.value === value);
@@ -426,15 +432,20 @@ deliver(projection({
     card('p7', { section: 'recent', actionable: false, stale: true, status: 'blocked' }),
   ],
 }));
-check('history is not clickable', typeof cardsIn(0)[0].onclick !== 'function');
-check('history says so to a screen reader', cardsIn(0)[0]['aria-disabled'] === 'true');
-check('history is disabled', cardsIn(0)[0].disabled === true);
-check('a stale card explains the host, not the agent', cardsIn(0)[1].children[1].children[1].textContent === 'host not connected');
+check('history is not clickable', typeof openOf(cardsIn(0)[0]).onclick !== 'function');
+check('history says so to a screen reader', openOf(cardsIn(0)[0])['aria-disabled'] === 'true');
+check('history is disabled', openOf(cardsIn(0)[0]).disabled === true);
+check(
+  'a stale card explains the host, not the agent',
+  openOf(cardsIn(0)[1]).children[1].children[1].textContent === 'host not connected',
+);
+check('a gone agent offers nothing to mark', marksOf(cardsIn(0)[0]).length === 0);
+check('a stale card still offers its marks', marksOf(cardsIn(0)[1]).length === 3);
 
 // Opening a card routes to its own qualified pane and settles its attention.
 deliver(projection({ needs_you: [card('p1', { unread: true })] }));
 sent.length = 0;
-cardsIn(0)[0].onclick();
+openOf(cardsIn(0)[0]).onclick();
 check(
   'opening a card marks its attention seen',
   sent.some(one => one.body.type === 'attention.mark_seen' && one.body.pane.resource === 'p1'),
@@ -459,6 +470,45 @@ deliver(projection({
 check('a repaint keeps watching the same pane', page.el('viewing').textContent === watched);
 check('a repaint subscribes to nothing', sent.every(one => one.body.type !== 'pane.subscribe'));
 check('a repaint takes no focus', page.el('line').focused === false);
+
+// Pins, mutes and snoozes are requests to the daemon, and never anything that
+// reaches the host.
+deliver(projection({ needs_you: [card('p1'), card('p2')] }));
+sent.length = 0;
+markChip(cardsIn(0)[1], 'pin').onclick();
+const pinRequest = sent.find(one => one.body.type === 'agents.mark');
+check('pinning names the qualified agent', pinRequest.body.agent.resource === 'p2'
+  && pinRequest.body.agent.target === 'first' && pinRequest.body.agent.session === 'main');
+check('pinning asks for a pin', pinRequest.body.mark.kind === 'pin' && pinRequest.body.mark.pinned === true);
+check('a mark is the only thing sent', sent.length === 1);
+
+sent.length = 0;
+markChip(cardsIn(0)[0], 'snooze').onclick();
+const snoozeRequest = sent.find(one => one.body.type === 'agents.mark');
+check('a snooze asks for a duration, never a moment',
+  snoozeRequest.body.mark.kind === 'snooze' && snoozeRequest.body.mark.minutes === 60);
+
+// The daemon answers by republishing the inbox; the page renders that and
+// never assumes its own request landed.
+deliver(projection({
+  needs_you: [
+    card('p2', { marks: { pinned: true, muted: false } }),
+    card('p1'),
+  ],
+}));
+check('a pinned card reports itself pressed', markChip(cardsIn(0)[0], 'pin')['aria-pressed'] === 'true');
+check('a pinned card names the state it is in', markChip(cardsIn(0)[0], 'pin').textContent === 'Pinned');
+check('an unpinned card stays unpressed', markChip(cardsIn(0)[1], 'pin')['aria-pressed'] === 'false');
+check('a pinned agent offers a pinned filter', chipFor('state', 'pinned') !== undefined);
+chipFor('state', 'pinned').onclick();
+check('the pinned filter keeps only pinned cards', cardsIn(0).length === 1);
+check('the pinned filter keeps the qualified identity', cardsIn(0)[0].dataset.agent === 'first/main/p2');
+sent.length = 0;
+markChip(cardsIn(0)[0], 'pin').onclick();
+check('unpinning asks to clear the pin',
+  sent.find(one => one.body.type === 'agents.mark').body.mark.pinned === false);
+deliver(projection({ needs_you: [card('p2'), card('p1')] }));
+check('a filter that can no longer match anything steps aside', cardsIn(0).length === 2);
 
 // A reconnect asks for the inbox again, because the daemon remembers nothing
 // about what this page held.

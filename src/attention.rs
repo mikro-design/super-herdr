@@ -321,7 +321,7 @@ pub(crate) fn agent_phase(status: &str, interactive_ready: bool) -> AgentPhase {
     }
 }
 
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -483,26 +483,26 @@ impl AttentionStore {
 }
 
 #[cfg(unix)]
-fn set_directory_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .context("failed to secure the attention state directory")
 }
 
 #[cfg(not(unix))]
-fn set_directory_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn set_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_file_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .context("failed to secure the attention state file")
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn set_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
