@@ -2311,6 +2311,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         }
     }
 

@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         socket: None,
         herdr_bins: vec!["herdr".to_owned()],
         roots: Vec::new(),
+        tags: Vec::new(),
     };
 
     let payload = png(64 * 1024);
@@ -214,6 +215,7 @@ async fn relay(
                     "herdr".to_owned(),
                 ],
                 roots: Vec::new(),
+                tags: Vec::new(),
             }],
             devices: Vec::new(),
             quick_replies: None,
@@ -222,6 +224,7 @@ async fn relay(
         DaemonOptions {
             socket: directory.path().join("unused.sock"),
             agent_marks: None,
+            aliases: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: std::time::Duration::from_secs(3600),
             web_port: None,

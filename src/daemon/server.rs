@@ -37,10 +37,11 @@ use tokio::task::JoinHandle;
 
 use crate::agent_card::{AgentCardIndex, agent_key_for_pane};
 use crate::agent_marks::{AgentMarkStore, AgentMarks};
+use crate::aliases::{AliasStore, Aliases};
 use crate::attention::{AttentionEventKind, AttentionIndex, AttentionStore, unix_time_ms};
 use crate::clipboard;
 use crate::config::{Config, Device, Target, TransportConfig};
-use crate::daemon::broker::{Broker, ClientId, Effect};
+use crate::daemon::broker::{Broker, ClientId, Effect, LocalChange};
 use crate::daemon::web;
 use crate::model::{PaneId, TargetSession};
 use crate::notifications::NotificationQueue;
@@ -73,6 +74,9 @@ const MAX_PENDING_PAIRING_APPROVALS: usize = 16;
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     pub socket: PathBuf,
+    /// Where local names, favourites and jump slots live. `None` discovers the
+    /// standard location.
+    pub aliases: Option<PathBuf>,
     /// Where the durable agent marks live. `None` discovers the standard
     /// location; a test points this somewhere disposable.
     pub agent_marks: Option<PathBuf>,
@@ -114,6 +118,7 @@ impl DaemonOptions {
         Ok(Self {
             socket: root.join("super-herdr/daemon.sock"),
             agent_marks: None,
+            aliases: None,
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
             web_port: None,
@@ -706,6 +711,11 @@ struct Daemon {
     agent_cards: AgentCardIndex,
     agent_marks: AgentMarks,
     agent_mark_store: Option<AgentMarkStore>,
+    /// Local names, favourites and jump slots. Held here because they are
+    /// display state the daemon applies once, so every client shows the same
+    /// name rather than each keeping its own list.
+    aliases: Aliases,
+    alias_store: Option<AliasStore>,
     /// Alerts for paired devices. A second sink beside the desktop's own,
     /// which the frontend runs against its attention mirror — this one lives
     /// here because the point of it is a phone learning that an agent is
@@ -1002,6 +1012,34 @@ async fn run(
     // The device sink borrows the desktop's filters, coalescing and rate
     // limits, and is switched on separately: wanting alerts on a phone is not
     // the same request as wanting them on the laptop being sat at.
+    let alias_store = match options.aliases.clone() {
+        Some(path) => Some(AliasStore::at(path)),
+        None => AliasStore::discover().ok(),
+    };
+    let mut aliases = alias_store
+        .as_ref()
+        .and_then(|store| store.load().ok())
+        .unwrap_or_default();
+    // A target somebody removed from the configuration is a decision; its
+    // names going with it follows from that decision rather than from a host
+    // being briefly unreachable.
+    let configured = active
+        .targets
+        .iter()
+        .map(crate::state::target_key)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut forgot_any = false;
+    for stale in aliases
+        .targets()
+        .into_iter()
+        .filter(|target| !configured.contains(target))
+        .collect::<Vec<_>>()
+    {
+        forgot_any |= aliases.forget_target(&stale);
+    }
+    if forgot_any && let Some(store) = alias_store.as_ref() {
+        let _ = store.save(&aliases);
+    }
     let mut device_notifications = active.notifications.clone();
     device_notifications.enabled = device_notifications.devices;
     let notify_devices = device_notifications.enabled;
@@ -1031,6 +1069,8 @@ async fn run(
         agent_cards: AgentCardIndex::default(),
         agent_marks,
         agent_mark_store,
+        aliases,
+        alias_store,
         device_notifications: NotificationQueue::new(device_notifications, None),
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
@@ -1821,6 +1861,56 @@ impl Daemon {
                     destination,
                     name,
                 } => self.begin_between(client, request, source, path, destination, name),
+                Effect::LocalNaming {
+                    client,
+                    request,
+                    change,
+                } => {
+                    let outcome = match change {
+                        LocalChange::Name {
+                            resource,
+                            label: Some(label),
+                            observed,
+                        } => self.aliases.set(resource, &label, &observed).map(|()| true),
+                        LocalChange::Name {
+                            resource,
+                            label: None,
+                            ..
+                        } => Ok(self.aliases.clear(&resource)),
+                        LocalChange::ConfirmName { resource, observed } => {
+                            Ok(self.aliases.confirm(&resource, &observed))
+                        }
+                        LocalChange::Favourite { resource } => {
+                            self.aliases.favourite(resource).map(|_| true)
+                        }
+                        LocalChange::Slot { slot, resource } => {
+                            self.aliases.set_slot(slot, resource).map(|()| true)
+                        }
+                    };
+                    match outcome {
+                        Ok(changed) => {
+                            if changed {
+                                if let Some(store) = self.alias_store.as_ref() {
+                                    // A failed write costs the next restart
+                                    // these names and nothing else.
+                                    let _ = store.save(&self.aliases);
+                                }
+                                pending.extend(self.project_agent_cards());
+                            }
+                            if let Some(outbox) = self.outboxes.get(&client) {
+                                let _ = outbox.send(ServerMessage::OperationResult {
+                                    request,
+                                    applied: true,
+                                    message: String::new(),
+                                    plugin_run: None,
+                                });
+                            }
+                        }
+                        // A bounded list that is full, or a name that is not
+                        // one, is answered rather than silently dropped.
+                        Err(error) => self.refuse(client, request, error.to_string()),
+                    }
+                }
                 Effect::ListRemoteDirectory {
                     client,
                     request,
@@ -3036,9 +3126,15 @@ impl Daemon {
         if self.agent_marks.expire(now_ms) {
             self.persist_agent_marks();
         }
-        let projection =
-            self.agent_cards
-                .project(&self.state, &self.attention, &self.agent_marks, now_ms);
+        let projection = self.agent_cards.project(
+            &self.state,
+            &self.attention,
+            crate::agent_card::LocalView {
+                marks: &self.agent_marks,
+                aliases: &self.aliases,
+                now_ms,
+            },
+        );
         self.broker.agent_cards_updated(projection)
     }
 
@@ -3190,6 +3286,7 @@ mod tests {
         let options = DaemonOptions {
             socket: directory.path().join("daemon.sock"),
             agent_marks: None,
+            aliases: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: Some(port),
@@ -3259,6 +3356,7 @@ mod tests {
                 socket: None,
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
                 roots: Vec::new(),
+                tags: Vec::new(),
             }],
             ..empty_config()
         }
@@ -3277,6 +3375,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         });
         config
     }
@@ -3291,6 +3390,7 @@ mod tests {
             let options = DaemonOptions {
                 socket: directory.path().join("daemon.sock"),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
@@ -3469,6 +3569,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -3546,6 +3647,7 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
                 web_port: None,
@@ -3814,6 +3916,7 @@ mod tests {
                 socket: None,
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
                 roots: Vec::new(),
+                tags: Vec::new(),
             }],
             devices: Vec::new(),
             quick_replies: None,
@@ -3824,6 +3927,7 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -4191,6 +4295,7 @@ mod tests {
                 DaemonOptions {
                     socket: socket.clone(),
                     agent_marks: None,
+                    aliases: None,
                     attention_state: Some(directory.path().join("attention.json")),
                     refresh_interval: Duration::from_secs(3600),
                     web_port: None,
@@ -4261,6 +4366,7 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: Some(port),
@@ -4715,6 +4821,7 @@ mod tests {
                 socket: None,
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
                 roots: Vec::new(),
+                tags: Vec::new(),
             },
             &Default::default(),
             crate::clipboard::OPAQUE,
@@ -4733,6 +4840,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         };
         let error = super::accept_copy(
             &destination,
@@ -4913,6 +5021,7 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -4992,6 +5101,7 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -5033,6 +5143,7 @@ mod tests {
         let options = DaemonOptions {
             socket: harness.socket(),
             agent_marks: None,
+            aliases: None,
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
@@ -5061,6 +5172,7 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,

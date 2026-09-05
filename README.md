@@ -156,6 +156,15 @@ A card whose host has disconnected, or whose agent has ended, is shown and not
 offered — Super-Herdr resolves the live pane again before it routes anything,
 so a reconnect can never redirect your next keystroke.
 
+Give an agent, workspace, pane, session or host a name of your own, mark the
+ones you keep coming back to as favourites, and put the busiest in numbered
+jump slots. These are Super-Herdr's own labels: nothing about them reaches a
+host or renames a Herdr resource. If the host later calls something else by
+that id, the name is suspended and shown as needing confirmation rather than
+applied to whatever turned up — Super-Herdr cannot tell a rename from a reused
+id, so it asks. Your inbox filters and landing view are remembered by the
+browser you use them in.
+
 `super-herdr plugins list` shows what is installed on every host and what
 differs — missing plugins, version drift, and the same version built from
 different commits. Plugins are matched by where they were installed from
@@ -198,6 +207,9 @@ same metadata for a support bundle.
   output and the command to run for anything broken
 - Cross-host plugin inventory, drift, a pinned lockfile, and a printed
   install plan that runs nothing
+- Local names, favourites and jump slots that never rename a Herdr resource and
+  are never trusted onto a reused id
+- OpenSSH config import with a preview, per-host probing, and local tags
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer
@@ -234,10 +246,32 @@ super-herdr clipboard check
 super-herdr notifications check
 ```
 
+If your machines are already in `~/.ssh/config`, `super-herdr target import`
+lists them and adds nothing. Name the ones you want with `--add`, and each is
+probed on its own before it is written — one host being unreachable says
+nothing about the others, and an alias that did not answer is reported rather
+than added. `--tag work` groups what a run adds.
+
 See [config.example.toml](config.example.toml) for manual TOML configuration.
-The browser route can use the hosted bridge, a private address, Tailscale Serve,
-or an operator-managed proxy. See the [architecture](ARCHITECTURE.md) for those
-trust boundaries and the [bridge guide](crates/bridge/README.md) for self-hosting.
+
+### Choosing how a phone reaches you
+
+These are peers, not a ladder. Pick the trust boundary you want:
+
+| Route | What it needs | Who can see the traffic |
+| --- | --- | --- |
+| **Hosted bridge** (default) | Nothing. Works from any network. | TLS terminates at the relay, so it is a trusted relay rather than end-to-end encryption. It carries bounded opaque traffic and holds no device tokens, but it is a third party in the path. |
+| **Direct address** | The phone and the daemon on one network. | Nobody in between. Refused on a public address: a device token authenticates but does not encrypt. |
+| **Tailscale, NetBird, or another WireGuard-style network** | That network on both devices. | Nobody in between; the tunnel is theirs, not Super-Herdr's. Point `web.address` at the interface it gives you. |
+| **Your own proxy** | A TLS terminator you run. | You, wherever you terminate. Set `web.url` to where the phone reaches it. |
+
+The default is the bridge because it works with no setup from a hotel network,
+and being clear about it matters more than defending it: it needs no Tailscale,
+and it is a relay you are trusting. If that is the wrong trade for your machines,
+the other three rows are one configuration key each.
+
+See the [architecture](ARCHITECTURE.md) for those trust boundaries and the
+[bridge guide](crates/bridge/README.md) for self-hosting.
 
 ## Security summary
 

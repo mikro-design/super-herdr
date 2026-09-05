@@ -61,6 +61,10 @@ discover_sessions = true
 # reading — a paired device already holds pane control and can read anything
 # its user can, so a root is a place to look rather than a permission.
 #roots = ["/srv/build", "/home/example/work"]
+# Local groupings for filtering — work, home, lab, a pod name. A tag never
+# reaches a host and never takes part in identity: two hosts tagged "work" are
+# still two entirely separate targets.
+#tags = ["work", "lab"]
 # Optional overrides:
 #session = "default"
 #socket = "/absolute/path/to/herdr.sock"

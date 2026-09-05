@@ -1112,6 +1112,38 @@ write into. Until such an envelope exists, transfers are initiated from the
 client, and Super-Herdr does not invent a side channel by scraping the pane's
 own output for markers.
 
+## Names that belong to this installation
+
+A person running agents on five machines ends up with `w1`, `w3` and `wD`
+meaning "the compiler one", "the flaky one" and "the customer's". Herdr can be
+told to rename a workspace, but that changes it for everybody using that host
+and is somebody else's decision. So Super-Herdr keeps its own: a label it
+shows, a set of destinations worth one action, and nine slots for the ones
+somebody jumps to constantly. Nothing here renames anything on a host; Herdr's
+own rename stays a separate, explicit action.
+
+An alias is never an identity. Everything is keyed by a qualified id and looked
+up by one, so two hosts can both have a "build" without anything colliding, and
+a card carrying a local name still carries the identity that routes.
+
+The hard part is that Herdr's ids are server-local and can come back: delete
+`w1` and the next workspace may be `w1` again. An alias keyed only by that id
+would move silently onto a different workspace, and the person would see a name
+they trust over something they have never looked at. So an alias also records
+what the resource was called when it was named, and when that no longer matches
+the alias is *suspended* — shown as needing confirmation rather than applied or
+deleted, because nothing here can tell a rename from a reuse and guessing
+either way is worse than asking. A person can confirm it; only a person can.
+
+Names for a target removed from the configuration are forgotten, because
+removing it was a decision. Nothing is forgotten because a host was merely
+unreachable, which is not a decision anybody made.
+
+Filters and the landing view are the exception: they live in the browser rather
+than the daemon, because they are one person's habit on one device — the phone
+that only ever wants "needs you" and the laptop that wants everything — and a
+device that refuses to remember them still has to render one.
+
 ## Plugins across hosts
 
 Herdr installs plugins per host, so once somebody runs agents on three

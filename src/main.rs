@@ -179,6 +179,27 @@ enum DeviceCommands {
 
 #[derive(Debug, Subcommand)]
 enum TargetCommands {
+    /// Offer the hosts already in an OpenSSH configuration.
+    ///
+    /// Prints what it found and adds nothing. Naming aliases with `--add` is
+    /// what adds them, and each is probed on its own before it is written.
+    Import {
+        /// An OpenSSH configuration to read. Defaults to ~/.ssh/config.
+        #[arg(long, value_name = "PATH")]
+        ssh_config: Option<PathBuf>,
+        /// Aliases to add. Without this, nothing is written.
+        #[arg(long = "add", value_name = "ALIAS")]
+        add: Vec<String>,
+        /// Tag every alias added by this run.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Add an alias even if it did not answer.
+        #[arg(long)]
+        force: bool,
+        /// Per-host probe timeout.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
     /// Add a local or SSH Herdr host to the TOML configuration.
     Add {
         /// Stable name used to qualify this host's Herdr IDs.
@@ -419,7 +440,7 @@ async fn run() -> Result<ExitCode> {
     }
     let command = match command {
         Commands::Target { command } => {
-            return run_target_command(cli.config.as_deref(), command);
+            return run_target_command(cli.config.as_deref(), command).await;
         }
         Commands::Device { command } => {
             return run_device_command(cli.config.as_deref(), command);
@@ -737,7 +758,7 @@ fn run_device_command(
     }
 }
 
-fn run_target_command(
+async fn run_target_command(
     config_path: Option<&std::path::Path>,
     command: TargetCommands,
 ) -> Result<ExitCode> {
@@ -766,6 +787,7 @@ fn run_target_command(
                 // considered decision about a host, written where it can be
                 // read back, rather than a flag typed once while adding one.
                 roots: Vec::new(),
+                tags: Vec::new(),
             };
             let path = Config::add_target_file(config_path, target)?;
             stdout_line(format_args!("added target {name:?} to {}", path.display()))?;
@@ -856,6 +878,109 @@ fn run_target_command(
                 path.display()
             ))?;
             stdout_line(format_args!("no Herdr session was stopped or restarted"))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        TargetCommands::Import {
+            ssh_config,
+            add,
+            tags,
+            force,
+            timeout,
+        } => {
+            let path = ssh_config
+                .or_else(super_herdr::ssh_config::default_path)
+                .context("no OpenSSH configuration to read; pass --ssh-config")?;
+            let hosts = super_herdr::ssh_config::load(&path)?;
+            let (config, config_path) = Config::load(config_path)?;
+            let existing = config
+                .targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+
+            if add.is_empty() {
+                // A preview and nothing else. A first run that silently
+                // adopted forty hosts, half of them jump boxes, would be a
+                // federation nobody asked for.
+                println!("{} host(s) in {}", hosts.len(), path.display());
+                for host in &hosts {
+                    println!(
+                        "  {}{}",
+                        host.summary(),
+                        if existing.contains(host.alias.as_str()) {
+                            "  (already configured)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                println!("\nAdd them by name: super-herdr target import --add NAME [--add NAME]");
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let timeout =
+                Duration::from_secs(timeout.unwrap_or(config.transport.command_timeout_seconds));
+            let mut candidates = Vec::new();
+            for alias in &add {
+                if existing.contains(alias.as_str()) {
+                    println!("{alias}: already configured, left alone");
+                    continue;
+                }
+                if !hosts.iter().any(|host| &host.alias == alias) {
+                    println!("{alias}: not in {}", path.display());
+                    continue;
+                }
+                candidates.push(Target {
+                    name: alias.clone(),
+                    ssh: Some(alias.clone()),
+                    discover_sessions: true,
+                    session: None,
+                    socket: None,
+                    herdr_bins: vec!["herdr".to_owned()],
+                    roots: Vec::new(),
+                    tags: tags.clone(),
+                });
+            }
+
+            // Probed together and reported apart: one host being unreachable
+            // says nothing about the others, and a wizard that gave up on the
+            // first failure would be one people run once.
+            let probing = Config {
+                targets: candidates.clone(),
+                ..config.clone()
+            };
+            let reports = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                probe_all(&probing, timeout).await?
+            };
+
+            let mut added = 0;
+            for candidate in candidates {
+                let report = reports
+                    .iter()
+                    .find(|report| report.target == candidate.name);
+                if report.is_some_and(|report| report.ok) || force {
+                    Config::add_target_file(Some(&config_path), candidate.clone())?;
+                    println!("{}: added", candidate.name);
+                    added += 1;
+                    continue;
+                }
+                // Reported and not written. An alias that names a machine
+                // Herdr is not on is a target that would fail on every refresh
+                // afterwards, and adding it anyway is how a federation fills
+                // with entries nobody meant.
+                println!(
+                    "{}: not added; {}",
+                    candidate.name,
+                    report
+                        .and_then(|report| report.error.clone())
+                        .unwrap_or_else(|| "it was not probed".to_owned())
+                );
+            }
+            if added > 0 {
+                println!("\nWrote {} target(s) to {}", added, config_path.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
         TargetCommands::List => {

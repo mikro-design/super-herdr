@@ -521,6 +521,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -539,6 +540,7 @@ mod tests {
             // No socket is bound in this mode; the path is never used.
             socket: directory.path().join("unused.sock"),
             agent_marks: None,
+            aliases: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
@@ -609,6 +611,7 @@ mod tests {
             socket: None,
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
+            tags: Vec::new(),
         }]);
         let _ = directory;
 

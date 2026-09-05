@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_marks::{AgentMarkState, AgentMarks};
+use crate::aliases::{AliasState, Aliases, ResourceRef};
 use crate::attention::{AgentPhase, AttentionIndex, agent_phase, bounded_metadata};
 use crate::model::{AgentId, PaneId};
 use crate::state::{
@@ -144,6 +145,18 @@ pub struct AgentCard {
     /// something that reached the host: see [`crate::agent_marks`].
     #[serde(default)]
     pub marks: AgentMarkState,
+    /// A local name for this agent, when there is one that still fits. Shown
+    /// instead of the title; `title` keeps the host's own word so a client can
+    /// show both and nothing has to ask the host what it used to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// A local name exists but the host now calls this something else. Neither
+    /// applied nor forgotten: a person is asked, because nothing here can tell
+    /// a rename from a reused id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alias_suspended: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub favourite: bool,
 }
 
 /// The whole inbox, in the order it should be rendered.
@@ -174,6 +187,20 @@ impl AgentCardProjection {
     pub fn is_empty(&self) -> bool {
         self.needs_you.is_empty() && self.working.is_empty() && self.recent.is_empty()
     }
+}
+
+/// What this installation, rather than a host, has to say about an agent.
+///
+/// Bundled because they travel together and mean one thing: everything here is
+/// Super-Herdr's own state, none of it reaches a host, and a caller holding
+/// one of them almost always holds all three.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalView<'a> {
+    pub marks: &'a AgentMarks,
+    pub aliases: &'a Aliases,
+    /// The clock a snooze is measured against, supplied so a projection of the
+    /// same inputs is the same projection and a test can say so.
+    pub now_ms: u64,
 }
 
 /// A resolved, current route to an agent's pane.
@@ -267,8 +294,7 @@ impl AgentCardIndex {
         &mut self,
         state: &FederationState,
         attention: &AttentionIndex,
-        marks: &AgentMarks,
-        now_ms: u64,
+        local: LocalView<'_>,
     ) -> AgentCardProjection {
         let mut seen = BTreeMap::new();
         let mut ambiguous = BTreeSet::new();
@@ -279,7 +305,7 @@ impl AgentCardIndex {
             let live = target.connection == TargetConnectionState::Live;
             for agent in snapshot.agents.values() {
                 let id = agent_key(agent);
-                let card = self.build_card(agent, snapshot, attention, live, marks, now_ms);
+                let card = self.build_card(agent, snapshot, attention, live, local);
                 if seen.insert(id.clone(), card).is_some() {
                     // Two agents on one target answering to one identity. Both
                     // cards stay visible — a person should be able to see that
@@ -481,8 +507,7 @@ impl AgentCardIndex {
         snapshot: &NormalizedSnapshot,
         attention: &AttentionIndex,
         live: bool,
-        marks: &AgentMarks,
-        now_ms: u64,
+        local: LocalView<'_>,
     ) -> AgentCard {
         let pane = snapshot.panes.get(&agent.pane);
         let status = bounded_metadata(
@@ -498,13 +523,14 @@ impl AgentCardIndex {
             agent.interactive_ready.unwrap_or(false),
         ));
         let key = agent_key(agent);
-        let marked = marks.state(&key);
+        let marked = local.marks.state(&key);
+        let reference = ResourceRef::Agent(key.clone());
         // A muted or snoozed agent keeps its activity — it is still blocked,
         // and saying otherwise would be a lie a person could act on — but it
         // stops competing for the top of the inbox. Coming back is re-entering
         // the queue: it takes a fresh place in the section rather than
         // reclaiming the one it held before it was quieted.
-        let section = if marked.quiet_at(now_ms) {
+        let section = if marked.quiet_at(local.now_ms) {
             AgentCardSection::Recent
         } else {
             match activity {
@@ -535,18 +561,26 @@ impl AgentCardIndex {
                     .unwrap_or(tab.resource.as_str())
             })
             .unwrap_or("unassigned");
+        let title = bounded_metadata(
+            agent
+                .name
+                .as_deref()
+                .or_else(|| pane.and_then(|pane| pane.agent.as_deref()))
+                .or_else(|| pane.and_then(|pane| pane.label.as_deref()))
+                .unwrap_or(&agent.pane.resource),
+            MAX_LABEL_CHARACTERS,
+        );
+        // Compared against the title rather than the raw resource, because
+        // the title is what a person read when they named it.
+        let (alias, alias_suspended) = match local.aliases.resolve(&reference, &title) {
+            Some((label, AliasState::Current)) => (Some(label.to_owned()), false),
+            Some((_, AliasState::Suspended)) => (None, true),
+            None => (None, false),
+        };
         AgentCard {
             agent: key,
             pane: Some(agent.pane.clone()),
-            title: bounded_metadata(
-                agent
-                    .name
-                    .as_deref()
-                    .or_else(|| pane.and_then(|pane| pane.agent.as_deref()))
-                    .or_else(|| pane.and_then(|pane| pane.label.as_deref()))
-                    .unwrap_or(&agent.pane.resource),
-                MAX_LABEL_CHARACTERS,
-            ),
+            title: title.clone(),
             workspace: bounded_metadata(workspace, MAX_LABEL_CHARACTERS),
             tab: bounded_metadata(tab, MAX_LABEL_CHARACTERS),
             pane_label: bounded_metadata(
@@ -572,6 +606,9 @@ impl AgentCardIndex {
                 .find(|event| event.pane == agent.pane)
                 .map(|event| event.occurred_at_ms),
             marks: marked,
+            alias,
+            alias_suspended,
+            favourite: local.aliases.is_favourite(&reference),
         }
     }
 }
@@ -634,9 +671,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AgentActivity, AgentCardIndex, AgentCardSection, CardRouteError, MAX_HISTORY_CARDS,
+        AgentActivity, AgentCardIndex, AgentCardSection, CardRouteError, LocalView,
+        MAX_HISTORY_CARDS,
     };
     use crate::agent_marks::{AgentMarkRequest, AgentMarks};
+    use crate::aliases::{Aliases, ResourceRef};
     use crate::attention::AttentionIndex;
     use crate::model::{AgentId, TargetSession};
     use crate::state::{
@@ -672,8 +711,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(titles(&projection.needs_you), ["reviewer"]);
@@ -702,8 +740,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert!(projection.needs_you.is_empty());
@@ -738,8 +775,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(projection.needs_you.len(), 2);
@@ -774,7 +810,11 @@ mod tests {
                 Some(agents_snapshot(&[("p9", "blocked")])),
             ),
         ]);
-        let before = index.project(&first, &attention, &AgentMarks::default(), NOW);
+        let before = index.project(
+            &first,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
         assert_eq!(
             order(&before.needs_you),
             [pane_key("host-a", "p1"), pane_key("host-b", "p9")]
@@ -791,7 +831,11 @@ mod tests {
                 Some(agents_snapshot(&[("p1", "blocked")])),
             ),
         );
-        let after = index.project(&second, &attention, &AgentMarks::default(), NOW);
+        let after = index.project(
+            &second,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert_eq!(
             order(&after.needs_you),
@@ -809,7 +853,11 @@ mod tests {
         );
 
         // A refresh that changes nothing at all publishes nothing at all.
-        let unchanged = index.project(&second, &attention, &AgentMarks::default(), NOW);
+        let unchanged = index.project(
+            &second,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
         assert_eq!(unchanged.revision, after.revision);
         assert_eq!(unchanged.needs_you, after.needs_you);
     }
@@ -823,7 +871,11 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked"), ("p2", "blocked")])),
         )]);
-        index.project(&blocked_pair, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &blocked_pair,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         // p1 is answered and starts working, then blocks again. It is now the
         // most recently blocked agent, so it queues behind p2 rather than
@@ -833,8 +885,16 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "working"), ("p2", "blocked")])),
         )]);
-        index.project(&answered, &attention, &AgentMarks::default(), NOW);
-        let projection = index.project(&blocked_pair, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &answered,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
+        let projection = index.project(
+            &blocked_pair,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert_eq!(
             order(&projection.needs_you),
@@ -851,14 +911,22 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        index.project(&running, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &running,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         let ended = federation(vec![(
             "host-a",
             TargetConnectionState::Live,
             Some(agents_snapshot(&[])),
         )]);
-        let projection = index.project(&ended, &attention, &AgentMarks::default(), NOW);
+        let projection = index.project(
+            &ended,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert!(projection.needs_you.is_empty());
         assert_eq!(projection.recent.len(), 1);
@@ -881,14 +949,22 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        index.project(&before, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &before,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         let after_move = federation(vec![(
             "host-a",
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p2", "blocked")])),
         )]);
-        let projection = index.project(&after_move, &attention, &AgentMarks::default(), NOW);
+        let projection = index.project(
+            &after_move,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert_eq!(order(&projection.needs_you), [pane_key("host-a", "p2")]);
         assert_eq!(projection.recent.len(), 1);
@@ -911,7 +987,11 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        index.project(&live, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &live,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         // Disconnected, but the last snapshot is retained: the agent is
         // probably still there, and emptying the inbox on a flapping link
@@ -921,7 +1001,11 @@ mod tests {
             TargetConnectionState::Backoff { attempt: 1 },
             Some(agents_snapshot(&[("p1", "blocked")])),
         )]);
-        let projection = index.project(&dropped, &attention, &AgentMarks::default(), NOW);
+        let projection = index.project(
+            &dropped,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert_eq!(projection.needs_you.len(), 1);
         let card = &projection.needs_you[0];
@@ -948,15 +1032,13 @@ mod tests {
                 Some(agents_snapshot(&[("p1", "blocked")])),
             )]),
             &attention,
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         let projection = index.project(
             &federation(vec![("host-a", TargetConnectionState::Connecting, None)]),
             &attention,
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(projection.needs_you.len(), 1);
@@ -975,15 +1057,13 @@ mod tests {
                 Some(agents_snapshot(&[("p1", "blocked")])),
             )]),
             &attention,
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         let projection = index.project(
             &FederationState::default(),
             &attention,
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert!(
@@ -1008,8 +1088,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(projection.needs_you.len(), 1);
@@ -1067,8 +1146,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
         let card = projection.cards().next().unwrap();
 
@@ -1091,8 +1169,7 @@ mod tests {
                     Some(agents_snapshot(&[(name.as_str(), "blocked")])),
                 )]),
                 &attention,
-                &AgentMarks::default(),
-                NOW,
+                local(&AgentMarks::default(), &Aliases::default()),
             );
         }
         let projection = index.project(
@@ -1102,8 +1179,7 @@ mod tests {
                 Some(agents_snapshot(&[])),
             )]),
             &attention,
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(projection.recent.len(), MAX_HISTORY_CARDS);
@@ -1130,8 +1206,11 @@ mod tests {
         )]);
         attention.observe(&blocked);
 
-        let projection =
-            AgentCardIndex::default().project(&blocked, &attention, &AgentMarks::default(), NOW);
+        let projection = AgentCardIndex::default().project(
+            &blocked,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert!(projection.needs_you[0].unread);
         assert!(projection.needs_you[0].last_change_ms.is_some());
@@ -1148,7 +1227,11 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked"), ("p2", "blocked")])),
         )]);
-        index.project(&state, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &state,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         let mut marks = AgentMarks::default();
         marks.apply(
@@ -1156,7 +1239,7 @@ mod tests {
             AgentMarkRequest::Pin { pinned: true },
             NOW,
         );
-        let projection = index.project(&state, &attention, &marks, NOW);
+        let projection = index.project(&state, &attention, local(&marks, &Aliases::default()));
 
         assert_eq!(
             order(&projection.needs_you),
@@ -1181,7 +1264,11 @@ mod tests {
             NOW,
         );
 
-        let projection = index.project(&state, &AttentionIndex::default(), &marks, NOW);
+        let projection = index.project(
+            &state,
+            &AttentionIndex::default(),
+            local(&marks, &Aliases::default()),
+        );
 
         assert!(projection.needs_you.is_empty());
         assert_eq!(projection.recent.len(), 1);
@@ -1206,7 +1293,11 @@ mod tests {
             TargetConnectionState::Live,
             Some(agents_snapshot(&[("p1", "blocked"), ("p2", "blocked")])),
         )]);
-        index.project(&state, &attention, &AgentMarks::default(), NOW);
+        index.project(
+            &state,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         let mut marks = AgentMarks::default();
         marks.apply(
@@ -1214,11 +1305,19 @@ mod tests {
             AgentMarkRequest::Snooze { minutes: Some(10) },
             NOW,
         );
-        let quiet = index.project(&state, &attention, &marks, NOW);
+        let quiet = index.project(&state, &attention, local(&marks, &Aliases::default()));
         assert_eq!(order(&quiet.needs_you), [pane_key("host-a", "p2")]);
 
         marks.expire(NOW + 10 * 60_000);
-        let awake = index.project(&state, &attention, &marks, NOW + 10 * 60_000);
+        let awake = index.project(
+            &state,
+            &attention,
+            LocalView {
+                marks: &marks,
+                aliases: &Aliases::default(),
+                now_ms: NOW + 10 * 60_000,
+            },
+        );
 
         assert_eq!(
             order(&awake.needs_you),
@@ -1236,7 +1335,11 @@ mod tests {
             TargetConnectionState::Live,
             Some(session_snapshot("p1", "abc123")),
         )]);
-        let first = index.project(&before, &attention, &AgentMarks::default(), NOW);
+        let first = index.project(
+            &before,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
         let identity = first.needs_you[0].agent.clone();
 
         let after = federation(vec![(
@@ -1244,7 +1347,11 @@ mod tests {
             TargetConnectionState::Live,
             Some(session_snapshot("p2", "abc123")),
         )]);
-        let moved = index.project(&after, &attention, &AgentMarks::default(), NOW);
+        let moved = index.project(
+            &after,
+            &attention,
+            local(&AgentMarks::default(), &Aliases::default()),
+        );
 
         assert_eq!(
             moved
@@ -1273,7 +1380,11 @@ mod tests {
             Some(session_snapshot("p1", "abc123")),
         )]);
         let identity = index
-            .project(&before, &attention, &AgentMarks::default(), NOW)
+            .project(
+                &before,
+                &attention,
+                local(&AgentMarks::default(), &Aliases::default()),
+            )
             .needs_you[0]
             .agent
             .clone();
@@ -1285,7 +1396,7 @@ mod tests {
             TargetConnectionState::Live,
             Some(session_snapshot("p2", "abc123")),
         )]);
-        let moved = index.project(&after, &attention, &marks, NOW);
+        let moved = index.project(&after, &attention, local(&marks, &Aliases::default()));
 
         assert!(
             moved.needs_you[0].marks.pinned,
@@ -1312,8 +1423,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(projection.needs_you.len(), 1, "one identity is one card");
@@ -1346,8 +1456,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(projection.needs_you.len(), 2);
@@ -1387,8 +1496,7 @@ mod tests {
         let projection = index.project(
             &state,
             &AttentionIndex::default(),
-            &AgentMarks::default(),
-            NOW,
+            local(&AgentMarks::default(), &Aliases::default()),
         );
 
         assert_eq!(
@@ -1417,6 +1525,91 @@ mod tests {
     /// The identity a pane-keyed agent gets. Written out here rather than
     /// hidden behind the production helper, so a test that asserts on identity
     /// would notice the format changing under it.
+    #[test]
+    fn a_local_name_is_shown_beside_the_host_own_word_and_never_instead_of_the_identity() {
+        let mut index = AgentCardIndex::default();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(json!({
+                "workspaces": [],
+                "panes": [{"pane_id": "p1"}],
+                "agents": [{"pane_id": "p1", "name": "builder", "agent_status": "blocked"}]
+            })),
+        )]);
+        let mut aliases = Aliases::default();
+        let agent = ResourceRef::Agent(pane_agent("host-a", "p1"));
+        aliases
+            .set(agent.clone(), "the flaky one", "builder")
+            .unwrap();
+        aliases.favourite(agent).unwrap();
+
+        let card = index
+            .project(
+                &state,
+                &AttentionIndex::default(),
+                local(&AgentMarks::default(), &aliases),
+            )
+            .needs_you
+            .remove(0);
+
+        assert_eq!(card.alias.as_deref(), Some("the flaky one"));
+        assert_eq!(
+            card.title, "builder",
+            "the host's own word is kept, so a client can show both"
+        );
+        assert!(card.favourite);
+        assert!(!card.alias_suspended);
+        assert_eq!(
+            card.agent.resource,
+            format!("pane{AGENT_KEY_SEPARATOR}p1"),
+            "a name is never part of the identity"
+        );
+    }
+
+    #[test]
+    fn a_name_over_an_agent_the_host_now_calls_something_else_is_suspended() {
+        let mut index = AgentCardIndex::default();
+        let mut aliases = Aliases::default();
+        aliases
+            .set(
+                ResourceRef::Agent(pane_agent("host-a", "p1")),
+                "the flaky one",
+                "builder",
+            )
+            .unwrap();
+        let state = federation(vec![(
+            "host-a",
+            TargetConnectionState::Live,
+            Some(json!({
+                "workspaces": [],
+                "panes": [{"pane_id": "p1"}],
+                "agents": [{"pane_id": "p1", "name": "customer demo", "agent_status": "blocked"}]
+            })),
+        )]);
+
+        let card = index
+            .project(
+                &state,
+                &AttentionIndex::default(),
+                local(&AgentMarks::default(), &aliases),
+            )
+            .needs_you
+            .remove(0);
+
+        assert!(card.alias.is_none(), "a suspended name is not applied");
+        assert!(card.alias_suspended, "and it is not forgotten either");
+        assert_eq!(card.title, "customer demo");
+    }
+
+    fn local<'a>(marks: &'a AgentMarks, aliases: &'a Aliases) -> LocalView<'a> {
+        LocalView {
+            marks,
+            aliases,
+            now_ms: NOW,
+        }
+    }
+
     fn pane_agent(target: &str, resource: &str) -> AgentId {
         AgentId::new(
             target,

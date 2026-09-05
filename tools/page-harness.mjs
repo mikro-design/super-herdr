@@ -125,6 +125,19 @@ class StubEventSource {
   close() {}
 }
 globalThis.EventSource = StubEventSource;
+// A browser that remembers, and one that refuses to. Both have to work.
+let stored = {};
+let storageWorks = true;
+globalThis.localStorage = {
+  getItem(key) {
+    if (!storageWorks) throw new Error('storage is blocked');
+    return Object.prototype.hasOwnProperty.call(stored, key) ? stored[key] : null;
+  },
+  setItem(key, value) {
+    if (!storageWorks) throw new Error('storage is blocked');
+    stored[key] = String(value);
+  },
+};
 // Object URLs are a browser thing; the page revokes what it creates, so the
 // stub counts both to catch a blob left behind.
 let objectUrls = 0;
@@ -458,7 +471,12 @@ const sections = () => page.el('inbox-sections').children;
 // put on it. Reaching through it here keeps the assertions about behaviour
 // rather than about which element happens to carry the handler.
 const openOf = one => one.children[0];
-const marksOf = one => (one.children[1] ? one.children[1].children : []);
+// Found by what it holds rather than by position: a card grows a note when it
+// carries a local name, and an index would quietly start measuring that.
+const marksOf = one => (
+  one.children.find(child => child.children.some(held => held.dataset && held.dataset.mark))
+    || { children: [] }
+).children;
 const markChip = (one, kind) => marksOf(one).find(chip => chip.dataset.mark === kind);
 const cardsIn = index => sections()[index].children.slice(1);
 const chipFor = (group, value) => page.el('inbox-filters').children
@@ -526,7 +544,7 @@ check(
   openOf(cardsIn(0)[1]).children[1].children[1].textContent === 'host not connected',
 );
 check('a gone agent offers nothing to mark', marksOf(cardsIn(0)[0]).length === 0);
-check('a stale card still offers its marks', marksOf(cardsIn(0)[1]).length === 3);
+check('a stale card still offers its marks', marksOf(cardsIn(0)[1]).length === 4);
 
 // Opening a card routes to its own qualified pane and settles its attention.
 deliver(projection({ needs_you: [card('p1', { unread: true })] }));
@@ -962,3 +980,40 @@ check('choosing a search result fills the whole path',
 // The picker belongs to the pane being watched.
 page.observe({ target: 'first', session: 'main', resource: 'w1:p2' }, 'other');
 check('watching another pane clears the picker', entries().length === 0);
+
+// A local name is shown over the host's own word and never instead of the
+// identity, and a favourite is one more thing this installation remembers.
+deliver(projection({
+  needs_you: [
+    card('p1', { alias: 'the flaky one', favourite: true }),
+    card('p2', { alias_suspended: true }),
+  ],
+}));
+const nameOf = one => openOf(one).children[0].children[0].textContent;
+const noteOf = one => one.children[1].textContent;
+check('a local name is what the card says', nameOf(cardsIn(0)[0]) === 'the flaky one');
+check('the host word is kept underneath', noteOf(cardsIn(0)[0]) === 'host calls it p1');
+check(
+  'a favourite is marked',
+  openOf(cardsIn(0)[0]).children[0].children[2].textContent === '★',
+);
+check(
+  'a suspended name is neither shown nor dropped',
+  nameOf(cardsIn(0)[1]) === 'p2' && noteOf(cardsIn(0)[1]).includes('out of date'),
+);
+
+sent.length = 0;
+markChip(cardsIn(0)[1], 'favourite').onclick();
+const favourited = sent.find(one => one.body.type === 'local.favourite');
+check('favouriting names the qualified agent',
+  favourited.body.resource.kind === 'agent' && favourited.body.resource.resource === 'p2');
+
+// Filters are remembered per browser, and a browser that refuses to remember
+// still renders one.
+stored = {};
+chipFor('state', 'working').onclick();
+check('a chosen filter is written down', JSON.parse(stored['super-herdr.view']).state === 'working');
+storageWorks = false;
+chipFor('state', 'all').onclick();
+check('a browser that will not remember still filters', sections().length >= 1);
+storageWorks = true;
