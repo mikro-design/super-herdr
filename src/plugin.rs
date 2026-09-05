@@ -17,6 +17,8 @@ use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
 use crate::transport::{ApiSession, SnapshotError};
 
 const MAX_PLUGIN_ACTIONS: usize = 512;
+
+use crate::plugin_fleet::{InstalledPlugin, MAX_PLUGINS_PER_TARGET, PluginSource};
 const MAX_PLUGIN_RUNS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +157,134 @@ pub async fn list(
     })
     .await
     .map_err(|_| SnapshotError::timed_out(request_timeout))?
+}
+
+/// What is installed on one host, through Herdr's documented `plugin.list`.
+///
+/// Separate from the action registry because it answers a different question:
+/// the registry says what a pane can be asked to do right now, and this says
+/// what somebody installed and where it came from. The command arrays that the
+/// action path strips are not present here at all.
+pub async fn installed(
+    target: &Target,
+    transport: &TransportConfig,
+    request_timeout: Duration,
+) -> Result<Vec<InstalledPlugin>, SnapshotError> {
+    timeout(request_timeout, async {
+        let mut session = ApiSession::open(target, transport, request_timeout).await?;
+        let value = session.request("plugin.list", json!({})).await?;
+        parse_installed(value)
+    })
+    .await
+    .map_err(|_| SnapshotError::timed_out(request_timeout))?
+}
+
+fn parse_installed(value: Value) -> Result<Vec<InstalledPlugin>, SnapshotError> {
+    let listed: PluginList = serde_json::from_value(value)
+        .map_err(|_| SnapshotError::unavailable("Herdr returned an invalid plugin list"))?;
+    if listed.kind != "plugin_list" {
+        return Err(SnapshotError::unavailable(
+            "Herdr returned an unexpected plugin list response",
+        ));
+    }
+    if listed.plugins.len() > MAX_PLUGINS_PER_TARGET {
+        return Err(SnapshotError::unavailable(format!(
+            "Herdr reported more than {MAX_PLUGINS_PER_TARGET} plugins"
+        )));
+    }
+    Ok(listed
+        .plugins
+        .into_iter()
+        .map(|plugin| InstalledPlugin {
+            plugin_id: bounded(&plugin.plugin_id),
+            name: bounded(&plugin.name),
+            version: bounded(&plugin.version),
+            enabled: plugin.enabled,
+            requested_ref: plugin.requested_ref_of(),
+            resolved_commit: plugin.resolved_commit_of(),
+            // A source is an identity only when it is complete. A partial one
+            // would let two different plugins agree on whatever half of it
+            // arrived, which is the collision this whole module exists to
+            // avoid — so anything missing a field is no source at all.
+            source: plugin.source.as_ref().and_then(|source| {
+                Some(PluginSource {
+                    kind: bounded(source.kind.as_deref()?),
+                    owner: bounded(source.owner.as_deref()?),
+                    repo: bounded(source.repo.as_deref()?),
+                    subdir: source.subdir.as_deref().map(bounded),
+                })
+            }),
+            warnings: plugin
+                .warnings
+                .iter()
+                .take(8)
+                .map(|warning| bounded(warning))
+                .collect(),
+        })
+        .collect())
+}
+
+fn bounded(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(256)
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct PluginList {
+    #[serde(rename = "type")]
+    kind: String,
+    plugins: Vec<ListedPlugin>,
+}
+
+#[derive(Deserialize)]
+struct ListedPlugin {
+    plugin_id: String,
+    name: String,
+    version: String,
+    enabled: bool,
+    #[serde(default)]
+    source: Option<ListedSource>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+impl ListedPlugin {
+    fn requested_ref_of(&self) -> Option<String> {
+        self.source.as_ref()?.requested_ref.as_deref().map(bounded)
+    }
+
+    fn resolved_commit_of(&self) -> Option<String> {
+        self.source
+            .as_ref()?
+            .resolved_commit
+            .as_deref()
+            .map(bounded)
+    }
+}
+
+#[derive(Deserialize)]
+struct ListedSource {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+    #[serde(default)]
+    requested_ref: Option<String>,
+    #[serde(default)]
+    resolved_commit: Option<String>,
 }
 
 fn parse_list(target: &TargetSession, value: Value) -> Result<Vec<PluginAction>, SnapshotError> {
@@ -547,6 +677,74 @@ fn insert_optional(context: &mut Map<String, Value>, field: &str, value: Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_source_missing_a_field_is_no_source_at_all() {
+        let value = serde_json::json!({
+            "type": "plugin_list",
+            "plugins": [
+                {
+                    "plugin_id": "complete", "name": "complete", "version": "1.0",
+                    "enabled": true,
+                    "source": {
+                        "kind": "github", "owner": "alice", "repo": "review",
+                        "requested_ref": "v1", "resolved_commit": "abc"
+                    }
+                },
+                {
+                    "plugin_id": "partial", "name": "partial", "version": "1.0",
+                    "enabled": true,
+                    "source": {"kind": "github", "owner": "alice"}
+                },
+                {"plugin_id": "linked", "name": "linked", "version": "0.1", "enabled": false}
+            ]
+        });
+
+        let plugins = super::parse_installed(value).unwrap();
+
+        assert_eq!(
+            plugins[0].source.as_ref().unwrap().to_string(),
+            "alice/review"
+        );
+        assert_eq!(plugins[0].resolved_commit.as_deref(), Some("abc"));
+        assert!(
+            plugins[1].source.is_none(),
+            "half an identity would let two different plugins agree on the half that arrived"
+        );
+        assert!(plugins[2].source.is_none());
+        assert!(!plugins[2].enabled);
+    }
+
+    #[test]
+    fn a_host_reporting_absurdly_many_plugins_is_refused() {
+        let plugins = (0..super::MAX_PLUGINS_PER_TARGET + 1)
+            .map(|index| {
+                serde_json::json!({
+                    "plugin_id": format!("p{index}"), "name": "p", "version": "1",
+                    "enabled": true
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            super::parse_installed(serde_json::json!({
+                "type": "plugin_list",
+                "plugins": plugins
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unexpected_response_is_not_read_as_a_plugin_list() {
+        assert!(
+            super::parse_installed(serde_json::json!({
+                "type": "plugin_action_list",
+                "plugins": []
+            }))
+            .is_err()
+        );
+    }
+
     use serde_json::json;
 
     use super::{

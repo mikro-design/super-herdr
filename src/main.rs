@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use super_herdr::clipboard;
 use super_herdr::config::{Config, Target};
 use super_herdr::daemon::{DaemonOptions, serve};
+use super_herdr::doctor;
 use super_herdr::notifications;
 use super_herdr::probe::{FederationReport, probe_all};
 use super_herdr::transport::expand_discovered_sessions;
@@ -60,6 +61,20 @@ enum Commands {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
+    /// Inspect plugins across every configured host.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
+    /// Report which layer is broken, without changing anything.
+    Doctor {
+        /// Emit one machine-readable report of metadata only.
+        #[arg(long)]
+        json: bool,
+        /// Override the per-check network timeout.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
     /// Open the federated terminal UI.
     Tui,
     /// Serve the federation on a local socket for Super-Herdr clients.
@@ -99,6 +114,31 @@ enum Commands {
     Target {
         #[command(subcommand)]
         command: TargetCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommands {
+    /// List what is installed where, and what differs.
+    List {
+        /// Emit one machine-readable inventory.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write down one host's plugins as the set to reproduce elsewhere.
+    Lock {
+        /// The target whose plugins are the desired set.
+        #[arg(long, value_name = "NAME")]
+        from: String,
+    },
+    /// Show what it would take to bring hosts to a lockfile. Runs nothing.
+    Plan {
+        /// A lockfile written by `super-herdr plugins lock`.
+        #[arg(long, value_name = "PATH")]
+        lock: PathBuf,
+        /// Restrict the plan to these targets; every target by default.
+        #[arg(long = "target", value_name = "NAME")]
+        targets: Vec<String>,
     },
 }
 
@@ -221,6 +261,112 @@ enum TargetCommands {
     List,
 }
 
+/// Ask every configured host what it has installed, each on its own clock.
+///
+/// One host failing is one line in the report rather than the end of it: a
+/// fleet report where an unreachable machine hides the other five is one
+/// nobody can act on.
+async fn plugin_inventory(
+    config: &Config,
+    timeout: Duration,
+) -> super_herdr::plugin_fleet::Inventory {
+    let mut inventory = super_herdr::plugin_fleet::Inventory::default();
+    for target in &config.targets {
+        let key = super_herdr::state::target_key(target);
+        match super_herdr::plugin::installed(target, &config.transport, timeout).await {
+            Ok(plugins) => {
+                inventory.installed.insert(key, plugins);
+            }
+            Err(error) => {
+                inventory.errors.insert(key, error.to_string());
+            }
+        }
+    }
+    inventory
+}
+
+fn render_inventory(inventory: &super_herdr::plugin_fleet::Inventory) -> String {
+    use super_herdr::plugin_fleet::Drift;
+
+    let mut rendered = String::new();
+    for (target, plugins) in &inventory.installed {
+        rendered.push_str(&format!("{target}\n"));
+        if plugins.is_empty() {
+            rendered.push_str("  no plugins installed\n");
+        }
+        for plugin in plugins {
+            rendered.push_str(&format!(
+                "  {} {}{}{}\n",
+                plugin.name,
+                plugin.version,
+                plugin
+                    .source
+                    .as_ref()
+                    .map(|source| format!("  {source}"))
+                    .unwrap_or_else(|| "  (linked locally)".to_owned()),
+                if plugin.enabled { "" } else { "  [disabled]" }
+            ));
+        }
+    }
+    for (target, error) in &inventory.errors {
+        rendered.push_str(&format!("{target}\n  could not be asked: {error}\n"));
+    }
+
+    let drift = inventory.drift();
+    if drift.is_empty() && inventory.errors.is_empty() {
+        rendered.push_str("\nEvery host that answered agrees.\n");
+        return rendered;
+    }
+    if !drift.is_empty() {
+        rendered.push_str("\ndifferences\n");
+    }
+    for one in &drift {
+        rendered.push_str(&match one {
+            Drift::Missing {
+                source,
+                absent_from,
+                ..
+            } => format!(
+                "  {source} is not installed on {}\n",
+                absent_from
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Drift::Version { source, versions } => format!(
+                "  {source} differs: {}\n",
+                versions
+                    .iter()
+                    .map(|(version, targets)| format!("{version} on {}", targets.len()))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Drift::Commit { source, commits } => format!(
+                "  {source} is one version built from {} different commits\n",
+                commits.len()
+            ),
+            Drift::Disabled {
+                source,
+                disabled_on,
+            } => format!(
+                "  {source} is switched off on {}\n",
+                disabled_on
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Drift::LocalOnly {
+                target,
+                name,
+                plugin_id,
+            } => format!("  {name} ({plugin_id}) is linked locally on {target} only\n"),
+        });
+    }
+    rendered
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -304,6 +450,115 @@ async fn run() -> Result<ExitCode> {
                 ))?;
             }
             Ok(ExitCode::SUCCESS)
+        }
+        Commands::Plugins { command } => {
+            let expanded = expand_discovered_sessions(config).await;
+            let timeout = Duration::from_secs(expanded.transport.command_timeout_seconds);
+            let inventory = plugin_inventory(&expanded, timeout).await;
+            match command {
+                PluginCommands::List { json } => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "inventory": inventory,
+                                "drift": inventory.drift(),
+                            }))?
+                        );
+                    } else {
+                        print!("{}", render_inventory(&inventory));
+                    }
+                    // One unreachable host is a failure worth an exit code,
+                    // and the hosts that answered are still reported above it.
+                    Ok(if inventory.errors.is_empty() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    })
+                }
+                PluginCommands::Lock { from } => {
+                    let key = expanded
+                        .targets
+                        .iter()
+                        .map(super_herdr::state::target_key)
+                        .find(|key| key.target == from)
+                        .with_context(|| format!("no configured target named {from:?}"))?;
+                    let lockfile = inventory
+                        .lockfile(&key)
+                        .with_context(|| format!("{from} reported no plugins"))?;
+                    println!("{}", serde_json::to_string_pretty(&lockfile)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                PluginCommands::Plan { lock, targets } => {
+                    let text = std::fs::read_to_string(&lock)
+                        .with_context(|| format!("failed to read {}", lock.display()))?;
+                    let lockfile: super_herdr::plugin_fleet::Lockfile =
+                        serde_json::from_str(&text).context("that lockfile is not valid")?;
+                    let wanted = expanded
+                        .targets
+                        .iter()
+                        .map(super_herdr::state::target_key)
+                        .filter(|key| targets.is_empty() || targets.contains(&key.target))
+                        .collect::<Vec<_>>();
+                    let steps = inventory.plan(&lockfile, &wanted);
+                    if steps.is_empty() {
+                        println!("Every named host already holds this set.");
+                    }
+                    for step in &steps {
+                        println!(
+                            "{} {} on {}{}",
+                            match step.action {
+                                super_herdr::plugin_fleet::PlanAction::Install => "install",
+                                super_herdr::plugin_fleet::PlanAction::Update => "update",
+                            },
+                            step.source,
+                            step.target,
+                            step.from
+                                .as_deref()
+                                .map(|from| format!(" (from {from})"))
+                                .unwrap_or_default()
+                        );
+                        println!("    {}", step.command);
+                    }
+                    // Printed and not run. Applying belongs to a command that
+                    // asks first, per target, and does not exist yet.
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        Commands::Doctor { json, timeout } => {
+            let socket = DaemonOptions::discover().ok().map(|options| options.socket);
+            let mut checks = doctor::local_checks(&config, &path, socket.as_deref());
+            let expanded = expand_discovered_sessions(config).await;
+            let timeout = timeout.map(Duration::from_secs);
+            checks.extend(doctor::probe_targets(&expanded, timeout).await);
+            for target in &expanded.targets {
+                let tools = doctor::digest_tools(target, &expanded.transport).await;
+                checks.push(doctor::transfer_tools_check(
+                    &target.name,
+                    &tools.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+            }
+            for line in clipboard::diagnostic_lines(None).await {
+                checks.push(doctor::Check::note("clipboard", line));
+            }
+            for line in notifications::diagnostic_lines(&expanded.notifications).await {
+                checks.push(doctor::Check::note("notifications", line));
+            }
+
+            let report = doctor::Report { checks };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render());
+            }
+            // A failing check is an exit code, so this can sit in a script
+            // without anybody parsing the text.
+            Ok(if report.failed() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Commands::Probe {
             json,

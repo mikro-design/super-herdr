@@ -1112,6 +1112,70 @@ write into. Until such an envelope exists, transfers are initiated from the
 client, and Super-Herdr does not invent a side channel by scraping the pane's
 own output for markers.
 
+## Plugins across hosts
+
+Herdr installs plugins per host, so once somebody runs agents on three
+machines, "which of them has the review plugin, and is it the same one?" stops
+being answerable by looking. The usual answer — install it everywhere again and
+hope — is how versions drift apart quietly.
+
+Two things make this harder than diffing lists, and both are decisions rather
+than details. A `plugin_id` is server-local: two hosts can name unrelated
+plugins the same thing, and one plugin can be installed under different ids, so
+matching on it would report drift between things that were never the same
+plugin and silence between two copies of one. Identity here is therefore the
+*source* the plugin was installed from, and the id stays qualified by its
+target. And a plugin with no source has no identity to compare at all — a
+linked local plugin exists only where it was linked, so it is named as local to
+that host and never matched, because a name is not evidence that two
+directories hold the same code. A source is an identity only when it is
+complete; a partial one is discarded rather than half-matched.
+
+A version difference and a commit difference are reported separately, and never
+both for the same plugin: a version that did not change while the code did is
+the drift nobody would otherwise look for, while a version difference already
+explains a commit one. A host that could not be asked is a line in the report
+rather than the end of it, and is never counted as missing anything — an
+unreachable machine is not evidence, and treating it as one sends somebody to
+install a plugin that is already there.
+
+Nothing here installs anything. A lockfile records what one named host has,
+pinned to resolved commits rather than tags, because a tag can be moved and a
+branch certainly will. A plan prints the `herdr plugin install` commands that
+would close the gap and runs none of them: Herdr has an installer, and a second
+one would be a second thing to keep correct. Applying belongs to a command that
+asks per target, which does not exist yet.
+
+## Diagnosing a layer
+
+Super-Herdr sits on several things it does not own: a configuration file, a
+Herdr on every host, SSH between them, a daemon socket, a browser route, and a
+desktop's clipboard and notification tools. When one of them is wrong the
+symptom is usually the same — something did not appear — and the layer it came
+from is the expensive part to work out. `super-herdr doctor` answers that in one
+pass, and never guesses on the strength of a symptom it did not check.
+
+It reports and never repairs. Every failed check carries the command somebody
+would run, and none of them run here: a diagnostic that changes the system is
+one people are afraid to run on a machine that is nearly working, which is
+exactly when it is most useful. If a `--fix` mode is ever added it will need a
+separate confirmation per mutation, and it must never stop or restart a Herdr
+session — that is somebody's running work.
+
+The output is meant to be pasted somewhere public. Host names, SSH
+destinations, socket paths, browser URLs and home directories are reduced to
+their shape; target names are kept, because they are the labels somebody chose
+and without them a report says a problem exists without saying where. Terminal
+contents, clipboard payloads, device tokens and pairing material do not appear
+at all, and no check reads any of them. `--json` emits the same metadata for a
+support bundle.
+
+Every network check is bounded and independent, so one unreachable host delays
+its own line and nothing else. Two checks exist because their failure is
+otherwise invisible until somebody tries: a Herdr older than protocol 20 is a
+warning rather than a failure, because everything except plugin actions works
+against it, and a host with no digest tool cannot verify a transfer at all.
+
 ## Security
 
 - OpenSSH configuration and host-key verification remain authoritative.

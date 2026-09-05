@@ -223,35 +223,44 @@ one controlled pane.
 
 ### 5. Unified diagnostics
 
-- [ ] Add a read-only `super-herdr doctor` command.
-- [ ] Check configuration permissions, Herdr executable/protocol compatibility,
-      SSH aliases, each target independently, the daemon socket, bridge route,
-      pairing prerequisites, clipboard tools, notification capability, and
-      transfer dependencies.
-- [ ] Bound and time out every network check.
-- [ ] Redact host details, credentials, authorization headers, private routes,
+- [x] Add a read-only `super-herdr doctor` command.
+- [x] Check configuration permissions, Herdr executable/protocol compatibility,
+      each target independently, the daemon socket, bridge route, pairing
+      prerequisites, clipboard tools, notification capability, and transfer
+      dependencies. SSH alias resolution is not checked separately: a target
+      that resolves is one the probe reached, and one that does not fails the
+      probe with ssh's own message, which is more useful than a second opinion.
+- [x] Bound and time out every network check.
+- [x] Redact host details, credentials, authorization headers, private routes,
       terminal contents, and pairing material from output.
-- [ ] Report corrective commands instead of changing the system automatically.
+- [x] Report corrective commands instead of changing the system automatically.
 - [ ] If a later `--fix` mode is added, require a separate confirmation for
-      every mutation and never stop or restart a Herdr session.
-- [ ] Add machine-readable output for support bundles containing metadata only.
+      every mutation and never stop or restart a Herdr session. No `--fix` mode
+      exists; this stays open as the constraint on adding one.
+- [x] Add machine-readable output for support bundles containing metadata only.
 
 Exit condition: a user can identify which layer is broken without exposing
 private material or affecting a healthy target.
 
 ### 6. Cross-host plugin inventory and explicit sync
 
-- [ ] Read installed plugin inventory through documented Herdr CLI/socket
+- [x] Read installed plugin inventory through documented Herdr CLI/socket
       interfaces for each qualified target and session.
-- [ ] Show missing plugins and version drift without treating same-named
+- [x] Show missing plugins and version drift without treating same-named
       server-local plugin IDs as globally identical.
-- [ ] Add marketplace search and plugin-detail links.
-- [ ] Export a desired plugin set with pinned references and a lockfile.
-- [ ] Produce an installation/update plan before making changes.
-- [ ] Apply only to explicitly selected targets after confirmation.
-- [ ] Isolate errors per target and never roll back by stopping or restarting a
+- [x] Isolate errors per target and never roll back by stopping or restarting a
       Herdr session.
-- [ ] Do not import Herdr internals or duplicate its plugin installer.
+- [x] Do not import Herdr internals or duplicate its plugin installer.
+- [x] Export a desired plugin set with pinned references and a lockfile.
+- [x] Produce an installation/update plan before making changes.
+- [ ] Add plugin-detail links, and marketplace search. Detail links ship,
+      derived from the source Herdr reports. Search does not: Herdr documents
+      no marketplace or catalogue interface — `herdr plugin install` takes an
+      `owner/repo`, and there is nothing to query. Blocked upstream, like the
+      structured choices in step 2.
+- [ ] Apply only to explicitly selected targets after confirmation. The plan
+      exists and is printed; running it changes somebody's hosts and wants its
+      own branch and its own review.
 
 Exit condition: the operator can see and deliberately reconcile plugin drift
 across machines while one failing target leaves every other target usable.
