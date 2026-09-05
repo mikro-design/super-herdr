@@ -309,9 +309,20 @@ hand-writing TOML and can understand which network trust boundary they chose.
 
 ### 9. Remote development preview, after the core path is qualified
 
-- [ ] Write a threat model before implementation, covering SSRF, private-network
+- [x] Write a threat model before implementation, covering SSRF, private-network
       traversal, redirects, cookies, authentication headers, response size,
-      content type, and malicious target services.
+      content type, and malicious target services. Written in
+      [REMOTE_PREVIEW.md](REMOTE_PREVIEW.md). Its central finding is not SSRF:
+      a paired device can already `curl` a dev server through pane control.
+      What the feature adds is *rendering* that response in a browser holding
+      the `sh_device` cookie, so content served from Super-Herdr's own origin
+      could issue authenticated commands without ever reading the token. Every
+      item below is conditioned on that, and the document lists seven things
+      that must be true before an implementation branch opens.
+
+The items below stay closed pending the design review this document is the
+input to. The backlog already required that review; the threat model is what it
+reviews.
 - [ ] Require an explicit, expiring grant for one target-local origin.
 - [ ] Restrict the first version to configured loopback origins on the selected
       target.
