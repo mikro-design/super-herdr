@@ -1112,6 +1112,40 @@ write into. Until such an envelope exists, transfers are initiated from the
 client, and Super-Herdr does not invent a side channel by scraping the pane's
 own output for markers.
 
+## Plugins across hosts
+
+Herdr installs plugins per host, so once somebody runs agents on three
+machines, "which of them has the review plugin, and is it the same one?" stops
+being answerable by looking. The usual answer — install it everywhere again and
+hope — is how versions drift apart quietly.
+
+Two things make this harder than diffing lists, and both are decisions rather
+than details. A `plugin_id` is server-local: two hosts can name unrelated
+plugins the same thing, and one plugin can be installed under different ids, so
+matching on it would report drift between things that were never the same
+plugin and silence between two copies of one. Identity here is therefore the
+*source* the plugin was installed from, and the id stays qualified by its
+target. And a plugin with no source has no identity to compare at all — a
+linked local plugin exists only where it was linked, so it is named as local to
+that host and never matched, because a name is not evidence that two
+directories hold the same code. A source is an identity only when it is
+complete; a partial one is discarded rather than half-matched.
+
+A version difference and a commit difference are reported separately, and never
+both for the same plugin: a version that did not change while the code did is
+the drift nobody would otherwise look for, while a version difference already
+explains a commit one. A host that could not be asked is a line in the report
+rather than the end of it, and is never counted as missing anything — an
+unreachable machine is not evidence, and treating it as one sends somebody to
+install a plugin that is already there.
+
+Nothing here installs anything. A lockfile records what one named host has,
+pinned to resolved commits rather than tags, because a tag can be moved and a
+branch certainly will. A plan prints the `herdr plugin install` commands that
+would close the gap and runs none of them: Herdr has an installer, and a second
+one would be a second thing to keep correct. Applying belongs to a command that
+asks per target, which does not exist yet.
+
 ## Diagnosing a layer
 
 Super-Herdr sits on several things it does not own: a configuration file, a

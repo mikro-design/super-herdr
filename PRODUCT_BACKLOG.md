@@ -244,17 +244,23 @@ private material or affecting a healthy target.
 
 ### 6. Cross-host plugin inventory and explicit sync
 
-- [ ] Read installed plugin inventory through documented Herdr CLI/socket
+- [x] Read installed plugin inventory through documented Herdr CLI/socket
       interfaces for each qualified target and session.
-- [ ] Show missing plugins and version drift without treating same-named
+- [x] Show missing plugins and version drift without treating same-named
       server-local plugin IDs as globally identical.
-- [ ] Add marketplace search and plugin-detail links.
-- [ ] Export a desired plugin set with pinned references and a lockfile.
-- [ ] Produce an installation/update plan before making changes.
-- [ ] Apply only to explicitly selected targets after confirmation.
-- [ ] Isolate errors per target and never roll back by stopping or restarting a
+- [x] Isolate errors per target and never roll back by stopping or restarting a
       Herdr session.
-- [ ] Do not import Herdr internals or duplicate its plugin installer.
+- [x] Do not import Herdr internals or duplicate its plugin installer.
+- [x] Export a desired plugin set with pinned references and a lockfile.
+- [x] Produce an installation/update plan before making changes.
+- [ ] Add plugin-detail links, and marketplace search. Detail links ship,
+      derived from the source Herdr reports. Search does not: Herdr documents
+      no marketplace or catalogue interface — `herdr plugin install` takes an
+      `owner/repo`, and there is nothing to query. Blocked upstream, like the
+      structured choices in step 2.
+- [ ] Apply only to explicitly selected targets after confirmation. The plan
+      exists and is printed; running it changes somebody's hosts and wants its
+      own branch and its own review.
 
 Exit condition: the operator can see and deliberately reconcile plugin drift
 across machines while one failing target leaves every other target usable.

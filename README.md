@@ -156,6 +156,15 @@ A card whose host has disconnected, or whose agent has ended, is shown and not
 offered — Super-Herdr resolves the live pane again before it routes anything,
 so a reconnect can never redirect your next keystroke.
 
+`super-herdr plugins list` shows what is installed on every host and what
+differs — missing plugins, version drift, and the same version built from
+different commits. Plugins are matched by where they were installed from
+rather than by the id a host gave them, so two hosts that happen to use the
+same name are not mistaken for one plugin. `plugins lock --from HOST` writes
+that host's set pinned to resolved commits, and `plugins plan --lock FILE`
+prints the `herdr plugin install` commands that would close the gap without
+running any of them.
+
 Run `super-herdr doctor` when something does not appear and you cannot tell
 which layer is at fault. It checks the configuration, every target
 independently, the daemon socket, the browser route, pairing, clipboard tools,
@@ -187,6 +196,8 @@ same metadata for a support bundle.
   machine, both from the same right-click menus
 - `super-herdr doctor`: one read-only pass over every layer, with redacted
   output and the command to run for anything broken
+- Cross-host plugin inventory, drift, a pinned lockfile, and a printed
+  install plan that runs nothing
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer
