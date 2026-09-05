@@ -91,6 +91,25 @@
     padding: .35rem .7rem; cursor: pointer;
   }
   button:disabled { color: var(--dim); cursor: default; opacity: .6; }
+  .inbox-head { display: flex; align-items: baseline; gap: .6rem; }
+  .inbox-head h2 { margin: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: .35rem; margin: .6rem 0 .2rem; }
+  .chip {
+    background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: .35rem .7rem; font-size: .82rem;
+    min-height: 2.1rem; cursor: pointer;
+  }
+  .chip[aria-pressed="true"] { border-color: var(--work); color: var(--work); }
+  .inbox-section { margin-top: .9rem; }
+  .inbox-title { display: flex; gap: .5rem; align-items: baseline; color: var(--dim); font-size: .78rem; margin: .35rem 0; }
+  .card {
+    display: block; width: 100%; text-align: left; background: var(--panel);
+    color: var(--ink); border: 1px solid var(--line); border-radius: .6rem;
+    padding: .6rem .7rem; margin-top: .35rem; min-height: 3rem;
+  }
+  .card + .card { margin-top: .35rem; }
+  .card[aria-disabled="true"] { color: var(--dim); }
+  .card-meta { display: flex; gap: .4rem; color: var(--dim); font-size: .78rem; margin-top: .25rem; }
   .actions { display: flex; gap: .5rem; margin-top: .7rem; }
   #line {
     flex: 1; min-width: 0; padding: .5rem .6rem; font: inherit;
@@ -239,8 +258,20 @@
   <p class="note" id="pair-error"></p>
 </section>
 <main hidden>
-  <h2>Terminals</h2>
-  <ul id="panes"><li class="empty">no panes</li></ul>
+  <section id="inbox" aria-label="Agent inbox">
+    <div class="inbox-head">
+      <h2>Agents</h2>
+      <span id="inbox-count" class="note"></span>
+    </div>
+    <div id="inbox-filters" class="chips" role="group" aria-label="Filter agents"></div>
+    <div id="inbox-sections"></div>
+    <p id="inbox-empty" class="empty">waiting for the daemon…</p>
+  </section>
+
+  <details id="hierarchy">
+    <summary>All targets and panes</summary>
+    <ul id="panes"><li class="empty">no panes</li></ul>
+  </details>
 
   <details id="attention-panel">
     <summary>Attention <span id="attention-count" class="badge gone">none</span></summary>
@@ -1125,6 +1156,167 @@ function resync() {
   subscribeScreen(pane);
 }
 
+// The inbox exactly as the daemon built it. This page renders that answer and
+// never derives a second one: sections and ordering are the daemon's, so a
+// person moving between the TUI and this phone reads one inbox rather than two
+// views that disagree the moment a snapshot is a refresh apart.
+let inbox = null;
+// What is being shown of it. A filter is a view, never a different request:
+// hiding a card here does not change what the daemon sends or what it holds,
+// so a filtered-out agent that starts waiting is still one chip away.
+const filters = { state: 'all', target: 'all', provider: 'all' };
+
+const INBOX_SECTIONS = [
+  { key: 'needs_you', title: 'Needs you' },
+  { key: 'working', title: 'Working' },
+  { key: 'recent', title: 'Recent' },
+];
+
+function inboxCards() {
+  if (!inbox) return [];
+  return INBOX_SECTIONS.flatMap(section => inbox[section.key] || []);
+}
+
+function matchesFilters(card, section) {
+  if (filters.state === 'needs_you' && section !== 'needs_you') return false;
+  if (filters.state === 'working' && section !== 'working') return false;
+  if (filters.target !== 'all' && text(card.agent && card.agent.target) !== filters.target) {
+    return false;
+  }
+  return !(filters.provider !== 'all' && text(card.provider) !== filters.provider);
+}
+
+function chip(label, group, value, container) {
+  const button = document.createElement('button');
+  button.className = 'chip';
+  button.type = 'button';
+  button.textContent = label;
+  button.dataset.group = group;
+  button.dataset.value = value;
+  button.setAttribute('aria-pressed', filters[group] === value ? 'true' : 'false');
+  button.onclick = () => {
+    filters[group] = value;
+    renderInbox();
+  };
+  container.append(button);
+}
+
+function renderFilters() {
+  const strip = el('inbox-filters');
+  strip.innerHTML = '';
+  const cards = inboxCards();
+  chip('All', 'state', 'all', strip);
+  chip('Needs you', 'state', 'needs_you', strip);
+  chip('Working', 'state', 'working', strip);
+
+  // A chip for a dimension with one value would be a control that cannot
+  // change anything, so the row appears only once there is a choice to make.
+  const targetNames = [...new Set(cards.map(card => text(card.agent && card.agent.target)))]
+    .filter(Boolean).sort();
+  if (targetNames.length > 1) {
+    chip('All hosts', 'target', 'all', strip);
+    for (const name of targetNames) chip(name, 'target', name, strip);
+  } else if (filters.target !== 'all') {
+    filters.target = 'all';
+  }
+
+  const providers = [...new Set(cards.map(card => text(card.provider)))].filter(Boolean).sort();
+  if (providers.length > 1) {
+    chip('Any agent', 'provider', 'all', strip);
+    for (const name of providers) chip(name, 'provider', name, strip);
+  } else if (filters.provider !== 'all') {
+    filters.provider = 'all';
+  }
+}
+
+function renderCard(card, section) {
+  const item = document.createElement('button');
+  item.className = 'card';
+  item.type = 'button';
+  item.dataset.agent = paneKey(card.agent);
+  item.dataset.section = section;
+  if (card.unread) item.classList.add('unread');
+  const row = document.createElement('div');
+  row.className = 'row';
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.textContent = text(card.title) || 'agent';
+  const badge = document.createElement('span');
+  badge.className = 'badge';
+  badge.textContent = text(card.status) || 'unknown';
+  badge.classList.add(card.stale ? 'gone' : phase(text(card.status)));
+  row.append(name, badge);
+  const meta = document.createElement('div');
+  meta.className = 'card-meta';
+  const where = document.createElement('span');
+  // The host and Herdr session are named on every card, because the whole
+  // reason to qualify an identity is undone if a person cannot see which
+  // machine they are about to type into.
+  where.textContent = [
+    text(card.agent && card.agent.target),
+    text(card.agent && card.agent.session),
+    text(card.workspace),
+    text(card.pane_label),
+  ].filter(Boolean).join(' · ');
+  meta.append(where);
+  item.append(row, meta);
+
+  if (card.actionable && card.pane) {
+    item.onclick = () => {
+      if (card.unread) send({ type: 'attention.mark_seen', pane: card.pane });
+      observe(card.pane, `${qualify(card.pane)}/${text(card.title)}`);
+    };
+    return item;
+  }
+
+  // A card that cannot resolve is shown and not offered. The daemon refuses a
+  // stale route anyway; this is so a person is told why rather than tapping
+  // something that silently does nothing.
+  item.setAttribute('aria-disabled', 'true');
+  item.disabled = true;
+  const why = document.createElement('span');
+  why.className = 'note';
+  why.textContent = card.stale ? 'host not connected' : 'no longer running';
+  meta.append(why);
+  return item;
+}
+
+function renderInbox() {
+  const container = el('inbox-sections');
+  container.innerHTML = '';
+  if (!inbox) {
+    el('inbox-empty').hidden = false;
+    el('inbox-empty').textContent = 'waiting for the daemon…';
+    el('inbox-count').textContent = '';
+    el('inbox-filters').innerHTML = '';
+    return;
+  }
+  renderFilters();
+
+  let shown = 0;
+  for (const section of INBOX_SECTIONS) {
+    const cards = (inbox[section.key] || []).filter(card => matchesFilters(card, section.key));
+    if (!cards.length) continue;
+    shown += cards.length;
+    const block = document.createElement('section');
+    block.className = 'inbox-section';
+    block.dataset.section = section.key;
+    const title = document.createElement('div');
+    title.className = 'inbox-title';
+    title.textContent = `${section.title} (${cards.length})`;
+    block.append(title);
+    for (const card of cards) block.append(renderCard(card, section.key));
+    container.append(block);
+  }
+
+  const waiting = (inbox.needs_you || []).length;
+  el('inbox-count').textContent = waiting ? `${waiting} waiting` : 'nothing waiting';
+  el('inbox-empty').hidden = shown > 0;
+  el('inbox-empty').textContent = inboxCards().length
+    ? 'no agents match these filters'
+    : 'no agents yet';
+}
+
 function renderPanes() {
   const list = el('panes');
   list.innerHTML = '';
@@ -1288,6 +1480,21 @@ function apply(message) {
       }
       pendingPluginOperations.clear();
       send({ type: 'state.subscribe' });
+      // The inbox is a separate subscription because it answers a separate
+      // question. A reconnect asks again: the daemon holds no memory of what
+      // this page had, and the projection is sent whole, so the first message
+      // after this replaces whatever was on screen.
+      //
+      // A daemon that does not offer it is an older one this page can still
+      // drive. Say so and open the hierarchy, rather than leaving a person
+      // watching a panel that will never fill.
+      if ((message.features || []).includes('agent_cards')) {
+        send({ type: 'agents.subscribe' });
+      } else {
+        inbox = null;
+        el('inbox').hidden = true;
+        el('hierarchy').open = true;
+      }
       // A reconnect is a new client to the daemon, which knows nothing about
       // what this page was watching — so what was being watched is asked for
       // again here. Without this the last screen stays painted and the link
@@ -1299,6 +1506,10 @@ function apply(message) {
         subscribeScreen(watching);
       }
       schedulePluginPoll();
+      break;
+    case 'agents.cards':
+      inbox = message.projection;
+      renderInbox();
       break;
     case 'state.full':
       targets.clear();

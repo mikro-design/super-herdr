@@ -112,16 +112,17 @@ the exact selected route while targets connect or disconnect.
 
 #### Browser
 
-- [ ] Make the inbox the default paired-device screen.
-- [ ] Give each card one primary action: open the live pane.
+- [x] Make the inbox the default paired-device screen.
+- [x] Give each card one primary action: open the live pane.
 - [ ] Add compact filters for needs-attention, active, pinned, target, and
-      provider.
-- [ ] Add a clear path back to the full infrastructure hierarchy.
+      provider. State, target, and provider chips ship; pinned waits on the
+      pin store.
+- [x] Add a clear path back to the full infrastructure hierarchy.
 - [ ] Add an optional pinned-agent grid for monitoring several panes.
-- [ ] Keep cards readable and controls reachable at narrow phone widths.
-- [ ] Preserve the open card and its exact qualified pane during background
+- [x] Keep cards readable and controls reachable at narrow phone widths.
+- [x] Preserve the open card and its exact qualified pane during background
       target churn.
-- [ ] Extend `tools/page-harness.mjs` for ordering, filtering, reconnection,
+- [x] Extend `tools/page-harness.mjs` for ordering, filtering, reconnection,
       accessibility, and non-focus-stealing behavior.
 
 #### TUI
