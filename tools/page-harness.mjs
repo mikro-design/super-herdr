@@ -59,11 +59,6 @@ const keyButtons = [
   button.dataset = { key };
   return button;
 });
-const quickReplyButtons = ['yes', 'no', 'continue', 'retry'].map(reply => {
-  const button = node(`reply-${reply}`);
-  button.dataset = { reply };
-  return button;
-});
 const codeBoxNodes = Array.from({ length: 8 }, (_, index) => node(`code-${index}`));
 
 globalThis.document = {
@@ -72,7 +67,6 @@ globalThis.document = {
   querySelector: selector => node(`sel-${selector}`),
   querySelectorAll: selector => {
     if (selector === '.keys button') return keyButtons;
-    if (selector === '.quick-replies button') return quickReplyButtons;
     if (selector === '.code-box') return codeBoxNodes;
     return [];
   },
@@ -109,13 +103,29 @@ globalThis.fetch = (url, init) => {
   }
   return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
 };
+// A notification the page raised, and the permission it was raised under.
+const alerts = [];
+class StubNotification {
+  constructor(title, options) {
+    this.title = title;
+    this.options = options;
+    alerts.push(this);
+  }
+}
+StubNotification.permission = 'default';
+StubNotification.requestPermission = () => {
+  StubNotification.permission = StubNotification.granting ? 'granted' : 'denied';
+  return Promise.resolve(StubNotification.permission);
+};
+globalThis.Notification = StubNotification;
+
 class StubEventSource {
   constructor() { StubEventSource.latest = this; }
   close() {}
 }
 globalThis.EventSource = StubEventSource;
 
-const module = new Function(`${script}\nreturn { apply, observe, takeControl, uploadSelectedFiles, shellQuote, el, KEYS, QUICK_REPLIES, endpoint, renderPanes, codeBoxes, enteredCode };`);
+const module = new Function(`${script}\nreturn { apply, observe, takeControl, uploadSelectedFiles, shellQuote, el, KEYS, endpoint, renderPanes, codeBoxes, enteredCode };`);
 const page = module();
 
 const deliver = message => page.apply(message);
@@ -128,6 +138,15 @@ const check = (what, condition) => {
     console.log(`ok: ${what}`);
   }
 };
+const replies = () => page.el('quick-replies').children;
+const configureReplies = quick_replies => deliver({
+  type: 'server.hello',
+  protocol: 3,
+  server_version: '0.7.20',
+  features: ['terminal', 'agent_cards'],
+  quick_replies,
+});
+
 const waitFor = async predicate => {
   for (let attempt = 0; attempt < 100; attempt++) {
     if (predicate()) return;
@@ -221,6 +240,14 @@ sent.length = 0;
 keyButtons[0].onclick();
 check('an observer sends no input', sent.length === 0);
 
+// The daemon said which replies it offers during the handshake.
+configureReplies([
+  { label: 'Yes', send: 'y', submit: true, confirm: false },
+  { label: 'No', send: 'n', submit: true, confirm: false },
+  { label: 'Paste path', send: '/srv/build', submit: false, confirm: false },
+  { label: 'Wipe', send: 'reset --hard', submit: true, confirm: true },
+]);
+
 // Ask for control.
 page.takeControl();
 check('asks for control', sent.at(-1).body.type === 'pane.take_control');
@@ -228,7 +255,10 @@ check('reveals the keyboard during the control tap', page.el('keyboard').hidden 
 check('focuses the line during the control tap', page.el('line').focused === true);
 check('does not enable Send before the lease arrives', page.el('send').disabled === true);
 check('does not enable terminal keys before the lease arrives', keyButtons.every(one => one.disabled));
-check('does not enable quick replies before the lease arrives', quickReplyButtons.every(one => one.disabled));
+check(
+  'does not enable quick replies before the lease arrives',
+  replies().length > 0 && replies().every(one => one.disabled),
+);
 sent.length = 0;
 page.el('line').value = 'typed while waiting';
 page.el('line-form').onsubmit({ preventDefault() {} });
@@ -241,7 +271,10 @@ check('the keyboard appears with control', page.el('keyboard').hidden === false)
 check('control is no longer offered', page.el('control').hidden === true);
 check('enables Send only with control', page.el('send').disabled === false);
 check('enables terminal keys only with control', keyButtons.every(one => !one.disabled));
-check('enables quick replies only with control', quickReplyButtons.every(one => !one.disabled));
+check(
+  'enables quick replies only with control',
+  replies().length > 0 && replies().every(one => !one.disabled),
+);
 
 // A browser file uses the daemon's verified upload protocol. Its MIME can be
 // an Office type the clipboard-media table does not know; the name preserves
@@ -318,16 +351,55 @@ for (const [index, key] of [
   check(`${key} sends ${JSON.stringify(page.KEYS[key])}`, bytes === page.KEYS[key]);
 }
 
-// Quick replies are explicit one-tap submissions, not text inferred from the
-// terminal screen. They include Enter and do not summon the software keyboard.
-for (const [index, reply] of ['yes', 'no', 'continue', 'retry'].entries()) {
+// Quick replies are what the daemon was configured to offer, rendered exactly
+// as sent. Nothing here is inferred from the terminal screen.
+
+check('renders one button per configured reply', replies().length === 4);
+check('a reply is labelled as configured', replies()[0].textContent === 'Yes');
+check(
+  'a reply says what it sends',
+  replies()[0]['aria-label'] === 'Send y and Enter'
+    && replies()[2]['aria-label'] === 'Send /srv/build',
+);
+
+for (const [index, expected] of [['Yes', 'y\r'], ['No', 'n\r'], ['Paste path', '/srv/build']].entries()) {
   sent.length = 0;
   page.el('line').focused = false;
-  quickReplyButtons[index].onclick();
+  replies()[index].onclick();
   const bytes = Buffer.from(sent.at(-1).body.bytes, 'base64').toString('utf8');
-  check(`${reply} is submitted in one tap`, bytes === page.QUICK_REPLIES[reply]);
-  check(`${reply} does not open the software keyboard`, page.el('line').focused === false);
+  check(`${expected[0]} is submitted in one tap`, bytes === expected[1]);
+  check(`${expected[0]} does not open the software keyboard`, page.el('line').focused === false);
 }
+
+// A reply that declared it needs confirming takes two taps, on itself.
+sent.length = 0;
+replies()[3].onclick();
+check('a confirming reply sends nothing on the first tap', sent.length === 0);
+check('a confirming reply says it is armed', replies()[3]['aria-pressed'] === 'true');
+check('a confirming reply asks for the second tap', replies()[3].textContent === 'Tap again');
+replies()[3].onclick();
+check(
+  'a confirming reply sends on the second tap',
+  Buffer.from(sent.at(-1).body.bytes, 'base64').toString('utf8') === 'reset --hard\r',
+);
+check('a sent reply disarms', replies()[3].textContent === 'Wipe');
+
+// Losing the lease ends the moment an armed reply belonged to.
+replies()[3].onclick();
+deliver({ type: 'pane.lease', pane, access: 'observe' });
+check('a lost lease disarms a waiting reply', replies()[3].textContent === 'Wipe');
+sent.length = 0;
+replies()[0].onclick();
+check('an observer sends no reply', sent.length === 0);
+deliver({ type: 'pane.lease', pane, access: 'control' });
+
+// A daemon that offers none draws none. The page does not invent a fallback,
+// because a button nobody configured would be a guess about what to type.
+configureReplies([]);
+check('no configured replies draws no buttons', replies().length === 0);
+check('an empty strip is hidden', page.el('quick-replies').hidden === true);
+configureReplies([{ label: 'Yes', send: 'y', submit: true, confirm: false }]);
+deliver({ type: 'pane.lease', pane, access: 'control' });
 
 // Losing the lease takes the keyboard with it.
 deliver({ type: 'pane.lease', pane, access: 'observe' });
@@ -524,3 +596,81 @@ check('an older daemon hides the inbox', page.el('inbox').hidden === true);
 check('an older daemon opens the hierarchy instead', page.el('hierarchy').open === true);
 deliver({ type: 'server.hello', protocol: 3, server_version: '0.7.20', features: ['terminal', 'agent_cards'] });
 page.el('inbox').hidden = false;
+
+// Alerts are two permissions, granted at different moments: the browser's, and
+// this page's subscription to the daemon. Rendering the inbox is neither.
+StubNotification.granting = false;
+alerts.length = 0;
+sent.length = 0;
+await page.el('alerts').onclick();
+check('a refused browser permission subscribes to nothing',
+  sent.every(one => one.body.type !== 'notifications.subscribe'));
+check('a refused browser permission says so', page.el('alert-note').textContent.includes('not allowing'));
+check('a refused permission leaves the toggle off', page.el('alerts')['aria-pressed'] === 'false');
+
+StubNotification.granting = true;
+sent.length = 0;
+await page.el('alerts').onclick();
+check('a granted permission subscribes',
+  sent.some(one => one.body.type === 'notifications.subscribe'));
+check('a granted permission shows the toggle on', page.el('alerts')['aria-pressed'] === 'true');
+
+// An alert carries bounded metadata and replaces its own agent's last one.
+deliver(projection({ needs_you: [card('p1', { unread: true })] }));
+alerts.length = 0;
+deliver({
+  type: 'notification',
+  agent: { target: 'first', session: 'main', resource: 'p1' },
+  title: 'Agent needs attention',
+  body: 'reviewer · compiler',
+});
+check('an alert is raised', alerts.length === 1);
+check('an alert carries the daemon title', alerts[0].title === 'Agent needs attention');
+check('an alert is tagged by its agent', alerts[0].options.tag === 'first/main/p1');
+
+// Tapping it opens the agent it names, against the inbox as it is now.
+sent.length = 0;
+alerts[0].onclick();
+check(
+  'tapping an alert opens the agent it names',
+  sent.some(one => one.body.type === 'pane.subscribe' && one.body.pane.resource === 'p1'),
+);
+check('an opened alert clears the note', page.el('alert-note').textContent === '');
+
+// The race the exit condition names: the agent went away between the alert
+// being sent and the tap landing.
+deliver(projection({ needs_you: [] }));
+sent.length = 0;
+alerts[0].onclick();
+check('a tap on a departed agent opens nothing',
+  sent.every(one => one.body.type !== 'pane.subscribe'));
+check('a tap on a departed agent says so',
+  page.el('alert-note').textContent === 'That agent is no longer running.');
+
+// An agent still listed but not reachable — its host dropped — is a different
+// sentence, because the agent has not ended.
+deliver(projection({
+  needs_you: [card('p1', { actionable: false, stale: true })],
+}));
+sent.length = 0;
+alerts[0].onclick();
+check('a tap on an unreachable agent opens nothing',
+  sent.every(one => one.body.type !== 'pane.subscribe'));
+check('a tap on an unreachable agent distinguishes the host',
+  page.el('alert-note').textContent === 'That agent is no longer reachable.');
+
+// Turning them off ends the daemon's side, and a stray alert is ignored.
+sent.length = 0;
+await page.el('alerts').onclick();
+check('turning alerts off unsubscribes',
+  sent.some(one => one.body.type === 'notifications.unsubscribe'));
+alerts.length = 0;
+deliver({
+  type: 'notification',
+  agent: { target: 'first', session: 'main', resource: 'p1' },
+  title: 'Agent needs attention',
+  body: 'reviewer · compiler',
+});
+check('an alert after turning them off raises nothing', alerts.length === 0);
+StubNotification.granting = true;
+await page.el('alerts').onclick();

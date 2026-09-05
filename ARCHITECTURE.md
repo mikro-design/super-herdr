@@ -512,6 +512,74 @@ without another clock in the process to keep correct. The file is bounded in
 every direction — how many agents may be marked, how large it may be, how far a
 snooze may reach — because it is written by a request from a paired device.
 
+One-tap replies on a paired device are configuration, not interpretation. The
+distinction is forced by what Herdr documents: its API reports an agent's
+status and whether it is ready for input, and nothing anywhere in its request
+or event schemas describes the options a blocked agent is offering. There is
+therefore no structured prompt metadata to render a semantic Yes, No, Approve
+or numbered-choice button from, and the only way to produce one would be to
+read the terminal and guess. Super-Herdr does not: a button that types `y`
+because the screen looked like a yes/no prompt is a keystroke sent on the
+strength of a pattern match, and the person holding the phone cannot see the
+match that produced it.
+
+So the replies are what somebody wrote down in their own configuration. The
+daemon sends the list in the handshake, because it is constant for the process
+and a client needs it before it can draw controls, and a client renders exactly
+that list — an empty one draws no buttons rather than falling back to a guess.
+Each reply carries its own text, whether Enter follows it, and whether it wants
+confirming; with no structured metadata to learn that a response is
+irreversible from, the person who wrote the reply is the one who declares it,
+and confirming is a second tap on the button rather than a dialog a phone
+dismisses by reflex. Control characters are refused in a reply's text, so a
+configuration cannot smuggle an escape sequence into a pane: Enter, Escape, Tab
+and Ctrl-C are separate, explicitly labelled keys.
+
+A reply becomes terminal input like any other, which means it needs the pane's
+control lease and is refused by the daemon without one. An armed confirmation
+belongs to the moment it was armed in, so losing the lease disarms it.
+
+Alerting a paired device is a second sink beside the desktop's own, and it
+lives in the daemon rather than in the frontend. The desktop's queue belongs to
+the machine somebody is sitting at; this one exists precisely for the case
+where they are not, so it runs where the attention index is derived and needs
+no client awake to produce it. It reuses that queue's filters, coalescing
+window and rate limit rather than inventing a second set, and is switched on
+separately, because wanting alerts on a phone is not the same request as
+wanting them on the laptop.
+
+Three consents are kept distinct, because they are granted at different moments
+and one must never stand in for another: the operator enables the sink in
+configuration, the browser grants its own notification permission, and the page
+subscribes. Rendering the inbox subscribes to nothing — showing somebody their
+agents is not the same as interrupting them about one — and an alert reaching a
+page that has turned them off is discarded there as well as not sent. A device
+that subscribes late is not caught up: an interruption about a moment already
+over is only noise.
+
+Per-agent modes are the marks that already exist plus one more. Muting or
+snoozing an agent quiets it everywhere, because an agent somebody removed from
+their inbox has not asked to keep calling their phone, and the only new mode is
+the narrow one — tell me when this agent is blocked on me and never otherwise.
+
+A payload carries bounded metadata by construction rather than by filtering. It
+is built from an attention event, which holds an agent name, a workspace label,
+a qualified pane and a transition kind; terminal contents never reach one. That
+is worth stating as a rule rather than an accident, because Herdr's snapshot
+does carry `terminal_title` — an agent's current sentence, often a paraphrase
+of somebody's prompt — and nothing here reads it. An alert names an identity
+rather than a route, so tapping one re-resolves the live pane against the inbox
+as it is now and refuses when the agent has gone, distinguishing an agent that
+ended from one whose host is unreachable.
+
+What this does not yet do is reach a device whose browser is closed. That needs
+Web Push: a service worker, VAPID signing, and a third-party push service as a
+new outbound trust boundary — the endpoint is supplied by the browser, so it
+also needs bounding against being pointed somewhere else. The design that would
+fit here sends no payload at all and lets the woken service worker ask the
+daemon, so the push service learns that something happened and never what. That
+is a separate decision about dependencies and trust, not a detail of this sink.
+
 Delivering a notification is a separate question from owning the index, and it
 divides the way the clipboard does. Native desktop delivery is a desktop-session
 capability: it belongs to the client, because a daemon on another machine

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::agent_marks::AgentMarkRequest;
+use crate::agent_marks::{AgentMarkRequest, NotifyMode};
 use crate::model::{AgentId, PaneId, TabId, TargetSession, WorkspaceId};
 use crate::plugin::{PluginAction, PluginInvocationTarget};
 
@@ -186,6 +186,12 @@ impl ResourceAction {
                     minutes: Some(minutes),
                 } => format!("Snooze agent {label:?} for {minutes} minutes"),
                 AgentMarkRequest::Snooze { minutes: None } => format!("Wake agent {label:?}"),
+                AgentMarkRequest::Notify {
+                    mode: NotifyMode::NeedsYouOnly,
+                } => format!("Notify about agent {label:?} only when it needs you"),
+                AgentMarkRequest::Notify {
+                    mode: NotifyMode::Default,
+                } => format!("Notify about agent {label:?} normally"),
             },
         }
     }

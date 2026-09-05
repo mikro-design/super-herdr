@@ -140,6 +140,13 @@ naming the host and Herdr session it belongs to. Tap one to open that exact
 pane. Chips filter by state, host, and agent kind, and **All targets and
 panes** is always one tap away when you want the hierarchy instead.
 
+Turn on **Alerts** in the browser to be told when an agent wants you, under the
+same filters, coalescing and rate limit as the desktop notifications — opt in
+with `notifications.devices` and grant the browser's own permission. An alert
+carries a label and a status word, never terminal contents, and tapping it
+opens that exact agent or says it has gone. It reaches a device while the page
+is running; waking a closed browser needs Web Push and is not built yet.
+
 Pin an agent to keep it at the top, or mute or snooze one to move it out of the
 way for a while — in the browser on the card itself, in the TUI from the same
 right-click menus and action palette. These are Super-Herdr's own view of your
@@ -156,13 +163,16 @@ so a reconnect can never redirect your next keystroke.
   tap to the exact pane that needs you
 - Per-agent pins, mutes, and snoozes that order your own inbox and never touch
   a Herdr session
+- Opt-in paired-device alerts carrying bounded metadata, with per-agent
+  needs-you-only, mute, and snooze modes
 - A live, clickable TUI with tabs, split panes, search, and agent attention
 - Qualified plugin actions in the TUI and browser, with sanitized run status
   and explicit routing to any newly opened pane
 - Explicit control leases: background panes and newly opened browser panes are
   read-only until control is granted
 - Desktop selection, clipboard paste, drag-and-drop, and verified uploads
-- Browser quick replies, terminal keys, a soft-keyboard dock, and a file picker
+- Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
+  a file picker
 - Digest-verified local-to-host, host-to-local, and host-to-host file transfer
 - Bounded reconnects and per-target failure isolation
 

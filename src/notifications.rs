@@ -131,6 +131,25 @@ pub struct NotificationDelivery {
     timeout: Duration,
 }
 
+impl NotificationDelivery {
+    /// What a delivery says, for a sink that renders it somewhere other than
+    /// this machine's desktop. Both are already bounded metadata: an agent
+    /// name, a workspace label, a qualified target and session, and the kind
+    /// of transition. No terminal contents reach either one, because attention
+    /// events carry none.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn pane(&self) -> Option<&PaneId> {
+        self.pane.as_ref()
+    }
+}
+
 fn notification_title(count: usize, latest: &AttentionEvent) -> String {
     if count > 1 {
         return format!("{count} Super-Herdr agent updates");

@@ -17,6 +17,13 @@ completed = true
 disappeared = true
 working = false
 status_changed = false
+# Also alert paired devices, under the same filters, coalescing and rate limit.
+# Separate from `enabled`, which is this machine's own desktop notifications:
+# wanting alerts on a phone is not the same request as wanting them on the
+# laptop you are sitting at. A device still has to grant its browser's
+# notification permission and turn Alerts on in the page, and today it is
+# alerted while that page is running — see ARCHITECTURE.md.
+devices = false
 minimum_interval_seconds = 5
 command_timeout_seconds = 5
 
@@ -25,6 +32,23 @@ command_timeout_seconds = 5
 # never held whole — and it is separate from the clipboard's own 32 MiB limit.
 [transfers]
 max_bytes = 1073741824
+
+# One-tap replies offered on a paired device.
+#
+# These are replies you decided you send often, not choices read off a screen.
+# Herdr's API reports that an agent is ready for input, never what it is
+# asking, so Super-Herdr will not show a Yes button because a terminal looked
+# like a yes/no prompt — that would be a keystroke sent on a pattern match.
+#
+# Leaving this out offers Yes, No, Continue and Retry. An empty list
+# (quick_replies = []) offers none. At most eight, each sending 1 to 256 bytes
+# of text with no control characters: Enter, Escape, Tab and Ctrl-C are their
+# own keys, and `submit` is what appends the Enter.
+#[[quick_replies]]
+#label = "Approve"
+#send = "approve"
+#submit = true      # append Enter; on by default
+#confirm = false    # ask for a second tap before sending
 
 [[targets]]
 name = "development"

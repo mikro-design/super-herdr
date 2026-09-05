@@ -698,7 +698,12 @@ mod tests {
         assert!(APP.contains("type=\"file\""));
         assert!(APP.contains("type: 'upload.begin'"));
         assert!(APP.contains("crypto.subtle.digest('SHA-256'"));
-        assert_eq!(APP.matches("data-reply=").count(), 4);
+        // Replies are drawn from what the daemon sends, so the markup holds a
+        // container and no buttons. A hardcoded reply here would be a button
+        // nobody configured.
+        assert!(APP.contains("id=\"quick-replies\""));
+        assert!(!APP.contains("data-reply=\""));
+        assert!(APP.contains("message.quick_replies"));
         assert!(APP.contains("class=\"keys control-strip\""));
         assert!(APP.contains("id=\"plugin-tools\""));
         assert!(APP.contains("type: 'plugin.actions.list'"));
@@ -725,6 +730,7 @@ mod tests {
                 web: Default::default(),
                 targets: Vec::new(),
                 devices: Vec::new(),
+                quick_replies: None,
             },
             None,
             DaemonOptions {

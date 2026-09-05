@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep_until};
 
 use crate::agent_card::agent_key;
-use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
+use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
 use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex};
 use crate::client::{Client, ClientCommands};
 use crate::clipboard;
@@ -488,6 +488,7 @@ impl TargetForm {
             web: Default::default(),
             targets,
             devices: Vec::new(),
+            quick_replies: None,
         }
         .validate()
         .err()
@@ -2976,6 +2977,12 @@ fn agent_mark_actions(
                 .is_none()
                 .then_some(TUI_SNOOZE_MINUTES),
         }),
+        mark(AgentMarkRequest::Notify {
+            mode: match marked.notify {
+                NotifyMode::Default => NotifyMode::NeedsYouOnly,
+                NotifyMode::NeedsYouOnly => NotifyMode::Default,
+            },
+        }),
     ]
 }
 
@@ -5350,6 +5357,11 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         // renders is still its own. What the projection is read for here is
         // the marks a person put on a card, so a context menu can offer the
         // toggle that is available instead of both halves of it.
+        // The TUI runs its own notification queue against its attention
+        // mirror, because a desktop alert belongs to the machine somebody is
+        // sitting at. It does not subscribe to the device sink and is never
+        // sent one.
+        ServerMessage::Notification { .. } => {}
         ServerMessage::AgentCards { projection } => {
             app.agent_marks = projection
                 .cards()
@@ -7801,6 +7813,7 @@ mod tests {
             web: Default::default(),
             targets: vec![configured.clone()],
             devices: Vec::new(),
+            quick_replies: None,
         });
         assert!(!super::atomic_paste_available(&unresolved, &key));
 
@@ -7819,6 +7832,7 @@ mod tests {
             web: Default::default(),
             targets: vec![discovered],
             devices: Vec::new(),
+            quick_replies: None,
         });
         assert!(
             super::atomic_paste_available(&resolved, &key),
@@ -7850,7 +7864,7 @@ mod tests {
         update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
         visible_pane_areas,
     };
-    use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
+    use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
     use crate::config::{Config, Target};
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::plugin::{PluginAction, PluginActionContext, PluginActionId};
@@ -8138,9 +8152,15 @@ mod tests {
                 (expected.clone(), AgentMarkRequest::Pin { pinned: true }),
                 (expected.clone(), AgentMarkRequest::Mute { muted: true }),
                 (
-                    expected,
+                    expected.clone(),
                     AgentMarkRequest::Snooze {
                         minutes: Some(TUI_SNOOZE_MINUTES)
+                    }
+                ),
+                (
+                    expected,
+                    AgentMarkRequest::Notify {
+                        mode: NotifyMode::NeedsYouOnly
                     }
                 ),
             ]
@@ -8213,6 +8233,7 @@ mod tests {
                 pinned: true,
                 muted: false,
                 snoozed_until_ms: Some(1_700_000_000_000),
+                notify: NotifyMode::Default,
             },
         )]);
 

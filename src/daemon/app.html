@@ -268,7 +268,9 @@
     <div class="inbox-head">
       <h2>Agents</h2>
       <span id="inbox-count" class="note"></span>
+      <button id="alerts" type="button" class="chip" aria-pressed="false" hidden>Alerts</button>
     </div>
+    <p id="alert-note" class="note" role="status"></p>
     <div id="inbox-filters" class="chips" role="group" aria-label="Filter agents"></div>
     <div id="inbox-sections"></div>
     <p id="inbox-empty" class="empty">waiting for the daemon…</p>
@@ -306,12 +308,7 @@
                  enterkeyhint="send">
           <button id="send" type="submit">Send</button>
         </form>
-        <div class="quick-replies control-strip" aria-label="Quick replies">
-          <button type="button" data-reply="yes" aria-label="Send y and Enter">Yes</button>
-          <button type="button" data-reply="no" aria-label="Send n and Enter">No</button>
-          <button type="button" data-reply="continue" aria-label="Send continue and Enter">Continue</button>
-          <button type="button" data-reply="retry" aria-label="Send retry and Enter">Retry</button>
-        </div>
+        <div id="quick-replies" class="quick-replies control-strip" aria-label="Quick replies"></div>
         <div class="tool-row">
           <div class="keys control-strip" aria-label="Terminal keys">
             <button data-key="enter">Enter</button>
@@ -1002,17 +999,75 @@ const KEYS = {
   backspace: '\x7f',
 };
 
+// Replies the daemon is configured to offer, and the buttons drawn from them.
+//
+// They arrive in the handshake and are rendered exactly as sent. Nothing here
+// reads the terminal to decide what an agent is asking: Herdr reports that an
+// agent is ready for input, never what it wants, so a Yes button that appeared
+// because the screen looked like a prompt would be a keystroke sent on the
+// strength of a pattern match. An empty list draws no buttons rather than
+// falling back to a guess.
+let quickReplies = [];
+let quickReplyButtons = [];
+// The reply waiting for its second tap, when one declared that it needs one.
+let armedReply = null;
+
+function renderQuickReplies() {
+  const strip = el('quick-replies');
+  strip.innerHTML = '';
+  quickReplyButtons = [];
+  armedReply = null;
+  strip.hidden = quickReplies.length === 0;
+  for (const [index, reply] of quickReplies.entries()) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'reply';
+    button.dataset.reply = String(index);
+    button.textContent = text(reply.label);
+    button.setAttribute(
+      'aria-label',
+      `Send ${text(reply.send)}${reply.submit === false ? '' : ' and Enter'}`,
+    );
+    // Keeping the tap off the text field is what stops a phone keyboard
+    // opening for a reply that needs no typing.
+    button.onpointerdown = event => event.preventDefault();
+    button.onclick = () => tapReply(index);
+    strip.append(button);
+    quickReplyButtons.push(button);
+  }
+  renderKeyboard();
+}
+
+// A reply that declared it needs confirming arms on the first tap and sends on
+// the second. Two taps on the button itself rather than a dialog: a modal on a
+// phone is dismissed by the same reflex that opened it, and there is no
+// structured metadata to learn that a response is destructive from — the person
+// who wrote the reply is the one who said so.
+function tapReply(index) {
+  const reply = quickReplies[index];
+  if (!reply) return;
+  if (reply.confirm && armedReply !== index) {
+    armReply(index);
+    return;
+  }
+  armReply(null);
+  sendText(`${text(reply.send)}${reply.submit === false ? '' : '\r'}`);
+}
+
+function armReply(index) {
+  armedReply = index;
+  for (const [position, button] of quickReplyButtons.entries()) {
+    const reply = quickReplies[position];
+    const armed = position === index;
+    button.setAttribute('aria-pressed', armed ? 'true' : 'false');
+    button.textContent = armed ? 'Tap again' : text(reply.label);
+  }
+}
+
 // These are deliberately short, fixed replies rather than inferred actions.
 // Reading terminal output to guess a response would be both brittle and a
 // surprising authority boundary. The arrow in the button label tells the user
 // each explicit tap sends the reply immediately with Enter.
-const QUICK_REPLIES = {
-  yes: 'y\r',
-  no: 'n\r',
-  continue: 'continue\r',
-  retry: 'retry\r',
-};
-
 // Reveal the input during the tap that requests control, but enable every send
 // action only after the daemon grants the lease. This opens a phone keyboard
 // without turning an optimistic UI transition into authorization.
@@ -1026,9 +1081,12 @@ function renderKeyboard() {
   for (const button of document.querySelectorAll('.keys button')) {
     button.disabled = !holding;
   }
-  for (const button of document.querySelectorAll('.quick-replies button')) {
+  for (const button of quickReplyButtons) {
     button.disabled = !holding;
   }
+  // A reply waiting for its second tap is a decision that belonged to the
+  // moment it was armed in. Losing the lease ends that moment.
+  if (!holding && armedReply !== null) armReply(null);
 }
 
 async function uploadBrowserFile(file, pane) {
@@ -1160,6 +1218,76 @@ function resync() {
   send({ type: 'pane.unsubscribe', pane });
   screen = null;
   subscribeScreen(pane);
+}
+
+// Whether this device has been asked to be interrupted, and has agreed.
+//
+// Two separate permissions that a person grants at different moments: the
+// browser's own notification permission, and this page's subscription to the
+// daemon. Neither implies the other, and rendering the inbox implies neither —
+// showing somebody their agents is not the same as interrupting them about one.
+let alertsOn = false;
+
+function alertsAvailable() {
+  return typeof Notification === 'function';
+}
+
+function renderAlerts() {
+  const button = el('alerts');
+  button.hidden = !alertsAvailable();
+  button.setAttribute('aria-pressed', alertsOn ? 'true' : 'false');
+  button.textContent = alertsOn ? 'Alerts on' : 'Alerts';
+}
+
+async function toggleAlerts() {
+  if (!alertsAvailable()) return;
+  if (alertsOn) {
+    // The browser keeps its permission; what this turns off is the daemon
+    // sending anything, which is the part this page controls.
+    alertsOn = false;
+    send({ type: 'notifications.unsubscribe' });
+    renderAlerts();
+    return;
+  }
+  const permission = Notification.permission === 'granted'
+    ? 'granted'
+    : await Notification.requestPermission();
+  alertsOn = permission === 'granted';
+  if (alertsOn) send({ type: 'notifications.subscribe' });
+  else el('alert-note').textContent = 'This browser is not allowing notifications.';
+  renderAlerts();
+}
+
+function showAlert(message) {
+  // Belt and braces: the daemon sends these only to a subscriber, and a page
+  // that has turned them off ignores one that arrives anyway rather than
+  // interrupting somebody who asked it not to.
+  if (!alertsOn || !alertsAvailable()) return;
+  const alert = new Notification(text(message.title), {
+    body: text(message.body),
+    // One agent replaces its own previous alert instead of stacking: a phone
+    // holding six notices about one agent is a phone somebody stops reading.
+    tag: paneKey(message.agent),
+  });
+  alert.onclick = () => openAgentFromAlert(message.agent);
+}
+
+// A tap on an alert is acted on against the inbox as it is now, not as it was
+// when the alert was sent. An agent that has since gone is reported rather than
+// approximated: there is no nearby pane that will do.
+function openAgentFromAlert(agent) {
+  if (typeof window.focus === 'function') window.focus();
+  const wanted = paneKey(agent);
+  const card = inboxCards().find(one => one.agent && paneKey(one.agent) === wanted);
+  if (card && card.actionable && card.pane) {
+    el('alert-note').textContent = '';
+    if (card.unread) send({ type: 'attention.mark_seen', pane: card.pane });
+    observe(card.pane, `${qualify(card.pane)}/${text(card.title)}`);
+    return;
+  }
+  el('alert-note').textContent = card
+    ? 'That agent is no longer reachable.'
+    : 'That agent is no longer running.';
 }
 
 // The inbox exactly as the daemon built it. This page renders that answer and
@@ -1567,7 +1695,19 @@ function apply(message) {
         cell = null;
         subscribeScreen(watching);
       }
+      quickReplies = Array.isArray(message.quick_replies) ? message.quick_replies : [];
+      renderQuickReplies();
+      // A reconnect is a new client to the daemon, which is not holding this
+      // page's subscription any more. Permission already granted is not asked
+      // for again; the subscription is.
+      if (alertsAvailable() && Notification.permission === 'granted' && alertsOn) {
+        send({ type: 'notifications.subscribe' });
+      }
+      renderAlerts();
       schedulePluginPoll();
+      break;
+    case 'notification':
+      showAlert(message);
       break;
     case 'agents.cards':
       inbox = message.projection;
@@ -1774,10 +1914,7 @@ for (const button of document.querySelectorAll('.keys button')) {
     el('line').focus();
   };
 }
-for (const button of document.querySelectorAll('.quick-replies button')) {
-  button.onpointerdown = event => event.preventDefault();
-  button.onclick = () => sendText(QUICK_REPLIES[button.dataset.reply] || '');
-}
+el('alerts').onclick = () => { void toggleAlerts(); };
 el('stop').onclick = () => stopWatching('');
 
 // A rotation or a resize changes how much of the pane fits, not the pane.

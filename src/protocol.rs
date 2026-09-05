@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent_card::AgentCardProjection;
 use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
+use crate::config::QuickReply;
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginRun, PluginRunId};
@@ -333,6 +334,19 @@ pub enum ClientMessage {
         agent: AgentId,
         mark: AgentMarkRequest,
     },
+    /// Ask to be told when an agent wants attention.
+    ///
+    /// Opt-in per connection and never implied by any other subscription: a
+    /// device that renders the inbox has not thereby asked to be interrupted
+    /// by it, and on a phone those are different permissions granted at
+    /// different moments.
+    #[serde(rename = "notifications.subscribe")]
+    SubscribeNotifications,
+    /// Stop being told. Separate from revoking the browser's own permission,
+    /// which this daemon neither holds nor can change: what this ends is the
+    /// daemon sending anything to this connection.
+    #[serde(rename = "notifications.unsubscribe")]
+    UnsubscribeNotifications,
 }
 
 /// Sent by the daemon.
@@ -344,6 +358,17 @@ pub enum ServerMessage {
         protocol: u32,
         server_version: String,
         features: Vec<String>,
+        /// The one-tap replies this daemon is configured to offer.
+        ///
+        /// Sent here because they are constant for the process and a client
+        /// needs them before it can draw its controls. They are *replies*, not
+        /// choices: Herdr's documented API says whether an agent is ready for
+        /// input, never what it is asking, so there is nothing to derive a
+        /// semantic button from and this daemon will not read a terminal to
+        /// guess one. A client renders exactly this list and invents nothing
+        /// when it is empty.
+        #[serde(default)]
+        quick_replies: Vec<QuickReply>,
     },
     /// The whole federation, sent once per state subscription.
     #[serde(rename = "state.full")]
@@ -424,6 +449,23 @@ pub enum ServerMessage {
     /// this projection exists to prevent.
     #[serde(rename = "agents.cards")]
     AgentCards { projection: AgentCardProjection },
+    /// One coalesced attention alert for a paired device.
+    ///
+    /// Bounded metadata only, and by construction rather than by filtering
+    /// here: the title and body are built from attention history, which holds
+    /// an agent name, a workspace label, a qualified pane and a transition
+    /// kind, and never terminal contents, clipboard data, file names or
+    /// pairing material.
+    ///
+    /// `agent` is what a click acts on. It is an identity rather than a route,
+    /// so acting on it re-resolves the live pane and can refuse — a person may
+    /// tap an alert long after the agent it named has gone.
+    #[serde(rename = "notification")]
+    Notification {
+        agent: AgentId,
+        title: String,
+        body: String,
+    },
     /// A pairing code and how long it lasts. Never persisted: a code that
     /// survived a restart would be a credential nobody knew was outstanding.
     #[serde(rename = "pairing.code")]
@@ -620,7 +662,7 @@ mod tests {
         AGENT_CARD_PROJECTION_VERSION, AgentActivity, AgentCard, AgentCardProjection,
         AgentCardSection,
     };
-    use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
+    use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::operation::Operation;
@@ -760,6 +802,8 @@ mod tests {
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
         round_trip_client(ClientMessage::SubscribeAgentCards);
+        round_trip_client(ClientMessage::SubscribeNotifications);
+        round_trip_client(ClientMessage::UnsubscribeNotifications);
         round_trip_client(ClientMessage::MarkAgent {
             request: 11,
             agent: AgentId::new("first", "default", "w1:p1"),
@@ -788,6 +832,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             server_version: "0.3.1".to_owned(),
             features: vec!["terminal".to_owned()],
+            quick_replies: crate::config::default_quick_replies(),
         });
         round_trip_server(ServerMessage::AgentCards {
             projection: AgentCardProjection {
@@ -812,11 +857,17 @@ mod tests {
                         pinned: true,
                         muted: false,
                         snoozed_until_ms: None,
+                        notify: NotifyMode::Default,
                     },
                 }],
                 working: Vec::new(),
                 recent: Vec::new(),
             },
+        });
+        round_trip_server(ServerMessage::Notification {
+            agent: AgentId::new("first", "default", "w1:p1"),
+            title: "Agent needs attention".to_owned(),
+            body: "reviewer · compiler".to_owned(),
         });
         round_trip_server(ServerMessage::PaneClosed { pane: pane() });
         round_trip_server(ServerMessage::PaneLease {

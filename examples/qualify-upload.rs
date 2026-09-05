@@ -214,6 +214,7 @@ async fn relay(
                 ],
             }],
             devices: Vec::new(),
+            quick_replies: None,
         },
         None,
         DaemonOptions {

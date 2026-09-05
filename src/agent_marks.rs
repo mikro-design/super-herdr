@@ -51,6 +51,23 @@ const MAX_MARKED_AGENTS: usize = 512;
 /// enough that a forgotten snooze surfaces again by itself.
 pub const MAX_SNOOZE_MINUTES: u32 = 24 * 60;
 
+/// When an agent may reach a paired device.
+///
+/// Muting and snoozing already quiet an agent everywhere, so the only mode
+/// left to name is the narrow one: tell me when this agent is blocked on me,
+/// and never for anything else. It is per-agent because the useful setting
+/// differs by agent — the one running a long build is worth a completion
+/// alert, the chatty one is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyMode {
+    /// Whatever the daemon's notification filters allow.
+    #[default]
+    Default,
+    /// Only when the agent is blocked on a person.
+    NeedsYouOnly,
+}
+
 /// One agent's marks. All-default means "not marked", which is why an unmarked
 /// agent costs nothing to describe and nothing to store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +79,8 @@ pub struct AgentMarkState {
     /// means not snoozed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until_ms: Option<u64>,
+    #[serde(default)]
+    pub notify: NotifyMode,
 }
 
 impl AgentMarkState {
@@ -77,6 +96,20 @@ impl AgentMarkState {
     /// Whether this agent should stop competing for the top of the inbox.
     pub fn quiet_at(&self, now_ms: u64) -> bool {
         self.muted || self.snoozed_at(now_ms)
+    }
+
+    /// Whether an attention event about this agent may reach a paired device.
+    ///
+    /// Quiet means quiet everywhere: an agent somebody muted or snoozed to get
+    /// it out of their inbox has not asked to keep hearing from it on a phone.
+    pub fn may_notify(&self, needs_attention: bool, now_ms: u64) -> bool {
+        if self.quiet_at(now_ms) {
+            return false;
+        }
+        match self.notify {
+            NotifyMode::Default => true,
+            NotifyMode::NeedsYouOnly => needs_attention,
+        }
     }
 }
 
@@ -97,6 +130,10 @@ pub enum AgentMarkRequest {
     /// the bound is the daemon's business rather than an error to explain.
     Snooze {
         minutes: Option<u32>,
+    },
+    /// When this agent may reach a paired device.
+    Notify {
+        mode: NotifyMode,
     },
 }
 
@@ -122,6 +159,7 @@ impl AgentMarks {
         match request {
             AgentMarkRequest::Pin { pinned } => state.pinned = pinned,
             AgentMarkRequest::Mute { muted } => state.muted = muted,
+            AgentMarkRequest::Notify { mode } => state.notify = mode,
             AgentMarkRequest::Snooze { minutes } => {
                 state.snoozed_until_ms = minutes.map(|minutes| {
                     let bounded = u64::from(minutes.min(MAX_SNOOZE_MINUTES));
@@ -349,7 +387,8 @@ impl AgentMarkStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentMarkRequest, AgentMarkStore, AgentMarks, MAX_MARKED_AGENTS, MAX_SNOOZE_MINUTES,
+        AgentMarkRequest, AgentMarkState, AgentMarkStore, AgentMarks, MAX_MARKED_AGENTS,
+        MAX_SNOOZE_MINUTES, NotifyMode,
     };
     use crate::model::AgentId;
 
@@ -484,6 +523,45 @@ mod tests {
                 ))
                 .pinned,
             "the newest request is the one that survives"
+        );
+    }
+
+    #[test]
+    fn a_quieted_agent_reaches_no_device_either() {
+        let mut marks = AgentMarks::default();
+        let muted = AgentId::new("host-a", "work", "p1");
+        let snoozed = AgentId::new("host-a", "work", "p2");
+        marks.apply(&muted, AgentMarkRequest::Mute { muted: true }, NOW);
+        marks.apply(&snoozed, AgentMarkRequest::Snooze { minutes: Some(5) }, NOW);
+
+        assert!(
+            !marks.state(&muted).may_notify(true, NOW),
+            "an agent muted out of the inbox has not asked to keep calling a phone"
+        );
+        assert!(!marks.state(&snoozed).may_notify(true, NOW));
+        assert!(
+            marks.state(&snoozed).may_notify(true, NOW + 6 * 60_000),
+            "a snooze that ran out stops quieting anything"
+        );
+    }
+
+    #[test]
+    fn needs_you_only_admits_exactly_one_kind_of_interruption() {
+        let mut marks = AgentMarks::default();
+        let agent = AgentId::new("host-a", "work", "p1");
+        marks.apply(
+            &agent,
+            AgentMarkRequest::Notify {
+                mode: NotifyMode::NeedsYouOnly,
+            },
+            NOW,
+        );
+
+        assert!(marks.state(&agent).may_notify(true, NOW));
+        assert!(!marks.state(&agent).may_notify(false, NOW));
+        assert!(
+            AgentMarkState::default().may_notify(false, NOW),
+            "an unmarked agent is whatever the daemon's own filters allow"
         );
     }
 

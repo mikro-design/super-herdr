@@ -27,6 +27,76 @@ pub struct Config {
     /// which is why a daemon with no paired device serves loopback only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<Device>,
+    /// One-tap replies offered on a paired device. Absent means the built-in
+    /// set; an explicit empty list means none, because turning them off has to
+    /// be expressible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_replies: Option<Vec<QuickReply>>,
+}
+
+/// How many replies a control strip may offer.
+///
+/// They share one row on a phone. Past this the row wraps into something a
+/// person scans rather than taps, which is the opposite of the point.
+const MAX_QUICK_REPLIES: usize = 8;
+const MAX_QUICK_REPLY_LABEL_CHARACTERS: usize = 24;
+const MAX_QUICK_REPLY_SEND_BYTES: usize = 256;
+
+/// One configured, one-tap reply.
+///
+/// Deliberately a *reply* and not a *choice*. Herdr's documented API reports an
+/// agent's status and whether it is ready for input; it does not describe the
+/// options a blocked agent is offering, so there is nothing to render a
+/// semantic Yes/No/Approve button from. The alternative would be reading the
+/// terminal and guessing, which is exactly the thing Super-Herdr refuses to do:
+/// a button that types "y" because the screen looked like a yes/no prompt is a
+/// keystroke sent on the strength of a pattern match.
+///
+/// So these are what a person decided they send often, written down in their
+/// own configuration. Nothing here is inferred, and nothing here claims to know
+/// what the agent asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuickReply {
+    /// What the button says.
+    pub label: String,
+    /// The text it types. Control characters are refused: a reply is short
+    /// text, and the escape, tab and interrupt keys are their own explicit
+    /// controls rather than something a configuration can smuggle into a pane.
+    pub send: String,
+    /// Whether a carriage return follows, submitting the line. On by default,
+    /// because a reply that has to be confirmed with a second tap is two taps.
+    #[serde(default = "default_true")]
+    pub submit: bool,
+    /// Ask before sending. There is no structured metadata to learn that a
+    /// response is destructive from, so the person who wrote the reply is the
+    /// one who declares it.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+impl QuickReply {
+    fn new(label: &str, send: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            send: send.to_owned(),
+            submit: true,
+            confirm: false,
+        }
+    }
+}
+
+/// The replies offered when a configuration says nothing.
+///
+/// Short, common, and unambiguous to type by hand. They are a default rather
+/// than a meaning: none of them is chosen by looking at what an agent asked.
+pub fn default_quick_replies() -> Vec<QuickReply> {
+    vec![
+        QuickReply::new("Yes", "y"),
+        QuickReply::new("No", "n"),
+        QuickReply::new("Continue", "continue"),
+        QuickReply::new("Retry", "retry"),
+    ]
 }
 
 /// What the daemon will move on someone's behalf.
@@ -453,6 +523,12 @@ pub struct NotificationsConfig {
     pub working: bool,
     #[serde(default)]
     pub status_changed: bool,
+    /// Also deliver to paired devices. Off by default and separate from
+    /// `enabled`, which turns on this machine's own desktop notifications: a
+    /// person who wants alerts on their phone has not thereby asked for them
+    /// on the laptop they are sitting at, or the other way round.
+    #[serde(default)]
+    pub devices: bool,
     #[serde(default = "default_notification_interval")]
     pub minimum_interval_seconds: u64,
     #[serde(default = "default_notification_timeout")]
@@ -468,6 +544,7 @@ impl Default for NotificationsConfig {
             disappeared: true,
             working: false,
             status_changed: false,
+            devices: false,
             minimum_interval_seconds: default_notification_interval(),
             command_timeout_seconds: default_notification_timeout(),
         }
@@ -561,6 +638,7 @@ impl Config {
                 web: Default::default(),
                 targets: vec![target],
                 devices: Vec::new(),
+                quick_replies: None,
             };
             config.validate()?;
             toml::to_string_pretty(&config)?
@@ -680,6 +758,34 @@ impl Config {
             || self.notifications.command_timeout_seconds > 30
         {
             bail!("notifications.command_timeout_seconds must be between 1 and 30");
+        }
+        if let Some(replies) = self.quick_replies.as_deref() {
+            if replies.len() > MAX_QUICK_REPLIES {
+                bail!("at most {MAX_QUICK_REPLIES} [[quick_replies]] entries are supported");
+            }
+            for reply in replies {
+                let label = reply.label.trim();
+                if label.is_empty()
+                    || label.chars().count() > MAX_QUICK_REPLY_LABEL_CHARACTERS
+                    || label.chars().any(char::is_control)
+                {
+                    bail!(
+                        "a quick reply label must be 1 to {MAX_QUICK_REPLY_LABEL_CHARACTERS} \
+                         characters and contain no control characters"
+                    );
+                }
+                if reply.send.is_empty() || reply.send.len() > MAX_QUICK_REPLY_SEND_BYTES {
+                    bail!(
+                        "quick reply {label:?} must send 1 to {MAX_QUICK_REPLY_SEND_BYTES} bytes"
+                    );
+                }
+                if reply.send.chars().any(char::is_control) {
+                    bail!(
+                        "quick reply {label:?} must not send control characters; Enter, Escape, \
+                         Tab and Ctrl-C are separate terminal keys"
+                    );
+                }
+            }
         }
 
         let mut names = HashSet::new();
@@ -1073,6 +1179,124 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{Config, Device, ResolvedWeb, Target, WebConfig};
+
+    #[test]
+    fn quick_replies_default_to_a_short_built_in_set() {
+        let config = Config::parse(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.quick_replies.is_none());
+        assert_eq!(
+            super::default_quick_replies()
+                .iter()
+                .map(|reply| reply.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Yes", "No", "Continue", "Retry"]
+        );
+    }
+
+    #[test]
+    fn quick_replies_can_be_configured_and_turned_off() {
+        let configured = Config::parse(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+
+[[quick_replies]]
+label = "Approve"
+send = "approve"
+confirm = true
+
+[[quick_replies]]
+label = "Path"
+send = "/srv/build"
+submit = false
+"#,
+        )
+        .unwrap();
+
+        let replies = configured.quick_replies.as_deref().unwrap();
+        assert_eq!(replies[0].label, "Approve");
+        assert!(replies[0].submit, "submitting is the default");
+        assert!(replies[0].confirm);
+        assert!(!replies[1].submit);
+        assert!(!replies[1].confirm, "confirming is not");
+
+        // An empty list is how somebody turns them off. Absent means the
+        // built-in set, so the two must stay distinguishable.
+        let none = Config::parse(
+            r#"
+quick_replies = []
+
+[[targets]]
+name = "one"
+ssh = "host"
+"#,
+        )
+        .unwrap();
+        assert_eq!(none.quick_replies.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_quick_reply_may_not_smuggle_control_characters_into_a_pane() {
+        // TOML decodes the escape, so what reaches validation is a real
+        // escape character — the thing a reply must never carry.
+        let error = Config::parse(
+            "\n[[targets]]\nname = \"one\"\nssh = \"host\"\n\n\
+             [[quick_replies]]\nlabel = \"Escape\"\nsend = \"\\u001B[A\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("control characters"),
+            "Escape, Tab and Ctrl-C are separate keys, not something a reply carries: {error}"
+        );
+    }
+
+    #[test]
+    fn a_quick_reply_is_bounded_in_label_and_payload() {
+        let long_label = Config::parse(&format!(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+
+[[quick_replies]]
+label = "{}"
+send = "y"
+"#,
+            "x".repeat(25)
+        ));
+        assert!(long_label.is_err());
+
+        let empty_send = Config::parse(
+            r#"
+[[targets]]
+name = "one"
+ssh = "host"
+
+[[quick_replies]]
+label = "Nothing"
+send = ""
+"#,
+        );
+        assert!(empty_send.is_err());
+
+        let too_many = Config::parse(&format!(
+            "\n[[targets]]\nname = \"one\"\nssh = \"host\"\n{}",
+            (0..9)
+                .map(|index| format!("\n[[quick_replies]]\nlabel = \"r{index}\"\nsend = \"y\"\n"))
+                .collect::<String>()
+        ));
+        assert!(too_many.is_err());
+    }
 
     #[test]
     fn a_transfer_ceiling_is_configurable_and_has_a_default() {
