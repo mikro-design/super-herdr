@@ -21,8 +21,9 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::agent_marks::AgentMarkRequest;
 use crate::daemon::server::DaemonHandle;
-use crate::model::{PaneId, TargetSession};
+use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::PluginRunId;
 use crate::protocol::{
@@ -203,6 +204,10 @@ impl Client {
 
     pub fn subscribe_state(&self) {
         self.commands.subscribe_state();
+    }
+
+    pub fn subscribe_agent_cards(&self) {
+        self.commands.subscribe_agent_cards();
     }
 }
 
@@ -454,6 +459,22 @@ impl ClientCommands {
         self.send(ClientMessage::DecidePairing { attempt, approve });
     }
 
+    /// Pin, mute, or snooze one agent. Super-Herdr's own inbox state; nothing
+    /// here reaches the host.
+    pub fn mark_agent(&self, agent: AgentId, mark: AgentMarkRequest) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::MarkAgent {
+            request,
+            agent,
+            mark,
+        });
+        request
+    }
+
+    pub fn subscribe_agent_cards(&self) {
+        self.send(ClientMessage::SubscribeAgentCards);
+    }
+
     pub fn mark_attention_seen(&self, pane: PaneId) {
         self.send(ClientMessage::MarkAttentionSeen { pane });
     }
@@ -515,6 +536,7 @@ mod tests {
         let options = DaemonOptions {
             // No socket is bound in this mode; the path is never used.
             socket: directory.path().join("unused.sock"),
+            agent_marks: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,

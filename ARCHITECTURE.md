@@ -442,6 +442,76 @@ clears in the frame the person acted in, but that edit is optimistic — the
 republished history overrides it, so a request that never lands is corrected
 rather than silently believed.
 
+The same ownership argument produces the agent card projection. The federation
+hierarchy answers where a pane is; it does not answer which agent is waiting,
+and on a phone that is the only question with room on the screen. The daemon
+therefore builds one inbox — sections for needs-attention, working, and recent,
+in one order — rather than letting each client derive its own. Two clients
+deriving sections independently would disagree the moment their snapshots
+differed by a refresh, and a person moving between the TUI and a phone would be
+reading two different inboxes of the same federation.
+
+A card is keyed by a qualified agent identity: the agent session Herdr reports
+where it reports one, and otherwise the pane the agent occupies, in both cases
+carried with its target and Herdr session. Two hosts that both name a pane
+`w1:p1` produce two cards that never collapse. The session is preferred because
+it survives the agent moving to another pane, which a pane id cannot express —
+a move would otherwise read as one agent dying and another being born, taking
+the card's place in the queue and any pin on it along with it. It is optional
+in Herdr's schema and absent in practice at protocol 19, so nothing depends on
+having one, and the two forms are tagged rather than merged so that a session
+value which happened to equal a pane id cannot name the same card as a
+different agent. A reference missing any of its four fields, or carrying the
+separator the key is built from, is treated as no reference at all: a partial
+key is one two different sessions could share.
+
+Because the identity is not the route, resolution asks the current snapshot
+which agent answers to a key rather than taking the key apart. Two agents
+answering to one identity is therefore a case that can happen and is refused —
+both cards stay visible, because a person should be able to see that it
+happened, and neither is offered, because the daemon cannot say which pane an
+action would mean. Ordering is by section entry
+rather than by first sighting, so the agent blocked longest is at the top, and
+an unrelated target connecting, disconnecting, or refreshing does not renumber
+anything: the projection republishes only when the cards actually differ.
+
+A card is not a route. It records what was true when it was built, and the live
+pane is derived again from the current federation before anything is sent —
+refusing when the target is not live, the agent is gone, its pane is missing, or
+a snapshot disagrees with itself. That is what lets a card one refresh out of
+date be rendered safely, and it is why a disconnect never changes which pane
+receives the next byte. A disappeared agent stays visible as bounded history
+with no pane at all, so it can be read and never typed into. Cards carry labels,
+a status word, a phase, and timestamps; terminal contents are not summarized,
+indexed, or persisted, and the projection itself is derived rather than stored,
+because the federation state and attention index it reads already survive a
+restart on their own terms.
+
+Pins, mutes and snoozes are Super-Herdr's own opinions about that inbox, and
+deliberately not Herdr's. Pinning an agent does not rename, move, or focus the
+pane it runs in; muting one does not stop it working or change what its target
+reports. Nothing in a mark crosses back to a host, so a mark can never be the
+reason a session behaves differently — which is why the TUI files them among
+the Herdr actions a person reaches for while excluding them from the actions
+that mutate Herdr.
+
+They are keyed by the same qualified agent identity the cards use, so pinning
+an agent on one host cannot silence a same-named agent on another. A pin is the
+one reorder a person actually asked for and so is allowed to win over section
+entry; a mute or a snooze moves a card out of the way without denying what it
+is, because an agent that is still blocked is still blocked and a card claiming
+otherwise is one a person could act on wrongly. Coming back from either is
+re-entering the queue rather than reclaiming a former place in it.
+
+A snooze is stored as a deadline the daemon computed from a duration the client
+asked for. A client never names a moment: a phone with a wrong clock would
+otherwise be able to silence an agent until next year, and the daemon has no
+way to tell that from a deliberate request. Expiry is checked on the projection
+path rather than by a timer, so it surfaces within one federation refresh
+without another clock in the process to keep correct. The file is bounded in
+every direction — how many agents may be marked, how large it may be, how far a
+snooze may reach — because it is written by a request from a paired device.
+
 Delivering a notification is a separate question from owning the index, and it
 divides the way the clipboard does. Native desktop delivery is a desktop-session
 capability: it belongs to the client, because a daemon on another machine

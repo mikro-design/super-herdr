@@ -729,6 +729,7 @@ mod tests {
             None,
             DaemonOptions {
                 socket: directory.path().join("unused.sock"),
+                agent_marks: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,

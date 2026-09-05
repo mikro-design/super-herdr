@@ -140,6 +140,36 @@ pub struct LayoutState {
     pub panes: Vec<LayoutPane>,
 }
 
+/// The separator between the parts of an agent key.
+///
+/// A key is assembled from several fields, so no field may contain it: a value
+/// carrying one could otherwise be written so that two different agents
+/// produce the same key, and the whole point of the key is that they cannot.
+pub const AGENT_KEY_SEPARATOR: char = '\u{1f}';
+
+/// How long any one part of an agent session reference may be. Session ids and
+/// paths are short; a target that sends something long is not describing one.
+const MAX_AGENT_SESSION_FIELD_BYTES: usize = 256;
+
+/// The agent session a pane is running, as Herdr reports it.
+///
+/// Optional in Herdr's documented snapshot and, at protocol 19, absent in
+/// practice — so nothing may depend on having one. What it buys where it is
+/// present is an identity that survives the agent moving to another pane,
+/// which a pane id cannot express.
+///
+/// All four fields take part in identity. `kind` distinguishes an `id` from a
+/// `path`, which could otherwise collide; `source` and `agent` say who
+/// reported it and which program it is, and two reporters describing the same
+/// value are not self-evidently the same session.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AgentSessionRef {
+    pub source: String,
+    pub agent: String,
+    pub kind: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentState {
     pub pane: PaneId,
@@ -148,6 +178,8 @@ pub struct AgentState {
     pub status: Option<String>,
     pub interactive_ready: Option<bool>,
     pub revision: Option<u64>,
+    /// Absent whenever Herdr did not report one, which is the common case.
+    pub session: Option<AgentSessionRef>,
 }
 
 impl Keyed for WorkspaceState {
@@ -809,10 +841,39 @@ fn agent_states(snapshot: &Value, target: &TargetSession) -> BTreeMap<PaneId, Ag
                     status: optional_string(item, "agent_status"),
                     interactive_ready: optional_bool(item, "interactive_ready"),
                     revision: optional_u64(item, "revision"),
+                    session: agent_session(item.get("agent_session")),
                 },
             ))
         })
         .collect()
+}
+
+/// Read an agent session reference, and only a complete one.
+///
+/// Every field is required by Herdr's schema, so a record missing one is not a
+/// session this can identify anything by. Taking a partial one would produce a
+/// key that two different sessions could share, which is the exact failure a
+/// qualified identity exists to prevent — so a partial record is treated as no
+/// record and the pane remains the identity.
+fn agent_session(value: Option<&Value>) -> Option<AgentSessionRef> {
+    let value = value?;
+    Some(AgentSessionRef {
+        source: bounded_identity(value.get("source")?.as_str()?)?,
+        agent: bounded_identity(value.get("agent")?.as_str()?)?,
+        kind: bounded_identity(value.get("kind")?.as_str()?)?,
+        value: bounded_identity(value.get("value")?.as_str()?)?,
+    })
+}
+
+/// An identity component crosses this boundary only if it is short, printable,
+/// and free of the separator the key is built with. A target that sent
+/// something else does not get to shape another target's keys.
+fn bounded_identity(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= MAX_AGENT_SESSION_FIELD_BYTES
+        && !value.contains(AGENT_KEY_SEPARATOR)
+        && !value.chars().any(char::is_control))
+    .then(|| value.to_owned())
 }
 
 fn collection<'a>(value: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
@@ -869,7 +930,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        FederationState, FederationStore, NormalizedSnapshot, SupervisorOptions,
+        AgentSessionRef, FederationState, FederationStore, NormalizedSnapshot, SupervisorOptions,
         TargetConnectionState,
     };
     use crate::config::{Config, Target, TransportConfig};
@@ -1183,5 +1244,48 @@ mod tests {
             super::TargetUpdateMode::Events
         );
         store.shutdown().await;
+    }
+
+    #[test]
+    fn reads_a_complete_agent_session_and_refuses_a_partial_one() {
+        let key = crate::model::TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "panes": [{"pane_id": "p1"}, {"pane_id": "p2"}, {"pane_id": "p3"}],
+                "agents": [
+                    {
+                        "pane_id": "p1",
+                        "agent_session": {
+                            "source": "herdr", "agent": "claude",
+                            "kind": "id", "value": "abc123"
+                        }
+                    },
+                    {"pane_id": "p2", "agent_session": {"kind": "id", "value": "abc123"}},
+                    {"pane_id": "p3"}
+                ]
+            }),
+        );
+
+        let session = |resource: &str| {
+            snapshot
+                .agents
+                .get(&crate::model::PaneId::new("host-a", "work", resource))
+                .and_then(|agent| agent.session.clone())
+        };
+        assert_eq!(
+            session("p1"),
+            Some(AgentSessionRef {
+                source: "herdr".to_owned(),
+                agent: "claude".to_owned(),
+                kind: "id".to_owned(),
+                value: "abc123".to_owned(),
+            })
+        );
+        assert!(
+            session("p2").is_none(),
+            "a partial reference would key two different sessions the same way"
+        );
+        assert!(session("p3").is_none());
     }
 }

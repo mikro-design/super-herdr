@@ -22,8 +22,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crate::agent_card::AgentCardProjection;
+use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
-use crate::model::{PaneId, TargetSession};
+use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginRun, PluginRunId};
 use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
@@ -163,6 +165,15 @@ pub enum Effect {
         destination: PaneId,
         name: Option<String>,
     },
+    /// Pin, mute, or snooze one agent. The daemon owns the durable marks, for
+    /// the same reason it owns attention history: two writers would overwrite
+    /// each other's file.
+    MarkAgent {
+        client: ClientId,
+        request: u64,
+        agent: AgentId,
+        mark: AgentMarkRequest,
+    },
     MarkAttentionSeen {
         pane: PaneId,
     },
@@ -236,6 +247,7 @@ struct Route {
 struct Client {
     greeted: bool,
     state_subscribed: bool,
+    agent_cards_subscribed: bool,
     panes: BTreeMap<PaneId, PaneSubscription>,
 }
 
@@ -244,6 +256,7 @@ impl Client {
         Self {
             greeted: false,
             state_subscribed: false,
+            agent_cards_subscribed: false,
             panes: BTreeMap::new(),
         }
     }
@@ -291,6 +304,10 @@ pub struct Broker {
     routes: BTreeMap<PaneId, Route>,
     screens: BTreeMap<PaneId, ScreenState>,
     state: FederationState,
+    /// The inbox as last published. Kept so a client subscribing between two
+    /// federation updates is given the current one instead of waiting for the
+    /// next change, and so a rebuild that changed nothing sends nothing.
+    agent_cards: Option<AgentCardProjection>,
     next_client: u64,
 }
 
@@ -349,6 +366,7 @@ impl Broker {
             routes: BTreeMap::new(),
             screens: BTreeMap::new(),
             state: FederationState::default(),
+            agent_cards: None,
             next_client: 0,
         }
     }
@@ -450,6 +468,31 @@ impl Broker {
                 // A client renders attention it did not derive, so it needs the
                 // history before the next event rather than after it.
                 effects.push(Effect::SendAttentionHistory { client });
+            }
+            ClientMessage::MarkAgent {
+                request,
+                agent,
+                mark,
+            } => effects.push(Effect::MarkAgent {
+                client,
+                request,
+                agent,
+                mark,
+            }),
+            ClientMessage::SubscribeAgentCards => {
+                if let Some(session) = self.clients.get_mut(&client) {
+                    session.agent_cards_subscribed = true;
+                }
+                // Only if the daemon has projected once. Before that there is
+                // no inbox to describe, and an empty one would be a claim that
+                // no agent needs anything — which is a different statement from
+                // "not known yet".
+                if let Some(projection) = self.agent_cards.clone() {
+                    effects.push(Effect::Send {
+                        client,
+                        message: ServerMessage::AgentCards { projection },
+                    });
+                }
             }
             ClientMessage::SubscribePane {
                 pane,
@@ -993,6 +1036,35 @@ impl Broker {
             .collect()
     }
 
+    /// Publish a freshly built inbox.
+    ///
+    /// The daemon rebuilds the projection whenever the federation or attention
+    /// history moves; this only fans it out, and only when it differs from what
+    /// subscribers were last sent. A person watching a busy federation gets one
+    /// message per real change to their inbox rather than one per refresh.
+    pub fn agent_cards_updated(&mut self, projection: AgentCardProjection) -> Vec<Effect> {
+        if self.agent_cards.as_ref() == Some(&projection) {
+            return Vec::new();
+        }
+        self.agent_cards = Some(projection.clone());
+        let mut effects = Vec::new();
+        for client in self
+            .clients
+            .iter()
+            .filter(|(_, session)| session.agent_cards_subscribed)
+            .map(|(client, _)| *client)
+            .collect::<Vec<_>>()
+        {
+            effects.push(Effect::Send {
+                client,
+                message: ServerMessage::AgentCards {
+                    projection: projection.clone(),
+                },
+            });
+        }
+        effects
+    }
+
     pub fn attention_observed(&mut self, event: AttentionEvent) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.broadcast_state(ServerMessage::Attention { event }, &mut effects);
@@ -1371,8 +1443,10 @@ mod tests {
     use super::{
         Broker, ClientId, Effect, MAX_OUTSTANDING_SCREEN_UPDATES, PaneSubscription, Rendered,
     };
+    use crate::agent_card::{AGENT_CARD_PROJECTION_VERSION, AgentCardProjection};
+    use crate::agent_marks::AgentMarkRequest;
     use crate::attention::{AttentionEvent, AttentionEventKind};
-    use crate::model::{PaneId, TargetSession};
+    use crate::model::{AgentId, PaneId, TargetSession};
     use crate::operation::Operation;
     use crate::plugin::PluginRunId;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage};
@@ -3286,6 +3360,112 @@ mod tests {
             [ServerMessage::AttentionHistory { .. }]
         ));
         assert!(messages_for(&effects, silent).is_empty());
+    }
+
+    #[test]
+    fn the_inbox_reaches_only_the_clients_that_asked_for_it() {
+        let mut broker = broker();
+        let subscriber = greet(&mut broker);
+        let bystander = greet(&mut broker);
+        broker.handle(subscriber, ClientMessage::SubscribeAgentCards);
+
+        let effects = broker.agent_cards_updated(projection(1));
+
+        let recipients = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Send {
+                    client,
+                    message: ServerMessage::AgentCards { .. },
+                } => Some(*client),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recipients, vec![subscriber]);
+        assert!(
+            !recipients.contains(&bystander),
+            "a client that did not ask for the inbox is not sent one"
+        );
+    }
+
+    #[test]
+    fn a_late_subscriber_is_given_the_inbox_that_already_exists() {
+        let mut broker = broker();
+        let early = greet(&mut broker);
+        broker.handle(early, ClientMessage::SubscribeAgentCards);
+        broker.agent_cards_updated(projection(1));
+
+        let late = greet(&mut broker);
+        let effects = broker.handle(late, ClientMessage::SubscribeAgentCards);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send {
+                message: ServerMessage::AgentCards { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_subscriber_that_arrives_before_the_first_projection_is_told_nothing() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+
+        assert!(
+            broker
+                .handle(client, ClientMessage::SubscribeAgentCards)
+                .is_empty(),
+            "an empty inbox and an unknown one are different claims"
+        );
+    }
+
+    #[test]
+    fn republishing_an_unchanged_inbox_sends_nothing() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        broker.handle(client, ClientMessage::SubscribeAgentCards);
+        assert!(!broker.agent_cards_updated(projection(1)).is_empty());
+
+        assert!(broker.agent_cards_updated(projection(1)).is_empty());
+        assert!(!broker.agent_cards_updated(projection(2)).is_empty());
+    }
+
+    #[test]
+    fn a_mark_is_carried_to_the_daemon_with_its_qualified_agent() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        let agent = AgentId::new("first", "main", "w1:p1");
+
+        let effects = broker.handle(
+            client,
+            ClientMessage::MarkAgent {
+                request: 3,
+                agent: agent.clone(),
+                mark: AgentMarkRequest::Snooze { minutes: Some(30) },
+            },
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::MarkAgent {
+                client,
+                request: 3,
+                agent,
+                mark: AgentMarkRequest::Snooze { minutes: Some(30) },
+            }],
+            "the broker routes a mark and never decides one"
+        );
+    }
+
+    fn projection(revision: u64) -> AgentCardProjection {
+        AgentCardProjection {
+            version: AGENT_CARD_PROJECTION_VERSION,
+            revision,
+            needs_you: Vec::new(),
+            working: Vec::new(),
+            recent: Vec::new(),
+        }
     }
 
     #[test]

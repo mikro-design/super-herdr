@@ -37,8 +37,10 @@ use anyhow::{Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::agent_card::AgentCardProjection;
+use crate::agent_marks::AgentMarkRequest;
 use crate::attention::AttentionEvent;
-use crate::model::{PaneId, TargetSession};
+use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginRun, PluginRunId};
 use crate::screen::{Diff as ScreenDiff, Snapshot};
@@ -308,6 +310,29 @@ pub enum ClientMessage {
     /// forgetting part of it is a request like any other mutation.
     #[serde(rename = "attention.clear_seen")]
     ClearSeenAttention,
+    /// Begin the agent-card stream: one `agents.cards` at once, then one more
+    /// whenever the projection actually changes.
+    ///
+    /// Separate from `state.subscribe` because the two answer different
+    /// questions and a client may want either. The TUI renders the hierarchy
+    /// and can want both; a phone that only ever shows the inbox has no reason
+    /// to be sent every layout rectangle in the federation.
+    #[serde(rename = "agents.subscribe")]
+    SubscribeAgentCards,
+    /// Pin, mute, or snooze one agent.
+    ///
+    /// A mark is Super-Herdr's own opinion about a person's inbox and never
+    /// reaches the host: nothing here renames, focuses, stops, or otherwise
+    /// touches a Herdr object. A snooze asks for a duration rather than a
+    /// moment, because the daemon owns the clock — a phone whose clock is
+    /// wrong would otherwise silence an agent until next year, and the daemon
+    /// could not tell that from a deliberate request.
+    #[serde(rename = "agents.mark")]
+    MarkAgent {
+        request: u64,
+        agent: AgentId,
+        mark: AgentMarkRequest,
+    },
 }
 
 /// Sent by the daemon.
@@ -389,6 +414,16 @@ pub enum ServerMessage {
     },
     #[serde(rename = "plugin.run")]
     PluginRun { request: u64, run: PluginRun },
+    /// The agent inbox, whole.
+    ///
+    /// Sent complete rather than as a diff. The projection is bounded by the
+    /// number of agents a person is running, its ordering is the daemon's
+    /// answer and not something a client should be reassembling from
+    /// fragments, and a card that arrived without the section it belongs to
+    /// would be a card a client had to place itself — which is the disagreement
+    /// this projection exists to prevent.
+    #[serde(rename = "agents.cards")]
+    AgentCards { projection: AgentCardProjection },
     /// A pairing code and how long it lasts. Never persisted: a code that
     /// survived a restart would be a credential nobody knew was outstanding.
     #[serde(rename = "pairing.code")]
@@ -581,8 +616,13 @@ mod tests {
         ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, PaneRepresentation, ServerMessage,
         decode, encode,
     };
+    use crate::agent_card::{
+        AGENT_CARD_PROJECTION_VERSION, AgentActivity, AgentCard, AgentCardProjection,
+        AgentCardSection,
+    };
+    use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
     use crate::attention::{AttentionEvent, AttentionEventKind};
-    use crate::model::{PaneId, TargetSession, WorkspaceId};
+    use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::operation::Operation;
     use crate::plugin::{
         PluginAction, PluginActionContext, PluginActionId, PluginRun, PluginRunId, PluginRunStatus,
@@ -719,6 +759,22 @@ mod tests {
         round_trip_client(ClientMessage::MarkAttentionSeen { pane: pane() });
         round_trip_client(ClientMessage::MarkAllAttentionSeen);
         round_trip_client(ClientMessage::ClearSeenAttention);
+        round_trip_client(ClientMessage::SubscribeAgentCards);
+        round_trip_client(ClientMessage::MarkAgent {
+            request: 11,
+            agent: AgentId::new("first", "default", "w1:p1"),
+            mark: AgentMarkRequest::Pin { pinned: true },
+        });
+        round_trip_client(ClientMessage::MarkAgent {
+            request: 12,
+            agent: AgentId::new("first", "default", "w1:p1"),
+            mark: AgentMarkRequest::Snooze { minutes: Some(60) },
+        });
+        round_trip_client(ClientMessage::MarkAgent {
+            request: 13,
+            agent: AgentId::new("first", "default", "w1:p1"),
+            mark: AgentMarkRequest::Mute { muted: false },
+        });
         round_trip_client(ClientMessage::RequestPairingCode { request: 9 });
         round_trip_client(ClientMessage::DecidePairing {
             attempt: "a".repeat(64),
@@ -732,6 +788,35 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             server_version: "0.3.1".to_owned(),
             features: vec!["terminal".to_owned()],
+        });
+        round_trip_server(ServerMessage::AgentCards {
+            projection: AgentCardProjection {
+                version: AGENT_CARD_PROJECTION_VERSION,
+                revision: 4,
+                needs_you: vec![AgentCard {
+                    agent: AgentId::new("first", "default", "w1:p1"),
+                    pane: Some(pane()),
+                    title: "reviewer".to_owned(),
+                    workspace: "compiler".to_owned(),
+                    tab: "build".to_owned(),
+                    pane_label: "left".to_owned(),
+                    provider: Some("claude".to_owned()),
+                    activity: AgentActivity::NeedsInput,
+                    status: "blocked".to_owned(),
+                    section: AgentCardSection::NeedsYou,
+                    unread: true,
+                    stale: false,
+                    actionable: true,
+                    last_change_ms: Some(1_700_000_000_000),
+                    marks: AgentMarkState {
+                        pinned: true,
+                        muted: false,
+                        snoozed_until_ms: None,
+                    },
+                }],
+                working: Vec::new(),
+                recent: Vec::new(),
+            },
         });
         round_trip_server(ServerMessage::PaneClosed { pane: pane() });
         round_trip_server(ServerMessage::PaneLease {

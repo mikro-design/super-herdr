@@ -16,7 +16,7 @@ let created = 0;
 const node = id => {
   if (!nodes.has(id)) {
     const held = {
-      id, hidden: false, textContent: '', innerHTML: '', value: '',
+      id, hidden: false, textContent: '', value: '',
       className: '', style: {}, dataset: {}, children: [], disabled: false,
       append(...children) { this.children.push(...children); },
       remove() {},
@@ -34,6 +34,18 @@ const node = id => {
           .filter(Boolean).join(' ');
       },
     };
+    // A real element drops its children when its markup is replaced. The stub
+    // has to as well: rendering a list twice would otherwise report the sum of
+    // both renders, and every count assertion below would be measuring a bug
+    // that does not exist in a browser.
+    let markup = '';
+    Object.defineProperty(held, 'innerHTML', {
+      get: () => markup,
+      set(value) {
+        markup = value;
+        if (value === '') held.children = [];
+      },
+    });
     held.querySelector = selector => node(`${id}-${selector}`);
     nodes.set(id, held);
   }
@@ -330,3 +342,185 @@ check(
   'utf-8 survives',
   Buffer.from(sent.at(-1).body.bytes, 'base64').toString('utf8') === 'echo Sønderborg\r',
 );
+
+// The agent inbox. Sections, ordering and membership are the daemon's answer;
+// this page renders it and is checked for exactly that.
+const card = (resource, overrides = {}) => ({
+  agent: { target: 'first', session: 'main', resource },
+  pane: { target: 'first', session: 'main', resource },
+  title: resource,
+  workspace: 'compiler',
+  tab: 'build',
+  pane_label: resource,
+  provider: 'claude',
+  activity: 'needs_input',
+  status: 'blocked',
+  section: 'needs_you',
+  unread: false,
+  stale: false,
+  actionable: true,
+  ...overrides,
+});
+const projection = overrides => ({
+  type: 'agents.cards',
+  projection: {
+    version: 1, revision: 1, needs_you: [], working: [], recent: [], ...overrides,
+  },
+});
+const sections = () => page.el('inbox-sections').children;
+// A card is a container: the primary action first, then the marks a person can
+// put on it. Reaching through it here keeps the assertions about behaviour
+// rather than about which element happens to carry the handler.
+const openOf = one => one.children[0];
+const marksOf = one => (one.children[1] ? one.children[1].children : []);
+const markChip = (one, kind) => marksOf(one).find(chip => chip.dataset.mark === kind);
+const cardsIn = index => sections()[index].children.slice(1);
+const chipFor = (group, value) => page.el('inbox-filters').children
+  .find(one => one.dataset.group === group && one.dataset.value === value);
+
+deliver(projection({
+  needs_you: [card('p2'), card('p1')],
+  working: [card('p3', { status: 'working', activity: 'working', section: 'working' })],
+}));
+check('renders one block per non-empty section', sections().length === 2);
+check(
+  'keeps the order the daemon published',
+  cardsIn(0).map(one => one.dataset.agent).join() === 'first/main/p2,first/main/p1',
+);
+check('titles a section with its count', sections()[0].children[0].textContent === 'Needs you (2)');
+check('reports how many agents are waiting', page.el('inbox-count').textContent === '2 waiting');
+check('offers the hierarchy as a way back', page.el('hierarchy') !== undefined);
+
+// Filtering is a view of the same projection. It never asks the daemon for a
+// different one, and it never changes what is being watched.
+sent.length = 0;
+chipFor('state', 'working').onclick();
+check('a state filter narrows to one section', sections().length === 1);
+check('a state filter keeps its section intact', cardsIn(0).length === 1);
+check('filtering asks the daemon for nothing', sent.length === 0);
+check(
+  'a chip reports its own pressed state',
+  chipFor('state', 'working')['aria-pressed'] === 'true'
+    && chipFor('state', 'all')['aria-pressed'] === 'false',
+);
+chipFor('state', 'all').onclick();
+check('clearing a filter restores every section', sections().length === 2);
+
+// A dimension with one value offers no chip, because a control that cannot
+// change anything is only something else to read on a phone.
+check('offers no host chips for a single host', chipFor('target', 'all') === undefined);
+deliver(projection({
+  needs_you: [
+    card('p1'),
+    { ...card('p9'), agent: { target: 'second', session: 'main', resource: 'p9' },
+      pane: { target: 'second', session: 'main', resource: 'p9' }, provider: 'codex' },
+  ],
+}));
+check('offers host chips once there are two hosts', chipFor('target', 'second') !== undefined);
+chipFor('target', 'second').onclick();
+check('a host filter keeps only that host', cardsIn(0).length === 1);
+check('a host filter keeps the qualified identity', cardsIn(0)[0].dataset.agent === 'second/main/p9');
+chipFor('provider', 'codex') && chipFor('provider', 'codex').onclick();
+check('an agent-kind filter composes with a host filter', cardsIn(0).length === 1);
+chipFor('target', 'all').onclick();
+chipFor('provider', 'all').onclick();
+
+// A card that cannot resolve is shown and not offered.
+deliver(projection({
+  recent: [
+    card('p8', { section: 'recent', actionable: false, pane: undefined, activity: 'gone', status: 'idle' }),
+    card('p7', { section: 'recent', actionable: false, stale: true, status: 'blocked' }),
+  ],
+}));
+check('history is not clickable', typeof openOf(cardsIn(0)[0]).onclick !== 'function');
+check('history says so to a screen reader', openOf(cardsIn(0)[0])['aria-disabled'] === 'true');
+check('history is disabled', openOf(cardsIn(0)[0]).disabled === true);
+check(
+  'a stale card explains the host, not the agent',
+  openOf(cardsIn(0)[1]).children[1].children[1].textContent === 'host not connected',
+);
+check('a gone agent offers nothing to mark', marksOf(cardsIn(0)[0]).length === 0);
+check('a stale card still offers its marks', marksOf(cardsIn(0)[1]).length === 3);
+
+// Opening a card routes to its own qualified pane and settles its attention.
+deliver(projection({ needs_you: [card('p1', { unread: true })] }));
+sent.length = 0;
+openOf(cardsIn(0)[0]).onclick();
+check(
+  'opening a card marks its attention seen',
+  sent.some(one => one.body.type === 'attention.mark_seen' && one.body.pane.resource === 'p1'),
+);
+check(
+  'opening a card subscribes to its exact qualified pane',
+  sent.some(one => one.body.type === 'pane.subscribe'
+    && one.body.pane.target === 'first' && one.body.pane.resource === 'p1'),
+);
+const watched = page.el('viewing').textContent;
+
+// Background churn repaints the inbox and must not move what a person is
+// reading. The daemon re-resolves before it routes; the page must not
+// re-route on its own.
+sent.length = 0;
+page.el('line').focused = false;
+deliver(projection({
+  revision: 2,
+  needs_you: [card('p4'), card('p1', { unread: true })],
+  working: [card('p5', { status: 'working', section: 'working' })],
+}));
+check('a repaint keeps watching the same pane', page.el('viewing').textContent === watched);
+check('a repaint subscribes to nothing', sent.every(one => one.body.type !== 'pane.subscribe'));
+check('a repaint takes no focus', page.el('line').focused === false);
+
+// Pins, mutes and snoozes are requests to the daemon, and never anything that
+// reaches the host.
+deliver(projection({ needs_you: [card('p1'), card('p2')] }));
+sent.length = 0;
+markChip(cardsIn(0)[1], 'pin').onclick();
+const pinRequest = sent.find(one => one.body.type === 'agents.mark');
+check('pinning names the qualified agent', pinRequest.body.agent.resource === 'p2'
+  && pinRequest.body.agent.target === 'first' && pinRequest.body.agent.session === 'main');
+check('pinning asks for a pin', pinRequest.body.mark.kind === 'pin' && pinRequest.body.mark.pinned === true);
+check('a mark is the only thing sent', sent.length === 1);
+
+sent.length = 0;
+markChip(cardsIn(0)[0], 'snooze').onclick();
+const snoozeRequest = sent.find(one => one.body.type === 'agents.mark');
+check('a snooze asks for a duration, never a moment',
+  snoozeRequest.body.mark.kind === 'snooze' && snoozeRequest.body.mark.minutes === 60);
+
+// The daemon answers by republishing the inbox; the page renders that and
+// never assumes its own request landed.
+deliver(projection({
+  needs_you: [
+    card('p2', { marks: { pinned: true, muted: false } }),
+    card('p1'),
+  ],
+}));
+check('a pinned card reports itself pressed', markChip(cardsIn(0)[0], 'pin')['aria-pressed'] === 'true');
+check('a pinned card names the state it is in', markChip(cardsIn(0)[0], 'pin').textContent === 'Pinned');
+check('an unpinned card stays unpressed', markChip(cardsIn(0)[1], 'pin')['aria-pressed'] === 'false');
+check('a pinned agent offers a pinned filter', chipFor('state', 'pinned') !== undefined);
+chipFor('state', 'pinned').onclick();
+check('the pinned filter keeps only pinned cards', cardsIn(0).length === 1);
+check('the pinned filter keeps the qualified identity', cardsIn(0)[0].dataset.agent === 'first/main/p2');
+sent.length = 0;
+markChip(cardsIn(0)[0], 'pin').onclick();
+check('unpinning asks to clear the pin',
+  sent.find(one => one.body.type === 'agents.mark').body.mark.pinned === false);
+deliver(projection({ needs_you: [card('p2'), card('p1')] }));
+check('a filter that can no longer match anything steps aside', cardsIn(0).length === 2);
+
+// A reconnect asks for the inbox again, because the daemon remembers nothing
+// about what this page held.
+sent.length = 0;
+deliver({ type: 'server.hello', protocol: 3, server_version: '0.7.20', features: ['terminal', 'agent_cards'] });
+check('a reconnect resubscribes to the inbox', sent.some(one => one.body.type === 'agents.subscribe'));
+
+// An older daemon has no inbox to send. Say so instead of waiting forever.
+sent.length = 0;
+deliver({ type: 'server.hello', protocol: 3, server_version: '0.7.20', features: ['terminal'] });
+check('an older daemon asks for no inbox', sent.every(one => one.body.type !== 'agents.subscribe'));
+check('an older daemon hides the inbox', page.el('inbox').hidden === true);
+check('an older daemon opens the hierarchy instead', page.el('hierarchy').open === true);
+deliver({ type: 'server.hello', protocol: 3, server_version: '0.7.20', features: ['terminal', 'agent_cards'] });
+page.el('inbox').hidden = false;

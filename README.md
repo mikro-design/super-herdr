@@ -134,9 +134,28 @@ shows whether the plugin command is running, finished, or failed. If the action
 opens a picker, overlay, board, or another pane, an **Open** button appears;
 your current terminal never changes until you tap it.
 
+The browser opens on an agent inbox rather than the full hierarchy: your
+agents grouped into **Needs you**, **Working**, and **Recent**, each card
+naming the host and Herdr session it belongs to. Tap one to open that exact
+pane. Chips filter by state, host, and agent kind, and **All targets and
+panes** is always one tap away when you want the hierarchy instead.
+
+Pin an agent to keep it at the top, or mute or snooze one to move it out of the
+way for a while — in the browser on the card itself, in the TUI from the same
+right-click menus and action palette. These are Super-Herdr's own view of your
+inbox: nothing about a mark reaches the host or changes a Herdr session.
+
+A card whose host has disconnected, or whose agent has ended, is shown and not
+offered — Super-Herdr resolves the live pane again before it routes anything,
+so a reconnect can never redirect your next keystroke.
+
 ## What is included
 
 - Concurrent discovery and supervision across local and SSH targets
+- A browser agent inbox: qualified per-agent cards, compact filters, and one
+  tap to the exact pane that needs you
+- Per-agent pins, mutes, and snoozes that order your own inbox and never touch
+  a Herdr session
 - A live, clickable TUI with tabs, split panes, search, and agent attention
 - Qualified plugin actions in the TUI and browser, with sanitized run status
   and explicit routing to any newly opened pane
@@ -200,6 +219,7 @@ Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.m
 - [Architecture and protocol boundaries](ARCHITECTURE.md)
 - [Security policy](SECURITY.md)
 - [Roadmap and current limitations](ROADMAP.md)
+- [Community-informed product backlog](PRODUCT_BACKLOG.md)
 - [Release test matrix](TESTING.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)

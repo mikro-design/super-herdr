@@ -24,12 +24,14 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep_until};
 
+use crate::agent_card::agent_key;
+use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
 use crate::attention::{AttentionEvent, AttentionEventKind, AttentionIndex};
 use crate::client::{Client, ClientCommands};
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
 use crate::daemon::server::{DaemonOptions, spawn_in_process};
-use crate::model::{PaneId, TabId, TargetSession, WorkspaceId};
+use crate::model::{AgentId, PaneId, TabId, TargetSession, WorkspaceId};
 use crate::notifications::{self, NotificationDelivery, NotificationQueue};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginActionContext, PluginInvocationTarget};
@@ -838,6 +840,11 @@ struct App {
     client: Option<ClientCommands>,
     pending_operations: BTreeMap<u64, PendingOperation>,
     plugin_catalogs: BTreeMap<TargetSession, PluginCatalog>,
+    /// What a person marked on each agent, taken from the daemon's inbox
+    /// projection. Held so a context menu can offer the toggle that is
+    /// actually available rather than both halves of it; the daemon remains
+    /// the authority, and this is a mirror of its answer.
+    agent_marks: BTreeMap<AgentId, AgentMarkState>,
     pending_plugin_catalogs: BTreeMap<u64, PendingPluginCatalog>,
     pending_uploads: BTreeMap<u64, PendingUpload>,
     last_frame_area: Option<Rect>,
@@ -897,6 +904,7 @@ impl Default for App {
             client: None,
             pending_operations: BTreeMap::new(),
             plugin_catalogs: BTreeMap::new(),
+            agent_marks: BTreeMap::new(),
             pending_plugin_catalogs: BTreeMap::new(),
             pending_uploads: BTreeMap::new(),
             last_frame_area: None,
@@ -973,6 +981,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     );
     let (client, mut daemon_events) = Client::attach(&daemon, "super-herdr-tui").await?;
     client.subscribe_state();
+    client.subscribe_agent_cards();
     let mut updates = client.state();
     let (input_sender, mut input) = mpsc::unbounded_channel();
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
@@ -2593,6 +2602,7 @@ fn command_palette_actions(
     state: &FederationState,
     selected: Option<&PaneId>,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
+    agent_marks: &BTreeMap<AgentId, AgentMarkState>,
 ) -> Vec<ResourceAction> {
     let mut actions = vec![
         ResourceAction::OpenTargetManager,
@@ -2658,9 +2668,15 @@ fn command_palette_actions(
             },
             ResourceAction::ClosePane {
                 pane: pane.id.clone(),
-                label: pane_label,
+                label: pane_label.clone(),
             },
         ]);
+        actions.extend(agent_mark_actions(
+            snapshot,
+            &pane.id,
+            &pane_label,
+            agent_marks,
+        ));
     }
 
     for runtime in state.targets.values() {
@@ -2916,11 +2932,59 @@ fn workspace_recreate_actions(
         .collect()
 }
 
+/// How long the TUI's snooze lasts. One duration rather than a submenu: the
+/// daemon clamps anything longer, and a menu of lengths is more to read than
+/// the choice is worth.
+const TUI_SNOOZE_MINUTES: u32 = 60;
+
+/// The marks a person can put on the agent in one pane.
+///
+/// Offered only where there is an agent to mark: a pane running a shell has
+/// nothing to pin, and an entry that did nothing would be one more line to read
+/// past. Each entry names the state it would move to rather than toggling, so
+/// the same menu item chosen twice is idempotent rather than a flip a person
+/// has to track.
+fn agent_mark_actions(
+    snapshot: &NormalizedSnapshot,
+    pane: &PaneId,
+    label: &str,
+    agent_marks: &BTreeMap<AgentId, AgentMarkState>,
+) -> Vec<ResourceAction> {
+    let Some(state) = snapshot.agents.get(pane) else {
+        return Vec::new();
+    };
+    // The one key builder, so a menu entry names the same agent the daemon's
+    // projection does. Deriving it here from the pane would silently miss an
+    // agent that reports a session and disagree with every card.
+    let agent = agent_key(state);
+    let marked = agent_marks.get(&agent).copied().unwrap_or_default();
+    let mark = |mark| ResourceAction::MarkAgent {
+        agent: agent.clone(),
+        mark,
+        label: label.to_owned(),
+    };
+    vec![
+        mark(AgentMarkRequest::Pin {
+            pinned: !marked.pinned,
+        }),
+        mark(AgentMarkRequest::Mute {
+            muted: !marked.muted,
+        }),
+        mark(AgentMarkRequest::Snooze {
+            minutes: marked
+                .snoozed_until_ms
+                .is_none()
+                .then_some(TUI_SNOOZE_MINUTES),
+        }),
+    ]
+}
+
 fn context_menu_for_target(
     state: &FederationState,
     target: ContextTarget,
     anchor: Position,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
+    agent_marks: &BTreeMap<AgentId, AgentMarkState>,
 ) -> Option<ContextMenu> {
     let (title, mut actions, invocation_target) = match &target {
         ContextTarget::Session(target) => {
@@ -2994,23 +3058,25 @@ fn context_menu_for_target(
             let snapshot = actionable_snapshot(state, &pane.target_session())?;
             let resource = snapshot.panes.get(pane)?;
             let label = display_label(&resource.id.resource, resource.label.as_deref());
+            let mut actions = vec![
+                ResourceAction::SplitPane {
+                    pane: pane.clone(),
+                    direction: SplitDirection::Right,
+                },
+                ResourceAction::SplitPane {
+                    pane: pane.clone(),
+                    direction: SplitDirection::Down,
+                },
+                ResourceAction::TogglePaneZoom { pane: pane.clone() },
+                ResourceAction::ClosePane {
+                    pane: pane.clone(),
+                    label: label.clone(),
+                },
+            ];
+            actions.extend(agent_mark_actions(snapshot, pane, &label, agent_marks));
             (
                 format!("pane {label} · {}", pane.target_session()),
-                vec![
-                    ResourceAction::SplitPane {
-                        pane: pane.clone(),
-                        direction: SplitDirection::Right,
-                    },
-                    ResourceAction::SplitPane {
-                        pane: pane.clone(),
-                        direction: SplitDirection::Down,
-                    },
-                    ResourceAction::TogglePaneZoom { pane: pane.clone() },
-                    ResourceAction::ClosePane {
-                        pane: pane.clone(),
-                        label,
-                    },
-                ],
+                actions,
                 PluginInvocationTarget::Pane { pane: pane.clone() },
             )
         }
@@ -3047,7 +3113,13 @@ fn open_context_menu(
     app.selection = None;
     app.selection_autoscroll = None;
     ensure_plugin_catalog(state, &target.target_session(), app);
-    if let Some(menu) = context_menu_for_target(state, target, anchor, &app.plugin_catalogs) {
+    if let Some(menu) = context_menu_for_target(
+        state,
+        target,
+        anchor,
+        &app.plugin_catalogs,
+        &app.agent_marks,
+    ) {
         app.context_menu = Some(menu);
         app.message = None;
     } else {
@@ -3086,8 +3158,9 @@ fn filtered_palette_actions(
     selected: Option<&PaneId>,
     query: &str,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
+    agent_marks: &BTreeMap<AgentId, AgentMarkState>,
 ) -> Vec<ResourceAction> {
-    let mut actions = command_palette_actions(state, selected, plugin_catalogs)
+    let mut actions = command_palette_actions(state, selected, plugin_catalogs, agent_marks)
         .into_iter()
         .filter_map(|action| fuzzy_score(&action.search_text(), query).map(|score| (score, action)))
         .collect::<Vec<_>>();
@@ -3109,6 +3182,7 @@ fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App)
         app.selected_pane.as_ref(),
         &palette.query,
         &app.plugin_catalogs,
+        &app.agent_marks,
     );
     match key {
         0x1b => return Ok(false),
@@ -3147,6 +3221,7 @@ fn handle_command_palette_input(key: u8, state: &FederationState, app: &mut App)
         app.selected_pane.as_ref(),
         &palette.query,
         &app.plugin_catalogs,
+        &app.agent_marks,
     )
     .len();
     palette.selected = palette.selected.min(count.saturating_sub(1));
@@ -3335,6 +3410,14 @@ fn execute_resource_action(action: ResourceAction, state: &FederationState, app:
                 format!("split pane {} on {target_session}", direction.label()),
                 true,
             );
+        }
+        ResourceAction::MarkAgent { agent, mark, .. } => {
+            // No confirmation and no Herdr operation: a mark changes what this
+            // inbox shows and nothing on the host, and the daemon answers by
+            // republishing the projection this mirror is built from.
+            if let Some(client) = app.client.as_ref() {
+                client.mark_agent(agent, mark);
+            }
         }
         ResourceAction::TogglePaneZoom { pane } => {
             let target_session = pane.target_session();
@@ -5263,6 +5346,16 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         ServerMessage::AttentionHistory { events } => {
             app.attention = AttentionIndex::mirror(events);
         }
+        // The hierarchy stays the TUI's navigation, and the agent list it
+        // renders is still its own. What the projection is read for here is
+        // the marks a person put on a card, so a context menu can offer the
+        // toggle that is available instead of both halves of it.
+        ServerMessage::AgentCards { projection } => {
+            app.agent_marks = projection
+                .cards()
+                .map(|card| (card.agent.clone(), card.marks))
+                .collect();
+        }
         ServerMessage::Hello { .. }
         | ServerMessage::FederationState { .. }
         | ServerMessage::TargetState { .. }
@@ -5362,6 +5455,7 @@ fn render(frame: &mut Frame, state: &FederationState, app: &App) {
             app.selected_pane.as_ref(),
             palette,
             &app.plugin_catalogs,
+            &app.agent_marks,
         );
     } else if let Some(prompt) = app.text_prompt.as_ref() {
         render_text_prompt(frame, prompt);
@@ -5467,6 +5561,7 @@ fn render_command_palette(
     selected: Option<&PaneId>,
     palette: &CommandPalette,
     plugin_catalogs: &BTreeMap<TargetSession, PluginCatalog>,
+    agent_marks: &BTreeMap<AgentId, AgentMarkState>,
 ) {
     let area = centered_popup(frame.area(), 82, 22);
     frame.render_widget(Clear, area);
@@ -5477,7 +5572,13 @@ fn render_command_palette(
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = filtered_palette_actions(state, selected, &palette.query, plugin_catalogs);
+    let actions = filtered_palette_actions(
+        state,
+        selected,
+        &palette.query,
+        plugin_catalogs,
+        agent_marks,
+    );
     let mut lines = vec![
         Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
@@ -7733,8 +7834,8 @@ mod tests {
         ClipboardFeedback, ContextTarget, DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode,
         MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS, MOUSE_CAPTURE_ENABLE, MouseInput,
         PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH, SelectionAutoscroll,
-        SelectionAutoscrollDirection, SelectionFinish, TargetForm, TargetManager,
-        TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
+        SelectionAutoscrollDirection, SelectionFinish, TUI_SNOOZE_MINUTES, TargetForm,
+        TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
         TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
         clamped_pane_position, command_palette_actions, context_menu_for_target, cycle_tab,
         desired_access, displayed_message, encode_mouse_event, federation_routes_changed,
@@ -7749,10 +7850,12 @@ mod tests {
         update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
         visible_pane_areas,
     };
+    use crate::agent_marks::{AgentMarkRequest, AgentMarkState};
     use crate::config::{Config, Target};
-    use crate::model::{PaneId, TargetSession, WorkspaceId};
+    use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::plugin::{PluginAction, PluginActionContext, PluginActionId};
     use crate::resource_action::ResourceAction;
+    use crate::state::AGENT_KEY_SEPARATOR;
     use crate::state::{
         FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
     };
@@ -7921,6 +8024,7 @@ mod tests {
             app.selected_pane.as_ref(),
             "jump second",
             &app.plugin_catalogs,
+            &app.agent_marks,
         );
         assert_eq!(actions.len(), 1);
         let ResourceAction::JumpToPane { pane, .. } = &actions[0] else {
@@ -7970,7 +8074,7 @@ mod tests {
             target.clone(),
             runtime(target, TargetConnectionState::Live, Some(snapshot)),
         );
-        let actions = command_palette_actions(&state, Some(&pane), &catalogs);
+        let actions = command_palette_actions(&state, Some(&pane), &catalogs, &BTreeMap::new());
         assert!(actions.iter().any(|action| {
             matches!(
                 action,
@@ -7986,6 +8090,150 @@ mod tests {
                     if action.id.action_id == "translate-selection"
             )
         }));
+    }
+
+    #[test]
+    fn a_pane_running_an_agent_can_be_pinned_muted_and_snoozed() {
+        let key = TargetSession::new("host-b", "work");
+        let pane = PaneId::new("host-b", "work", "w2:p1");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w2"}],
+                "tabs": [{"tab_id": "w2:t1", "workspace_id": "w2"}],
+                "panes": [
+                    {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"},
+                    {"pane_id": "w2:p2", "workspace_id": "w2", "tab_id": "w2:t1"}
+                ],
+                "agents": [{"pane_id": "w2:p1", "name": "reviewer", "agent_status": "blocked"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Pane(pane.clone()),
+            ratatui::layout::Position::new(1, 1),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let expected = AgentId::new("host-b", "work", &format!("pane{AGENT_KEY_SEPARATOR}w2:p1"));
+        let marks = menu
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ResourceAction::MarkAgent { agent, mark, .. } => Some((agent.clone(), *mark)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marks,
+            vec![
+                (expected.clone(), AgentMarkRequest::Pin { pinned: true }),
+                (expected.clone(), AgentMarkRequest::Mute { muted: true }),
+                (
+                    expected,
+                    AgentMarkRequest::Snooze {
+                        minutes: Some(TUI_SNOOZE_MINUTES)
+                    }
+                ),
+            ]
+        );
+        assert!(
+            menu.actions
+                .iter()
+                .filter(|action| matches!(action, ResourceAction::MarkAgent { .. }))
+                .all(|action| !action.mutates_herdr()),
+            "a mark is Super-Herdr's own inbox state and must not reach the host"
+        );
+    }
+
+    #[test]
+    fn a_pane_without_an_agent_is_offered_nothing_to_mark() {
+        let key = TargetSession::new("host-b", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w2"}],
+                "tabs": [{"tab_id": "w2:t1", "workspace_id": "w2"}],
+                "panes": [{"pane_id": "w2:p2", "workspace_id": "w2", "tab_id": "w2:t1"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Pane(PaneId::new("host-b", "work", "w2:p2")),
+            ratatui::layout::Position::new(1, 1),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            !menu
+                .actions
+                .iter()
+                .any(|action| matches!(action, ResourceAction::MarkAgent { .. })),
+            "a shell has nothing to pin, and an entry that did nothing is one more line to read past"
+        );
+    }
+
+    #[test]
+    fn a_marked_agent_is_offered_the_toggle_that_is_available() {
+        let key = TargetSession::new("host-b", "work");
+        let pane = PaneId::new("host-b", "work", "w2:p1");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w2"}],
+                "tabs": [{"tab_id": "w2:t1", "workspace_id": "w2"}],
+                "panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"}],
+                "agents": [{"pane_id": "w2:p1", "agent_status": "blocked"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let marks = BTreeMap::from([(
+            AgentId::new("host-b", "work", &format!("pane{AGENT_KEY_SEPARATOR}w2:p1")),
+            AgentMarkState {
+                pinned: true,
+                muted: false,
+                snoozed_until_ms: Some(1_700_000_000_000),
+            },
+        )]);
+
+        let menu = context_menu_for_target(
+            &state,
+            ContextTarget::Pane(pane),
+            ratatui::layout::Position::new(1, 1),
+            &BTreeMap::new(),
+            &marks,
+        )
+        .unwrap();
+
+        let labels = menu
+            .actions
+            .iter()
+            .filter(|action| matches!(action, ResourceAction::MarkAgent { .. }))
+            .map(ResourceAction::palette_label)
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label.starts_with("Unpin agent")));
+        assert!(labels.iter().any(|label| label.starts_with("Mute agent")));
+        assert!(labels.iter().any(|label| label.starts_with("Wake agent")));
     }
 
     #[test]
@@ -8010,6 +8258,7 @@ mod tests {
             &state,
             ContextTarget::Workspace(workspace.clone()),
             ratatui::layout::Position::new(4, 5),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .unwrap();
@@ -8062,6 +8311,7 @@ mod tests {
             &state,
             ContextTarget::Workspace(workspace.clone()),
             ratatui::layout::Position::new(4, 5),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .unwrap();
@@ -8178,6 +8428,7 @@ mod tests {
             ContextTarget::Workspace(workspace.clone()),
             ratatui::layout::Position::new(4, 5),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -8225,6 +8476,7 @@ mod tests {
             ContextTarget::Workspace(WorkspaceId::new("host-b", "work", "w1")),
             ratatui::layout::Position::new(0, 0),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         let menu_moves = menu
@@ -8237,6 +8489,7 @@ mod tests {
         let palette = command_palette_actions(
             &state,
             Some(&PaneId::new("host-b", "work", "w1:p1")),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         let palette_moves = palette
