@@ -35,6 +35,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::agent_card::AgentCardIndex;
 use crate::attention::{AttentionIndex, AttentionStore};
 use crate::clipboard;
 use crate::config::{Config, Device, Target, TransportConfig};
@@ -685,6 +686,10 @@ struct Daemon {
     attention: AttentionIndex,
     attention_store: Option<AttentionStore>,
     attention_cursor: Option<u64>,
+    /// The inbox projection. It lives beside the attention index because it
+    /// reads from it, and beside the federation state because it summarises
+    /// it — the one place in the process that holds both.
+    agent_cards: AgentCardIndex,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
     /// Queues handed over by connections, waiting for the broker to say whether
@@ -968,7 +973,11 @@ async fn run(
     let mut daemon = Daemon {
         broker: Broker::new(
             env!("CARGO_PKG_VERSION"),
-            vec!["terminal".to_owned(), "plugin_actions".to_owned()],
+            vec![
+                "terminal".to_owned(),
+                "plugin_actions".to_owned(),
+                "agent_cards".to_owned(),
+            ],
         ),
         web_url: options.web_url.clone(),
         bridge_pairing: options.web_bridge.as_ref().map(|_| bridge_pairing.clone()),
@@ -980,6 +989,7 @@ async fn run(
         attention,
         attention_store,
         attention_cursor,
+        agent_cards: AgentCardIndex::default(),
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
         offers: BTreeMap::new(),
@@ -1493,6 +1503,10 @@ impl Daemon {
                 self.state = state.clone();
                 let mut effects = self.broker.federation_updated(state);
                 effects.extend(self.observe_attention());
+                // After attention, not before: a card carries the attention
+                // state of its agent, so projecting first would publish an
+                // inbox that disagreed with the events sent alongside it.
+                effects.extend(self.project_agent_cards());
                 effects
             }
             Input::Frame {
@@ -2810,7 +2824,23 @@ impl Daemon {
     fn attention_changed(&mut self) -> Vec<Effect> {
         self.persist_attention();
         let events = self.attention.events().cloned().collect();
-        self.broker.attention_changed(events)
+        let mut effects = self.broker.attention_changed(events);
+        // Marking history seen changes what the inbox should show, so the
+        // cards are rebuilt from the same act rather than waiting for whatever
+        // federation refresh happens to come next.
+        effects.extend(self.project_agent_cards());
+        effects
+    }
+
+    /// Rebuild the inbox and publish it if it moved.
+    ///
+    /// The projection is derived, never stored durably: it is a view of the
+    /// federation and the attention index, both of which already survive a
+    /// restart on their own terms. Rebuilding it is cheap and keeps one
+    /// authority for each fact.
+    fn project_agent_cards(&mut self) -> Vec<Effect> {
+        let projection = self.agent_cards.project(&self.state, &self.attention);
+        self.broker.agent_cards_updated(projection)
     }
 
     fn persist_attention(&self) {

@@ -63,7 +63,7 @@ struct AgentObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentPhase {
+pub(crate) enum AgentPhase {
     Attention,
     Working,
     Idle,
@@ -298,7 +298,7 @@ fn transition_kind(
     })
 }
 
-fn agent_phase(status: &str, interactive_ready: bool) -> AgentPhase {
+pub(crate) fn agent_phase(status: &str, interactive_ready: bool) -> AgentPhase {
     if interactive_ready
         || matches!(
             status.to_ascii_lowercase().as_str(),
@@ -330,7 +330,7 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn bounded_metadata(value: &str, maximum_characters: usize) -> String {
+pub(crate) fn bounded_metadata(value: &str, maximum_characters: usize) -> String {
     value
         .chars()
         .map(|character| {

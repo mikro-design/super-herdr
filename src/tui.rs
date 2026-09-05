@@ -5263,7 +5263,12 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
         ServerMessage::AttentionHistory { events } => {
             app.attention = AttentionIndex::mirror(events);
         }
-        ServerMessage::Hello { .. }
+        // The TUI navigates the hierarchy and derives its own agent list from
+        // federation state, so it does not subscribe to the inbox projection
+        // and is never sent one. Named rather than caught by a wildcard, so
+        // adding a message a client must handle stays a compile error.
+        ServerMessage::AgentCards { .. }
+        | ServerMessage::Hello { .. }
         | ServerMessage::FederationState { .. }
         | ServerMessage::TargetState { .. }
         | ServerMessage::PluginRun { .. } => {}

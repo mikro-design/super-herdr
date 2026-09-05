@@ -96,17 +96,18 @@ the exact selected route while targets connect or disconnect.
 
 #### Daemon and protocol
 
-- [ ] Define a versioned `AgentCard` projection owned by the daemon.
-- [ ] Key each live card by target, Herdr session, and agent-session identity.
-- [ ] Include bounded display metadata: target label, workspace, tab, pane,
+- [x] Define a versioned `AgentCard` projection owned by the daemon.
+- [x] Key each live card by target, Herdr session, and agent-session identity.
+- [x] Include bounded display metadata: target label, workspace, tab, pane,
       provider, agent state, attention state, and last state-change time.
-- [ ] Publish deterministic sections: needs attention, active, and recent.
-- [ ] Preserve card ordering across unrelated federation refreshes.
+- [x] Publish deterministic sections: needs attention, active, and recent.
+- [x] Preserve card ordering across unrelated federation refreshes.
 - [ ] Resolve the live pane again before every card action and fail closed on a
-      missing or ambiguous route.
+      missing or ambiguous route. The resolver and its refusals exist; this
+      closes when a card action calls it.
 - [ ] Add persistence for pins, mutes, and snoozes using qualified identities.
-- [ ] Keep historical cards non-actionable after their agent disappears.
-- [ ] Add protocol and daemon tests for duplicate server-local IDs, target
+- [x] Keep historical cards non-actionable after their agent disappears.
+- [x] Add protocol and daemon tests for duplicate server-local IDs, target
       churn, agent moves, and stale cards.
 
 #### Browser
