@@ -161,7 +161,7 @@ impl FileSave {
                 self.length
             );
         }
-        let digest = format!("{:x}", self.hasher.finalize());
+        let digest = hex(&self.hasher.finalize());
         if !self.digest.is_empty() && digest != self.digest {
             bail!("that file did not match the digest its host reported");
         }
@@ -175,6 +175,15 @@ impl FileSave {
             .with_context(|| format!("failed to save {}", self.destination.display()))?;
         Ok(self.destination)
     }
+}
+
+/// A digest as the wire spells it.
+///
+/// Written out rather than formatted with `{:x}`: `sha2` stopped implementing
+/// `LowerHex` on its output in 0.11, and the two other digests in this crate
+/// were already spelled this way.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Where a saved file goes when nobody said.
@@ -202,7 +211,24 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     fn digest_of(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::new().chain_update(bytes).finalize())
+        super::hex(&Sha256::new().chain_update(bytes).finalize())
+    }
+
+    #[test]
+    fn a_digest_is_the_standard_value_spelled_the_way_the_wire_expects() {
+        // A known answer rather than a round trip. Every other test here
+        // compares a digest against one this module computed, which would
+        // agree with itself even if a library change altered the format — and
+        // the format is what a host's own `sha256sum` output is matched
+        // against, so a change in it fails a transfer rather than a test.
+        assert_eq!(
+            digest_of(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            digest_of(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
