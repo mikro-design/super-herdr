@@ -691,6 +691,10 @@ struct ActiveRoute {
 struct PendingOperation {
     description: String,
     follow_server_focus: bool,
+    /// The session the operation acted on. A followed focus belongs to that
+    /// session and nowhere else, so the selection it lands on is looked up
+    /// there rather than wherever the federation happens to be busiest.
+    follow_session: TargetSession,
     /// Reported through the transient feedback line instead of the message
     /// line, which is how clipboard results have always been shown.
     clipboard_feedback: Option<String>,
@@ -854,6 +858,11 @@ struct CloseConfirmation {
 struct App {
     selected_pane: Option<PaneId>,
     selection_explicit: bool,
+    /// Set when an operation that follows server focus has landed, naming the
+    /// session whose focus to adopt. Consumed by the next reconciliation, which
+    /// would otherwise fall back to the startup heuristic and choose a pane on
+    /// an unrelated machine.
+    follow_focus_session: Option<TargetSession>,
     restore_pending: Option<PaneId>,
     state_store: Option<UiStateStore>,
     mode: InputMode,
@@ -926,6 +935,7 @@ impl Default for App {
         Self {
             selected_pane: None,
             selection_explicit: false,
+            follow_focus_session: None,
             restore_pending: None,
             state_store: None,
             mode: InputMode::Terminal,
@@ -1992,6 +2002,7 @@ fn refresh_attention(app: &mut App) {
 
 fn select_pane(app: &mut App, pane: PaneId) {
     app.selection_explicit = true;
+    app.follow_focus_session = None;
     app.restore_pending = None;
     app.selection = None;
     app.selection_autoscroll = None;
@@ -2484,6 +2495,7 @@ fn run_operation(
         app.message = Some("Herdr action routing is unavailable".to_owned());
         return;
     };
+    let follow_session = operation.destination_session();
     let request = client.run_operation(operation);
     app.herdr_action_inflight = true;
     app.message = Some(format!("Herdr: {description}…"));
@@ -2492,6 +2504,7 @@ fn run_operation(
         PendingOperation {
             description,
             follow_server_focus,
+            follow_session,
             clipboard_feedback: None,
         },
     );
@@ -4637,6 +4650,7 @@ async fn paste_text_into_selected(
             PendingOperation {
                 description: "pasted terminal text".to_owned(),
                 follow_server_focus: false,
+                follow_session: selected.target_session(),
                 clipboard_feedback: Some(feedback),
             },
         );
@@ -5101,6 +5115,36 @@ fn reconcile_selection(state: &FederationState, app: &mut App) {
         return;
     }
 
+    // An operation that follows server focus named the session it acted on.
+    // Adopting that session's focus is the whole point of following: creating a
+    // workspace should land on the workspace just created, and the startup
+    // heuristic below would instead pick whichever machine is busiest, which is
+    // routinely a different one.
+    if let Some(session) = app.follow_focus_session.clone() {
+        let followed = state
+            .targets
+            .get(&session)
+            .filter(|target| target.connection == TargetConnectionState::Live)
+            .and_then(|target| target.snapshot.as_deref())
+            .and_then(|snapshot| snapshot.focused_pane.clone());
+        match followed {
+            Some(pane) => {
+                app.follow_focus_session = None;
+                // The operation's own result line survives the selection it
+                // caused; `select_pane` clears the message for navigation the
+                // person did instead of something they were told about.
+                let reported = app.message.take();
+                select_pane(app, pane);
+                app.message = reported;
+                return;
+            }
+            // Herdr has not reported the new focus yet, or the session is
+            // reconnecting. Wait for it rather than choosing somewhere else and
+            // moving the person a second time when it arrives.
+            None => return,
+        }
+    }
+
     let startup_pane = state
         .targets
         .values()
@@ -5332,9 +5376,10 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                         ));
                     }
                 }
-                if pending.is_some_and(|pending| pending.follow_server_focus) {
+                if let Some(pending) = pending.filter(|pending| pending.follow_server_focus) {
                     app.selection_explicit = false;
                     app.selected_pane = None;
+                    app.follow_focus_session = Some(pending.follow_session);
                 }
             } else {
                 app.message = Some(format!("Herdr action failed: {message}"));
@@ -10438,6 +10483,129 @@ mod tests {
             runtime(key, TargetConnectionState::Live, Some(snapshot)),
         );
         state
+    }
+
+    /// Creating a workspace clears the selection so the new one can be adopted
+    /// from server focus. Which server is not a detail: the startup heuristic
+    /// picks whichever machine has the most on it, so without the followed
+    /// session an operation on a quiet target moved the person to a busy one.
+    #[test]
+    fn a_followed_focus_lands_on_the_session_the_operation_acted_on() {
+        let acted_on = TargetSession::new("host-a", "work");
+        let busiest = TargetSession::new("host-b", "work");
+        let created = PaneId::new("host-a", "work", "w2:p1");
+        let elsewhere = PaneId::new("host-b", "work", "w1:p1");
+
+        let mut state = FederationState::default();
+        state.targets.insert(
+            acted_on.clone(),
+            runtime(
+                acted_on.clone(),
+                TargetConnectionState::Live,
+                Some(NormalizedSnapshot::from_value(
+                    &acted_on,
+                    &json!({
+                        "workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}],
+                        "panes": [{"pane_id": "w1:p1"}, {"pane_id": "w2:p1"}],
+                        "focused_pane_id": "w2:p1"
+                    }),
+                )),
+            ),
+        );
+        state.targets.insert(
+            busiest.clone(),
+            runtime(
+                busiest.clone(),
+                TargetConnectionState::Live,
+                Some(NormalizedSnapshot::from_value(
+                    &busiest,
+                    &json!({
+                        "workspaces": [
+                            {"workspace_id": "w1"},
+                            {"workspace_id": "w2"},
+                            {"workspace_id": "w3"}
+                        ],
+                        "panes": [
+                            {"pane_id": "w1:p1"},
+                            {"pane_id": "w2:p1"},
+                            {"pane_id": "w3:p1"}
+                        ],
+                        "focused_pane_id": "w1:p1"
+                    }),
+                )),
+            ),
+        );
+
+        // What the operation result leaves behind: no selection, and the
+        // session whose focus to adopt.
+        let mut app = App {
+            selected_pane: None,
+            follow_focus_session: Some(acted_on),
+            message: Some("Herdr: created workspace \"notes\" on host-a:work".to_owned()),
+            ..App::default()
+        };
+        reconcile_selection(&state, &mut app);
+
+        assert_eq!(app.selected_pane, Some(created));
+        assert!(app.selection_explicit);
+        // Consumed, so a later reconciliation does not move the person again.
+        assert_eq!(app.follow_focus_session, None);
+        // The result the person was shown outlives the selection it caused.
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Herdr: created workspace \"notes\" on host-a:work")
+        );
+
+        // Without a followed session the startup heuristic still chooses the
+        // busiest machine, which is correct at startup and was the bug here.
+        let mut app = App {
+            selected_pane: None,
+            ..App::default()
+        };
+        reconcile_selection(&state, &mut app);
+        assert_eq!(app.selected_pane, Some(elsewhere));
+    }
+
+    /// A followed session that has not reported its new focus yet is waited
+    /// for. Choosing anything else would move the person twice.
+    #[test]
+    fn a_followed_focus_waits_for_the_session_to_report_one() {
+        let acted_on = TargetSession::new("host-a", "work");
+        let busiest = TargetSession::new("host-b", "work");
+
+        let mut state = FederationState::default();
+        state.targets.insert(
+            acted_on.clone(),
+            runtime(
+                acted_on.clone(),
+                TargetConnectionState::Backoff { attempt: 1 },
+                None,
+            ),
+        );
+        state.targets.insert(
+            busiest.clone(),
+            runtime(
+                busiest.clone(),
+                TargetConnectionState::Live,
+                Some(NormalizedSnapshot::from_value(
+                    &busiest,
+                    &json!({
+                        "panes": [{"pane_id": "w1:p1"}],
+                        "focused_pane_id": "w1:p1"
+                    }),
+                )),
+            ),
+        );
+
+        let mut app = App {
+            selected_pane: None,
+            follow_focus_session: Some(acted_on.clone()),
+            ..App::default()
+        };
+        reconcile_selection(&state, &mut app);
+
+        assert_eq!(app.selected_pane, None);
+        assert_eq!(app.follow_focus_session, Some(acted_on));
     }
 
     fn layout_with_panes(
