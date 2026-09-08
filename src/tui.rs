@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Read, Stdout, Write};
 use std::path::PathBuf;
 use std::thread;
@@ -686,6 +686,31 @@ struct ActiveRoute {
     last_sequence: Option<u64>,
 }
 
+/// A focus to adopt once the session that was acted on reports one the
+/// operation could have produced.
+///
+/// The daemon does not refresh a target when an operation completes: it runs
+/// the command, reports the result, and lets the federation arrive on its own
+/// five-second cadence. So at the moment a result lands the state still holds
+/// the session as it was before, focus included. Adopting that focus selects
+/// the pane the person was already on and consumes the follow, and the refresh
+/// that finally carries the new workspace arrives to find a selection it must
+/// not disturb. The panes held beforehand are what tell the two apart.
+struct FollowedFocus {
+    session: TargetSession,
+    /// Panes the session was known to hold when the operation landed. Every
+    /// operation that follows focus creates a pane, so a focus inside this set
+    /// is state the daemon has not refreshed yet.
+    before: BTreeSet<PaneId>,
+    /// Stop waiting eventually. A session that never reports again must not
+    /// leave the frontend with nothing selected.
+    deadline: Instant,
+}
+
+/// Two polling intervals. Long enough that an ordinary refresh arrives first,
+/// short enough that a wedged target does not leave the frontend empty.
+const FOLLOW_FOCUS_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What a frontend needs to remember about an operation while the daemon runs
 /// it, since the result comes back carrying only a request identifier.
 struct PendingOperation {
@@ -858,11 +883,11 @@ struct CloseConfirmation {
 struct App {
     selected_pane: Option<PaneId>,
     selection_explicit: bool,
-    /// Set when an operation that follows server focus has landed, naming the
-    /// session whose focus to adopt. Consumed by the next reconciliation, which
-    /// would otherwise fall back to the startup heuristic and choose a pane on
-    /// an unrelated machine.
-    follow_focus_session: Option<TargetSession>,
+    /// Set when an operation that follows server focus has landed. Held until
+    /// the session it names reports a focus the operation could have produced,
+    /// because nothing refreshes a target when an operation completes and the
+    /// federation still describes the session as it was beforehand.
+    followed_focus: Option<FollowedFocus>,
     restore_pending: Option<PaneId>,
     state_store: Option<UiStateStore>,
     mode: InputMode,
@@ -935,7 +960,7 @@ impl Default for App {
         Self {
             selected_pane: None,
             selection_explicit: false,
-            follow_focus_session: None,
+            followed_focus: None,
             restore_pending: None,
             state_store: None,
             mode: InputMode::Terminal,
@@ -1191,14 +1216,14 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                 let Some(event) = event else {
                     break Err(anyhow::anyhow!("the daemon stopped serving this frontend"));
                 };
-                handle_daemon_event(event, &mut app);
+                handle_daemon_event(event, &mut app, &updates.borrow().clone());
                 // Frames are drained in bounded batches so a busy pane cannot
                 // starve input.
                 for _ in 1..ROUTE_EVENT_DRAIN_LIMIT {
                     let Ok(event) = daemon_events.try_recv() else {
                         break;
                     };
-                    handle_daemon_event(event, &mut app);
+                    handle_daemon_event(event, &mut app, &updates.borrow().clone());
                 }
                 should_draw = true;
             }
@@ -2002,7 +2027,7 @@ fn refresh_attention(app: &mut App) {
 
 fn select_pane(app: &mut App, pane: PaneId) {
     app.selection_explicit = true;
-    app.follow_focus_session = None;
+    app.followed_focus = None;
     app.restore_pending = None;
     app.selection = None;
     app.selection_autoscroll = None;
@@ -5115,21 +5140,29 @@ fn reconcile_selection(state: &FederationState, app: &mut App) {
         return;
     }
 
-    // An operation that follows server focus named the session it acted on.
-    // Adopting that session's focus is the whole point of following: creating a
-    // workspace should land on the workspace just created, and the startup
-    // heuristic below would instead pick whichever machine is busiest, which is
-    // routinely a different one.
-    if let Some(session) = app.follow_focus_session.clone() {
-        let followed = state
+    // An operation that follows server focus named the session it acted on, and
+    // the panes that session held before it ran. Adopting that session's focus
+    // is the whole point of following: creating a workspace should land on the
+    // workspace just created, and the startup heuristic below would instead
+    // pick whichever machine is busiest, which is routinely a different one.
+    if let Some(followed) = app.followed_focus.as_ref() {
+        let focused = state
             .targets
-            .get(&session)
+            .get(&followed.session)
             .filter(|target| target.connection == TargetConnectionState::Live)
             .and_then(|target| target.snapshot.as_deref())
             .and_then(|snapshot| snapshot.focused_pane.clone());
-        match followed {
+        // A focus the session already held is the state the operation ran
+        // against, not its result. Waiting for one it did not hold is what
+        // makes this land on the new workspace rather than back where the
+        // person started.
+        let created = focused
+            .clone()
+            .filter(|pane| !followed.before.contains(pane));
+        let expired = Instant::now() >= followed.deadline;
+        match created.or_else(|| expired.then_some(focused).flatten()) {
             Some(pane) => {
-                app.follow_focus_session = None;
+                app.followed_focus = None;
                 // The operation's own result line survives the selection it
                 // caused; `select_pane` clears the message for navigation the
                 // person did instead of something they were told about.
@@ -5138,10 +5171,14 @@ fn reconcile_selection(state: &FederationState, app: &mut App) {
                 app.message = reported;
                 return;
             }
-            // Herdr has not reported the new focus yet, or the session is
-            // reconnecting. Wait for it rather than choosing somewhere else and
-            // moving the person a second time when it arrives.
-            None => return,
+            // Still waiting on the refresh that carries the operation's result.
+            // Choosing anything now would move the person twice, and the second
+            // move is the one that cannot happen: a selection this makes is a
+            // selection the refresh is forbidden to disturb.
+            None if !expired => return,
+            // The session never reported. Fall through rather than leave the
+            // frontend with nothing selected.
+            None => app.followed_focus = None,
         }
     }
 
@@ -5283,7 +5320,11 @@ fn desired_access(pane: &PaneId, selected: &PaneId) -> TerminalAccess {
 }
 
 /// Apply one message from the daemon that is not federation state.
-fn handle_daemon_event(message: ServerMessage, app: &mut App) {
+///
+/// `state` is the federation as last published. It is read, never adopted: an
+/// operation result needs to know what its session held before the operation to
+/// recognise the refresh that follows it.
+fn handle_daemon_event(message: ServerMessage, app: &mut App, state: &FederationState) {
     match message {
         ServerMessage::PaneFrame {
             pane,
@@ -5379,7 +5420,17 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App) {
                 if let Some(pending) = pending.filter(|pending| pending.follow_server_focus) {
                     app.selection_explicit = false;
                     app.selected_pane = None;
-                    app.follow_focus_session = Some(pending.follow_session);
+                    let before = state
+                        .targets
+                        .get(&pending.follow_session)
+                        .and_then(|target| target.snapshot.as_deref())
+                        .map(|snapshot| snapshot.panes.keys().cloned().collect())
+                        .unwrap_or_default();
+                    app.followed_focus = Some(FollowedFocus {
+                        session: pending.follow_session,
+                        before,
+                        deadline: Instant::now() + FOLLOW_FOCUS_TIMEOUT,
+                    });
                 }
             } else {
                 app.message = Some(format!("Herdr action failed: {message}"));
@@ -8098,6 +8149,7 @@ mod tests {
                 message: "remote digest did not match".to_owned(),
             },
             &mut app,
+            &FederationState::default(),
         );
 
         let message = app.message.unwrap_or_default();
@@ -10485,10 +10537,96 @@ mod tests {
         state
     }
 
-    /// Creating a workspace clears the selection so the new one can be adopted
-    /// from server focus. Which server is not a detail: the startup heuristic
-    /// picks whichever machine has the most on it, so without the followed
-    /// session an operation on a quiet target moved the person to a busy one.
+    /// The bug this exists for: nothing refreshes a target when an operation
+    /// completes, so at the moment the result lands the federation still holds
+    /// the session as it was before. Adopting that focus selects the pane the
+    /// person was already on, and the refresh carrying the new workspace then
+    /// finds a selection it is forbidden to disturb — so the new workspace is
+    /// never reached at all.
+    #[test]
+    fn a_followed_focus_waits_for_the_refresh_that_carries_the_new_workspace() {
+        let session = TargetSession::new("host-a", "work");
+        let existing = PaneId::new("host-a", "work", "w1:p1");
+        let created = PaneId::new("host-a", "work", "w2:p1");
+
+        // What the federation says while the operation runs, and still says
+        // when its result arrives.
+        let mut stale = FederationState::default();
+        stale.targets.insert(
+            session.clone(),
+            runtime(
+                session.clone(),
+                TargetConnectionState::Live,
+                Some(NormalizedSnapshot::from_value(
+                    &session,
+                    &json!({
+                        "workspaces": [{"workspace_id": "w1"}],
+                        "panes": [{"pane_id": "w1:p1"}],
+                        "focused_pane_id": "w1:p1"
+                    }),
+                )),
+            ),
+        );
+
+        let mut app = App {
+            selected_pane: Some(existing.clone()),
+            selection_explicit: true,
+            ..App::default()
+        };
+        app.pending_operations.insert(
+            7,
+            super::PendingOperation {
+                description: "created workspace \"notes\"".to_owned(),
+                follow_server_focus: true,
+                follow_session: session.clone(),
+                clipboard_feedback: None,
+            },
+        );
+
+        super::handle_daemon_event(
+            crate::protocol::ServerMessage::OperationResult {
+                request: 7,
+                applied: true,
+                message: "ok".to_owned(),
+                plugin_run: None,
+            },
+            &mut app,
+            &stale,
+        );
+        assert_eq!(app.selected_pane, None);
+
+        // Reconciling against the state the result arrived with must not
+        // consume the follow: this focus is what the operation ran against.
+        reconcile_selection(&stale, &mut app);
+        assert_eq!(app.selected_pane, None);
+        assert!(app.followed_focus.is_some());
+
+        // The refresh that carries the new workspace is the one to adopt.
+        let mut refreshed = FederationState::default();
+        refreshed.targets.insert(
+            session.clone(),
+            runtime(
+                session.clone(),
+                TargetConnectionState::Live,
+                Some(NormalizedSnapshot::from_value(
+                    &session,
+                    &json!({
+                        "workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}],
+                        "panes": [{"pane_id": "w1:p1"}, {"pane_id": "w2:p1"}],
+                        "focused_pane_id": "w2:p1"
+                    }),
+                )),
+            ),
+        );
+        reconcile_selection(&refreshed, &mut app);
+
+        assert_eq!(app.selected_pane, Some(created));
+        assert!(app.followed_focus.is_none());
+    }
+
+    /// Which server the focus comes from is not a detail: the startup heuristic
+    /// picks whichever machine has the most on it, so an operation on a quiet
+    /// target moved the person to a busy one.
     #[test]
     fn a_followed_focus_lands_on_the_session_the_operation_acted_on() {
         let acted_on = TargetSession::new("host-a", "work");
@@ -10536,28 +10674,29 @@ mod tests {
             ),
         );
 
-        // What the operation result leaves behind: no selection, and the
-        // session whose focus to adopt.
         let mut app = App {
             selected_pane: None,
-            follow_focus_session: Some(acted_on),
-            message: Some("Herdr: created workspace \"notes\" on host-a:work".to_owned()),
+            followed_focus: Some(super::FollowedFocus {
+                session: acted_on,
+                before: std::collections::BTreeSet::from([PaneId::new("host-a", "work", "w1:p1")]),
+                deadline: Instant::now() + super::FOLLOW_FOCUS_TIMEOUT,
+            }),
+            message: Some("Herdr: created workspace \"notes\"".to_owned()),
             ..App::default()
         };
         reconcile_selection(&state, &mut app);
 
         assert_eq!(app.selected_pane, Some(created));
         assert!(app.selection_explicit);
-        // Consumed, so a later reconciliation does not move the person again.
-        assert_eq!(app.follow_focus_session, None);
+        assert!(app.followed_focus.is_none());
         // The result the person was shown outlives the selection it caused.
         assert_eq!(
             app.message.as_deref(),
-            Some("Herdr: created workspace \"notes\" on host-a:work")
+            Some("Herdr: created workspace \"notes\"")
         );
 
-        // Without a followed session the startup heuristic still chooses the
-        // busiest machine, which is correct at startup and was the bug here.
+        // Without one the startup heuristic still chooses the busiest machine,
+        // which is correct at startup and was the bug here.
         let mut app = App {
             selected_pane: None,
             ..App::default()
@@ -10566,29 +10705,21 @@ mod tests {
         assert_eq!(app.selected_pane, Some(elsewhere));
     }
 
-    /// A followed session that has not reported its new focus yet is waited
-    /// for. Choosing anything else would move the person twice.
+    /// Waiting is bounded. A session that never reports its new focus must not
+    /// leave the frontend with nothing selected.
     #[test]
-    fn a_followed_focus_waits_for_the_session_to_report_one() {
-        let acted_on = TargetSession::new("host-a", "work");
-        let busiest = TargetSession::new("host-b", "work");
+    fn a_followed_focus_stops_waiting_once_its_deadline_passes() {
+        let session = TargetSession::new("host-a", "work");
+        let existing = PaneId::new("host-a", "work", "w1:p1");
 
         let mut state = FederationState::default();
         state.targets.insert(
-            acted_on.clone(),
+            session.clone(),
             runtime(
-                acted_on.clone(),
-                TargetConnectionState::Backoff { attempt: 1 },
-                None,
-            ),
-        );
-        state.targets.insert(
-            busiest.clone(),
-            runtime(
-                busiest.clone(),
+                session.clone(),
                 TargetConnectionState::Live,
                 Some(NormalizedSnapshot::from_value(
-                    &busiest,
+                    &session,
                     &json!({
                         "panes": [{"pane_id": "w1:p1"}],
                         "focused_pane_id": "w1:p1"
@@ -10597,15 +10728,29 @@ mod tests {
             ),
         );
 
+        // Still waiting: the only focus on offer is the one held beforehand.
         let mut app = App {
             selected_pane: None,
-            follow_focus_session: Some(acted_on.clone()),
+            followed_focus: Some(super::FollowedFocus {
+                session: session.clone(),
+                before: std::collections::BTreeSet::from([existing.clone()]),
+                deadline: Instant::now() + super::FOLLOW_FOCUS_TIMEOUT,
+            }),
             ..App::default()
         };
         reconcile_selection(&state, &mut app);
-
         assert_eq!(app.selected_pane, None);
-        assert_eq!(app.follow_focus_session, Some(acted_on));
+
+        // Expired: take that session's focus rather than jumping to another
+        // machine or leaving the frontend empty.
+        app.followed_focus = Some(super::FollowedFocus {
+            session,
+            before: std::collections::BTreeSet::from([existing.clone()]),
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+        reconcile_selection(&state, &mut app);
+        assert_eq!(app.selected_pane, Some(existing));
+        assert!(app.followed_focus.is_none());
     }
 
     fn layout_with_panes(

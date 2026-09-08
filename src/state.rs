@@ -351,6 +351,11 @@ impl SupervisorOptions {
 pub struct FederationStore {
     receiver: watch::Receiver<FederationState>,
     shutdown: watch::Sender<bool>,
+    /// One per supervised target, used to ask for a snapshot now rather than
+    /// at the next deadline. Nothing about a target changes on our schedule:
+    /// an operation we just ran on it changed it a moment ago, and waiting out
+    /// the interval publishes a federation that is known to be wrong.
+    nudges: BTreeMap<TargetSession, watch::Sender<u64>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -370,8 +375,11 @@ impl FederationStore {
         let (updates, receiver) = watch::channel(initial_state);
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let mut tasks = Vec::with_capacity(config.targets.len());
+        let mut nudges = BTreeMap::new();
 
         for target in config.targets {
+            let (nudge, nudge_receiver) = watch::channel(0);
+            nudges.insert(target_key(&target), nudge);
             tasks.push(tokio::spawn(supervise_target(
                 target,
                 config.transport.clone(),
@@ -379,14 +387,30 @@ impl FederationStore {
                 options.clone(),
                 updates.clone(),
                 shutdown_receiver.clone(),
+                nudge_receiver,
             )));
         }
 
         Self {
             receiver,
             shutdown,
+            nudges,
             tasks,
         }
+    }
+
+    /// Ask one target's supervisor to take a snapshot now.
+    ///
+    /// Advisory: a supervisor mid-request finishes that one first, and a
+    /// disconnected target still waits out its backoff. Returns whether a
+    /// supervisor was there to ask, so a caller naming an unknown target is
+    /// not told something happened.
+    pub fn refresh_now(&self, key: &TargetSession) -> bool {
+        let Some(nudge) = self.nudges.get(key) else {
+            return false;
+        };
+        nudge.send_modify(|counter| *counter = counter.wrapping_add(1));
+        true
     }
 
     pub fn subscribe(&self) -> watch::Receiver<FederationState> {
@@ -417,6 +441,7 @@ async fn supervise_target<T>(
     options: SupervisorOptions,
     updates: watch::Sender<FederationState>,
     mut shutdown: watch::Receiver<bool>,
+    mut nudge: watch::Receiver<u64>,
 ) where
     T: SnapshotTransport,
 {
@@ -479,6 +504,12 @@ async fn supervise_target<T>(
                         }
                         continue;
                     }
+                    nudged = nudge.changed() => {
+                        if nudged.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     () = sleep_until(refresh_deadline) => continue,
                     result = transport.open_change_stream(
                         &target,
@@ -504,7 +535,8 @@ async fn supervise_target<T>(
                 }
             }
             let Some(changes) = change_stream.as_mut() else {
-                if wait_for_deadline_or_shutdown(refresh_deadline, &mut shutdown).await {
+                if wait_for_deadline_or_shutdown(refresh_deadline, &mut shutdown, &mut nudge).await
+                {
                     return;
                 }
                 continue;
@@ -512,6 +544,12 @@ async fn supervise_target<T>(
             let event_result = tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                nudged = nudge.changed() => {
+                    if nudged.is_err() {
                         return;
                     }
                     continue;
@@ -530,23 +568,30 @@ async fn supervise_target<T>(
                 TargetUpdateMode::Polling,
                 Some(error.message),
             );
-            if wait_for_deadline_or_shutdown(refresh_deadline, &mut shutdown).await {
+            if wait_for_deadline_or_shutdown(refresh_deadline, &mut shutdown, &mut nudge).await {
                 return;
             }
             continue;
         }
-        if wait_for_delay_or_shutdown(delay, &mut shutdown).await {
+        if wait_for_delay_or_shutdown(delay, &mut shutdown, &mut nudge).await {
             return;
         }
     }
 }
 
+/// Wait out a refresh deadline, returning whether the supervisor should stop.
+///
+/// A nudge ends the wait early: something changed the target on purpose and is
+/// waiting to see it. A dropped nudge sender means the store is gone, which is
+/// the same news as a shutdown.
 async fn wait_for_deadline_or_shutdown(
     deadline: Instant,
     shutdown: &mut watch::Receiver<bool>,
+    nudge: &mut watch::Receiver<u64>,
 ) -> bool {
     tokio::select! {
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        nudged = nudge.changed() => nudged.is_err(),
         () = sleep_until(deadline) => false,
     }
 }
@@ -558,9 +603,14 @@ fn snapshot_pane_ids(snapshot: &Value) -> Vec<String> {
         .collect()
 }
 
-async fn wait_for_delay_or_shutdown(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+async fn wait_for_delay_or_shutdown(
+    delay: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    nudge: &mut watch::Receiver<u64>,
+) -> bool {
     tokio::select! {
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        nudged = nudge.changed() => nudged.is_err(),
         () = sleep(delay) => false,
     }
 }
@@ -1186,6 +1236,75 @@ mod tests {
             reconnected.targets[&second_key].connection,
             TargetConnectionState::Live
         );
+
+        store.shutdown().await;
+    }
+
+    /// Nothing changes a target on the refresh interval's schedule. An
+    /// operation the daemon just ran changed it a moment ago, and a client told
+    /// the operation applied would otherwise act on a federation that still
+    /// describes the session as it was beforehand.
+    #[tokio::test]
+    async fn a_nudge_takes_a_snapshot_before_the_refresh_interval() {
+        let config = Config::parse(
+            r#"
+                [[targets]]
+                name = "host-a"
+                session = "dev"
+            "#,
+        )
+        .unwrap();
+        let key = TargetSession::new("host-a", "dev");
+        let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let transport = Arc::new(FakeTransport {
+            scripts: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(snapshot_rx)))]),
+            events: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(event_rx)))]),
+        });
+        // An hour, so nothing but the nudge can explain a second snapshot.
+        let options = SupervisorOptions {
+            command_timeout: Duration::from_secs(1),
+            refresh_interval: Duration::from_secs(3600),
+            initial_backoff: Duration::from_millis(1),
+            maximum_backoff: Duration::from_millis(4),
+        };
+
+        snapshot_tx.send(Ok(snapshot("w1:p1"))).unwrap();
+        let store = FederationStore::start(config, transport, options);
+        let mut receiver = store.subscribe();
+        wait_for(&mut receiver, |state| {
+            state.targets[&key]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .panes
+                        .contains_key(&PaneId::new("host-a", "dev", "w1:p1"))
+                })
+        })
+        .await;
+
+        // What the operation created, waiting to be read.
+        snapshot_tx.send(Ok(snapshot("w2:p1"))).unwrap();
+        assert!(store.refresh_now(&key));
+        let updated = wait_for(&mut receiver, |state| {
+            state.targets[&key]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .panes
+                        .contains_key(&PaneId::new("host-a", "dev", "w2:p1"))
+                })
+        })
+        .await;
+        assert_eq!(
+            updated.targets[&key].connection,
+            TargetConnectionState::Live
+        );
+
+        // A target nobody supervises is not quietly reported as refreshed.
+        assert!(!store.refresh_now(&TargetSession::new("host-b", "dev")));
 
         store.shutdown().await;
     }
