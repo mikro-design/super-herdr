@@ -1,6 +1,6 @@
 [package]
 name = "super-herdr"
-version = "0.7.21"
+version = "0.7.22"
 edition = "2024"
 publish = false
 description = "A multi-host control plane for persistent Herdr coding-agent sessions"
