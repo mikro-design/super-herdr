@@ -4,14 +4,25 @@
 [![Latest release](https://img.shields.io/github/v/release/mikro-design/super-herdr)](https://github.com/mikro-design/super-herdr/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Super-Herdr puts persistent Herdr sessions from all your machines in one terminal
-UI. Pair a phone when you need to read output, answer a prompt, or send a file
-away from your desk.
+An agent on one of your machines is blocked, waiting for an answer, and you are
+not at that desk.
 
-- One TUI for local and SSH-connected Herdr sessions
-- Phone access through an explicit device-login flow
-- Attention tracking across hosts, sessions, workspaces, and agents
-- Verified file transfer for images, PDFs, Office documents, and other files
+Super-Herdr is the cross-machine inbox and control plane for the Herdr sessions
+you already run. It answers three questions, from one terminal UI or from a
+paired phone:
+
+- **Which agent needs you?** Attention tracking across every host, session,
+  workspace, and agent, with the waiting ones first.
+- **What can you safely send it?** Nothing reaches a pane — a keystroke, a
+  paste, or an uploaded file — from a connection that does not hold that
+  pane's control lease.
+- **Which machine and session will receive it?** Every agent is addressed by
+  target and Herdr session, so a machine connecting or disconnecting never
+  redirects your next keystroke.
+
+Pairing a phone needs no Tailscale client, no shared Wi-Fi, and no inbound route
+to your computer. Read the output, answer the prompt, send the file, and get
+back to what you were doing.
 
 Herdr continues to own every shell, agent, workspace, and terminal history.
 Super-Herdr never automatically starts, stops, restarts, or takes over a Herdr
