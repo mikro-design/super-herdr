@@ -5,6 +5,20 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.22
+
+- Fixed the selection jumping to another machine after creating a workspace.
+  The operation follows Herdr's focus, but nothing recorded whose focus to
+  follow, so the frontend fell back to its startup rule and selected a pane on
+  whichever live target held the most agents, workspaces and panes. Creating a
+  tab, splitting a pane and moving a workspace jumped the same way. The session
+  the operation acted on is now carried with it, and a session that has not
+  reported its new focus yet is waited for rather than replaced.
+- Rewrote the README opening around the questions the product answers — which
+  agent needs you, what you can safely send it, and which machine and session
+  receives it — rather than the parts it is assembled from.
+- Updated `sha2` to 0.11, `base64` to 0.23.1 and `toml` to 1.1.5.
+
 ## 0.7.21
 
 - Fixed file transfers to and from hosts without GNU coreutils. Every transfer
