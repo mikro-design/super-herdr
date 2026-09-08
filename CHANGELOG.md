@@ -5,6 +5,19 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.23
+
+- Fixed creating a workspace not moving to it. 0.7.22 said it followed Herdr's
+  focus and moved nowhere at all. Nothing refreshed a target when an operation
+  completed, so at the instant a result landed the federation still described
+  the session as it was beforehand. The frontend adopted that focus, selected
+  the pane the person was already on, and the refresh carrying the new
+  workspace then arrived to find a selection it must not disturb. The frontend
+  now waits for a focus the session did not already hold, and the daemon asks
+  the target for a snapshot when an applied operation changes what a snapshot
+  would say. Creating a tab, splitting a pane and moving a workspace were
+  affected the same way.
+
 ## 0.7.22
 
 - Fixed the selection jumping to another machine after creating a workspace.
