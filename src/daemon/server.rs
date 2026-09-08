@@ -160,6 +160,10 @@ enum Input {
     OperationDone {
         client: ClientId,
         request: u64,
+        /// The session to re-snapshot once this lands, when the operation was
+        /// the kind that changes what a snapshot would say. Typing into a pane
+        /// is not: it changes a terminal, which the federation does not carry.
+        refresh: Option<TargetSession>,
         applied: bool,
         message: String,
         plugin_run: Option<plugin::PluginRun>,
@@ -1631,12 +1635,21 @@ impl Daemon {
             Input::OperationDone {
                 client,
                 request,
+                refresh,
                 applied,
                 message,
                 plugin_run,
-            } => self
-                .broker
-                .operation_completed(client, request, applied, message, plugin_run),
+            } => {
+                // An operation that landed changed the session a moment ago, so
+                // the federation describes it wrongly until the next snapshot.
+                // Ask for that snapshot rather than publishing a result whose
+                // state this daemon already knows is behind it.
+                if let Some(session) = refresh.filter(|_| applied) {
+                    self.refresh_target(&session);
+                }
+                self.broker
+                    .operation_completed(client, request, applied, message, plugin_run)
+            }
             Input::RelayFinished {
                 client,
                 request,
@@ -1988,6 +2001,17 @@ impl Daemon {
         }
     }
 
+    /// Ask one target's supervisor for a snapshot now.
+    ///
+    /// Advisory, and deliberately not awaited: the answer arrives as a
+    /// federation update like every other, and a target that is slow, wedged or
+    /// backing off is not made to answer faster by being asked twice.
+    fn refresh_target(&self, key: &TargetSession) {
+        if let Some(store) = self.store.as_ref() {
+            store.refresh_now(key);
+        }
+    }
+
     /// Re-read the durable configuration off the loop. One refresh runs at a
     /// time, so a slow discovery on an unreachable host cannot queue up behind
     /// itself.
@@ -2292,6 +2316,7 @@ impl Daemon {
             let _ = inputs.send(Input::OperationDone {
                 client,
                 request,
+                refresh: None,
                 applied,
                 message,
                 plugin_run: None,
@@ -2878,6 +2903,7 @@ impl Daemon {
             let _ = self.inputs.send(Input::OperationDone {
                 client,
                 request,
+                refresh: None,
                 applied: false,
                 message: format!("{source_key} is not a configured target"),
                 plugin_run: None,
@@ -2888,6 +2914,7 @@ impl Daemon {
             let _ = self.inputs.send(Input::OperationDone {
                 client,
                 request,
+                refresh: None,
                 applied: false,
                 message: format!("{destination_key} is not a configured target"),
                 plugin_run: None,
@@ -2924,6 +2951,7 @@ impl Daemon {
             let _ = inputs.send(Input::OperationDone {
                 client,
                 request,
+                refresh: Some(destination_key),
                 applied,
                 message,
                 plugin_run,
