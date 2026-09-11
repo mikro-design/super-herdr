@@ -45,7 +45,16 @@ With Homebrew on macOS or Linux:
 brew install mikro-design/tap/super-herdr
 ```
 
-On Debian and Ubuntu, add the package repository once:
+On Debian and Ubuntu:
+
+```sh
+curl -fsSL https://mikro-design.github.io/apt/install.sh | sudo bash
+```
+
+That adds the signed package repository and installs Super-Herdr, so every
+upgrade after it arrives with `apt upgrade`. amd64 and arm64 are both published.
+
+To do the same thing without piping a script to a shell:
 
 ```sh
 sudo install -d -m 0755 /usr/share/keyrings
@@ -53,18 +62,11 @@ curl -fsSL https://mikro-design.github.io/apt/super-herdr.gpg \
   | sudo tee /usr/share/keyrings/super-herdr.gpg > /dev/null
 echo "deb [signed-by=/usr/share/keyrings/super-herdr.gpg] https://mikro-design.github.io/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/super-herdr.list > /dev/null
-sudo apt update
+sudo apt update && sudo apt install super-herdr
 ```
 
-Then, now and for every release after it:
-
-```sh
-sudo apt install super-herdr
-```
-
-amd64 and arm64 are both published. To install one release without adding the
-repository, take its `.deb` from the releases page and let apt resolve the
-dependencies:
+To install one release without adding the repository at all, take its `.deb`
+from the releases page and let apt resolve the dependencies:
 
 ```sh
 version=0.7.23

@@ -73,6 +73,10 @@ if [[ "${#versions[@]}" -gt "${keep}" ]]; then
   done
 fi
 
+# The one-line installer is served from the repository root, so it ships with
+# the repository it configures and cannot drift from it.
+install -m 0755 "${here}/../packaging/install-apt.sh" "${repo}/install.sh"
+
 "${here}/render-apt-repo.sh" "${repo}"
 "${here}/sign-apt-repo.sh" "${repo}" "${key}"
 "${here}/verify-apt-repo.sh" "${repo}"
