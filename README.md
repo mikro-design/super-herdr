@@ -39,22 +39,27 @@ clipboard you use.
 
 ### 1. Install
 
-With Homebrew on macOS or Linux:
+On macOS, or Linux with Homebrew:
 
 ```sh
 brew install mikro-design/tap/super-herdr
 ```
 
-On Debian and Ubuntu:
+On Debian or Ubuntu:
 
 ```sh
 curl -fsSL https://mikro-design.github.io/apt/install.sh | sudo bash
 ```
 
-That adds the signed package repository and installs Super-Herdr, so every
-upgrade after it arrives with `apt upgrade`. amd64 and arm64 are both published.
+Either way, later versions arrive with `brew upgrade` or `apt upgrade`. amd64
+and arm64 are published for both.
 
-To do the same thing without piping a script to a shell:
+<details>
+<summary>Other ways to install</summary>
+
+The Debian one-liner adds a signed package repository and installs from it.
+These are the same four commands, for anyone who would rather not pipe a script
+to a root shell:
 
 ```sh
 sudo install -d -m 0755 /usr/share/keyrings
@@ -76,7 +81,7 @@ curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${vers
 sudo apt install "./${package}"
 ```
 
-Other Linux users can install a prebuilt archive:
+On Linux without Homebrew or apt, take a prebuilt archive:
 
 ```sh
 tag=v0.7.23
@@ -87,8 +92,11 @@ tar xzf "${archive}"
 sudo install -m 0755 "super-herdr-${tag}-${target}/super-herdr" /usr/local/bin/
 ```
 
-All macOS and Linux packages, checksums, and build attestations are on the
+Every package, checksum, and build attestation is on the
 [releases page](https://github.com/mikro-design/super-herdr/releases/latest).
+Building from source is covered under [Build from source](#build-from-source).
+
+</details>
 
 ### 2. Add a Herdr machine
 
