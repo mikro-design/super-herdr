@@ -36,6 +36,34 @@ case "${architecture}" in
     ;;
 esac
 
+# apt refuses every install transaction while any package is half-configured,
+# and it refuses this one with a complaint about whichever unrelated package is
+# broken. Somebody who ran a one-line installer and got told about
+# libnvidia-compute has no reason to connect the two, so the state is checked
+# before anything is added to their system, and named.
+# Only the states that actually block. `triggers-pending` and `triggers-awaited`
+# are cleared by the next dpkg run and are common on a healthy system, so
+# refusing on those would turn a working install into a false alarm.
+broken="$(dpkg-query -W -f='${Package} ${Status}\n' 2> /dev/null \
+  | awk '$NF == "unpacked" || $NF == "half-configured" || $NF == "half-installed" { print $1 }' \
+  | sort -u)"
+remaining="$(echo "${broken}" | sed '/^$/d' | wc -l)"
+if [[ -n "${broken}" ]]; then
+  cat >&2 <<EOF
+This system has packages that are not fully installed, and apt will not install
+anything else until they are sorted out. It is not related to Super-Herdr:
+
+$(echo "${broken}" | head -5 | sed 's/^/  /')$([[ "${remaining}" -gt 5 ]] && printf '\n  ... and %d more' "$(( remaining - 5 ))")
+
+Fix them first, then run this again:
+
+  sudo apt --fix-broken install
+
+If that does not clear it, try: sudo dpkg --configure -a
+EOF
+  exit 1
+fi
+
 for tool in curl gpg; do
   if ! command -v "${tool}" > /dev/null 2>&1; then
     echo "Installing ${tool}, which this needs to verify the repository."
