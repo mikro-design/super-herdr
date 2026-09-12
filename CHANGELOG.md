@@ -5,6 +5,23 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.25
+
+- Fixed the browser cutting off the right of every line on a phone. The page
+  subscribed with a fixed eighty columns, and the first subscriber to a pane
+  opens the route at the size it asks for — so a phone reshaped panes that were
+  fifty-four columns wide to eighty, then could not draw eighty columns legibly
+  on a phone-width screen. A third of each line sat off the edge, reachable only
+  by panning and indistinguishable from output that was never sent. The size
+  asked for now follows the viewport, measured at the same minimum font size the
+  page will draw at.
+- Fixed `--config <name>` with a bare file name failing every configuration
+  write, which meant a device could never pair against it. `Path::parent` of
+  such a path is the empty path rather than the current directory, and securing
+  the empty path fails; the daemon reported a configuration directory it could
+  not secure and named no directory. Adding a target and revoking a device
+  failed the same way.
+
 ## 0.7.24
 
 - Fixed the browser client stalling on any connection slower than a shared
