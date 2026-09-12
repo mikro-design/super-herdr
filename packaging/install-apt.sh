@@ -66,7 +66,37 @@ apt-get update -o Dir::Etc::sourcelist="${source_list}" \
   -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0
 
 echo "Installing super-herdr."
-apt-get install -y super-herdr
+if ! apt-get install -y super-herdr; then
+  # apt declines a transaction while another package is left half configured,
+  # and it declines this one by naming whichever unrelated package is broken.
+  # Somebody who ran a one-line installer and was told about libnvidia-compute
+  # has no reason to connect the two, so the state is read here and explained.
+  #
+  # After the failure rather than before it, deliberately. Half-configured
+  # packages do not always block — apt copes with plenty of them — and a check
+  # that ran first would refuse installs that were going to succeed, which is
+  # worse than the confusing error it set out to replace.
+  broken="$(dpkg-query -W -f='${Package} ${Status}\n' 2> /dev/null \
+    | awk '$NF == "unpacked" || $NF == "half-configured" || $NF == "half-installed" { print $1 }' \
+    | sort -u | sed '/^$/d')"
+  if [[ -n "${broken}" ]]; then
+    count="$(echo "${broken}" | wc -l)"
+    cat >&2 <<REASON
+
+That failure is about this system, not about Super-Herdr. These packages are
+not fully installed, and apt will not complete any transaction until they are:
+
+$(echo "${broken}" | head -5 | sed 's/^/  /')$([[ "${count}" -gt 5 ]] && printf '\n  ... and %d more' "$(( count - 5 ))")
+
+Sort them out, then run this again:
+
+  sudo apt --fix-broken install
+
+If that does not clear it, try: sudo dpkg --configure -a
+REASON
+  fi
+  exit 1
+fi
 
 cat <<EOF
 
