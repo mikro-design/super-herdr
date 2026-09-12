@@ -886,6 +886,10 @@ function runStyle(style) {
   return parts.join(';');
 }
 
+// The smallest size this page will draw a terminal at. Both the fit and the
+// size asked for are derived from it, so they cannot disagree.
+const MINIMUM_FONT_PIXELS = 12;
+
 function measure() {
   const host = el('screen');
   const probe = document.createElement('span');
@@ -907,9 +911,11 @@ function refit() {
   const reference = measure().width;
   const room = host.clientWidth - 2 * 0.7 * parseFloat(getComputedStyle(document.body).fontSize);
   const wanted = 14 * (room / screen.width) / reference;
-  // Below twelve pixels an 80-column pane technically fits but is not
-  // readable on a phone. Preserve legibility and let the terminal pan instead.
-  host.style.fontSize = `${Math.max(12, Math.min(16, wanted))}px`;
+  // Legibility is the floor, not the fit: a pane wider than this viewport can
+  // draw is panned rather than shrunk into unreadability. The subscription asks
+  // for a width that fits at this same size, so panning is now the exception it
+  // was meant to be rather than what every phone got.
+  host.style.fontSize = `${clamp(wanted, MINIMUM_FONT_PIXELS, 16)}px`;
   cell = measure();
 }
 
@@ -997,16 +1003,49 @@ function observe(pane, label) {
   subscribeScreen(pane);
 }
 
+// What this viewport can actually show, in character cells.
+//
+// The size matters more than it looks: the first subscriber to a pane opens the
+// route, and the route is opened at the size it asked for. Asking for eighty
+// columns from a phone therefore did two things, both wrong. It reshaped the
+// pane to a width nobody was looking at, re-wrapping the output for a terminal
+// that exists only in this request. And eighty columns cannot be drawn legibly
+// on a phone, so a third of every line sat off the right edge, reachable only
+// by panning and indistinguishable from output that was never sent.
+//
+// Measured at the smallest size `refit` will use, because a pane that fits only
+// at a size this page refuses to render is a pane that does not fit.
+function viewportCells() {
+  const host = el('screen');
+  const previous = host.style.fontSize;
+  host.style.fontSize = `${MINIMUM_FONT_PIXELS}px`;
+  const cell = measure();
+  host.style.fontSize = previous;
+  const padding = 2 * 0.7 * parseFloat(getComputedStyle(document.body).fontSize);
+  const room = Math.max(1, host.clientWidth - padding);
+  const height = Math.max(1, host.clientHeight);
+  // A terminal narrower than this is not worth reading, and one wider than a
+  // desktop is not worth asking a host to render.
+  const cols = clamp(Math.floor(room / (cell.width || 1)), 40, 200);
+  const rows = clamp(Math.floor(height / (cell.height || 1)), 10, 60);
+  return { cols, rows };
+}
+
+function clamp(value, low, high) {
+  return Math.max(low, Math.min(high, Number.isFinite(value) ? value : low));
+}
+
 // `screen` rather than `frames`: this page has no emulator and wants none.
 // One definition, because three callers ask for the same thing — opening a
 // pane, recovering from a gap, and recovering from a dropped connection.
 function subscribeScreen(pane) {
+  const { cols, rows } = viewportCells();
   send({
     type: 'pane.subscribe',
     pane,
     access: 'observe',
-    cols: 80,
-    rows: 24,
+    cols,
+    rows,
     representation: 'screen',
   });
 }

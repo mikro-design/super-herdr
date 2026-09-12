@@ -27,6 +27,7 @@ const node = id => {
       select() { this.selected = true; },
       getBoundingClientRect: () => ({ width: 8, height: 16 }),
       clientWidth: 800,
+      clientHeight: 400,
       appendChild(child) { this.children.push(child); },
     };
     held.classList = {
@@ -254,6 +255,20 @@ deliver({ type: 'attention.history', events: [] });
 // Watching a pane: observing, and no keyboard offered.
 page.observe(pane, 'first/main/w1:p1');
 check('subscribes on observe', sent.some(one => one.body.type === 'pane.subscribe'));
+// The route is opened at the size the first subscriber asks for, so asking for
+// a fixed eighty columns reshaped the pane and pushed a third of every line off
+// a phone's screen. The request is derived from the viewport now, and stays
+// inside bounds a terminal is worth rendering at.
+{
+  const subscribe = sent.find(one => one.body.type === 'pane.subscribe').body;
+  check('the size asked for is not a fixed 80x24',
+    !(subscribe.cols === 80 && subscribe.rows === 24));
+  check('the columns asked for suit the viewport',
+    subscribe.cols >= 40 && subscribe.cols <= 200);
+  check('the rows asked for suit the viewport',
+    subscribe.rows >= 10 && subscribe.rows <= 60);
+  check('the rows asked for follow the height on offer', subscribe.rows === 25);
+}
 check('no keyboard while observing', page.el('keyboard').hidden === true);
 check('control is offered', page.el('control').hidden === false);
 
