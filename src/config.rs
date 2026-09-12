@@ -1129,10 +1129,30 @@ fn remove_device_block(text: &str, name: &str) -> String {
     kept
 }
 
-fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    let directory = path
+/// The directory a configuration file lives in, as something that can be
+/// created and chmodded.
+///
+/// `Path::parent` of a bare file name is `Some("")`, not `None`: a relative
+/// path with no directory component still has a parent, and that parent is the
+/// empty path rather than the current directory. Every filesystem call then
+/// takes it literally — the empty path does not exist, `create_dir_all` treats
+/// it as nothing to do and succeeds, and `chmod("")` fails with ENOENT. What
+/// that surfaced as was a phone that could not pair against `--config
+/// config.local.toml`, reporting a configuration directory it could not secure
+/// and naming no directory.
+fn configuration_directory(path: &Path) -> Result<&Path> {
+    let parent = path
         .parent()
         .context("configuration path has no parent directory")?;
+    Ok(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
+}
+
+fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let directory = configuration_directory(path)?;
     let directory_exists = directory.exists();
     fs::create_dir_all(directory).context("failed to create the configuration directory")?;
     if !directory_exists {
@@ -2055,6 +2075,34 @@ ssh = "build-host"
         let config = Config::load(Some(&path)).unwrap().0;
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.targets[0].name, "development");
+    }
+
+    /// `--config config.local.toml` — a bare file name, which is what anyone
+    /// running from a checkout types — could not pair a device at all. The
+    /// parent of such a path is the empty path rather than the current
+    /// directory, and securing the empty path fails with ENOENT, so the write
+    /// reported a configuration directory it could not secure and named no
+    /// directory. Nothing about the pairing was wrong.
+    #[test]
+    fn a_config_path_with_no_directory_writes_beside_itself() {
+        use std::path::Path;
+
+        let bare = super::configuration_directory(Path::new("config.local.toml")).unwrap();
+        assert_eq!(bare, Path::new("."), "a bare name is written to the cwd");
+        // And it must be a directory that exists, or every call below it fails.
+        assert!(bare.is_dir());
+
+        for (path, expected) in [
+            ("/etc/super-herdr/config.toml", "/etc/super-herdr"),
+            ("./config.toml", "."),
+            ("nested/config.toml", "nested"),
+        ] {
+            assert_eq!(
+                super::configuration_directory(Path::new(path)).unwrap(),
+                Path::new(expected),
+                "{path}"
+            );
+        }
     }
 
     #[test]
