@@ -3118,9 +3118,6 @@ mod tests {
         );
     }
 
-    /// The bound belongs to the rendered path alone: a frame subscriber is
-    /// already stopped by the socket it is not draining.
-    #[test]
     /// The flood this was written for: an event-driven target reports success
     /// several times a second, and every report moved `last_success`. Comparing
     /// whole values made that a change, so the entire target — every workspace,
@@ -3164,6 +3161,9 @@ mod tests {
         ));
     }
 
+    /// The bound belongs to the rendered path alone: a frame subscriber is
+    /// already stopped by the socket it is not draining.
+    #[test]
     fn a_frame_subscriber_is_not_bounded_by_the_screen_limit() {
         let mut broker = broker();
         let tui = greet(&mut broker);
