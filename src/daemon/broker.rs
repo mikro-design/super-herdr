@@ -863,7 +863,11 @@ impl Broker {
     pub fn federation_updated(&mut self, state: FederationState) -> Vec<Effect> {
         let mut changes = Vec::new();
         for (key, target) in &state.targets {
-            if self.state.targets.get(key) != Some(target) {
+            let changed = match self.state.targets.get(key) {
+                Some(previous) => previous.differs_for_clients(target),
+                None => true,
+            };
+            if changed {
                 changes.push(ServerMessage::TargetState {
                     target: key.clone(),
                     state: Some(target.clone()),
@@ -3112,6 +3116,49 @@ mod tests {
             !broker.routes.contains_key(&pane("w1:p1")),
             "the route outlived the only client that wanted it"
         );
+    }
+
+    /// The flood this was written for: an event-driven target reports success
+    /// several times a second, and every report moved `last_success`. Comparing
+    /// whole values made that a change, so the entire target — every workspace,
+    /// pane and agent — went to every client each time, for a timestamp nothing
+    /// renders. Measured against one real session it was two megabytes in
+    /// twenty seconds, which a phone away from the house cannot drain.
+    #[test]
+    fn a_target_that_only_moved_its_clock_is_not_republished() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+        let quiet = federation(target_state(
+            TargetConnectionState::Live,
+            &["w1:p1"],
+            Some(1),
+        ));
+        broker.federation_updated(quiet.clone());
+        broker.handle(client, ClientMessage::SubscribeState);
+
+        // What a successful read does when nothing on the host moved.
+        let mut ticked = quiet.clone();
+        for target in ticked.targets.values_mut() {
+            target.last_success = Some(std::time::SystemTime::now());
+            target.retry_at = Some(std::time::SystemTime::now());
+        }
+        let effects = broker.federation_updated(ticked.clone());
+        assert!(
+            messages_for(&effects, client).is_empty(),
+            "a moved clock is not news: {:?}",
+            messages_for(&effects, client)
+        );
+
+        // Anything a client can see still goes out.
+        let mut changed = ticked;
+        for target in changed.targets.values_mut() {
+            target.connection = TargetConnectionState::Backoff { attempt: 1 };
+        }
+        let effects = broker.federation_updated(changed);
+        assert!(matches!(
+            messages_for(&effects, client).as_slice(),
+            [ServerMessage::TargetState { state: Some(_), .. }]
+        ));
     }
 
     /// The bound belongs to the rendered path alone: a frame subscriber is
