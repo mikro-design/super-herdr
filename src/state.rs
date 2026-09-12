@@ -296,6 +296,29 @@ pub struct TargetRuntimeState {
 }
 
 impl TargetRuntimeState {
+    /// Whether this differs in a way a client could act on.
+    ///
+    /// `last_success` and `retry_at` are this process's own bookkeeping. They
+    /// move on every successful read — several times a second on an
+    /// event-driven target — and nothing renders either of them. Deciding
+    /// whether to republish by comparing whole values therefore republished
+    /// always: twelve kilobytes of workspaces, panes and agents, to every
+    /// attached client, for a timestamp none of them display. On a desk that is
+    /// invisible. On a phone away from the house it is megabytes a minute
+    /// through a relay, and the stream backs up faster than the page drains it.
+    pub fn differs_for_clients(&self, other: &Self) -> bool {
+        self.key != other.key
+            || self.endpoint != other.endpoint
+            || self.connection != other.connection
+            || self.update_mode != other.update_mode
+            || self.event_error != other.event_error
+            || self.connection_generation != other.connection_generation
+            || self.selected_herdr_bin != other.selected_herdr_bin
+            || self.roots != other.roots
+            || self.snapshot != other.snapshot
+            || self.last_error != other.last_error
+    }
+
     fn new(target: &Target) -> Self {
         Self {
             key: target_key(target),
