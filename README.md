@@ -74,7 +74,7 @@ To install one release without adding the repository at all, take its `.deb`
 from the releases page and let apt resolve the dependencies:
 
 ```sh
-version=0.7.23
+version=0.7.24
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -84,7 +84,7 @@ sudo apt install "./${package}"
 On Linux without Homebrew or apt, take a prebuilt archive:
 
 ```sh
-tag=v0.7.23
+tag=v0.7.24
 target=x86_64-unknown-linux-gnu # or aarch64-unknown-linux-gnu
 archive="super-herdr-${tag}-${target}.tar.gz"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/${tag}/${archive}"

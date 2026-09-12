@@ -5,6 +5,27 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.24
+
+- Fixed the browser client stalling on any connection slower than a shared
+  network. Every successful read of a target moved a `last_success` timestamp,
+  and the daemon decided whether to republish a target by comparing whole
+  values — so every read looked like a change, and every change sent the entire
+  target, every workspace, pane and agent, to every attached client several
+  times a second. Against one session with nine panes and seven agents that was
+  two megabytes every twenty seconds to a viewer doing nothing; it is now 342
+  kilobytes. Nothing displayed the timestamp that caused it. An update is now
+  rare rather than small: each one is still a whole snapshot, and sending a
+  difference instead is still to come.
+- Added `apt install super-herdr`, served from a signed repository at
+  https://mikro-design.github.io/apt, with a one-line installer that adds the
+  repository and installs in a single command. The last ten releases stay
+  installable, so a version can be pinned or stepped back to. `dpkg -i` is gone
+  from the README: it resolves no dependencies and never upgrades.
+- An apt install that fails because the system has half-configured packages now
+  says so, and names them, rather than passing on an error about whichever
+  unrelated package is broken.
+
 ## 0.7.23
 
 - Fixed creating a workspace not moving to it. 0.7.22 said it followed Herdr's
