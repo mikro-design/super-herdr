@@ -692,8 +692,14 @@ mod tests {
         );
         assert_eq!(APP.matches("class=\"code-box\"").count(), 8);
         assert!(APP.contains("el('code').onpaste"));
-        assert!(APP.contains("Math.max(12"));
+        // The legibility floor, which is also the size the subscription asks
+        // for a pane to fit at. One constant, because a page that renders at a
+        // size it did not ask for is a page with output off the edge.
+        assert!(APP.contains("MINIMUM_FONT_PIXELS = 12"));
+        assert!(APP.contains("clamp(wanted, MINIMUM_FONT_PIXELS"));
+        assert!(APP.contains("host.style.fontSize = `${MINIMUM_FONT_PIXELS}px`"));
         assert!(!APP.contains("Math.max(7"));
+        assert!(!APP.contains("cols: 80,"));
         assert!(APP.contains("interactive-widget=resizes-content"));
         assert!(APP.contains("type=\"file\""));
         assert!(APP.contains("type: 'upload.begin'"));
