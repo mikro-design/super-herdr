@@ -11,14 +11,14 @@
 //! that is not state is forwarded verbatim, because frames, leases, and results
 //! are events a frontend must see in order rather than a value it can sample.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::agent_marks::AgentMarkRequest;
@@ -40,6 +40,69 @@ use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 /// far side must refuse.
 pub const UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
 
+/// How much of a transfer may be waiting for the socket at once.
+///
+/// The protocol says an upload is backpressured by the socket itself: the
+/// daemon stops reading, so the client stops writing. That holds for a sender
+/// that writes to the socket, and this one writes to an unbounded queue in
+/// front of it — so a file read at disk speed would pile up in this process's
+/// memory exactly as if nothing bounded it, which is the cost streaming from
+/// disk exists to avoid. A streaming sender waits while this much is already
+/// queued, which puts the socket back in charge of how fast the disk is read.
+const UPLOAD_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+
+/// What is queued for the socket but not yet written to it.
+///
+/// Chunks are counted wherever they came from, memory or disk: a clipboard
+/// paste queued beside a streaming upload occupies the same memory, and a
+/// sender waiting for room should be waiting for that too.
+#[derive(Default)]
+struct UploadWindow {
+    queued: AtomicUsize,
+    drained: Notify,
+    closed: AtomicBool,
+}
+
+impl UploadWindow {
+    /// What this message occupies while it waits. Only chunks are large enough
+    /// to be worth accounting; everything else is a few hundred bytes.
+    fn message_bytes(message: &ClientMessage) -> usize {
+        match message {
+            ClientMessage::UploadChunk { bytes, .. } => bytes.len(),
+            _ => 0,
+        }
+    }
+
+    fn enqueued(&self, bytes: usize) {
+        if bytes > 0 {
+            self.queued.fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// Taken by the socket, or given up on. Both free the room, because a
+    /// sender waiting on a message that will never be written waits forever.
+    fn written(&self, bytes: usize) {
+        if bytes > 0 {
+            self.queued.fetch_sub(bytes, Ordering::AcqRel);
+            self.drained.notify_waiters();
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.drained.notify_waiters();
+    }
+}
+
+/// Lowercase hex, which is how every digest crosses this protocol.
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// A connection to a daemon.
 ///
 /// Dropping this ends the connection: the daemon releases every lease and route
@@ -57,6 +120,7 @@ pub struct Client {
 pub struct ClientCommands {
     commands: mpsc::UnboundedSender<ClientMessage>,
     next_request: Arc<AtomicU64>,
+    window: Arc<UploadWindow>,
 }
 
 impl Drop for Client {
@@ -125,15 +189,24 @@ impl Client {
         }
 
         let (commands, mut outgoing) = mpsc::unbounded_channel::<ClientMessage>();
+        let window = Arc::new(UploadWindow::default());
+        let writing = Arc::clone(&window);
         let sending = tokio::spawn(async move {
             while let Some(message) = outgoing.recv().await {
+                let queued = UploadWindow::message_bytes(&message);
                 let Ok(line) = encode(&message) else {
+                    writing.written(queued);
                     continue;
                 };
-                if writer.write_all(&line).await.is_err() {
+                let wrote = writer.write_all(&line).await.is_ok();
+                writing.written(queued);
+                if !wrote {
                     break;
                 }
             }
+            // Nothing will drain this queue again, so a sender waiting for room
+            // is told rather than left waiting on a socket that has gone.
+            writing.close();
         });
 
         let (state, state_receiver) = watch::channel(FederationState::default());
@@ -185,6 +258,7 @@ impl Client {
                 commands: ClientCommands {
                     commands,
                     next_request: Arc::new(AtomicU64::new(0)),
+                    window,
                 },
                 state: state_receiver,
                 tasks: vec![sending, receiving],
@@ -331,6 +405,111 @@ impl ClientCommands {
         self.offer_upload(pane, mime, Some(name), bytes)
     }
 
+    /// Offer a file whose bytes have not been read yet.
+    ///
+    /// Split from `upload_file` because the request identifier has to exist
+    /// before any of the file moves: a caller registers what it is waiting for
+    /// under that identifier, and only then starts sending. The length is the
+    /// file's, read from its metadata, because the daemon is told what to
+    /// expect before anything is opened on the far side.
+    pub fn offer_file_upload(&self, pane: PaneId, name: String, mime: String, length: u64) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::BeginUpload {
+            request,
+            pane,
+            mime,
+            name: Some(name),
+            length,
+        });
+        request
+    }
+
+    /// Send a file from disk under an offer already made.
+    ///
+    /// Bounded chunks, hashed as they are sent, with the sender waiting
+    /// whenever the socket is behind: peak memory is the window rather than the
+    /// file. That is what lets `transfers.max_bytes` decide how large a copy may
+    /// be instead of whatever this process is willing to hold, and it is the
+    /// difference between this and `upload_file`, which needs the bytes in hand.
+    ///
+    /// A read that stops part way cancels the transfer rather than finishing
+    /// it: a digest over a partial read is a valid digest of the wrong file, and
+    /// the host would have no way to tell.
+    pub async fn stream_file_upload(&self, request: u64, path: PathBuf, length: u64) -> Result<()> {
+        match self.send_file(request, &path, length).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.cancel_upload(request);
+                Err(error)
+            }
+        }
+    }
+
+    async fn send_file(&self, request: u64, path: &Path, length: u64) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("{} cannot be read", path.display()))?;
+        let mut buffer = vec![0_u8; UPLOAD_CHUNK_BYTES];
+        let mut hasher = Sha256::new();
+        let mut sent = 0_u64;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("{} stopped being readable", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            // Waited for before the chunk is queued, so the room being waited
+            // for is the room this chunk then takes.
+            self.room_to_send().await?;
+            hasher.update(&buffer[..read]);
+            sent = sent.saturating_add(read as u64);
+            if sent > length {
+                anyhow::bail!("{} grew while it was being sent", path.display());
+            }
+            self.send(ClientMessage::UploadChunk {
+                request,
+                bytes: buffer[..read].to_vec(),
+            });
+        }
+        // The daemon was told a length before anything opened, and the host
+        // checks what it stored against it. A file that shrank mid-read would
+        // otherwise be attested to as whatever was left of it.
+        if sent != length {
+            anyhow::bail!("{} changed while it was being sent", path.display());
+        }
+        self.send(ClientMessage::FinishUpload {
+            request,
+            digest: hex_digest(hasher.finalize()),
+        });
+        Ok(())
+    }
+
+    /// Wait until the socket has taken enough of what is already queued.
+    ///
+    /// Only a streaming sender calls this: every other command is small enough
+    /// that queueing it is free. The wait is registered before the queue is
+    /// read, so a write that lands between the two wakes this sender rather
+    /// than being missed.
+    async fn room_to_send(&self) -> Result<()> {
+        loop {
+            let drained = self.window.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.window.closed.load(Ordering::Acquire) {
+                anyhow::bail!("the connection to the daemon closed");
+            }
+            if self.window.queued.load(Ordering::Acquire) < UPLOAD_WINDOW_BYTES {
+                return Ok(());
+            }
+            drained.await;
+        }
+    }
+
     /// Continue a transfer that stopped, under the token it was given.
     ///
     /// Chunks do not follow immediately: the daemon answers with
@@ -387,12 +566,10 @@ impl ClientCommands {
                 bytes: chunk.to_vec(),
             });
         }
-        let digest = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        self.send(ClientMessage::FinishUpload { request, digest });
+        self.send(ClientMessage::FinishUpload {
+            request,
+            digest: hex_digest(hasher.finalize()),
+        });
         request
     }
 
@@ -496,6 +673,7 @@ impl ClientCommands {
     /// Commands are fire-and-forget. A dead connection is reported by the event
     /// stream ending, so every call site does not have to handle it.
     fn send(&self, message: ClientMessage) {
+        self.window.enqueued(UploadWindow::message_bytes(&message));
         let _ = self.commands.send(message);
     }
 }
@@ -644,6 +822,187 @@ mod tests {
         assert_eq!(bytes as usize, payload.len());
         assert_eq!(std::fs::read(&path).unwrap(), payload);
         crate::clipboard::discard_local_upload(std::path::Path::new(&path));
+    }
+
+    /// A file larger than one chunk reaches a target without ever being held
+    /// whole in this process.
+    ///
+    /// The transfer that used to be bounded at 32 MiB because `upload_file`
+    /// takes its payload by reference: here the daemon is offered a length read
+    /// from the file's metadata, and the bytes follow from disk.
+    #[tokio::test]
+    async fn a_streamed_file_crosses_an_in_process_daemon() {
+        let (daemon, directory) = daemon_with(vec![Target {
+            name: "first".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
+            tags: Vec::new(),
+        }]);
+
+        // Bigger than one chunk and bigger than the pipe between the two, so
+        // the window is exercised rather than stepped over.
+        let contents: Vec<u8> = (0..1_400_000_u32).map(|index| index as u8).collect();
+        let source = directory.path().join("core.dump");
+        std::fs::write(&source, &contents).expect("a file to send");
+
+        let (client, mut events) = Client::attach(&daemon, "test").await.expect("attaches");
+        let commands = client.commands();
+        let pane = PaneId::new("first", "default", "w1:p1");
+        commands.subscribe_pane(pane.clone(), TerminalAccess::Control, 80, 24);
+
+        let request = commands.offer_file_upload(
+            pane,
+            "core.dump".to_owned(),
+            "application/octet-stream".to_owned(),
+            contents.len() as u64,
+        );
+        commands
+            .stream_file_upload(request, source.clone(), contents.len() as u64)
+            .await
+            .expect("a file that has not changed is sent whole");
+
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match events.recv().await {
+                    Some(ServerMessage::UploadComplete { path, bytes, .. }) => {
+                        return Some((path, bytes));
+                    }
+                    Some(ServerMessage::Error { message, .. }) => panic!("{message}"),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("a streamed upload finishes rather than wedging");
+
+        let (path, bytes) = result.expect("the daemon answers");
+        assert_eq!(bytes as usize, contents.len());
+        // The daemon verifies the host's own digest against the one computed
+        // while sending, so arriving at all is the assertion that they matched.
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        crate::clipboard::discard_local_upload(std::path::Path::new(&path));
+    }
+
+    /// A file larger than the ceiling this path used to inherit.
+    ///
+    /// 40 MiB was refused outright while a copy was bounded like a clipboard
+    /// payload, and the refusal had nothing to do with what the host would
+    /// accept. The assertion is that it arrives at all; that it arrives without
+    /// this process holding it is what the streaming is for.
+    #[tokio::test]
+    async fn a_file_over_the_old_clipboard_ceiling_is_a_transfer_now() {
+        let (daemon, directory) = daemon_with(vec![Target {
+            name: "first".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
+            tags: Vec::new(),
+        }]);
+
+        let length = 40 * 1024 * 1024_u64;
+        let source = directory.path().join("over-the-old-ceiling.bin");
+        {
+            use std::io::Write;
+            let block = vec![0xA5_u8; 1024 * 1024];
+            let mut file = std::fs::File::create(&source).expect("a file to send");
+            for _ in 0..40 {
+                file.write_all(&block).expect("written");
+            }
+        }
+
+        let (client, mut events) = Client::attach(&daemon, "test").await.expect("attaches");
+        let commands = client.commands();
+        let pane = PaneId::new("first", "default", "w1:p1");
+        commands.subscribe_pane(pane.clone(), TerminalAccess::Control, 80, 24);
+        let request = commands.offer_file_upload(
+            pane,
+            "over-the-old-ceiling.bin".to_owned(),
+            "application/octet-stream".to_owned(),
+            length,
+        );
+        commands
+            .stream_file_upload(request, source, length)
+            .await
+            .expect("40 MiB is a transfer rather than a refusal");
+
+        let (path, bytes) = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match events.recv().await {
+                    Some(ServerMessage::UploadComplete { path, bytes, .. }) => {
+                        return (path, bytes);
+                    }
+                    // The daemon compares the host's digest with the one this
+                    // client computed while sending, so a refusal here is the
+                    // streamed digest disagreeing with the streamed bytes.
+                    Some(ServerMessage::Error { message, .. }) => panic!("{message}"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("a large streamed upload finishes rather than wedging");
+        assert_eq!(bytes, length);
+        assert_eq!(
+            std::fs::metadata(&path).expect("staged").len(),
+            length,
+            "every declared byte is on the host"
+        );
+        crate::clipboard::discard_local_upload(std::path::Path::new(&path));
+    }
+
+    /// A file that is not the length it was offered as is withdrawn rather than
+    /// attested to.
+    ///
+    /// The digest would be a valid digest of the wrong file, and the host has
+    /// no way to tell one from the other; the failure has to happen on this
+    /// side, before `upload.finish` claims anything.
+    #[tokio::test]
+    async fn a_file_that_does_not_match_its_offer_is_withdrawn() {
+        let (daemon, directory) = daemon_with(vec![Target {
+            name: "first".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: vec!["/nonexistent/herdr".to_owned()],
+            roots: Vec::new(),
+            tags: Vec::new(),
+        }]);
+
+        let source = directory.path().join("shrinking.bin");
+        std::fs::write(&source, vec![7_u8; 4_096]).expect("a file to send");
+
+        let (client, _events) = Client::attach(&daemon, "test").await.expect("attaches");
+        let commands = client.commands();
+        let pane = PaneId::new("first", "default", "w1:p1");
+        commands.subscribe_pane(pane.clone(), TerminalAccess::Control, 80, 24);
+
+        // Offered as longer than it is, which is what a file truncated between
+        // the offer and the read looks like from here.
+        let request = commands.offer_file_upload(
+            pane,
+            "shrinking.bin".to_owned(),
+            "application/octet-stream".to_owned(),
+            8_192,
+        );
+        let error = commands
+            .stream_file_upload(request, source, 8_192)
+            .await
+            .expect_err("a file that is not the offered length is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was being sent"),
+            "the reason names what happened: {error}"
+        );
     }
 
     #[tokio::test]

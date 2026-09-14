@@ -178,10 +178,12 @@ does not prove that the browser path is reliable.
    per-pane control leases, target/session-qualified IDs, cancellation cleanup,
    bounded transfer state, and per-target failure isolation; filenames may be
    shown, but contents and credentials must never be logged.
-5. Stream TUI uploads from disk through the existing resumable protocol. File
-   drop and explicit-path upload currently read the file whole and inherit the
-   32 MiB clipboard ceiling; the general transfer path should instead use
-   `transfers.max_bytes`, bounded chunks, and host-reported resume offsets.
+5. Resume an interrupted TUI upload rather than starting it again. File drop
+   and explicit-path upload now stream from disk in bounded chunks, bounded by
+   `transfers.max_bytes` rather than by the clipboard's ceiling, but a transfer
+   that dies mid-file abandons whatever the host already staged: `upload.resume`
+   and the host-reported offset it answers with are still unused by this
+   client.
 6. Add push delivery of attention events to paired devices, as a further sink
    under the existing filters, coalescing, and rate limits. Native desktop
    delivery is not moving with it: notifying a desktop is a desktop-session

@@ -5,6 +5,19 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Copying a file from the TUI is no longer capped at 32 MiB. File drop and
+  explicit-path upload read the whole file into memory before sending any of
+  it, so they inherited the clipboard's ceiling — a bound on this process's
+  memory — while the daemon underneath would move up to `transfers.max_bytes`,
+  a gibibyte by default. The bytes now stream from disk in bounded chunks,
+  hashed as they are sent, and a file is measured against the host's ceiling
+  instead. A read that stops part way cancels the transfer rather than
+  attesting to a partial file, and the failure settles the batch it belonged
+  to. Peak memory is now a window rather than the file, so a copy is bounded by
+  what the target's disk will take rather than by what a frontend will hold.
+
 ## 0.7.25
 
 - Fixed the browser cutting off the right of every line on a phone. The page
