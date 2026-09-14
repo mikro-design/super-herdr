@@ -1257,11 +1257,11 @@ async fn open_local_source(path: &str, name: String) -> Result<SourceFile> {
     anyhow::ensure!(metadata.is_file(), "that path does not name a regular file");
     // Read once for the digest and once for the bytes, which is what the
     // remote side does, so both directions fail the same way on a file that
-    // changes underneath them.
-    let contents = tokio::fs::read(path)
+    // changes underneath them. The digest pass is blocks rather than the whole
+    // file: a core dump offered to a phone is exactly the case this exists for.
+    let (_, digest) = file_receipt(Path::new(path))
         .await
         .context("failed to read the file")?;
-    let digest = sha256_hex(&contents);
     let file = tokio::fs::File::open(path)
         .await
         .context("failed to open the file")?;
@@ -1523,18 +1523,22 @@ where
         }
     }
     // Read back rather than counted: the receipt has to describe the file, not
-    // the intention, exactly as the remote script's does.
-    let stored = fs::read(&path).context("failed to verify the local media file")?;
+    // the intention, exactly as the remote script's does. Read in blocks,
+    // because a transfer that streamed a gibibyte past this process should not
+    // end by holding one.
+    let (stored, digest) = file_receipt(&path)
+        .await
+        .context("failed to verify the local media file")?;
     if let Some(error) = failure
-        && stored.is_empty()
+        && stored == 0
     {
         discard_local_upload(&path);
         return Err(error);
     }
     Ok(RemoteUploadReceipt {
         path: path.display().to_string(),
-        bytes: stored.len(),
-        digest: sha256_hex(&stored),
+        bytes: stored as usize,
+        digest,
     })
 }
 
@@ -2113,6 +2117,33 @@ fn upload_local_media(
         mime: media.mime,
         digest: expected_digest.to_owned(),
     })
+}
+
+/// What a file is, without holding it: its length and its digest.
+///
+/// Read in blocks rather than whole. A receipt describes a file that was just
+/// streamed past this process, and reading it back into memory to describe it
+/// would put peak memory back on the file's size at the one hop that had
+/// stopped tracking it — which is most of what streaming a transfer buys.
+async fn file_receipt(path: &Path) -> Result<(u64, String)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut bytes = 0u64;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((bytes, digest))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2726,6 +2757,29 @@ mod tests {
         );
         let shouted = vec![b'x'; 4096];
         assert!(reader_complaint(&shouted, Some(1)).len() < MAXIMUM_COMPLAINT_CHARS + 40);
+    }
+
+    /// A receipt describes the file without the file being held.
+    ///
+    /// Blocks rather than one read, which is only observable in what it does
+    /// not allocate — so the test pins the values that prove the loop is whole:
+    /// a length and a digest over content spanning several blocks.
+    #[tokio::test]
+    async fn a_receipt_spans_every_block_of_a_file() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("staged.bin");
+        let contents: Vec<u8> = (0..(super::STREAM_CHUNK_BYTES * 3 + 17))
+            .map(|index| index as u8)
+            .collect();
+        std::fs::write(&path, &contents).expect("a staged file");
+
+        let (bytes, digest) = super::file_receipt(&path).await.expect("a receipt");
+        assert_eq!(bytes, contents.len() as u64);
+        assert_eq!(
+            digest,
+            super::sha256_hex(&contents),
+            "reading in blocks digests exactly what reading whole would"
+        );
     }
 
     #[test]

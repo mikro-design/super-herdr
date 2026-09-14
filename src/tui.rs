@@ -939,6 +939,18 @@ struct App {
     target_manager: Option<TargetManager>,
     target_test_sender: Option<mpsc::UnboundedSender<TargetTestEvent>>,
     next_target_test_request: u64,
+    /// Where a streamed upload reports that it could not finish.
+    ///
+    /// The bytes move on their own task, so a read that fails has no way back
+    /// into the frontend's state. Without this the batch it belonged to would
+    /// wait forever for a file that is never coming.
+    upload_failure_sender: Option<mpsc::UnboundedSender<UploadFailure>>,
+    /// What the daemon will move on somebody's behalf, from its configuration.
+    ///
+    /// Held here so a file can be refused with its own limit named, before
+    /// anything is offered. It bounds the target's disk rather than this
+    /// process's memory, which is why a copy is not bounded like a clipboard.
+    max_transfer_bytes: u64,
     agent_navigator: Option<AgentNavigator>,
     pairing: Option<PairingOffer>,
     pairing_approval: Option<PairingApproval>,
@@ -997,6 +1009,8 @@ impl Default for App {
             target_manager: None,
             target_test_sender: None,
             next_target_test_request: 1,
+            upload_failure_sender: None,
+            max_transfer_bytes: crate::config::TransferConfig::default().max_bytes,
             agent_navigator: None,
             pairing: None,
             pairing_approval: None,
@@ -1053,6 +1067,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let (input_sender, mut input) = mpsc::unbounded_channel();
     let (config_refresh_sender, mut config_refreshes) = mpsc::unbounded_channel();
     let (target_test_sender, mut target_test_events) = mpsc::unbounded_channel();
+    let (upload_failure_sender, mut upload_failures) = mpsc::unbounded_channel();
     let (notification_sender, mut notification_events) = mpsc::unbounded_channel();
     spawn_input_reader(input_sender);
     let mut ticks = interval(Duration::from_millis(100));
@@ -1081,6 +1096,8 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
         configured_targets,
         resolved_targets: resolved_targets(&active_config),
         target_test_sender: Some(target_test_sender),
+        upload_failure_sender: Some(upload_failure_sender),
+        max_transfer_bytes: active_config.transfers.max_bytes,
         client: Some(client.commands()),
         ..App::default()
     };
@@ -1159,6 +1176,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
                         }
                         app.configured_targets = configured.targets.clone();
                         app.resolved_targets = resolved_targets(&expanded);
+                        app.max_transfer_bytes = configured.transfers.max_bytes;
                         // Supervisors belong to the daemon, which refreshes them
                         // from the same file on its own schedule. What the
                         // frontend still needs from a reload is the local
@@ -1188,6 +1206,12 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
             event = target_test_events.recv() => {
                 if let Some(event) = event {
                     apply_target_test_event(event, &mut app);
+                    should_draw = true;
+                }
+            }
+            failure = upload_failures.recv() => {
+                if let Some(failure) = failure {
+                    fail_upload(&mut app, failure.request, failure.message);
                     should_draw = true;
                 }
             }
@@ -1912,6 +1936,35 @@ fn settled_batch(state: UploadBatch) -> (Vec<String>, Option<String>) {
         )
     });
     (paths, report)
+}
+
+/// A streamed upload that stopped before the daemon could rule on it.
+struct UploadFailure {
+    request: u64,
+    message: String,
+}
+
+/// Settle one upload that failed, wherever the failure came from.
+///
+/// A host that refuses and a local read that stops are the same event to the
+/// batch waiting on them: whichever it was, the files that did arrive must not
+/// wait for one that never will. Reports whether the request was an upload, so
+/// a refusal that was something else is still announced by its own caller.
+fn fail_upload(app: &mut App, request: u64, message: String) -> bool {
+    let Some(pending) = app.pending_uploads.remove(&request) else {
+        return false;
+    };
+    let Some(entry) = pending.batch else {
+        app.message = Some(format!("{}: {message}", pending.described));
+        return true;
+    };
+    if let Some(batch) = app.upload_batches.get_mut(&entry.batch) {
+        batch
+            .failures
+            .push(format!("{}: {message}", pending.described));
+    }
+    settle_upload_batch(app, entry.batch);
+    true
 }
 
 fn settle_upload_batch(app: &mut App, batch: u64) {
@@ -4789,18 +4842,24 @@ async fn paste_clipboard_media(state: &FederationState, app: &mut App) -> Result
 /// not the only one: dragging a file onto a terminal types its path and never
 /// touches a pasteboard at all, which is why a bridge that only ever read the
 /// clipboard looked broken to somebody whose files were arriving as text.
+///
+/// The bytes are streamed from disk rather than read here, so what bounds a
+/// copy is the daemon's `transfers.max_bytes` — a statement about the target's
+/// disk — rather than what this process is prepared to hold at once.
 fn send_local_files(
     app: &mut App,
     selected: &PaneId,
     client: &ClientCommands,
     files: &[PathBuf],
 ) -> Result<()> {
-    // Read before sending any of it, so a selection with an unreadable file in
-    // it fails while nothing has moved rather than half way through.
-    let mut payloads = Vec::with_capacity(files.len());
+    // Checked before anything is offered, so a selection with an unreadable
+    // file in it fails while nothing has moved rather than half way through.
+    // Only the name and the length: reading a gigabyte to find out it is too
+    // large is the thing this path stopped doing.
+    let mut offered = Vec::with_capacity(files.len());
     for path in files {
-        match read_local_file(path) {
-            Ok(read) => payloads.push(read),
+        match inspect_local_file(path, app.max_transfer_bytes) {
+            Ok((name, length)) => offered.push((path.clone(), name, length)),
             Err(error) => {
                 app.message = Some(format!("{}: {error}", path.display()));
                 return Ok(());
@@ -4810,17 +4869,17 @@ fn send_local_files(
 
     let batch = app.next_upload_batch;
     app.next_upload_batch = app.next_upload_batch.wrapping_add(1);
-    let total: usize = payloads.iter().map(|(_, payload)| payload.len()).sum();
-    let described = match payloads.as_slice() {
-        [(name, _)] => name.clone(),
+    let total: u64 = offered.iter().map(|(_, _, length)| length).sum();
+    let described = match offered.as_slice() {
+        [(_, name, _)] => name.clone(),
         many => format!("{} files", many.len()),
     };
-    for (position, (name, payload)) in payloads.iter().enumerate() {
-        let request = client.upload_file(
+    for (position, (path, name, length)) in offered.iter().enumerate() {
+        let request = client.offer_file_upload(
             selected.clone(),
             name.clone(),
             "application/octet-stream".to_owned(),
-            payload,
+            *length,
         );
         app.pending_uploads.insert(
             request,
@@ -4832,11 +4891,29 @@ fn send_local_files(
                 batch: Some(UploadBatchEntry { batch, position }),
             },
         );
+        // On its own task because a file large enough to be worth streaming is
+        // large enough that waiting for it here would stop the frontend
+        // redrawing, and because the files in a selection have no reason to
+        // queue behind each other.
+        let streaming = client.clone();
+        let failures = app.upload_failure_sender.clone();
+        let path = path.clone();
+        let length = *length;
+        tokio::spawn(async move {
+            if let Err(error) = streaming.stream_file_upload(request, path, length).await
+                && let Some(failures) = failures
+            {
+                let _ = failures.send(UploadFailure {
+                    request,
+                    message: error.to_string(),
+                });
+            }
+        });
     }
     app.upload_batches.insert(
         batch,
         UploadBatch {
-            expected: payloads.len(),
+            expected: offered.len(),
             paths: BTreeMap::new(),
             failures: Vec::new(),
         },
@@ -4845,13 +4922,14 @@ fn send_local_files(
     Ok(())
 }
 
-/// Read a file the clipboard pointed at, bounded like a clipboard payload.
+/// Establish that a file can be sent, without reading it.
 ///
-/// The bound is this process's rather than the daemon's: the client API takes a
-/// payload whole, so a file larger than this would be read into memory here
-/// before any of it moved. The daemon's own ceiling is separate and larger, and
-/// streaming from disk is what would close the gap.
-fn read_local_file(path: &std::path::Path) -> Result<(String, Vec<u8>)> {
+/// The name and the length are all that is needed to offer one, and taking only
+/// those is what lets the ceiling be the daemon's rather than this process's: a
+/// file is refused here for being larger than the host will accept, not for
+/// being larger than this frontend would like to hold. A clipboard payload is
+/// still bounded the other way, because those bytes really are in memory.
+fn inspect_local_file(path: &std::path::Path, max_bytes: u64) -> Result<(String, u64)> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -4860,13 +4938,12 @@ fn read_local_file(path: &std::path::Path) -> Result<(String, Vec<u8>)> {
     let metadata = std::fs::metadata(path).context("cannot be read")?;
     anyhow::ensure!(metadata.is_file(), "is not a regular file");
     anyhow::ensure!(
-        metadata.len() as usize <= MAX_CLIPBOARD_MEDIA_BYTES,
-        "is {} bytes; the limit for a copied file is {} MiB",
+        metadata.len() <= max_bytes,
+        "is {} bytes; the limit for a copied file is {} bytes",
         metadata.len(),
-        MAX_CLIPBOARD_MEDIA_BYTES / (1024 * 1024)
+        max_bytes
     );
-    let payload = std::fs::read(path).context("cannot be read")?;
-    Ok((name, payload))
+    Ok((name, metadata.len()))
 }
 
 fn terminal_paste_payload(text: &[u8], bracketed: bool) -> Result<Vec<u8>> {
@@ -5686,15 +5763,7 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App, state: &Federation
                 }
                 // A file that failed still has to settle its batch, or the
                 // files that did arrive wait forever for one that never will.
-                if let Some(pending) = app.pending_uploads.remove(&request)
-                    && let Some(entry) = pending.batch
-                {
-                    if let Some(batch) = app.upload_batches.get_mut(&entry.batch) {
-                        batch
-                            .failures
-                            .push(format!("{}: {message}", pending.described));
-                    }
-                    settle_upload_batch(app, entry.batch);
+                if fail_upload(app, request, message.clone()) {
                     return;
                 }
                 if app.pending_operations.remove(&request).is_some() {
@@ -8119,6 +8188,46 @@ mod tests {
                 && message.contains("1 of 2"),
             "a missing file keeps its exact failure: {message}"
         );
+    }
+
+    /// What bounds a copied file is the host's ceiling, not a clipboard's.
+    ///
+    /// The clipboard's 32 MiB is a statement about this process's memory, and a
+    /// file that is streamed from disk never occupies it. Measuring a copy
+    /// against `transfers.max_bytes` is the whole point of streaming it.
+    #[test]
+    fn a_copied_file_is_measured_against_the_hosts_ceiling() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("build.tar");
+        std::fs::write(&path, vec![0_u8; 64 * 1024]).expect("a file to offer");
+
+        assert_eq!(
+            App::default().max_transfer_bytes,
+            crate::config::TransferConfig::default().max_bytes,
+            "a copy is offered against the daemon's ceiling, not the clipboard's"
+        );
+        assert!(
+            App::default().max_transfer_bytes > super::MAX_CLIPBOARD_MEDIA_BYTES as u64,
+            "a file larger than a clipboard payload is a transfer, not a refusal"
+        );
+
+        let (name, length) =
+            super::inspect_local_file(&path, App::default().max_transfer_bytes).expect("readable");
+        assert_eq!(name, "build.tar");
+        assert_eq!(length, 64 * 1024);
+
+        // The ceiling that does apply is named in full, because "too large" on
+        // its own leaves somebody guessing what the host would have taken.
+        let error = super::inspect_local_file(&path, 4_096).expect_err("over the ceiling");
+        let reason = error.to_string();
+        assert!(
+            reason.contains("65536") && reason.contains("4096"),
+            "the refusal names both sizes: {reason}"
+        );
+
+        let error = super::inspect_local_file(directory.path(), u64::MAX)
+            .expect_err("a directory is not a file to copy");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
     }
 
     #[test]
