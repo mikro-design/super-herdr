@@ -897,6 +897,20 @@ ceiling, and a transfer is chunked and resumable so a large file survives a
 reconnect. Bytes stream through every hop rather than being buffered whole, so
 peak memory does not track file size at either end.
 
+A frontend is the one hop where that had to be arranged rather than inherited.
+An upload is backpressured by the socket — the daemon stops reading, so the
+client stops writing — but commands reach the socket through an unbounded queue,
+and a sender reading a file at disk speed would fill that queue with the file it
+was supposedly streaming. A streaming sender therefore waits while a window of
+queued bytes is outstanding, and the socket taking them is what releases the
+next read. Chunks are counted wherever they came from, so a clipboard paste
+queued beside a transfer is part of what the sender waits on.
+
+A receipt is read in blocks for the same reason. The daemon describes what a
+local host stored by reading it back — the receipt has to describe the file
+rather than the intention — and describing a gibibyte by holding a gibibyte
+would undo at the last step what every hop before it was careful about.
+
 A caller-supplied name was once ruled out here, and what changed is worth
 recording, because the objection was correct at the time. The name was
 interpolated into the staging script, where anything from the wire would have

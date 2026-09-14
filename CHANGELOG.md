@@ -17,6 +17,14 @@ inferred from commit titles alone.
   attesting to a partial file, and the failure settles the batch it belonged
   to. Peak memory is now a window rather than the file, so a copy is bounded by
   what the target's disk will take rather than by what a frontend will hold.
+- Fixed the daemon reading a whole transfer back into memory to describe it.
+  Every local upload finished by reading the staged file to produce the receipt
+  its sender is checked against, and a file offered from this machine was read
+  whole to compute its digest. Both were bounded in practice only by the 32 MiB
+  ceiling above, so raising that would have moved a gibibyte from a frontend's
+  memory into the daemon's: measured over a 1 GiB copy, peak resident memory was
+  1069 MB before and 28 MB after. Receipts and digests are now computed in
+  blocks.
 
 ## 0.7.25
 
