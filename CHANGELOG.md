@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.26
 
 - Copying a file from the TUI is no longer capped at 32 MiB. File drop and
   explicit-path upload read the whole file into memory before sending any of
