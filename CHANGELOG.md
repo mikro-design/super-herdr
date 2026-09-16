@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.27
 
 - Fixed events being dropped at every subscription against Herdr 0.9. Herdr 0.9
   starts a lifecycle subscription at the live edge rather than replaying what it
