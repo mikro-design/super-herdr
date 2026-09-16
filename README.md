@@ -262,7 +262,10 @@ payloads, credentials, and SSH material are never logged.
 ## Requirements
 
 - A compatible Herdr client on each target. Herdr 0.8.2 / protocol 20 is the
-  currently tested combination.
+  currently tested combination; 0.9.0 / protocol 22 is the current upstream
+  release and is accepted without being qualified here. Newer protocols are
+  never refused. Older ones work with the features that postdate them hidden —
+  `super-herdr doctor` names which, per target.
 - OpenSSH for remote targets. Existing SSH configuration, keys, host checking,
   and proxy settings remain authoritative.
 - `sha256sum` on targets that receive files.

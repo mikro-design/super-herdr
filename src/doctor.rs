@@ -363,13 +363,36 @@ pub fn target_check(report: &ProbeReport) -> Check {
         .protocol
         .map(|protocol| protocol.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    let status = if report.protocol.is_some_and(|protocol| protocol < 20) {
-        Status::Warn
-    } else {
-        Status::Ok
+    // Judged by what this build needs rather than by the number itself, so a
+    // Herdr newer than the one this was written against reads as fine — which
+    // it is — and an older one says which feature it costs.
+    let standing = crate::herdr_support::standing(report.protocol);
+    let status = match standing {
+        crate::herdr_support::Standing::Limited => Status::Warn,
+        _ => Status::Ok,
+    };
+    let note = match standing {
+        crate::herdr_support::Standing::Limited => {
+            let missing = crate::herdr_support::FEATURES
+                .iter()
+                .filter(|feature| {
+                    report.protocol.is_some_and(|protocol| {
+                        !crate::herdr_support::supports_protocol(protocol, **feature)
+                    })
+                })
+                .map(|feature| feature.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(", without {missing}")
+        }
+        crate::herdr_support::Standing::Newer => format!(
+            ", newer than the protocol {} this build was tested against",
+            crate::herdr_support::TESTED_PROTOCOL
+        ),
+        _ => String::new(),
     };
     let detail = format!(
-        "herdr {version}, protocol {protocol}, {} pane(s), {} agent(s), {} ms",
+        "herdr {version}, protocol {protocol}{note}, {} pane(s), {} agent(s), {} ms",
         report.panes, report.agents, report.elapsed_ms
     );
     let check = Check::new("targets", &report.target, status, detail);

@@ -14,6 +14,13 @@ inferred from commit titles alone.
   the target stayed wrong until some later refresh corrected it. The
   subscription is now opened first. A target in backoff is still snapshotted
   first, where that is the cheaper way to learn it is back.
+- Support for a target's Herdr is now asked by name instead of by protocol
+  number. A feature states what it needs, and it is answered from the
+  capabilities a host reports about itself, falling back to the protocol that
+  first carried the feature for hosts that report none. A protocol newer than
+  the tested one is accepted rather than refused, and `doctor` reports the
+  distance; an older one names the features it costs rather than reading as a
+  bare warning.
 
 ## 0.7.26
 

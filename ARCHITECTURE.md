@@ -68,6 +68,17 @@ learn the host is back. SSH targets
 use OpenSSH Unix-socket forwarding. The TUI keeps terminal screen models only in
 memory for currently visible panes.
 
+What a target can do is asked by name rather than by number. Herdr's protocol
+moves faster than this project qualifies it, so a feature states what it needs
+and `herdr_support` answers from two sources in order: the capabilities the host
+reports about itself, and — for hosts that report none, which is every Herdr
+before 0.9 — the protocol that first carried the feature. A protocol newer than
+the tested one is accepted rather than refused, because Herdr adds to its
+protocol rather than reshaping it and refusing would strand anyone who updates
+Herdr first; `doctor` reports the distance instead. An older one loses the
+features that postdate it, named individually, rather than being called
+unsupported.
+
 Before starting per-session supervisors, a host configured for discovery invokes
 the documented `herdr session list --json` command. Each returned session becomes
 an independently qualified target and uses the reported public socket path. Host
