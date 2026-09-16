@@ -58,7 +58,13 @@ connection generation after reconnect. A configured API socket enables one
 long-lived documented `events.subscribe` stream per target; events trigger an
 immediate authoritative snapshot while the five-second polling deadline remains
 the liveness and resynchronization boundary. The stream is replaced only after
-failure or a pane-set change, avoiding retained-event replay loops. SSH targets
+failure or a pane-set change, avoiding retained-event replay loops. The
+subscription is opened before the snapshot it will be compared against, not
+after: Herdr 0.9 starts a subscription at the live edge rather than replaying
+what it retained, so the other order silently drops whatever changed between the
+two and leaves the target wrong until a later refresh corrects it. A target in
+backoff is snapshotted first, because there the snapshot is the cheaper way to
+learn the host is back. SSH targets
 use OpenSSH Unix-socket forwarding. The TUI keeps terminal screen models only in
 memory for currently visible panes.
 

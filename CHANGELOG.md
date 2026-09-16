@@ -5,6 +5,16 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Fixed events being dropped at every subscription against Herdr 0.9. Herdr 0.9
+  starts a lifecycle subscription at the live edge rather than replaying what it
+  retained, and this subscribed after taking the snapshot the subscription was
+  meant to keep current — so anything that changed between the two was lost, and
+  the target stayed wrong until some later refresh corrected it. The
+  subscription is now opened first. A target in backoff is still snapshotted
+  first, where that is the cheaper way to learn it is back.
+
 ## 0.7.26
 
 - Copying a file from the TUI is no longer capped at 32 MiB. File drop and
