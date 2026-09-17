@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.28
 
 - Fixed quick replies and terminal keys not responding to a tap on the phone.
   Both prevented `pointerdown`'s default to keep the soft keyboard from opening
