@@ -716,7 +716,11 @@ The phone client gives the observed terminal the remaining dynamic viewport
 height and uses scrolling for panes wider than the screen. It never reduces
 terminal text below a readable minimum merely to fit all columns. Control input
 and explicit terminal keys stay in the bottom control area above the soft
-keyboard. Federation state is grouped as collapsed targets and sessions, and
+keyboard. Those controls act on `pointerup` rather than on `click`: suppressing
+the soft keyboard means preventing `pointerdown`'s default, and a browser that
+then withholds the click leaves a button that does nothing at all. A click
+carrying no click count — a keyboard, or assistive technology, which produce no
+pointer event — is the one case still answered on `click`. Federation state is grouped as collapsed targets and sessions, and
 agent attention is one bounded, deduplicated, actionable list rather than a
 second navigation tree. A control holder may pick files up to 32 MiB; the page
 hashes the bytes it chunks, the daemon verifies the target's size and SHA-256
