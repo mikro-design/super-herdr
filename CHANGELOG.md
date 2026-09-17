@@ -5,6 +5,17 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Fixed quick replies and terminal keys not responding to a tap on the phone.
+  Both prevented `pointerdown`'s default to keep the soft keyboard from opening
+  for a button that needs no typing, and then waited for a `click` that iOS can
+  withhold for exactly that reason — so the tap did nothing and the control read
+  as broken rather than slow. They now act on `pointerup`, with `click` kept for
+  activation that produced no pointer event at all. The page harness taps the
+  way a phone does rather than calling the click handler directly, which is why
+  this was invisible to it.
+
 ## 0.7.27
 
 - Fixed events being dropped at every subscription against Herdr 0.9. Herdr 0.9
