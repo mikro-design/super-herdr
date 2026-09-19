@@ -262,7 +262,10 @@ reads nothing.
 The second version ran from its own config directory via a wrapper
 (`herdr-0.9.0-edge`), because two Herdr versions on one host would otherwise
 share `~/.config/herdr`. On a real fleet each machine has its own install and the
-wrapper is not needed; it is a fixture, not something to leave configured.
+wrapper is not needed; it is a fixture, not something to leave configured. It was
+kept on this host afterwards, under a `herdr09@.service` user unit with its state
+in `~/.local/state/herdr-0.9.0`, so the mixed-version fleet outlives a reboot and
+this record stays reproducible.
 
 ### 2026-09-19 — browser control path, the half a machine can decide
 
