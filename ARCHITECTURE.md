@@ -58,9 +58,26 @@ connection generation after reconnect. A configured API socket enables one
 long-lived documented `events.subscribe` stream per target; events trigger an
 immediate authoritative snapshot while the five-second polling deadline remains
 the liveness and resynchronization boundary. The stream is replaced only after
-failure or a pane-set change, avoiding retained-event replay loops. SSH targets
+failure or a pane-set change, avoiding retained-event replay loops. The
+subscription is opened before the snapshot it will be compared against, not
+after: Herdr 0.9 starts a subscription at the live edge rather than replaying
+what it retained, so the other order silently drops whatever changed between the
+two and leaves the target wrong until a later refresh corrects it. A target in
+backoff is snapshotted first, because there the snapshot is the cheaper way to
+learn the host is back. SSH targets
 use OpenSSH Unix-socket forwarding. The TUI keeps terminal screen models only in
 memory for currently visible panes.
+
+What a target can do is asked by name rather than by number. Herdr's protocol
+moves faster than this project qualifies it, so a feature states what it needs
+and `herdr_support` answers from two sources in order: the capabilities the host
+reports about itself, and — for hosts that report none, which is every Herdr
+before 0.9 — the protocol that first carried the feature. A protocol newer than
+the tested one is accepted rather than refused, because Herdr adds to its
+protocol rather than reshaping it and refusing would strand anyone who updates
+Herdr first; `doctor` reports the distance instead. An older one loses the
+features that postdate it, named individually, rather than being called
+unsupported.
 
 Before starting per-session supervisors, a host configured for discovery invokes
 the documented `herdr session list --json` command. Each returned session becomes
@@ -699,7 +716,11 @@ The phone client gives the observed terminal the remaining dynamic viewport
 height and uses scrolling for panes wider than the screen. It never reduces
 terminal text below a readable minimum merely to fit all columns. Control input
 and explicit terminal keys stay in the bottom control area above the soft
-keyboard. Federation state is grouped as collapsed targets and sessions, and
+keyboard. Those controls act on `pointerup` rather than on `click`: suppressing
+the soft keyboard means preventing `pointerdown`'s default, and a browser that
+then withholds the click leaves a button that does nothing at all. A click
+carrying no click count — a keyboard, or assistive technology, which produce no
+pointer event — is the one case still answered on `click`. Federation state is grouped as collapsed targets and sessions, and
 agent attention is one bounded, deduplicated, actionable list rather than a
 second navigation tree. A control holder may pick files up to 32 MiB; the page
 hashes the bytes it chunks, the daemon verifies the target's size and SHA-256

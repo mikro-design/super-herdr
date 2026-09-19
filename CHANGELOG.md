@@ -5,6 +5,45 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.29
+
+- Added `cargo run --example qualify-federation`, which reports every target by
+  the Herdr version and protocol it answered on and then measures how long a
+  change made outside this client takes to arrive. Recorded against a fleet
+  holding both Herdr 0.8.0 (protocol 19) and 0.9.0 (protocol 22): 46 ms and
+  7.9 ms respectively, against a five-second refresh interval, which is the
+  first evidence that 0.7.27's subscription ordering works where it was aimed.
+  Herdr 0.9.0 turns out to report no capability object either, so the feature
+  gates are answered by the protocol floor today.
+
+## 0.7.28
+
+- Fixed quick replies and terminal keys not responding to a tap on the phone.
+  Both prevented `pointerdown`'s default to keep the soft keyboard from opening
+  for a button that needs no typing, and then waited for a `click` that iOS can
+  withhold for exactly that reason — so the tap did nothing and the control read
+  as broken rather than slow. They now act on `pointerup`, with `click` kept for
+  activation that produced no pointer event at all. The page harness taps the
+  way a phone does rather than calling the click handler directly, which is why
+  this was invisible to it.
+
+## 0.7.27
+
+- Fixed events being dropped at every subscription against Herdr 0.9. Herdr 0.9
+  starts a lifecycle subscription at the live edge rather than replaying what it
+  retained, and this subscribed after taking the snapshot the subscription was
+  meant to keep current — so anything that changed between the two was lost, and
+  the target stayed wrong until some later refresh corrected it. The
+  subscription is now opened first. A target in backoff is still snapshotted
+  first, where that is the cheaper way to learn it is back.
+- Support for a target's Herdr is now asked by name instead of by protocol
+  number. A feature states what it needs, and it is answered from the
+  capabilities a host reports about itself, falling back to the protocol that
+  first carried the feature for hosts that report none. A protocol newer than
+  the tested one is accepted rather than refused, and `doctor` reports the
+  distance; an older one names the features it costs rather than reading as a
+  bare warning.
+
 ## 0.7.26
 
 - Copying a file from the TUI is no longer capped at 32 MiB. File drop and

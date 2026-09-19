@@ -74,7 +74,7 @@ To install one release without adding the repository at all, take its `.deb`
 from the releases page and let apt resolve the dependencies:
 
 ```sh
-version=0.7.26
+version=0.7.29
 arch=amd64 # or arm64
 package="super-herdr_${version}-1_${arch}.deb"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/v${version}/${package}"
@@ -84,7 +84,7 @@ sudo apt install "./${package}"
 On Linux without Homebrew or apt, take a prebuilt archive:
 
 ```sh
-tag=v0.7.26
+tag=v0.7.29
 target=x86_64-unknown-linux-gnu # or aarch64-unknown-linux-gnu
 archive="super-herdr-${tag}-${target}.tar.gz"
 curl -fLO "https://github.com/mikro-design/super-herdr/releases/download/${tag}/${archive}"
@@ -262,7 +262,10 @@ payloads, credentials, and SSH material are never logged.
 ## Requirements
 
 - A compatible Herdr client on each target. Herdr 0.8.2 / protocol 20 is the
-  currently tested combination.
+  currently tested combination; 0.9.0 / protocol 22 is the current upstream
+  release and is accepted without being qualified here. Newer protocols are
+  never refused. Older ones work with the features that postdate them hidden —
+  `super-herdr doctor` names which, per target.
 - OpenSSH for remote targets. Existing SSH configuration, keys, host checking,
   and proxy settings remain authoritative.
 - `sha256sum` on targets that receive files.

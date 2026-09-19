@@ -166,6 +166,21 @@ const check = (what, condition) => {
     console.log(`ok: ${what}`);
   }
 };
+// A tap the way a phone makes one: pointerdown, pointerup, and — on iOS, once
+// pointerdown's default is prevented — no click at all. Calling onclick() is
+// what this harness used to do, which is the one sequence a phone may never
+// produce, so every button that takes a tap is exercised this way instead.
+const tap = button => {
+  if (button.onpointerdown) button.onpointerdown({ preventDefault() {} });
+  if (button.onpointerup) button.onpointerup({ button: 0 });
+  else if (button.onclick) button.onclick({ detail: 1 });
+};
+
+// The same button reached without a pointer: a keyboard or assistive
+// technology sends only a click, counting no taps behind it, and it has to
+// still work.
+const activate = button => button.onclick({ detail: 0 });
+
 const replies = () => page.el('quick-replies').children;
 const configureReplies = quick_replies => deliver({
   type: 'server.hello',
@@ -279,7 +294,7 @@ check('observer lease keeps the keyboard away', page.el('keyboard').hidden === t
 // Typing is refused while observing, rather than silently dropped on the floor
 // at the daemon.
 sent.length = 0;
-keyButtons[0].onclick();
+tap(keyButtons[0]);
 check('an observer sends no input', sent.length === 0);
 
 // The daemon said which replies it offers during the handshake.
@@ -388,7 +403,7 @@ for (const [index, key] of [
   'enter', 'escape', 'tab', 'up', 'down', 'left', 'right', 'backspace', 'interrupt',
 ].entries()) {
   sent.length = 0;
-  keyButtons[index].onclick();
+  tap(keyButtons[index]);
   const bytes = Buffer.from(sent.at(-1).body.bytes, 'base64').toString('binary');
   check(`${key} sends ${JSON.stringify(page.KEYS[key])}`, bytes === page.KEYS[key]);
 }
@@ -407,7 +422,7 @@ check(
 for (const [index, expected] of [['Yes', 'y\r'], ['No', 'n\r'], ['Paste path', '/srv/build']].entries()) {
   sent.length = 0;
   page.el('line').focused = false;
-  replies()[index].onclick();
+  tap(replies()[index]);
   const bytes = Buffer.from(sent.at(-1).body.bytes, 'base64').toString('utf8');
   check(`${expected[0]} is submitted in one tap`, bytes === expected[1]);
   check(`${expected[0]} does not open the software keyboard`, page.el('line').focused === false);
@@ -415,11 +430,11 @@ for (const [index, expected] of [['Yes', 'y\r'], ['No', 'n\r'], ['Paste path', '
 
 // A reply that declared it needs confirming takes two taps, on itself.
 sent.length = 0;
-replies()[3].onclick();
+tap(replies()[3]);
 check('a confirming reply sends nothing on the first tap', sent.length === 0);
 check('a confirming reply says it is armed', replies()[3]['aria-pressed'] === 'true');
 check('a confirming reply asks for the second tap', replies()[3].textContent === 'Tap again');
-replies()[3].onclick();
+tap(replies()[3]);
 check(
   'a confirming reply sends on the second tap',
   Buffer.from(sent.at(-1).body.bytes, 'base64').toString('utf8') === 'reset --hard\r',
@@ -427,13 +442,34 @@ check(
 check('a sent reply disarms', replies()[3].textContent === 'Wipe');
 
 // Losing the lease ends the moment an armed reply belonged to.
-replies()[3].onclick();
+tap(replies()[3]);
 deliver({ type: 'pane.lease', pane, access: 'observe' });
 check('a lost lease disarms a waiting reply', replies()[3].textContent === 'Wipe');
 sent.length = 0;
-replies()[0].onclick();
+tap(replies()[0]);
 check('an observer sends no reply', sent.length === 0);
 deliver({ type: 'pane.lease', pane, access: 'control' });
+
+// The three sequences a browser can actually produce, on the control that
+// broke: a phone's tap with no click behind it, a keyboard activation with no
+// pointer in front of it, and a desktop's tap followed by its click — which is
+// one action, not two.
+sent.length = 0;
+tap(replies()[0]);
+check('a pointer tap sends without waiting for a click', sent.length === 1);
+
+sent.length = 0;
+activate(replies()[0]);
+check('a keyboard activation still sends', sent.length === 1);
+
+sent.length = 0;
+tap(replies()[0]);
+replies()[0].onclick({ detail: 1 });
+check('a tap and the click behind it send once', sent.length === 1);
+
+sent.length = 0;
+tap(keyButtons[0]);
+check('a key button answers the tap itself', sent.length === 1);
 
 // A daemon that offers none draws none. The page does not invent a fallback,
 // because a button nobody configured would be a guess about what to type.

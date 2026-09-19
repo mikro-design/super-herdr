@@ -2903,11 +2903,10 @@ fn command_palette_actions(
 fn plugin_target_available(state: &FederationState, target: &TargetSession) -> bool {
     state.targets.get(target).is_some_and(|runtime| {
         runtime.connection == TargetConnectionState::Live
-            && runtime
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.protocol)
-                .is_some_and(|protocol| protocol >= 20)
+            && crate::herdr_support::supports(
+                runtime.snapshot.as_deref(),
+                crate::herdr_support::Feature::PluginActions,
+            )
     })
 }
 
@@ -2972,11 +2971,10 @@ fn ensure_plugin_catalog(state: &FederationState, target: &TargetSession, app: &
         return;
     };
     if runtime.connection != TargetConnectionState::Live
-        || runtime
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.protocol)
-            .is_none_or(|protocol| protocol < 20)
+        || !crate::herdr_support::supports(
+            runtime.snapshot.as_deref(),
+            crate::herdr_support::Feature::PluginActions,
+        )
     {
         return;
     }

@@ -457,6 +457,72 @@ impl Drop for FederationStore {
     }
 }
 
+/// What one attempt at opening a change stream did.
+enum StreamAttempt {
+    Opened(Box<dyn crate::transport::ChangeStream>),
+    Failed(SnapshotError),
+    /// Something else wants the loop: a nudge, a deadline, a reconfiguration.
+    Interrupted,
+    Stop,
+}
+
+/// The two things that can end a supervisor's wait before it is done waiting.
+struct Interrupts<'a> {
+    shutdown: &'a mut watch::Receiver<bool>,
+    nudge: &'a mut watch::Receiver<u64>,
+}
+
+/// Open a change stream, giving up if the supervisor has somewhere better to be.
+///
+/// Shared by the two places that need one, which want the same thing on every
+/// outcome but differ on how long they are prepared to wait: before a snapshot
+/// there is no refresh deadline to respect yet, and after one there is.
+async fn attempt_change_stream<T>(
+    transport: &Arc<T>,
+    target: &Target,
+    transport_config: &TransportConfig,
+    command_timeout: Duration,
+    pane_ids: &[String],
+    deadline: Option<Instant>,
+    interrupts: &mut Interrupts<'_>,
+) -> StreamAttempt
+where
+    T: SnapshotTransport,
+{
+    let waiting_out = async {
+        match deadline {
+            Some(deadline) => sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        changed = interrupts.shutdown.changed() => {
+            if changed.is_err() || *interrupts.shutdown.borrow() {
+                StreamAttempt::Stop
+            } else {
+                StreamAttempt::Interrupted
+            }
+        }
+        nudged = interrupts.nudge.changed() => {
+            if nudged.is_err() {
+                StreamAttempt::Stop
+            } else {
+                StreamAttempt::Interrupted
+            }
+        }
+        () = waiting_out => StreamAttempt::Interrupted,
+        result = transport.open_change_stream(
+            target,
+            transport_config,
+            command_timeout,
+            pane_ids,
+        ) => match result {
+            Ok(stream) => StreamAttempt::Opened(stream),
+            Err(error) => StreamAttempt::Failed(error),
+        },
+    }
+}
+
 async fn supervise_target<T>(
     target: Target,
     transport_config: TransportConfig,
@@ -474,8 +540,51 @@ async fn supervise_target<T>(
     let mut failed_attempts = 0_u32;
     let mut change_stream: Option<Box<dyn crate::transport::ChangeStream>> = None;
     let mut subscribed_pane_ids = Vec::new();
+    // The pane set the last good snapshot described, kept across failures
+    // because it is what a subscription opened before the next snapshot has to
+    // be built from.
+    let mut known_pane_ids: Vec<String> = Vec::new();
 
     loop {
+        // Subscribed before the snapshot rather than after it. Herdr 0.9 starts
+        // a subscription at the live edge instead of replaying what it
+        // retained, so a change that lands between the two is delivered in this
+        // order and dropped in the other — and dropped means stale until the
+        // next refresh happens to notice. Skipped while a target is failing,
+        // where the snapshot is the cheaper way to find out it is back.
+        if target.socket.is_some() && change_stream.is_none() && failed_attempts == 0 {
+            match attempt_change_stream(
+                &transport,
+                &target,
+                &transport_config,
+                options.command_timeout,
+                &known_pane_ids,
+                None,
+                &mut Interrupts {
+                    shutdown: &mut shutdown,
+                    nudge: &mut nudge,
+                },
+            )
+            .await
+            {
+                StreamAttempt::Stop => return,
+                StreamAttempt::Interrupted => continue,
+                StreamAttempt::Opened(opened) => {
+                    change_stream = Some(opened);
+                    subscribed_pane_ids.clone_from(&known_pane_ids);
+                    record_update_mode(&updates, &key, TargetUpdateMode::Events, None);
+                }
+                StreamAttempt::Failed(error) => {
+                    record_update_mode(
+                        &updates,
+                        &key,
+                        TargetUpdateMode::Polling,
+                        Some(error.message),
+                    );
+                }
+            }
+        }
+
         let result = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -491,6 +600,7 @@ async fn supervise_target<T>(
         let delay = match result {
             Ok(selection) => {
                 event_pane_ids = snapshot_pane_ids(&selection.snapshot);
+                known_pane_ids.clone_from(&event_pane_ids);
                 if !connected {
                     connection_generation = connection_generation.saturating_add(1);
                 }
@@ -518,36 +628,34 @@ async fn supervise_target<T>(
 
         if snapshot_succeeded && target.socket.is_some() {
             let refresh_deadline = Instant::now() + delay;
+            // A pane set that changed needs its own subscriptions, and the
+            // snapshot that names them has just been taken; the next pass
+            // around the loop re-baselines against this stream before waiting
+            // on it.
             if change_stream.is_none() || subscribed_pane_ids != event_pane_ids {
                 change_stream = None;
-                let opened = tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return;
-                        }
-                        continue;
-                    }
-                    nudged = nudge.changed() => {
-                        if nudged.is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                    () = sleep_until(refresh_deadline) => continue,
-                    result = transport.open_change_stream(
-                        &target,
-                        &transport_config,
-                        options.command_timeout,
-                        &event_pane_ids,
-                    ) => result,
-                };
-                match opened {
-                    Ok(opened) => {
+                match attempt_change_stream(
+                    &transport,
+                    &target,
+                    &transport_config,
+                    options.command_timeout,
+                    &event_pane_ids,
+                    Some(refresh_deadline),
+                    &mut Interrupts {
+                        shutdown: &mut shutdown,
+                        nudge: &mut nudge,
+                    },
+                )
+                .await
+                {
+                    StreamAttempt::Stop => return,
+                    StreamAttempt::Interrupted => continue,
+                    StreamAttempt::Opened(opened) => {
                         change_stream = Some(opened);
                         subscribed_pane_ids.clone_from(&event_pane_ids);
                         record_update_mode(&updates, &key, TargetUpdateMode::Events, None);
                     }
-                    Err(error) => {
+                    StreamAttempt::Failed(error) => {
                         record_update_mode(
                             &updates,
                             &key,
@@ -1022,6 +1130,9 @@ mod tests {
     struct FakeTransport {
         scripts: BTreeMap<TargetSession, ScriptReceiver>,
         events: BTreeMap<TargetSession, Arc<Mutex<mpsc::UnboundedReceiver<()>>>>,
+        /// Every call in the order it was made, for the tests that care which
+        /// of the two came first.
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl SnapshotTransport for FakeTransport {
@@ -1031,6 +1142,7 @@ mod tests {
             _config: &'a TransportConfig,
             _command_timeout: Duration,
         ) -> SnapshotFuture<'a> {
+            self.calls.lock().unwrap().push("snapshot");
             let script = self
                 .scripts
                 .get(&TargetSession::new(&target.name, target.session_name()))
@@ -1053,6 +1165,7 @@ mod tests {
             _connect_timeout: Duration,
             _pane_ids: &'a [String],
         ) -> crate::transport::OpenChangeStreamFuture<'a> {
+            self.calls.lock().unwrap().push("subscribe");
             let events = self
                 .events
                 .get(&TargetSession::new(&target.name, target.session_name()))
@@ -1180,6 +1293,7 @@ mod tests {
                 (second_key.clone(), Arc::new(Mutex::new(second_rx))),
             ]),
             events: BTreeMap::new(),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         let options = SupervisorOptions {
             command_timeout: Duration::from_secs(1),
@@ -1283,6 +1397,7 @@ mod tests {
         let transport = Arc::new(FakeTransport {
             scripts: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(snapshot_rx)))]),
             events: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(event_rx)))]),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         // An hour, so nothing but the nudge can explain a second snapshot.
         let options = SupervisorOptions {
@@ -1332,6 +1447,69 @@ mod tests {
         store.shutdown().await;
     }
 
+    /// The subscription is opened before the snapshot it will be compared
+    /// against.
+    ///
+    /// Herdr 0.9 starts a subscription at the live edge rather than replaying
+    /// retained history, so the other order loses whatever changed between the
+    /// two — and losing it means a target that is wrong until some later
+    /// refresh happens to correct it. The order is the whole fix, so the order
+    /// is what is asserted.
+    #[tokio::test]
+    async fn a_subscription_is_opened_before_the_first_snapshot() {
+        let config = Config::parse(
+            r#"
+                [[targets]]
+                name = "host-a"
+                session = "dev"
+                socket = "/tmp/fake-herdr.sock"
+            "#,
+        )
+        .unwrap();
+        let key = TargetSession::new("host-a", "dev");
+        let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = Arc::new(FakeTransport {
+            scripts: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(snapshot_rx)))]),
+            events: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(event_rx)))]),
+            calls: Arc::clone(&calls),
+        });
+        let options = SupervisorOptions {
+            command_timeout: Duration::from_secs(1),
+            refresh_interval: Duration::from_secs(3600),
+            initial_backoff: Duration::from_millis(1),
+            maximum_backoff: Duration::from_millis(4),
+        };
+
+        snapshot_tx.send(Ok(snapshot("w1:p1"))).unwrap();
+        let store = FederationStore::start(config, transport, options);
+        let mut receiver = store.subscribe();
+        wait_for(&mut receiver, |state| {
+            state.targets[&key]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .panes
+                        .contains_key(&PaneId::new("host-a", "dev", "w1:p1"))
+                })
+        })
+        .await;
+        store.shutdown().await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.first(),
+            Some(&"subscribe"),
+            "the stream is opened before anything is snapshotted: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"snapshot"),
+            "and the snapshot still happens: {calls:?}"
+        );
+    }
+
     #[tokio::test]
     async fn event_signal_triggers_an_immediate_authoritative_snapshot() {
         let config = Config::parse(
@@ -1349,6 +1527,7 @@ mod tests {
         let transport = Arc::new(FakeTransport {
             scripts: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(snapshot_rx)))]),
             events: BTreeMap::from([(key.clone(), Arc::new(Mutex::new(event_rx)))]),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         let options = SupervisorOptions {
             command_timeout: Duration::from_secs(1),

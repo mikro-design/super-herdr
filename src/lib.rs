@@ -9,6 +9,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod file_save;
+pub mod herdr_support;
 pub mod model;
 pub mod notifications;
 pub mod operation;

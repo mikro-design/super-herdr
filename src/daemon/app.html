@@ -1089,6 +1089,32 @@ function sendText(text) {
   sendBytes(new TextEncoder().encode(text));
 }
 
+// Act on the tap itself rather than on a click the browser may never send.
+//
+// Preventing default on `pointerdown` is what stops a phone keyboard opening
+// for a button that needs no typing — and on iOS that same prevention can
+// suppress the `click` that used to carry the action, so a tap did nothing and
+// the control read as broken. The action therefore happens on `pointerup`, on
+// the button the finger is still over.
+//
+// `click` is kept for activation that produced no pointer event at all —
+// a keyboard, or assistive technology — which is the case `pointerup` cannot
+// serve. The two are told apart by the click count the event carries: a click
+// behind a real tap counts that tap, and a keyboard's click counts nothing.
+// That is a property of the event rather than a window of time, so a person
+// alternating between finger and keyboard is not racing anything.
+function onTap(button, act) {
+  button.onpointerdown = event => event.preventDefault();
+  button.onpointerup = event => {
+    if (event && event.button !== undefined && event.button !== 0) return;
+    act();
+  };
+  button.onclick = event => {
+    if (!event || event.detail !== 0) return;
+    act();
+  };
+}
+
 // What the buttons send. Named rather than numbered so the markup says what it
 // means, and kept here rather than in the markup so a key is one definition.
 const KEYS = {
@@ -1134,8 +1160,7 @@ function renderQuickReplies() {
     );
     // Keeping the tap off the text field is what stops a phone keyboard
     // opening for a reply that needs no typing.
-    button.onpointerdown = event => event.preventDefault();
-    button.onclick = () => tapReply(index);
+    onTap(button, () => tapReply(index));
     strip.append(button);
     quickReplyButtons.push(button);
   }
@@ -2438,11 +2463,10 @@ el('line-form').onsubmit = event => {
   el('line').focus();
 };
 for (const button of document.querySelectorAll('.keys button')) {
-  button.onpointerdown = event => event.preventDefault();
-  button.onclick = () => {
+  onTap(button, () => {
     sendText(KEYS[button.dataset.key] || '');
     el('line').focus();
-  };
+  });
 }
 el('hierarchy').ontoggle = () => rememberView();
 el('picker-search-form').onsubmit = event => {
