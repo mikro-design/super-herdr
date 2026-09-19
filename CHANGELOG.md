@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.29
 
 - Added `cargo run --example qualify-federation`, which reports every target by
   the Herdr version and protocol it answered on and then measures how long a
