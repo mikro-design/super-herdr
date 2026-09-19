@@ -5,6 +5,17 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Added `cargo run --example qualify-federation`, which reports every target by
+  the Herdr version and protocol it answered on and then measures how long a
+  change made outside this client takes to arrive. Recorded against a fleet
+  holding both Herdr 0.8.0 (protocol 19) and 0.9.0 (protocol 22): 46 ms and
+  7.9 ms respectively, against a five-second refresh interval, which is the
+  first evidence that 0.7.27's subscription ordering works where it was aimed.
+  Herdr 0.9.0 turns out to report no capability object either, so the feature
+  gates are answered by the protocol floor today.
+
 ## 0.7.28
 
 - Fixed quick replies and terminal keys not responding to a tap on the phone.

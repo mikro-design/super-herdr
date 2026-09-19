@@ -228,6 +228,69 @@ keystroke reaches a pane and no running process is disturbed. Run it first on
 each frontend; what it does not cover needs a person at that desktop, and a row
 stays unrecorded until someone does it.
 
+### 2026-09-19 — two Herdr versions in one federation
+
+Run with `cargo run --example qualify-federation -- <config>`. Unit tests drive a
+fake transport, and a fake cannot disagree with real Herdr about what a
+subscription means — which is the thing Herdr 0.9 changed. The example reports
+each target as this client sees it, then changes each session through Herdr's own
+CLI and measures the wait until the change arrives.
+
+Both targets were on this one host: `ws01` a Herdr 0.8.0 server, `edge09` a
+Herdr 0.9.0 server started beside it. Super-Herdr 0.7.28.
+
+- `edge09`: herdr 0.9.0, protocol 22, event-driven updates, with plugin actions
+- `ws01`: herdr 0.8.0, protocol 19, event-driven updates, without plugin actions
+- two distinct Herdr versions supervised in one federation, each reported by the
+  version and protocol it answered on
+- a change made outside this client arrived in **7.9 ms** from 0.9.0 and
+  **46 ms** from 0.8.0, both far inside the five-second refresh interval — so an
+  event carried it rather than a poll finding it later
+
+That last line is what 0.7.27's subscription ordering was written for and could
+not be tested without a 0.9 host: Herdr 0.9 starts a subscription at the live
+edge rather than replaying retained history, so a client that subscribed after
+its snapshot would have dropped that change and shown stale state until the next
+refresh.
+
+Also recorded, because it changes what the capability work is doing: Herdr 0.9.0
+reports no `capabilities` object either — `capabilities: null` at protocol 22,
+exactly as at 19. The feature gates are therefore answered entirely by the
+protocol floor today; the capability branch is forward-looking and currently
+reads nothing.
+
+The second version ran from its own config directory via a wrapper
+(`herdr-0.9.0-edge`), because two Herdr versions on one host would otherwise
+share `~/.config/herdr`. On a real fleet each machine has its own install and the
+wrapper is not needed; it is a fixture, not something to leave configured.
+
+### 2026-09-19 — browser control path, the half a machine can decide
+
+Run against a daemon started with `super-herdr daemon --socket <path>` on
+Super-Herdr 0.7.28, checked over the loopback browser route.
+
+- the page served is the shipped one, carrying the `pointerup` tap handler and
+  the click-count guard, 103 KB, with no external script, style, or CDN
+  reference
+- `GET /session` on a client that has never paired: `{"paired":false,...}`
+- `GET /events` unpaired: **401**, `this device is not paired with this daemon`
+- `POST /command` unpaired: **401**, the same
+- `POST /pair` with a code nobody issued: **403**, `no pairing code is waiting;
+  ask for one from the terminal client` — which does not say whether another
+  code would have worked
+- `super-herdr device list`: no paired devices, and the browser client serves
+  loopback only until one exists
+
+What this does not qualify, and cannot: pairing needs a six-digit comparison
+approved in the trusted TUI by a person, and that approval is deliberately not
+available from any CLI. Until a device is paired the public bridge publishes no
+route for this daemon, so every path under it answers `no such bridge route` —
+which is the correct default, and also why the bridge hop itself stays
+unqualified here. Everything past approval is device work: observe before
+control, taking and losing the lease, the terminal keys, a quick reply landing on
+one tap, reconnect and catch-up, and revocation taking effect on the next
+request. ROADMAP item 2 stays open on that basis.
+
 ### 2026-08-20 — verified upload over a real SSH target
 
 Run with `cargo run --example qualify-upload -- <ssh-destination>` against a host
