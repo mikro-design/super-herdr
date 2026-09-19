@@ -5,6 +5,13 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.30
+
+No functional change. Dependency updates — clap 4.6.7, toml 1.1.6, and rustls
+0.23.45, the last of which is why this is a release rather than a wait — plus a
+corrected qualification record. Anyone on 0.7.29 gains nothing here but the
+updated libraries.
+
 ## 0.7.29
 
 - Added `cargo run --example qualify-federation`, which reports every target by
