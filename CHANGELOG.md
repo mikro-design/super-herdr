@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.31
 
 - Fixed quick replies and terminal keys doing nothing on a phone — a regression
   introduced by 0.7.28's attempt at the same bug. That change answered
@@ -18,8 +18,6 @@ inferred from commit titles alone.
   control dead. Nothing is prevented on `pointerdown` any more — a soft keyboard
   that opens when it should not is an annoyance, and a button that does nothing
   is not.
-
-## Unreleased
 
 - `doctor` now answers "can my phone reach me right now". A bridge route exists
   only while a daemon holds one open — the route identifier is made fresh at
