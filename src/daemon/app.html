@@ -1089,28 +1089,48 @@ function sendText(text) {
   sendBytes(new TextEncoder().encode(text));
 }
 
-// Act on the tap itself rather than on a click the browser may never send.
+// Act on whichever event the browser actually delivers.
 //
-// Preventing default on `pointerdown` is what stops a phone keyboard opening
-// for a button that needs no typing — and on iOS that same prevention can
-// suppress the `click` that used to carry the action, so a tap did nothing and
-// the control read as broken. The action therefore happens on `pointerup`, on
-// the button the finger is still over.
+// This has failed in both directions now, so it waits for neither. Preventing
+// `pointerdown`'s default stops a soft keyboard opening, and on iOS it can also
+// suppress the `click` the action used to ride on — a dead button. Answering
+// `pointerup` instead has the opposite fault: a finger the browser decides was
+// a pan gets `pointercancel` and no `pointerup`, and on a phone every finger
+// moves a little, so that is a dead button too.
 //
-// `click` is kept for activation that produced no pointer event at all —
-// a keyboard, or assistive technology — which is the case `pointerup` cannot
-// serve. The two are told apart by the click count the event carries: a click
-// behind a real tap counts that tap, and a keyboard's click counts nothing.
-// That is a property of the event rather than a window of time, so a person
-// alternating between finger and keyboard is not racing anything.
+// So whichever arrives first acts. A gesture begins at `pointerdown`, which is
+// what marks it unanswered; the `click` belonging to a gesture already answered
+// always arrives before the next `pointerdown` does, so one flag separates them
+// with no window of time to get wrong — and a second press of the same button,
+// however fast, is a new gesture that acts again.
+//
+// Nothing is prevented on `pointerdown` any more. A keyboard that opens when it
+// should not is an annoyance; a control that does nothing is not.
 function onTap(button, act) {
-  button.onpointerdown = event => event.preventDefault();
+  let answered = false;
+  button.onpointerdown = () => {
+    answered = false;
+  };
   button.onpointerup = event => {
-    if (event && event.button !== undefined && event.button !== 0) return;
+    // Secondary mouse buttons are not taps. Touch reports no button at all.
+    if (event && event.button !== undefined && event.button > 0) return;
+    answered = true;
     act();
   };
   button.onclick = event => {
-    if (!event || event.detail !== 0) return;
+    // A click carrying no click count had no pointer behind it — a keyboard, or
+    // assistive technology — and there is no gesture it could be a duplicate
+    // of, so it always acts. A click that does carry one is either the tail of
+    // a gesture already answered, or the only thing a cancelled pointer left
+    // behind; the flag is what tells those apart.
+    if (!event || event.detail === 0) {
+      act();
+      return;
+    }
+    if (answered) {
+      answered = false;
+      return;
+    }
     act();
   };
 }

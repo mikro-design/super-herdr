@@ -5,6 +5,20 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Fixed quick replies and terminal keys doing nothing on a phone — a regression
+  introduced by 0.7.28's attempt at the same bug. That change answered
+  `pointerup` and suppressed the click behind it, which fixes the case where iOS
+  withholds the click and breaks the case where the browser decides a finger
+  moved: a pointer it treats as a pan is cancelled and delivers no `pointerup`
+  at all, so nothing fired. On a phone every finger moves a little. Taps now act
+  on whichever of the two events arrives first, with the gesture itself telling a
+  duplicate from a cancelled one, so neither browser behaviour can leave a
+  control dead. Nothing is prevented on `pointerdown` any more — a soft keyboard
+  that opens when it should not is an annoyance, and a button that does nothing
+  is not.
+
 ## 0.7.30
 
 No functional change. Dependency updates — clap 4.6.7, toml 1.1.6, and rustls
