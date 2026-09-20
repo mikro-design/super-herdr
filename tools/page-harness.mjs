@@ -176,6 +176,15 @@ const tap = button => {
   else if (button.onclick) button.onclick({ detail: 1 });
 };
 
+// A tap the browser decided was a pan: pointercancel, no pointerup, and then
+// the click it still delivers because nothing prevented it. This is the phone
+// case that a pointerup-only handler dropped on the floor.
+const tapAfterPan = button => {
+  if (button.onpointerdown) button.onpointerdown({ preventDefault() {} });
+  if (button.onpointercancel) button.onpointercancel({});
+  if (button.onclick) button.onclick({ detail: 1 });
+};
+
 // The same button reached without a pointer: a keyboard or assistive
 // technology sends only a click, counting no taps behind it, and it has to
 // still work.
@@ -470,6 +479,22 @@ check('a tap and the click behind it send once', sent.length === 1);
 sent.length = 0;
 tap(keyButtons[0]);
 check('a key button answers the tap itself', sent.length === 1);
+
+// The regression that made the phone useless: a finger that moved.
+sent.length = 0;
+tapAfterPan(replies()[0]);
+check('a tap the browser called a pan still sends', sent.length === 1);
+
+sent.length = 0;
+tapAfterPan(keyButtons[0]);
+check('a key button survives the same', sent.length === 1);
+
+// Pressing the same button twice quickly is two taps, not one. An earlier
+// attempt at this deduplicated by time and ate the second press.
+sent.length = 0;
+tap(keyButtons[0]);
+tap(keyButtons[0]);
+check('two fast presses of one button send twice', sent.length === 2);
 
 // A daemon that offers none draws none. The page does not invent a fallback,
 // because a button nobody configured would be a guess about what to type.
