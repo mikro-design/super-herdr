@@ -19,6 +19,17 @@ inferred from commit titles alone.
   that opens when it should not is an annoyance, and a button that does nothing
   is not.
 
+## Unreleased
+
+- `doctor` now answers "can my phone reach me right now". A bridge route exists
+  only while a daemon holds one open — the route identifier is made fresh at
+  start and never written down — so a paired device whose daemon is not running
+  reaches the bridge's pairing page and can get no further, which from the phone
+  is indistinguishable from the client being broken. The new `pairing/reachable`
+  check says so in one line, and names the remedy. It warns only when a device
+  is actually paired; nothing paired and nothing running is somebody who has not
+  started yet.
+
 ## 0.7.30
 
 No functional change. Dependency updates — clap 4.6.7, toml 1.1.6, and rustls
