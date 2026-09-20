@@ -342,6 +342,81 @@ fn browser_route(config: &Config) -> Check {
     }
 }
 
+/// Whether anything is publishing a route for the devices that were paired.
+///
+/// The gap this fills cost an afternoon: a phone that reaches nothing looks
+/// identical to a phone that is broken. A bridge route exists only while a
+/// daemon holds it open — the route identifier is made fresh at start and never
+/// written down, so nothing outside a running daemon can name it, and closing
+/// the frontend that hosts one takes the route with it. So the question a
+/// person actually has, "can my phone reach me right now", is answered here by
+/// the only thing that can answer it: whether a daemon is alive on the socket.
+///
+/// It does not report the bridge's own health. That would need an HTTP client
+/// this binary does not otherwise carry, and a bridge that is up helps nobody
+/// while there is no daemon behind it.
+pub async fn device_reachability(config: &Config, socket: Option<&Path>) -> Check {
+    let paired = config.devices.len();
+    let publishes = config.web.port != Some(0)
+        && (config.web.bridge || config.web.url.is_some() || config.web.address.is_some());
+    if !publishes {
+        return Check::new(
+            "pairing",
+            "reachable",
+            Status::Skipped,
+            "no browser route is configured, so nothing is published",
+        );
+    }
+    let Some(socket) = socket else {
+        return Check::new(
+            "pairing",
+            "reachable",
+            Status::Skipped,
+            "no daemon socket path to ask",
+        );
+    };
+    let alive = matches!(
+        tokio::time::timeout(
+            NETWORK_TIMEOUT,
+            crate::client::Client::connect_socket(socket, "doctor"),
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    match (alive, paired) {
+        (true, 0) => Check::new(
+            "pairing",
+            "reachable",
+            Status::Ok,
+            "a daemon is running and would publish a route; no device is paired to use it yet",
+        ),
+        (true, count) => Check::new(
+            "pairing",
+            "reachable",
+            Status::Ok,
+            format!("a daemon is running, so {count} paired device(s) have somewhere to reach"),
+        ),
+        (false, 0) => Check::new(
+            "pairing",
+            "reachable",
+            Status::Skipped,
+            "no daemon is running, and no device is paired either",
+        ),
+        // The case worth a warning: somebody paired a device, and today it
+        // reaches a bridge that has no route to give it.
+        (false, count) => Check::new(
+            "pairing",
+            "reachable",
+            Status::Warn,
+            format!(
+                "no daemon is running, so the route {count} paired device(s) use does not exist; \
+                 a phone reaches the pairing page and can get no further"
+            ),
+        )
+        .with_remedy("super-herdr daemon, or open the TUI, which hosts one".to_owned()),
+    }
+}
+
 /// Turn one target probe into a check, keeping hosts out of the text.
 pub fn target_check(report: &ProbeReport) -> Check {
     if !report.ok {
@@ -511,14 +586,87 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Check, Report, Status, local_checks, redact_destination, redact_path, redact_url,
-        target_check, transfer_tools_check,
+        Check, Report, Status, device_reachability, local_checks, redact_destination, redact_path,
+        redact_url, target_check, transfer_tools_check,
     };
     use crate::config::Config;
     use crate::probe::ProbeReport;
 
     fn config(text: &str) -> Config {
         Config::parse(text).unwrap()
+    }
+
+    /// A paired device with nothing running is the case worth saying out loud.
+    ///
+    /// It is indistinguishable from a broken phone: the bridge answers, serves
+    /// its pairing page, and has no route to give — because a route exists only
+    /// while a daemon holds one open. Diagnosing that from the phone end cost a
+    /// day, which is the whole reason this check exists.
+    #[tokio::test]
+    async fn a_paired_device_with_no_daemon_is_a_warning_that_names_the_cause() {
+        let paired = config(
+            r#"
+                [web]
+                bridge = true
+
+                [[devices]]
+                name = "phone"
+                token_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                paired_at_ms = 1
+
+                [[targets]]
+                name = "host"
+                session = "work"
+            "#,
+        );
+        let missing = Path::new("/nonexistent/super-herdr/doctor.sock");
+        let check = device_reachability(&paired, Some(missing)).await;
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("no daemon is running"), "{check:?}");
+        assert!(
+            check.detail.contains("pairing page"),
+            "it says what the phone sees: {check:?}"
+        );
+        assert!(check.remedy.is_some(), "and what to do: {check:?}");
+    }
+
+    /// No devices and no daemon is somebody who has not started yet, not a
+    /// fault. Saying so keeps the warning above meaning something.
+    #[tokio::test]
+    async fn nothing_paired_and_nothing_running_is_not_a_fault() {
+        let fresh = config(
+            r#"
+                [web]
+                bridge = true
+
+                [[targets]]
+                name = "host"
+                session = "work"
+            "#,
+        );
+        let missing = Path::new("/nonexistent/super-herdr/doctor.sock");
+        let check = device_reachability(&fresh, Some(missing)).await;
+        assert_eq!(check.status, Status::Skipped);
+    }
+
+    /// A configuration that publishes no browser route at all has nothing to
+    /// report here; the browser check already said so.
+    #[tokio::test]
+    async fn a_daemon_that_publishes_nothing_is_skipped() {
+        let quiet = config(
+            r#"
+                [web]
+                bridge = false
+
+                [[targets]]
+                name = "host"
+                session = "work"
+            "#,
+        );
+        let missing = Path::new("/nonexistent/super-herdr/doctor.sock");
+        let check = device_reachability(&quiet, Some(missing)).await;
+        assert_eq!(check.status, Status::Skipped);
+        assert!(check.detail.contains("no browser route"), "{check:?}");
     }
 
     fn probe(ok: bool, protocol: Option<u64>) -> ProbeReport {

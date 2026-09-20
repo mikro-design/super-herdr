@@ -550,6 +550,7 @@ async fn run() -> Result<ExitCode> {
         Commands::Doctor { json, timeout } => {
             let socket = DaemonOptions::discover().ok().map(|options| options.socket);
             let mut checks = doctor::local_checks(&config, &path, socket.as_deref());
+            checks.push(doctor::device_reachability(&config, socket.as_deref()).await);
             let expanded = expand_discovered_sessions(config).await;
             let timeout = timeout.map(Duration::from_secs);
             checks.extend(doctor::probe_targets(&expanded, timeout).await);
