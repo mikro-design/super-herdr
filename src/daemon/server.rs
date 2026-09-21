@@ -1227,7 +1227,7 @@ impl web::Devices for DevicePolicy {
         if confirmation.len() != 6 || !confirmation.bytes().all(|byte| byte.is_ascii_digit()) {
             anyhow::bail!("the browser did not provide a valid confirmation number");
         }
-        let name = device_name(name);
+        let name = unique_device_name(name, &self.current());
         let attempt = pairing::token()?;
         let (decision, waiting) = oneshot::channel();
         let now = SystemTime::now();
@@ -1259,13 +1259,6 @@ impl web::Devices for DevicePolicy {
                     "that is not the code waiting; {remaining} attempt(s) left before it is discarded"
                 );
             }
-            if self.current().iter().any(|existing| existing.name == name) {
-                return Ok(web::PairingStart::RetryWithSameCode {
-                    message: format!(
-                        "A device named {name:?} is already paired. Choose a different device name and try this code again."
-                    ),
-                });
-            }
             // Matched, so it is spent: a code overheard after use opens nothing.
             *held = None;
         }
@@ -1290,6 +1283,26 @@ impl web::Devices for DevicePolicy {
 /// A device name comes from a person typing into a browser, so it is bounded
 /// and stripped of anything that would make the configuration file or a listing
 /// hard to read.
+/// A name for a device that is not already taken.
+///
+/// Naming used to be somebody's job: the browser asked for one, and a second
+/// phone offering the same one was refused and told to think of another while
+/// its code sat waiting. That is a naming conflict invented by this program and
+/// pushed onto a person holding a phone, for the sake of a label only ever read
+/// when revoking something. So the daemon settles it — the offered name if it
+/// is free, and the same name with a number if it is not.
+fn unique_device_name(offered: &str, existing: &[Device]) -> String {
+    let base = device_name(offered);
+    if !existing.iter().any(|device| device.name == base) {
+        return base;
+    }
+    // Two is where a person counts from when the first one had no number.
+    (2..)
+        .map(|suffix| format!("{base} {suffix}"))
+        .find(|candidate| !existing.iter().any(|device| &device.name == candidate))
+        .unwrap_or(base)
+}
+
 fn device_name(offered: &str) -> String {
     let cleaned = offered
         .chars()
@@ -4371,6 +4384,38 @@ mod tests {
         }
     }
 
+    /// A second device does not have to be given a different name by hand.
+    ///
+    /// It used to: the browser asked a person for a name, a name already taken
+    /// was refused, and the refusal arrived while they were holding a phone with
+    /// a live code. The label exists to tell devices apart when revoking one,
+    /// which is the daemon's problem to solve, not theirs.
+    #[test]
+    fn a_second_device_is_named_rather_than_refused() {
+        let paired = |name: &str| Device {
+            name: name.to_owned(),
+            token_sha256: crate::pairing::fingerprint(name),
+            paired_at_ms: 1,
+        };
+
+        assert_eq!(super::unique_device_name("phone", &[]), "phone");
+        assert_eq!(
+            super::unique_device_name("phone", &[paired("phone")]),
+            "phone 2"
+        );
+        assert_eq!(
+            super::unique_device_name("phone", &[paired("phone"), paired("phone 2")]),
+            "phone 3"
+        );
+        // An empty name is the common case now that nobody types one, and two
+        // of them must not collide either.
+        assert_eq!(super::unique_device_name("", &[]), "paired device");
+        assert_eq!(
+            super::unique_device_name("", &[paired("paired device")]),
+            "paired device 2"
+        );
+    }
+
     #[tokio::test]
     async fn a_typed_code_needs_matching_trusted_approval_before_it_creates_a_device() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4433,45 +4478,6 @@ mod tests {
             }
         };
 
-        Config::add_device_file(
-            Some(&config_path),
-            Device {
-                name: "phone".to_owned(),
-                token_sha256: crate::pairing::fingerprint("already paired token"),
-                paired_at_ms: 1,
-            },
-        )
-        .unwrap();
-        let duplicate_body =
-            format!("{{\"code\":\"{code}\",\"name\":\"phone\",\"confirmation\":\"482193\"}}");
-        let duplicate_response = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            stream
-                .write_all(
-                    format!(
-                        "POST /pair HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{duplicate_body}",
-                        duplicate_body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            response
-        })
-        .await
-        .expect("a duplicate device name waited for pointless approval");
-        assert!(
-            duplicate_response.starts_with(b"HTTP/1.1 409 Conflict"),
-            "{}",
-            String::from_utf8_lossy(&duplicate_response)
-        );
-        assert!(
-            String::from_utf8_lossy(&duplicate_response)
-                .contains("Choose a different device name and try this code again")
-        );
-
         let body =
             format!("{{\"code\":\"{code}\",\"name\":\"tablet\",\"confirmation\":\"482193\"}}");
         let browser = tokio::spawn(async move {
@@ -4511,7 +4517,11 @@ mod tests {
             }
         };
         assert!(
-            Config::load(Some(&config_path)).unwrap().0.devices.len() == 1,
+            Config::load(Some(&config_path))
+                .unwrap()
+                .0
+                .devices
+                .is_empty(),
             "knowing the short code created a device before approval"
         );
 
@@ -4527,9 +4537,8 @@ mod tests {
             .unwrap();
         assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
         let loaded = Config::load(Some(&config_path)).unwrap().0;
-        assert_eq!(loaded.devices.len(), 2);
-        assert_eq!(loaded.devices[0].name, "phone");
-        assert_eq!(loaded.devices[1].name, "tablet");
+        assert_eq!(loaded.devices.len(), 1);
+        assert_eq!(loaded.devices[0].name, "tablet");
 
         let _ = stop.send(());
         let _ = tokio::time::timeout(Duration::from_secs(10), server).await;

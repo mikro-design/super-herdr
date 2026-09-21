@@ -5,6 +5,19 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Pairing no longer asks anybody to name their device. The browser reports what
+  kind of device it is and the daemon makes that unique, so a second phone is
+  named `phone 2` instead of being refused with "choose a different device name
+  and try this code again" — a naming conflict this program invented and then
+  handed to somebody holding a live pairing code.
+- A pairing request that never comes back no longer claims the bridge could not
+  be reached. The page itself arrived over that same connection, so an
+  unreachable bridge is the least likely explanation and was the first one
+  chased. It now names what failed and points at `/_bridge/health`, which
+  separates a bridge that is down from a daemon that did not answer.
+
 ## 0.7.31
 
 - Fixed quick replies and terminal keys doing nothing on a phone — a regression
