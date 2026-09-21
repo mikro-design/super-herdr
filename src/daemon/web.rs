@@ -105,7 +105,6 @@ pub type PairingDecision = oneshot::Receiver<std::result::Result<String, String>
 /// the public bridge retry without spending or republishing the code.
 pub enum PairingStart {
     AwaitingApproval(PairingDecision),
-    RetryWithSameCode { message: String },
 }
 
 pub fn loopback(port: u16) -> SocketAddr {
@@ -275,9 +274,6 @@ async fn handle(
                             .await
                         }
                     }
-                }
-                Ok(PairingStart::RetryWithSameCode { message }) => {
-                    write_status(&mut writer, "409 Conflict", &message).await
                 }
                 // The reason is the daemon's, and says which check failed
                 // without saying anything about codes that would have worked.

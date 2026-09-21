@@ -38,13 +38,10 @@ let request;
 let responseKind = 'conflict';
 globalThis.fetch = async (url, init) => {
   request = { url, body: JSON.parse(init.body) };
-  if (responseKind === 'conflict') {
-    return {
-      ok: false,
-      status: 409,
-      headers: { get: () => null },
-      text: async () => 'Choose a different device name and try this code again.',
-    };
+  if (responseKind === 'threw') {
+    const failure = new Error('Load failed');
+    failure.name = 'TypeError';
+    throw failure;
   }
   return {
     ok: true,
@@ -83,17 +80,27 @@ page.el('code').onpaste({
 check('a complete code pastes across all boxes', page.enteredCode() === 'ABCD2345');
 check('pasting suppresses the one-field default', pastePrevented);
 
-page.el('name').value = 'phone';
 await page.el('connect').onsubmit({ preventDefault() {} });
 check('the normalized code is posted outside the URL', request.url === '/_bridge/pair');
 check('all eight characters are posted', request.body.code === 'ABCD2345');
-check('a used name keeps the browser on the pairing page', replacement === undefined);
-check('a used name explains how to retry', page.el('error').textContent.includes('different'));
-check('a used name is selected for replacement', page.el('name').focused && page.el('name').selected);
-check('the same code remains ready to retry', page.enteredCode() === 'ABCD2345');
+
+// Nobody types a name any more. The page says what kind of device this is and
+// the daemon makes it unique, so a second phone is not somebody's problem.
+check('a device kind is offered without anybody typing one', typeof request.body.name === 'string' && request.body.name.length > 0);
+check('no name field is left on the page', page.el('name').textContent === '' && !page.el('name').value);
+
+// A request that never came back is not a bridge that cannot be reached: the
+// page itself arrived over that same connection. Saying so sent a real search
+// in the wrong direction for a day.
+responseKind = 'threw';
+await page.el('connect').onsubmit({ preventDefault() {} });
+check('a dropped request is not reported as an unreachable bridge',
+  !page.el('error').textContent.includes('could not be reached'));
+check('a dropped request names what failed', page.el('error').textContent.includes('TypeError'));
+check('a dropped request points at a check anybody can run',
+  page.el('error').textContent.includes('/_bridge/health'));
+check('a dropped request keeps the code for another try', page.enteredCode() === 'ABCD2345');
 
 responseKind = 'success';
-page.el('name').value = 'tablet';
 await page.el('connect').onsubmit({ preventDefault() {} });
-check('the retry carries the new name', request.body.name === 'tablet');
 check('the bridge route is used only after pairing', replacement === '/r/test-route/');

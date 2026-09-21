@@ -46,9 +46,6 @@
       <input class="code-box" aria-label="Code character 7" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
       <input class="code-box" aria-label="Code character 8" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="1" required>
     </div>
-    <label>Name this device
-      <input id="name" class="field-input" autocomplete="off" maxlength="48" placeholder="phone">
-    </label>
     <button id="submit" type="submit">Connect</button>
   </form>
   <p id="confirmation" hidden>Compare this number with Super-Herdr before approving:
@@ -112,14 +109,16 @@ function confirmationNumber() {
   return String(random[0] % 1000000).padStart(6, '0');
 }
 
-function suggestedName() {
+// What kind of device this is, so the daemon can name it without asking. It is
+// a guess from the user agent and nothing depends on it being right: the daemon
+// makes whatever arrives unique, so two phones are never a naming conflict a
+// person has to resolve by typing.
+function deviceKind() {
   const agent = navigator.userAgent || '';
   if (/iPad|Tablet/i.test(agent)) return 'iPad';
   if (/Android|iPhone|Mobile/i.test(agent)) return 'phone';
   return 'browser';
 }
-
-el('name').value = suggestedName();
 el('connect').onsubmit = async event => {
   event.preventDefault();
   el('error').textContent = '';
@@ -140,7 +139,7 @@ el('connect').onsubmit = async event => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         code,
-        name: el('name').value,
+        name: deviceKind(),
         confirmation,
       }),
     });
@@ -151,13 +150,16 @@ el('connect').onsubmit = async event => {
     }
     el('confirmation').hidden = true;
     el('error').textContent = await response.text() || 'That code was not accepted.';
-    if (response.status === 409) {
-      el('name').focus();
-      el('name').select();
-    }
-  } catch (_) {
+  } catch (failure) {
+    // The request never came back, which is a different thing from a refusal
+    // and used to be reported as the same one sentence. What failed matters:
+    // the page itself arrived over this same connection, so a bridge that is
+    // wholly unreachable is the least likely explanation and the one people
+    // chased first.
     el('confirmation').hidden = true;
-    el('error').textContent = 'The bridge could not be reached. Try again.';
+    el('error').textContent =
+      `The connection dropped before Super-Herdr answered (${failure && failure.name ? failure.name : 'network error'}). `
+      + 'Check /_bridge/health in this browser: if that says ok, the bridge is fine and the daemon did not answer in time.';
   }
   el('submit').disabled = false;
 };
