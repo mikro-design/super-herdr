@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.32
 
 - Pairing no longer asks anybody to name their device. The browser reports what
   kind of device it is and the daemon makes that unique, so a second phone is
