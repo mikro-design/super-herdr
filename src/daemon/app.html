@@ -315,7 +315,7 @@
         <div id="plugin-actions" class="control-strip"></div>
         <div id="plugin-results"></div>
       </section>
-      <div class="actions"><button id="control">Take control &amp; type</button></div>
+      <div class="actions"><button id="control" hidden>Take control from the client using it</button></div>
       <div id="keyboard" hidden>
         <form id="line-form" class="actions">
           <input id="line" placeholder="Type a reply or command" autocapitalize="off"
@@ -1052,6 +1052,9 @@ function subscribeScreen(pane) {
 
 // Control is asked for rather than assumed. The daemon hands the lease over
 // and tells whoever held it, so this never takes one silently.
+// Taking the lease from whoever holds it. Deliberate by construction: it
+// interrupts somebody, so it is its own button and never something an ordinary
+// action does on a person's behalf.
 function takeControl() {
   if (!watching) return;
   requestingControl = true;
@@ -1061,6 +1064,26 @@ function takeControl() {
   // the phone keyboard closed.
   el('line').focus();
   send({ type: 'pane.take_control', pane: watching });
+  el('screen-note').textContent = 'asking for control…';
+}
+
+// Do something that needs the lease, acquiring it first if nobody has it.
+//
+// Typing a line is somebody saying they want to type; asking them to say so
+// twice, through a button whose only job is to ask, is ceremony. So the action
+// itself is the request, and it waits for the answer rather than being dropped
+// — the daemon is asked only-if-free, so a pane another client is using is
+// never taken out from under them by somebody starting to type on a phone.
+function withControl(act) {
+  if (!watching) return;
+  if (lease === 'control') {
+    act();
+    return;
+  }
+  pendingAction = act;
+  requestingControl = true;
+  renderKeyboard();
+  send({ type: 'pane.take_control', pane: watching, only_if_free: true });
   el('screen-note').textContent = 'asking for control…';
 }
 
@@ -1159,6 +1182,11 @@ const KEYS = {
 // falling back to a guess.
 let quickReplies = [];
 let quickReplyButtons = [];
+// The action that asked for the lease, waiting for the answer.
+let pendingAction = null;
+// Whether the last only-if-free ask came back observing, which is the one case
+// where a person still has to decide to interrupt somebody.
+let heldElsewhere = false;
 // The reply waiting for its second tap, when one declared that it needs one.
 let armedReply = null;
 
@@ -1180,7 +1208,7 @@ function renderQuickReplies() {
     );
     // Keeping the tap off the text field is what stops a phone keyboard
     // opening for a reply that needs no typing.
-    onTap(button, () => tapReply(index));
+    onTap(button, () => withControl(() => tapReply(index)));
     strip.append(button);
     quickReplyButtons.push(button);
   }
@@ -1222,16 +1250,21 @@ function armReply(index) {
 // without turning an optimistic UI transition into authorization.
 function renderKeyboard() {
   const holding = Boolean(watching) && lease === 'control';
-  el('keyboard').hidden = !holding && !requestingControl;
-  el('control').hidden = holding || requestingControl || !watching;
-  el('send').disabled = !holding;
-  el('files').disabled = !holding || uploadBusy;
-  el('file-action').className = `file-action${!holding || uploadBusy ? ' disabled' : ''}`;
+  // Usable while watching, rather than only while holding: the first thing
+  // somebody does with these is what asks for the lease. A pane another client
+  // is using is the one case where asking is not enough, and that is when the
+  // button appears.
+  const usable = Boolean(watching) && !heldElsewhere;
+  el('keyboard').hidden = !watching;
+  el('control').hidden = !watching || holding || !heldElsewhere;
+  el('send').disabled = !usable;
+  el('files').disabled = !usable || uploadBusy;
+  el('file-action').className = `file-action${!usable || uploadBusy ? ' disabled' : ''}`;
   for (const button of document.querySelectorAll('.keys button')) {
-    button.disabled = !holding;
+    button.disabled = !usable;
   }
   for (const button of quickReplyButtons) {
-    button.disabled = !holding;
+    button.disabled = !usable;
   }
   // A reply waiting for its second tap is a decision that belonged to the
   // moment it was armed in. Losing the lease ends that moment.
@@ -2339,13 +2372,27 @@ function apply(message) {
     case 'pane.lease':
       if (sameId(message.pane, watching)) {
         lease = message.access;
+        const waiting = pendingAction;
+        pendingAction = null;
+        if (lease === 'control') {
+          heldElsewhere = false;
+        } else if (waiting) {
+          // Asked only-if-free and told to observe, so somebody else is in
+          // this pane. Their keystrokes are not interrupted; the button that
+          // would interrupt them is now the only way, and it says so.
+          heldElsewhere = true;
+        }
         requestingControl = false;
         // A control lease that is refused or lost arrives as a downgrade to
         // observe rather than as an error, so this is also how the keyboard
         // goes away when somebody else takes the pane.
-        el('screen-note').textContent =
-          lease === 'control' ? 'holding control' : 'watching';
+        el('screen-note').textContent = lease === 'control'
+          ? 'holding control'
+          : heldElsewhere
+            ? 'another client is typing in this pane'
+            : 'watching';
         renderKeyboard();
+        if (lease === 'control' && waiting) waiting();
       }
       break;
     case 'pane.closed':
@@ -2474,17 +2521,20 @@ el('control').onclick = takeControl;
 el('files').onchange = event => { void uploadSelectedFiles(event.target.files || []); };
 el('line-form').onsubmit = event => {
   event.preventDefault();
-  if (lease !== 'control') return;
   const line = el('line').value;
-  // Enter is what a shell is waiting for, so a sent line carries it. An empty
-  // line is still a line — it is how somebody asks for a fresh prompt.
-  sendText(`${line}\r`);
+  // Taken before the lease arrives, because the field is cleared now and the
+  // person has moved on; what is sent is what they typed when they sent it.
+  withControl(() => {
+    // Enter is what a shell is waiting for, so a sent line carries it. An empty
+    // line is still a line — it is how somebody asks for a fresh prompt.
+    sendText(`${line}\r`);
+  });
   el('line').value = '';
   el('line').focus();
 };
 for (const button of document.querySelectorAll('.keys button')) {
   onTap(button, () => {
-    sendText(KEYS[button.dataset.key] || '');
+    withControl(() => sendText(KEYS[button.dataset.key] || ''));
     el('line').focus();
   });
 }

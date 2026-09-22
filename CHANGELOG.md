@@ -5,6 +5,19 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Taking control of a pane is no longer a step of its own. Typing a line,
+  tapping a quick reply or a terminal key asks for the lease and then does the
+  thing you asked for — the action is the intent, and being made to state it
+  twice was ceremony. The input-safety rule is unchanged: an observer still
+  sends no input, it just asks for the lease instead of being refused.
+- A pane another client is using is never taken by somebody starting to type.
+  The new `only_if_free` form of `pane.take_control` leaves the holder entirely
+  alone — no downgrade, no resize, no route reopened under their keystrokes —
+  and answers the asker with observation. Taking it from them stays a deliberate
+  button, which now says that is what it does.
+
 ## 0.7.32
 
 - Pairing no longer asks anybody to name their device. The browser reports what

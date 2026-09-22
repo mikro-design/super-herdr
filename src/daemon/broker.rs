@@ -655,8 +655,8 @@ impl Broker {
                     self.release_pane(client, &pane, &mut effects);
                 }
             }
-            ClientMessage::TakePaneControl { pane } => {
-                self.take_control(client, &pane, &mut effects);
+            ClientMessage::TakePaneControl { pane, only_if_free } => {
+                self.take_control(client, &pane, only_if_free, &mut effects);
             }
             ClientMessage::PaneInput { pane, bytes } => {
                 if self.holds_control(client, &pane, &mut effects) {
@@ -1400,7 +1400,13 @@ impl Broker {
         });
     }
 
-    fn take_control(&mut self, client: ClientId, pane: &PaneId, effects: &mut Vec<Effect>) {
+    fn take_control(
+        &mut self,
+        client: ClientId,
+        pane: &PaneId,
+        only_if_free: bool,
+        effects: &mut Vec<Effect>,
+    ) {
         let Some(session) = self.clients.get(&client) else {
             return;
         };
@@ -1418,6 +1424,21 @@ impl Broker {
             return;
         };
         if route.control == Some(client) {
+            return;
+        }
+        // Asked for only if free, and it is not: the holder keeps typing and the
+        // asker is told it is observing, which is what it would have been told
+        // had it never asked. Nothing about the pane changes, because an action
+        // somebody took on their own device must not move a keyboard away from
+        // somebody else's.
+        if only_if_free && route.control.is_some() {
+            effects.push(Effect::Send {
+                client,
+                message: ServerMessage::PaneLease {
+                    pane: pane.clone(),
+                    access: TerminalAccess::Observe,
+                },
+            });
             return;
         }
 
@@ -2102,6 +2123,7 @@ mod tests {
             second,
             ClientMessage::TakePaneControl {
                 pane: pane("w1:p1"),
+                only_if_free: false,
             },
         );
 
@@ -2154,6 +2176,7 @@ mod tests {
             second,
             ClientMessage::TakePaneControl {
                 pane: pane("w1:p1"),
+                only_if_free: false,
             },
         );
 
@@ -2205,6 +2228,7 @@ mod tests {
             phone,
             ClientMessage::TakePaneControl {
                 pane: pane("w1:p1"),
+                only_if_free: false,
             },
         );
         assert!(effects.contains(&Effect::RouteResize {
@@ -2212,6 +2236,70 @@ mod tests {
             cols: 40,
             rows: 20,
         }));
+    }
+
+    /// A pane somebody is using is not taken by somebody else starting to type.
+    ///
+    /// The lease moves when a person decides it should, and an action on a
+    /// phone — a tapped reply, a typed line — is not that decision. Asked
+    /// only-if-free, a held pane answers with observation and the holder is
+    /// left entirely alone: no downgrade, no resize, no route reopened under
+    /// their keystrokes.
+    #[test]
+    fn a_pane_someone_holds_is_not_taken_by_an_ordinary_action() {
+        let mut held = broker();
+        let holder = greet(&mut held);
+        let asker = greet(&mut held);
+        subscribe(&mut held, holder, "w1:p1", TerminalAccess::Control, 80, 24);
+        subscribe(&mut held, asker, "w1:p1", TerminalAccess::Observe, 80, 24);
+
+        let effects = held.handle(
+            asker,
+            ClientMessage::TakePaneControl {
+                pane: pane("w1:p1"),
+                only_if_free: true,
+            },
+        );
+
+        assert_eq!(
+            messages_for(&effects, asker),
+            vec![ServerMessage::PaneLease {
+                pane: pane("w1:p1"),
+                access: TerminalAccess::Observe,
+            }],
+            "the asker is told it is observing"
+        );
+        assert!(
+            messages_for(&effects, holder).is_empty(),
+            "and the holder is not told anything, because nothing happened to them"
+        );
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::CloseRoute { .. } | Effect::OpenRoute { .. } | Effect::RouteResize { .. }
+            )),
+            "the pane itself is untouched: {effects:?}"
+        );
+
+        // The same ask on a free pane is granted, which is what makes it worth
+        // asking from an ordinary action at all.
+        let mut free = broker();
+        let alone = greet(&mut free);
+        subscribe(&mut free, alone, "w1:p1", TerminalAccess::Observe, 80, 24);
+        let effects = free.handle(
+            alone,
+            ClientMessage::TakePaneControl {
+                pane: pane("w1:p1"),
+                only_if_free: true,
+            },
+        );
+        assert!(
+            messages_for(&effects, alone).contains(&ServerMessage::PaneLease {
+                pane: pane("w1:p1"),
+                access: TerminalAccess::Control,
+            }),
+            "a free pane is granted: {effects:?}"
+        );
     }
 
     #[test]
@@ -2223,6 +2311,7 @@ mod tests {
             client,
             ClientMessage::TakePaneControl {
                 pane: pane("w1:p1"),
+                only_if_free: false,
             },
         );
 
@@ -2457,6 +2546,7 @@ mod tests {
             observer,
             ClientMessage::TakePaneControl {
                 pane: pane("w1:p1"),
+                only_if_free: false,
             },
         );
         assert!(

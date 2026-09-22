@@ -716,7 +716,12 @@ The phone client gives the observed terminal the remaining dynamic viewport
 height and uses scrolling for panes wider than the screen. It never reduces
 terminal text below a readable minimum merely to fit all columns. Control input
 and explicit terminal keys stay in the bottom control area above the soft
-keyboard. Those controls act on `pointerup` rather than on `click`: suppressing
+keyboard. Acquiring control is the first input action rather than a button
+before it: typing a line, tapping a reply or a key asks for the lease
+only-if-free and carries the action out when it is granted, so a pane nobody is
+using costs no ceremony. A pane another client holds is the one case that still
+takes a decision — the daemon leaves the holder alone and answers with
+observation, and the page then offers an interrupt that says what it will do. Those controls act on `pointerup` rather than on `click`: suppressing
 the soft keyboard means preventing `pointerdown`'s default, and a browser that
 then withholds the click leaves a button that does nothing at all. A click
 carrying no click count — a keyboard, or assistive technology, which produce no
