@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.33
 
 - Taking control of a pane is no longer a step of its own. Typing a line,
   tapping a quick reply or a terminal key asks for the lease and then does the
