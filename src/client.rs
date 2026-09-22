@@ -321,8 +321,26 @@ impl ClientCommands {
         self.send(ClientMessage::UnsubscribePane { pane });
     }
 
+    /// Take a pane's control lease, downgrading whoever held it.
+    ///
+    /// The deliberate form: somebody decided the keyboard belongs here now.
     pub fn take_pane_control(&self, pane: PaneId) {
-        self.send(ClientMessage::TakePaneControl { pane });
+        self.send(ClientMessage::TakePaneControl {
+            pane,
+            only_if_free: false,
+        });
+    }
+
+    /// Ask for the lease and settle for observing if another client holds it.
+    ///
+    /// What an ordinary action uses — a typed line, a tapped reply — so that
+    /// acquiring control costs no ceremony when nobody is using the pane, and
+    /// never interrupts somebody who is.
+    pub fn request_pane_control(&self, pane: PaneId) {
+        self.send(ClientMessage::TakePaneControl {
+            pane,
+            only_if_free: true,
+        });
     }
 
     pub fn send_input(&self, pane: PaneId, bytes: Vec<u8>) {

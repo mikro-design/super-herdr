@@ -293,18 +293,31 @@ check('subscribes on observe', sent.some(one => one.body.type === 'pane.subscrib
     subscribe.rows >= 10 && subscribe.rows <= 60);
   check('the rows asked for follow the height on offer', subscribe.rows === 25);
 }
-check('no keyboard while observing', page.el('keyboard').hidden === true);
-check('control is offered', page.el('control').hidden === false);
+// The controls are there to be used: using one is what asks for the lease, so
+// there is no separate step whose only job is to say you meant it.
+check('the keyboard is there while observing', page.el('keyboard').hidden === false);
+check('no interrupt button until one is needed', page.el('control').hidden === true);
 
-// The daemon confirms an observer lease: still no keyboard.
 deliver({ type: 'pane.lease', pane, access: 'observe' });
-check('observer lease keeps the keyboard away', page.el('keyboard').hidden === true);
+check('an observer lease leaves the controls usable', page.el('keyboard').hidden === false);
 
-// Typing is refused while observing, rather than silently dropped on the floor
-// at the daemon.
+// The invariant that has to survive: an observer sends no input. What it sends
+// is a request for the lease, and the input waits for the answer.
 sent.length = 0;
 tap(keyButtons[0]);
-check('an observer sends no input', sent.length === 0);
+const asked = sent.filter(one => one.body.type === 'pane.take_control');
+check('an observer sends no input', sent.every(one => one.body.type !== 'pane.input'));
+check('an observer asks for the lease instead', asked.length === 1);
+check('and asks only if nobody else holds it', asked[0].body.only_if_free === true);
+
+// Told to observe with an action waiting: somebody else is in this pane. Their
+// keystrokes are not interrupted, and taking it becomes a decision with a
+// button of its own.
+sent.length = 0;
+deliver({ type: 'pane.lease', pane, access: 'observe' });
+check('a refused request still sends no input', sent.every(one => one.body.type !== 'pane.input'));
+check('a pane somebody else holds offers the interrupt', page.el('control').hidden === false);
+check('and says who is in the way', page.el('screen-note').textContent.includes('another client'));
 
 // The daemon said which replies it offers during the handshake.
 configureReplies([
@@ -314,22 +327,20 @@ configureReplies([
   { label: 'Wipe', send: 'reset --hard', submit: true, confirm: true },
 ]);
 
-// Ask for control.
+// The interrupt, which is the deliberate form and says so on the wire.
 page.takeControl();
 check('asks for control', sent.at(-1).body.type === 'pane.take_control');
+check('the interrupt does not ask only-if-free', !sent.at(-1).body.only_if_free);
 check('reveals the keyboard during the control tap', page.el('keyboard').hidden === false);
 check('focuses the line during the control tap', page.el('line').focused === true);
-check('does not enable Send before the lease arrives', page.el('send').disabled === true);
-check('does not enable terminal keys before the lease arrives', keyButtons.every(one => one.disabled));
-check(
-  'does not enable quick replies before the lease arrives',
-  replies().length > 0 && replies().every(one => one.disabled),
-);
+
+// A line typed before the lease arrives is not lost and not sent early: it is
+// held, and goes when the answer does.
 sent.length = 0;
 page.el('line').value = 'typed while waiting';
 page.el('line-form').onsubmit({ preventDefault() {} });
-check('sends nothing before control is granted', sent.length === 0);
-check('keeps a line typed while waiting', page.el('line').value === 'typed while waiting');
+check('sends no input before control is granted', sent.every(one => one.body.type !== 'pane.input'));
+check('clears the field it took the line from', page.el('line').value === '');
 
 // The daemon grants it.
 deliver({ type: 'pane.lease', pane, access: 'control' });
@@ -456,7 +467,9 @@ deliver({ type: 'pane.lease', pane, access: 'observe' });
 check('a lost lease disarms a waiting reply', replies()[3].textContent === 'Wipe');
 sent.length = 0;
 tap(replies()[0]);
-check('an observer sends no reply', sent.length === 0);
+check('an observer sends no reply', sent.every(one => one.body.type !== 'pane.input'));
+check('an observer asks for the lease a reply needs',
+  sent.some(one => one.body.type === 'pane.take_control' && one.body.only_if_free === true));
 deliver({ type: 'pane.lease', pane, access: 'control' });
 
 // The three sequences a browser can actually produce, on the control that
@@ -504,9 +517,16 @@ check('an empty strip is hidden', page.el('quick-replies').hidden === true);
 configureReplies([{ label: 'Yes', send: 'y', submit: true, confirm: false }]);
 deliver({ type: 'pane.lease', pane, access: 'control' });
 
-// Losing the lease takes the keyboard with it.
+// Losing the lease no longer takes the controls away. Input still cannot flow
+// without one — the next tap asks for it again, which is the whole point of
+// acquiring control from the action rather than from a button.
+sent.length = 0;
 deliver({ type: 'pane.lease', pane, access: 'observe' });
-check('a lost lease hides the keyboard', page.el('keyboard').hidden === true);
+check('a lost lease leaves the controls usable', page.el('keyboard').hidden === false);
+tap(keyButtons[0]);
+check('and a tap after losing it sends no input', sent.every(one => one.body.type !== 'pane.input'));
+check('but does ask for the lease back',
+  sent.some(one => one.body.type === 'pane.take_control'));
 
 // Non-ASCII survives the trip.
 deliver({ type: 'pane.lease', pane, access: 'control' });

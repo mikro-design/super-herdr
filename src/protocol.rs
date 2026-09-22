@@ -133,7 +133,21 @@ pub enum ClientMessage {
     /// stolen implicitly, and the previous holder is told it was downgraded
     /// rather than discovering it from silence.
     #[serde(rename = "pane.take_control")]
-    TakePaneControl { pane: PaneId },
+    /// Ask for a pane's control lease.
+    ///
+    /// Taking one downgrades whoever held it, which is the right answer when a
+    /// person decides to move the keyboard to the device in their hand and the
+    /// wrong one when they merely started typing. So a caller says which it is:
+    /// `only_if_free` asks for the lease and accepts observation if somebody
+    /// else has it, and is how a client can acquire control from an ordinary
+    /// action — tapping a reply, typing a line — without that action ever
+    /// interrupting another client mid-keystroke. Absent means the deliberate
+    /// takeover this has always been.
+    TakePaneControl {
+        pane: PaneId,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        only_if_free: bool,
+    },
     #[serde(rename = "pane.input")]
     PaneInput {
         pane: PaneId,
@@ -795,7 +809,14 @@ mod tests {
             sequence: 12,
         });
         round_trip_client(ClientMessage::UnsubscribePane { pane: pane() });
-        round_trip_client(ClientMessage::TakePaneControl { pane: pane() });
+        round_trip_client(ClientMessage::TakePaneControl {
+            pane: pane(),
+            only_if_free: false,
+        });
+        round_trip_client(ClientMessage::TakePaneControl {
+            pane: pane(),
+            only_if_free: true,
+        });
         round_trip_client(ClientMessage::PaneResize {
             pane: pane(),
             cols: 80,
