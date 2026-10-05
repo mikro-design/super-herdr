@@ -1765,6 +1765,7 @@ fn mouse_pane_position(
         .find_map(|(pane, area)| {
             let selected = app.selected_pane.as_ref() == Some(&pane);
             let inner = pane_block(
+                state,
                 &pane,
                 selected,
                 app.routes.get(&pane).map(|route| route.access),
@@ -1801,6 +1802,7 @@ fn clamped_pane_position(
         .into_iter()
         .find_map(|(candidate, area)| (candidate == *pane).then_some(area))?;
     let inner = pane_block(
+        state,
         pane,
         app.selected_pane.as_ref() == Some(pane),
         app.routes.get(pane).map(|route| route.access),
@@ -1850,6 +1852,7 @@ fn pane_inner_area(
         .into_iter()
         .find_map(|(candidate, area)| (candidate == *pane).then_some(area))?;
     let inner = pane_block(
+        state,
         pane,
         app.selected_pane.as_ref() == Some(pane),
         app.routes.get(pane).map(|route| route.access),
@@ -5324,7 +5327,7 @@ fn ensure_routes(
     let desired = visible_pane_areas(state, Some(&selected), terminal_area)
         .into_iter()
         .filter_map(|(pane, area)| {
-            let inner = pane_block(&pane, pane == selected, None).inner(area);
+            let inner = pane_block(state, &pane, pane == selected, None).inner(area);
             (inner.width > 0 && inner.height > 0).then_some((pane, inner))
         })
         .collect::<BTreeMap<_, _>>();
@@ -6910,7 +6913,18 @@ fn ui_areas(area: Rect) -> (Rect, Rect, Rect) {
     (sidebar, tabs, terminal)
 }
 
-fn pane_block(pane: &PaneId, selected: bool, access: Option<TerminalAccess>) -> Block<'static> {
+fn pane_block(
+    state: &FederationState,
+    pane: &PaneId,
+    selected: bool,
+    access: Option<TerminalAccess>,
+) -> Block<'static> {
+    let label = state
+        .targets
+        .get(&pane.target_session())
+        .and_then(|target| target.snapshot.as_deref())
+        .and_then(|snapshot| snapshot.panes.get(pane))
+        .and_then(|pane| pane.label.as_deref());
     let border_color = if selected {
         Color::Blue
     } else {
@@ -6920,7 +6934,7 @@ fn pane_block(pane: &PaneId, selected: bool, access: Option<TerminalAccess>) -> 
         .title(Span::styled(
             format!(
                 " {}{} ",
-                safe_text(&pane.resource),
+                display_label(&pane.resource, label),
                 match access {
                     Some(TerminalAccess::Control) => " [control]",
                     Some(TerminalAccess::Observe) => " [read-only]",
@@ -7643,6 +7657,7 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
     for (pane, pane_area) in panes {
         let selected = app.selected_pane.as_ref() == Some(&pane);
         let block = pane_block(
+            state,
             &pane,
             selected,
             app.routes.get(&pane).map(|route| route.access),
@@ -9894,7 +9909,7 @@ mod tests {
         let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
         let terminal_area = ui_areas(frame_area).2;
         let pane_area = visible_pane_areas(&state, Some(&pane), terminal_area)[0].1;
-        let inner = super::pane_block(&pane, true, None).inner(pane_area);
+        let inner = super::pane_block(&state, &pane, true, None).inner(pane_area);
         let mut app = App {
             selected_pane: Some(pane.clone()),
             last_frame_area: Some(frame_area),
@@ -10273,6 +10288,89 @@ mod tests {
     #[test]
     fn strips_control_characters_from_server_labels() {
         assert_eq!(safe_text("safe\u{1b}[31m\nname"), "safe [31m name");
+    }
+
+    #[test]
+    fn terminal_surface_uses_the_pane_label_from_the_exact_target_session() {
+        let pane = PaneId::new("host-a", "work", "w1C:p1");
+        let mut state = FederationState::default();
+        for (host, session, label) in [
+            ("host-a", "work", "stil_utils-llm"),
+            ("host-a", "other", "other-session"),
+            ("host-b", "work", "other-host"),
+        ] {
+            let key = TargetSession::new(host, session);
+            let snapshot = NormalizedSnapshot::from_value(
+                &key,
+                &json!({"panes": [{"pane_id": "w1C:p1", "label": label}]}),
+            );
+            state.targets.insert(
+                key.clone(),
+                runtime(key, TargetConnectionState::Live, Some(snapshot)),
+            );
+        }
+        let app = App {
+            selected_pane: Some(pane.clone()),
+            ..App::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(80, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render_terminal_surfaces(frame, &state, &app, frame.area()))
+            .unwrap();
+        let header = (0..80)
+            .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(header.contains("stil_utils-llm"));
+        assert!(!header.contains("w1C:p1"));
+        assert!(!header.contains("other-session"));
+        assert!(!header.contains("other-host"));
+        assert_eq!(app.selected_pane, Some(pane));
+    }
+
+    #[test]
+    fn pane_border_updates_labels_and_preserves_fallbacks_and_access_status() {
+        let pane = PaneId::new("host-a", "work", "w1C:p1");
+        let key = pane.target_session();
+        let mut state = FederationState::default();
+        let backend = ratatui::backend::TestBackend::new(80, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        for (label, access, expected) in [
+            (None, None, "w1C:p1"),
+            (Some(""), Some(TerminalAccess::Control), "w1C:p1 [control]"),
+            (
+                Some("stil_utils-llm"),
+                Some(TerminalAccess::Control),
+                "stil_utils-llm [control]",
+            ),
+            (
+                Some("renamed-pane"),
+                Some(TerminalAccess::Observe),
+                "renamed-pane [read-only]",
+            ),
+            (Some("safe\nname"), None, "safe name"),
+        ] {
+            let snapshot = NormalizedSnapshot::from_value(
+                &key,
+                &json!({"panes": [{"pane_id": "w1C:p1", "label": label}]}),
+            );
+            state.targets.insert(
+                key.clone(),
+                runtime(key.clone(), TargetConnectionState::Live, Some(snapshot)),
+            );
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        super::pane_block(&state, &pane, true, access),
+                        frame.area(),
+                    );
+                })
+                .unwrap();
+            let header = (0..80)
+                .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
+                .collect::<String>();
+            assert!(header.contains(expected));
+        }
     }
 
     #[test]
