@@ -3330,28 +3330,30 @@ fn open_context_menu(
 
 fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
     let candidate = candidate.to_lowercase().chars().collect::<Vec<_>>();
-    let query = query.trim().to_lowercase().chars().collect::<Vec<_>>();
-    if query.is_empty() {
-        return Some(0);
-    }
-    let mut cursor = 0;
+    let query = query.to_lowercase();
     let mut score = 0;
-    let mut previous = None;
-    for expected in query {
-        let position = candidate
-            .iter()
-            .enumerate()
-            .skip(cursor)
-            .find(|(_, character)| **character == expected)
-            .map(|(position, _)| position)?;
-        score += position.saturating_sub(cursor);
-        if previous.is_some_and(|previous| position != previous + 1) {
-            score += 2;
+    // Every term must match, but spaces separate terms rather than requiring
+    // a literal space in the label. Terms may also match in any order.
+    for term in query.split_whitespace() {
+        let mut cursor = 0;
+        let mut previous = None;
+        for expected in term.chars() {
+            let position = candidate
+                .iter()
+                .enumerate()
+                .skip(cursor)
+                .find(|(_, character)| **character == expected)
+                .map(|(position, _)| position)?;
+            score += position.saturating_sub(cursor);
+            if previous.is_some_and(|previous| position != previous + 1) {
+                score += 2;
+            }
+            previous = Some(position);
+            cursor = position + 1;
         }
-        previous = Some(position);
-        cursor = position + 1;
+        score += candidate.len().saturating_sub(cursor) / 8;
     }
-    Some(score + candidate.len().saturating_sub(cursor) / 8)
+    Some(score)
 }
 
 fn filtered_palette_actions(
@@ -8526,6 +8528,62 @@ mod tests {
     fn command_palette_search_is_case_insensitive_and_fuzzy() {
         assert!(fuzzy_score("Close workspace Simulator", "CWSim").is_some());
         assert!(fuzzy_score("Open agent navigator", "target remove").is_none());
+    }
+
+    #[test]
+    fn command_palette_search_matches_each_whitespace_separated_term() {
+        let candidate = "Jump to workspace pulsar-sdr host-a/work";
+        assert!(fuzzy_score(candidate, "pul sdr").is_some());
+        assert!(fuzzy_score(candidate, "SDR PUL").is_some());
+        assert!(fuzzy_score(candidate, "  pul\t sdr\n").is_some());
+        assert!(fuzzy_score(candidate, "pul host-a").is_some());
+        assert!(fuzzy_score(candidate, "pul missing").is_none());
+        assert_eq!(fuzzy_score(candidate, " \t\n"), Some(0));
+        assert!(
+            fuzzy_score("pulsar-sdr", "pul sdr").unwrap()
+                < fuzzy_score("p-u-l-s-a-r-s-d-r", "pul sdr").unwrap()
+        );
+    }
+
+    #[test]
+    fn command_palette_search_finds_a_workspace_with_a_multi_term_query() {
+        let target = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &target,
+            &json!({
+                "workspaces": [{
+                    "workspace_id": "w1",
+                    "active_tab_id": "w1:t1",
+                    "label": "pulsar-sdr"
+                }],
+                "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1"}],
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1"
+                }]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            target.clone(),
+            runtime(target, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let actions = filtered_palette_actions(
+            &state,
+            None,
+            "pul sdr",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        );
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            ResourceAction::JumpToPane { pane, label }
+                if pane == &PaneId::new("host-a", "work", "w1:p1")
+                    && label == "workspace pulsar-sdr"
+        ));
     }
 
     #[test]
