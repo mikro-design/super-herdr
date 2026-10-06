@@ -5,6 +5,18 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- Pane borders show the name Herdr reports, so a pane reads as
+  `stil_utils-llm · w1C:p1` rather than `w1C:p1`. Both, because they answer
+  different questions: the name is how you know which pane you are looking at,
+  the identifier is what you type to act on it. A border too narrow for the
+  pair keeps the name. (#63, thanks @rbarzic)
+- Fixed the command palette finding nothing for a query with a space in it.
+  `pul sdr` missed the `pulsar-sdr` workspace, because the space was matched as
+  a character rather than read as a separator. Terms now match independently and
+  in any order, and all of them must match. (#62, thanks @rbarzic)
+
 ## 0.7.33
 
 - Taking control of a pane is no longer a step of its own. Typing a line,

@@ -1769,6 +1769,7 @@ fn mouse_pane_position(
                 &pane,
                 selected,
                 app.routes.get(&pane).map(|route| route.access),
+                area.width,
             )
             .inner(area);
             inner.contains(outer).then(|| {
@@ -1806,6 +1807,7 @@ fn clamped_pane_position(
         pane,
         app.selected_pane.as_ref() == Some(pane),
         app.routes.get(pane).map(|route| route.access),
+        area.width,
     )
     .inner(area);
     if inner.width == 0 || inner.height == 0 {
@@ -1856,6 +1858,7 @@ fn pane_inner_area(
         pane,
         app.selected_pane.as_ref() == Some(pane),
         app.routes.get(pane).map(|route| route.access),
+        area.width,
     )
     .inner(area);
     (inner.width > 0 && inner.height > 0).then_some(inner)
@@ -5329,7 +5332,7 @@ fn ensure_routes(
     let desired = visible_pane_areas(state, Some(&selected), terminal_area)
         .into_iter()
         .filter_map(|(pane, area)| {
-            let inner = pane_block(state, &pane, pane == selected, None).inner(area);
+            let inner = pane_block(state, &pane, pane == selected, None, area.width).inner(area);
             (inner.width > 0 && inner.height > 0).then_some((pane, inner))
         })
         .collect::<BTreeMap<_, _>>();
@@ -6920,6 +6923,7 @@ fn pane_block(
     pane: &PaneId,
     selected: bool,
     access: Option<TerminalAccess>,
+    width: u16,
 ) -> Block<'static> {
     let label = state
         .targets
@@ -6934,20 +6938,46 @@ fn pane_block(
     };
     Block::default()
         .title(Span::styled(
-            format!(
-                " {}{} ",
-                display_label(&pane.resource, label),
+            pane_title(
+                &pane.resource,
+                label,
                 match access {
                     Some(TerminalAccess::Control) => " [control]",
                     Some(TerminalAccess::Observe) => " [read-only]",
                     None => "",
-                }
+                },
+                width,
             ),
             Style::default().fg(Color::Gray),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .padding(Padding::horizontal(1))
+}
+
+/// What a pane's border says it is.
+///
+/// Both the name Herdr reports and the identifier this program addresses it
+/// by, because they answer different questions: the name is how somebody knows
+/// which pane they are looking at, and the identifier is what they type when
+/// they want to act on it from a shell. Showing only one means looking the
+/// other up somewhere else.
+///
+/// The name wins when there is not room for both. A border too narrow to hold
+/// the pair drops the identifier rather than letting the terminal truncate
+/// whichever happened to be last — and a pane with no name has only ever had
+/// the identifier to show.
+fn pane_title(id: &str, label: Option<&str>, access: &str, width: u16) -> String {
+    let id = safe_text(id);
+    let Some(name) = label.filter(|label| !label.is_empty()).map(safe_text) else {
+        return format!(" {id}{access} ");
+    };
+    let both = format!(" {name} · {id}{access} ");
+    // Two columns for the corners, which the title never gets to use.
+    if both.chars().count() <= usize::from(width.saturating_sub(2)) {
+        return both;
+    }
+    format!(" {name}{access} ")
 }
 
 fn visible_pane_areas(
@@ -7663,6 +7693,7 @@ fn render_terminal_surfaces(frame: &mut Frame, state: &FederationState, app: &Ap
             &pane,
             selected,
             app.routes.get(&pane).map(|route| route.access),
+            pane_area.width,
         );
         let inner = block.inner(pane_area);
         frame.render_widget(block, pane_area);
@@ -9967,7 +9998,7 @@ mod tests {
         let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
         let terminal_area = ui_areas(frame_area).2;
         let pane_area = visible_pane_areas(&state, Some(&pane), terminal_area)[0].1;
-        let inner = super::pane_block(&state, &pane, true, None).inner(pane_area);
+        let inner = super::pane_block(&state, &pane, true, None, pane_area.width).inner(pane_area);
         let mut app = App {
             selected_pane: Some(pane.clone()),
             last_frame_area: Some(frame_area),
@@ -10379,10 +10410,14 @@ mod tests {
         let header = (0..80)
             .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
             .collect::<String>();
-        assert!(header.contains("stil_utils-llm"));
-        assert!(!header.contains("w1C:p1"));
-        assert!(!header.contains("other-session"));
-        assert!(!header.contains("other-host"));
+        assert!(header.contains("stil_utils-llm"), "{header}");
+        // Both, because a name says which pane this is and an identifier is
+        // what somebody types to act on it from a shell.
+        assert!(header.contains("w1C:p1"), "{header}");
+        // The point of the three colliding identifiers above: a label belongs
+        // to one target and session, and no other host's name may appear.
+        assert!(!header.contains("other-session"), "{header}");
+        assert!(!header.contains("other-host"), "{header}");
         assert_eq!(app.selected_pane, Some(pane));
     }
 
@@ -10399,14 +10434,14 @@ mod tests {
             (
                 Some("stil_utils-llm"),
                 Some(TerminalAccess::Control),
-                "stil_utils-llm [control]",
+                "stil_utils-llm · w1C:p1 [control]",
             ),
             (
                 Some("renamed-pane"),
                 Some(TerminalAccess::Observe),
-                "renamed-pane [read-only]",
+                "renamed-pane · w1C:p1 [read-only]",
             ),
-            (Some("safe\nname"), None, "safe name"),
+            (Some("safe\nname"), None, "safe name · w1C:p1"),
         ] {
             let snapshot = NormalizedSnapshot::from_value(
                 &key,
@@ -10419,7 +10454,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     frame.render_widget(
-                        super::pane_block(&state, &pane, true, access),
+                        super::pane_block(&state, &pane, true, access, 80),
                         frame.area(),
                     );
                 })
@@ -10429,6 +10464,46 @@ mod tests {
                 .collect::<String>();
             assert!(header.contains(expected));
         }
+    }
+
+    /// A border too narrow for both keeps the name.
+    ///
+    /// Truncation would otherwise decide for us, and it decides badly: the
+    /// identifier sits last, so a tight pane would show a name followed by half
+    /// an identifier. Dropping it whole is legible, and the pane is still
+    /// addressable from anywhere that lists panes.
+    #[test]
+    fn a_narrow_border_keeps_the_name_and_drops_the_identifier() {
+        // Wide enough for both, and then not.
+        assert_eq!(
+            super::pane_title("w1C:p1", Some("stil_utils-llm"), " [control]", 80),
+            " stil_utils-llm · w1C:p1 [control] "
+        );
+        assert_eq!(
+            super::pane_title("w1C:p1", Some("stil_utils-llm"), "", 20),
+            " stil_utils-llm "
+        );
+        // Exactly the width of the pair, including the two border corners the
+        // title never gets to use.
+        let both = " stil_utils-llm · w1C:p1 ";
+        let width = u16::try_from(both.chars().count() + 2).unwrap();
+        assert_eq!(
+            super::pane_title("w1C:p1", Some("stil_utils-llm"), "", width),
+            both
+        );
+        assert_eq!(
+            super::pane_title("w1C:p1", Some("stil_utils-llm"), "", width - 1),
+            " stil_utils-llm "
+        );
+        // No name to show, so nothing changes for an unnamed pane.
+        assert_eq!(super::pane_title("w1C:p1", None, "", 80), " w1C:p1 ");
+        assert_eq!(super::pane_title("w1C:p1", Some(""), "", 80), " w1C:p1 ");
+        // A name carrying control characters is still sanitised, and still
+        // measured after sanitising rather than before.
+        assert_eq!(
+            super::pane_title("w1C:p1", Some("safe\nname"), "", 80),
+            " safe name · w1C:p1 "
+        );
     }
 
     #[test]
