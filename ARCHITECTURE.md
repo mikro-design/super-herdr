@@ -780,12 +780,16 @@ neither person. The bridge also bounds pairing submissions per Cloudflare
 source, but this is flood control rather than the authority check: even a valid
 short code grants only a comparison prompt.
 
-A device name must remain unique because it is the human-facing revocation
-identity. The daemon checks a submitted name only after verifying the live
-code, so the public endpoint cannot enumerate paired names. A collision returns
-`409 Conflict` before the code is consumed or an approval is requested; the
-bridge preserves that rendezvous and the browser can rename and retry the same
-code.
+A device's identity is an id the daemon mints when it pairs, and the name
+beside it is a label. That ordering was the other way round once: the name was
+the revocation identity, so it had to be unique, so a label the browser guessed
+could collide with one already paired — and the collision surfaced as a
+`409 Conflict` in front of somebody holding a phone and a live code, asking them
+to think of a different word. Nothing human is load-bearing now. Two phones may
+share a label; `device list` shows the id, and `device remove` takes an id, or a
+label when exactly one device wears it and refuses when several do. Devices
+paired before ids existed have none and are revoked by the label that was all
+they ever had.
 
 The fixed bridge URL is reserved. An old configuration may spell it explicitly
 as `web.url`; resolution still treats that exact address as the hosted outbound

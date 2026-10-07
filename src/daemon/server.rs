@@ -1227,7 +1227,7 @@ impl web::Devices for DevicePolicy {
         if confirmation.len() != 6 || !confirmation.bytes().all(|byte| byte.is_ascii_digit()) {
             anyhow::bail!("the browser did not provide a valid confirmation number");
         }
-        let name = unique_device_name(name, &self.current());
+        let name = device_name(name);
         let attempt = pairing::token()?;
         let (decision, waiting) = oneshot::channel();
         let now = SystemTime::now();
@@ -1283,26 +1283,6 @@ impl web::Devices for DevicePolicy {
 /// A device name comes from a person typing into a browser, so it is bounded
 /// and stripped of anything that would make the configuration file or a listing
 /// hard to read.
-/// A name for a device that is not already taken.
-///
-/// Naming used to be somebody's job: the browser asked for one, and a second
-/// phone offering the same one was refused and told to think of another while
-/// its code sat waiting. That is a naming conflict invented by this program and
-/// pushed onto a person holding a phone, for the sake of a label only ever read
-/// when revoking something. So the daemon settles it — the offered name if it
-/// is free, and the same name with a number if it is not.
-fn unique_device_name(offered: &str, existing: &[Device]) -> String {
-    let base = device_name(offered);
-    if !existing.iter().any(|device| device.name == base) {
-        return base;
-    }
-    // Two is where a person counts from when the first one had no number.
-    (2..)
-        .map(|suffix| format!("{base} {suffix}"))
-        .find(|candidate| !existing.iter().any(|device| &device.name == candidate))
-        .unwrap_or(base)
-}
-
 fn device_name(offered: &str) -> String {
     let cleaned = offered
         .chars()
@@ -2236,6 +2216,7 @@ impl Daemon {
             Config::add_device_file(
                 Some(path),
                 Device {
+                    id: pairing::device_id()?,
                     name: pending.name.clone(),
                     token_sha256: pairing::fingerprint(&token),
                     paired_at_ms: pairing::now_ms(SystemTime::now()),
@@ -4384,36 +4365,44 @@ mod tests {
         }
     }
 
-    /// A second device does not have to be given a different name by hand.
+    /// Two devices may share a label, because a label is not identity.
     ///
-    /// It used to: the browser asked a person for a name, a name already taken
-    /// was refused, and the refusal arrived while they were holding a phone with
-    /// a live code. The label exists to tell devices apart when revoking one,
-    /// which is the daemon's problem to solve, not theirs.
+    /// The daemon mints the identity, so nothing a browser guessed can collide
+    /// with something already paired — which is what used to arrive as a
+    /// refusal in front of somebody holding a phone.
     #[test]
-    fn a_second_device_is_named_rather_than_refused() {
-        let paired = |name: &str| Device {
-            name: name.to_owned(),
-            token_sha256: crate::pairing::fingerprint(name),
+    fn two_devices_may_share_a_label_and_are_told_apart_by_id() {
+        let first = Device {
+            id: "a1b2c3d4".to_owned(),
+            name: "phone".to_owned(),
+            token_sha256: crate::pairing::fingerprint("first"),
             paired_at_ms: 1,
         };
+        let second = Device {
+            id: "e5f6a7b8".to_owned(),
+            name: "phone".to_owned(),
+            token_sha256: crate::pairing::fingerprint("second"),
+            paired_at_ms: 2,
+        };
 
-        assert_eq!(super::unique_device_name("phone", &[]), "phone");
-        assert_eq!(
-            super::unique_device_name("phone", &[paired("phone")]),
-            "phone 2"
-        );
-        assert_eq!(
-            super::unique_device_name("phone", &[paired("phone"), paired("phone 2")]),
-            "phone 3"
-        );
-        // An empty name is the common case now that nobody types one, and two
-        // of them must not collide either.
-        assert_eq!(super::unique_device_name("", &[]), "paired device");
-        assert_eq!(
-            super::unique_device_name("", &[paired("paired device")]),
-            "paired device 2"
-        );
+        assert_eq!(first.name, second.name, "a label says what a thing is");
+        assert_ne!(first.id, second.id, "an id says which one it is");
+        assert_eq!(first.handle(), "a1b2c3d4", "an id is what somebody types");
+
+        // A device paired before ids existed has none, and is still revocable
+        // by the label that was all it ever had.
+        let legacy = Device {
+            id: String::new(),
+            name: "old-tablet".to_owned(),
+            token_sha256: crate::pairing::fingerprint("legacy"),
+            paired_at_ms: 3,
+        };
+        assert_eq!(legacy.handle(), "old-tablet");
+
+        // Labels are still bounded and sanitised, because they are still shown.
+        assert_eq!(super::device_name(""), "paired device");
+        assert_eq!(super::device_name("  phone  "), "phone");
+        assert_eq!(super::device_name("phone\u{1b}[31m"), "phone31m");
     }
 
     #[tokio::test]

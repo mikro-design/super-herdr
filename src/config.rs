@@ -451,11 +451,35 @@ fn address_toward(remote: &str) -> Option<std::net::IpAddr> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
-    /// What a person calls it when deciding whether to revoke it.
+    /// What this device is, as far as anything here is concerned.
+    ///
+    /// Minted by the daemon when the device pairs. Identity used to be the
+    /// name, which meant a label a browser guessed could collide with one
+    /// already paired — and the collision landed on whoever was holding the
+    /// phone, mid-pairing, as a demand to think of a different word. Nothing
+    /// human is load-bearing now.
+    ///
+    /// Empty for devices paired before this existed. Those are still revocable
+    /// by their label, which is what somebody would have used anyway.
+    #[serde(default)]
+    pub id: String,
+    /// What kind of device this is, for recognising it in a list. A label: two
+    /// phones may share one, and nothing compares them.
     pub name: String,
     /// SHA-256 of the device's token, as lowercase hex.
     pub token_sha256: String,
     pub paired_at_ms: u64,
+}
+
+impl Device {
+    /// How to refer to this device where somebody has to type it.
+    pub fn handle(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -692,12 +716,16 @@ impl Config {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let config =
             Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-        if config
-            .devices
-            .iter()
-            .any(|existing| existing.name == device.name)
+        // Identity is the id, so two phones sharing a label is ordinary and
+        // only a repeated id is a fault — which would mean the minting went
+        // wrong rather than that somebody chose badly.
+        if !device.id.is_empty()
+            && config
+                .devices
+                .iter()
+                .any(|existing| existing.id == device.id)
         {
-            anyhow::bail!("a device named {:?} is already paired", device.name);
+            anyhow::bail!("a device with id {:?} is already paired", device.id);
         }
         if !text.ends_with('\n') {
             text.push('\n');
@@ -713,18 +741,49 @@ impl Config {
 
     /// Revoke a device. What it holds stops working immediately, because the
     /// daemon has nothing left to compare it against.
-    pub fn remove_device_file(explicit_path: Option<&Path>, name: &str) -> Result<PathBuf> {
+    /// Revoke the device a person named, by id or by label.
+    ///
+    /// An id names exactly one device. A label may name several, and then this
+    /// refuses rather than guessing which one somebody meant to cut off.
+    pub fn remove_device_file(explicit_path: Option<&Path>, needle: &str) -> Result<PathBuf> {
         let path = resolve_path(explicit_path)?;
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut config =
             Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-        let before = config.devices.len();
-        config.devices.retain(|device| device.name != name);
-        if config.devices.len() == before {
-            anyhow::bail!("no device named {name:?} is paired");
+        let by_id = config
+            .devices
+            .iter()
+            .filter(|device| !device.id.is_empty() && device.id == needle)
+            .count();
+        let by_name = config
+            .devices
+            .iter()
+            .filter(|device| device.name == needle)
+            .count();
+        let (field, matches) = if by_id > 0 {
+            ("id", by_id)
+        } else {
+            ("name", by_name)
+        };
+        if matches == 0 {
+            anyhow::bail!("no device called {needle:?} is paired");
         }
-        let updated = remove_device_block(&text, name);
+        if matches > 1 {
+            anyhow::bail!(
+                "{matches} devices are labelled {needle:?}; revoke one by its id, which \
+                 `device list` shows"
+            );
+        }
+        let before = config.devices.len();
+        config.devices.retain(|device| match field {
+            "id" => device.id != needle,
+            _ => device.name != needle,
+        });
+        if config.devices.len() == before {
+            anyhow::bail!("no device called {needle:?} is paired");
+        }
+        let updated = remove_device_block(&text, field, needle);
         let parsed = Self::parse(&updated).context("generated configuration is invalid")?;
         anyhow::ensure!(
             parsed.devices.len() == config.devices.len(),
@@ -1091,7 +1150,7 @@ struct DeviceAppend<'a> {
 /// Rewriting the file from the parsed model would silently discard comments a
 /// person put there, so the text is edited instead and the result is parsed
 /// back to prove only the intended entry left.
-fn remove_device_block(text: &str, name: &str) -> String {
+fn remove_device_block(text: &str, field: &str, value: &str) -> String {
     let mut kept = String::with_capacity(text.len());
     let mut in_target_block = false;
     let mut dropping = false;
@@ -1102,11 +1161,11 @@ fn remove_device_block(text: &str, name: &str) -> String {
             dropping = false;
         }
         if in_target_block
-            && trimmed.starts_with("name")
-            && let Some((_, value)) = trimmed.split_once('=')
+            && trimmed.starts_with(field)
+            && let Some((_, found)) = trimmed.split_once('=')
         {
             {
-                dropping = value.trim().trim_matches('"') == name;
+                dropping = found.trim().trim_matches('"') == value;
                 if dropping {
                     // Remove the header line that was already written.
                     while kept.ends_with('\n') {
@@ -2118,6 +2177,7 @@ ssh = "build-host"
         Config::add_device_file(
             Some(&path),
             Device {
+                id: "77633814".to_owned(),
                 name: "phone".to_owned(),
                 token_sha256: "aa".repeat(32),
                 paired_at_ms: 1,
@@ -2127,6 +2187,7 @@ ssh = "build-host"
         Config::add_device_file(
             Some(&path),
             Device {
+                id: "37954179".to_owned(),
                 name: "tablet".to_owned(),
                 token_sha256: "bb".repeat(32),
                 paired_at_ms: 2,
@@ -2147,15 +2208,39 @@ ssh = "build-host"
             vec!["phone", "tablet"]
         );
 
-        // Pairing twice under one name is refused rather than silently
-        // shadowing the first, which would leave a credential nobody can see.
+        // A second phone is a second phone. The label repeats, the id does
+        // not, and nothing about that is a conflict for anybody to resolve.
+        Config::add_device_file(
+            Some(&path),
+            Device {
+                id: "c3d4e5f6".to_owned(),
+                name: "phone".to_owned(),
+                token_sha256: "cc".repeat(32),
+                paired_at_ms: 3,
+            },
+        )
+        .unwrap();
+        let config = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config
+                .devices
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phone", "tablet", "phone"]
+        );
+
+        // Repeating an id is refused, because that is minting gone wrong
+        // rather than somebody choosing badly, and it would leave a credential
+        // nobody can see.
         assert!(
             Config::add_device_file(
                 Some(&path),
                 Device {
-                    name: "phone".to_owned(),
-                    token_sha256: "cc".repeat(32),
-                    paired_at_ms: 3,
+                    id: "c3d4e5f6".to_owned(),
+                    name: "another".to_owned(),
+                    token_sha256: "dd".repeat(32),
+                    paired_at_ms: 4,
                 }
             )
             .is_err()
@@ -2171,10 +2256,15 @@ ssh = "build-host"
             "[[targets]]\nname = \"development\"\nssh = \"dev-host\"\n",
         )
         .unwrap();
-        for (name, digest) in [("phone", "aa"), ("tablet", "bb"), ("laptop", "cc")] {
+        for (id, name, digest) in [
+            ("1111aaaa", "phone", "aa"),
+            ("2222bbbb", "tablet", "bb"),
+            ("3333cccc", "laptop", "cc"),
+        ] {
             Config::add_device_file(
                 Some(&path),
                 Device {
+                    id: id.to_owned(),
                     name: name.to_owned(),
                     token_sha256: digest.repeat(32),
                     paired_at_ms: 1,
@@ -2183,6 +2273,8 @@ ssh = "build-host"
             .unwrap();
         }
 
+        // By label, which is what somebody reads off a list when it is the
+        // only thing wearing that label.
         Config::remove_device_file(Some(&path), "tablet").unwrap();
 
         let config = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -2197,6 +2289,59 @@ ssh = "build-host"
         assert_eq!(config.targets.len(), 1, "targets are untouched");
         // Revoking what is not paired says so rather than reporting success.
         assert!(Config::remove_device_file(Some(&path), "tablet").is_err());
+
+        // By id, which is the only way to say which of two phones to cut off.
+        Config::add_device_file(
+            Some(&path),
+            Device {
+                id: "4444dddd".to_owned(),
+                name: "phone".to_owned(),
+                token_sha256: "dd".repeat(32),
+                paired_at_ms: 2,
+            },
+        )
+        .unwrap();
+        let ambiguous = Config::remove_device_file(Some(&path), "phone")
+            .expect_err("two devices labelled phone cannot be told apart by that label");
+        assert!(
+            ambiguous.to_string().contains("by its id"),
+            "the refusal says how to be specific: {ambiguous}"
+        );
+        Config::remove_device_file(Some(&path), "4444dddd").unwrap();
+        let config = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config
+                .devices
+                .iter()
+                .map(|device| (device.id.as_str(), device.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("1111aaaa", "phone"), ("3333cccc", "laptop")],
+            "the other phone is untouched"
+        );
+
+        // A device paired before ids existed has none, and its label is still
+        // how somebody revokes it.
+        fs::write(
+            &path,
+            format!(
+                "{}\n[[devices]]\nname = \"old-tablet\"\ntoken_sha256 = \"{}\"\nparied_at_ms = 0\n",
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("paried_at_ms", "paired_at_ms"),
+                "ee".repeat(32)
+            )
+            .replace("paried_at_ms", "paired_at_ms"),
+        )
+        .unwrap();
+        Config::remove_device_file(Some(&path), "old-tablet").unwrap();
+        let config = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            config
+                .devices
+                .iter()
+                .all(|device| device.name != "old-tablet"),
+            "a device with no id is revocable by the label it has"
+        );
     }
 
     #[test]
