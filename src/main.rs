@@ -172,8 +172,8 @@ enum DeviceCommands {
     List,
     /// Revoke a device. What it holds stops working at once.
     Remove {
-        /// Name shown by `device list`.
-        name: String,
+        /// Id shown by `device list`, or its label when only one wears it.
+        device: String,
     },
 }
 
@@ -729,10 +729,13 @@ fn run_device_command(
                 config.devices.len()
             ))?;
             for device in &config.devices {
-                // The digest is shown truncated: enough to tell two entries
-                // apart, and useless to anyone who reads it over a shoulder.
+                // The id first, because it is what `device remove` takes and
+                // the only thing that tells two phones apart. The digest is
+                // shown truncated: enough to tell two entries apart, and
+                // useless to anyone who reads it over a shoulder.
                 stdout_line(format_args!(
-                    "  {}: paired {} (…{})",
+                    "  {}: {} paired {} (…{})",
+                    device.handle(),
                     device.name,
                     device.paired_at_ms,
                     &device.token_sha256[device.token_sha256.len().saturating_sub(8)..]
@@ -745,10 +748,10 @@ fn run_device_command(
             }
             Ok(ExitCode::SUCCESS)
         }
-        DeviceCommands::Remove { name } => {
-            let path = Config::remove_device_file(config_path, &name)?;
+        DeviceCommands::Remove { device } => {
+            let path = Config::remove_device_file(config_path, &device)?;
             stdout_line(format_args!(
-                "revoked device {name:?} in {}",
+                "revoked device {device:?} in {}",
                 path.display()
             ))?;
             stdout_line(format_args!(

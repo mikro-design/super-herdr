@@ -25,6 +25,9 @@ use sha2::{Digest, Sha256};
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_CHARACTERS: usize = super_herdr_bridge::PAIRING_CODE_CHARACTERS;
 const TOKEN_BYTES: usize = 32;
+/// Four bytes: eight characters to type, and a collision needs billions of
+/// pairings on one daemon before anybody notices.
+const DEVICE_ID_BYTES: usize = 4;
 
 /// How long a pairing code stays usable. Long enough to walk to another device,
 /// short enough that one left on a screen is not a standing invitation.
@@ -46,6 +49,16 @@ fn secret_bytes(count: usize) -> Result<Vec<u8>> {
 /// A device's secret. Held by the device; the daemon keeps only its digest.
 pub fn token() -> Result<String> {
     Ok(hex(&secret_bytes(TOKEN_BYTES)?))
+}
+
+/// An identifier for a paired device, minted here rather than asked for.
+///
+/// Short enough to type when revoking something and long enough that the
+/// daemon never has to ask anybody to choose a different one. Not derived from
+/// the device's token: an identifier is shown in lists and read over
+/// shoulders, and nothing shown that widely should be a function of a secret.
+pub fn device_id() -> Result<String> {
+    Ok(hex(&secret_bytes(DEVICE_ID_BYTES)?))
 }
 
 /// A short code a person can read aloud or type.

@@ -17,6 +17,16 @@ inferred from commit titles alone.
   a character rather than read as a separator. Terms now match independently and
   in any order, and all of them must match. (#62, thanks @rbarzic)
 
+## Unreleased
+
+- A paired device's identity is now an id the daemon mints, not the name a
+  browser guessed. Two phones may share a label, so pairing can never fail
+  because of one — which is what happened when an interrupted pairing left a
+  device called `phone` behind and every retry was refused for the name it
+  held. `device list` shows the id, `device remove` takes it, and a label still
+  works when exactly one device wears it. Devices paired before this have no id
+  and are revoked by their label, as before.
+
 ## 0.7.33
 
 - Taking control of a pane is no longer a step of its own. Typing a line,
