@@ -1425,6 +1425,58 @@ fn jump_from_notification(state: &FederationState, app: &mut App, pane: PaneId) 
     ));
 }
 
+/// Whether a modal overlay owns the keyboard right now. `app.mode` alone
+/// cannot answer this: every overlay below gates on itself before `app.mode`
+/// is ever consulted, so a check against `InputMode::Terminal` alone would
+/// wrongly treat an overlay's keystrokes as pane input.
+fn has_modal_overlay(app: &App) -> bool {
+    app.context_menu.is_some()
+        || app.close_confirmation.is_some()
+        || app.text_prompt.is_some()
+        || app.command_palette.is_some()
+        || app.target_manager.is_some()
+        || app.pairing_approval.is_some()
+        || app.pairing.is_some()
+        || app.agent_navigator.is_some()
+        || app.attention_center.is_some()
+}
+
+/// Send bytes straight to the selected pane's control route, atomically: one
+/// protocol message regardless of how many bytes, so an escape sequence never
+/// arrives at the target split across messages.
+fn forward_pane_bytes(bytes: Vec<u8>, state: &FederationState, app: &mut App) {
+    app.selection = None;
+    app.selection_autoscroll = None;
+    let Some(selected) = app.selected_pane.clone() else {
+        app.message = Some("no terminal pane is selected".to_owned());
+        return;
+    };
+    let Some(route) = app.routes.get(&selected) else {
+        app.message = Some("selected pane has no control route".to_owned());
+        return;
+    };
+    let Some(target) = state.targets.get(&route.pane.target_session()) else {
+        app.routes.remove(&selected);
+        return;
+    };
+    if !target.accepts_generation(route.generation) {
+        app.routes.remove(&selected);
+        app.message = Some("control route became stale".to_owned());
+        return;
+    }
+    let controlling = app
+        .routes
+        .get(&selected)
+        .is_some_and(|route| route.access == TerminalAccess::Control);
+    let Some(client) = app.client.clone().filter(|_| controlling) else {
+        app.message = Some(
+            "read-only: another Herdr client owns control; retrying automatically".to_owned(),
+        );
+        return;
+    };
+    client.send_input(selected, bytes);
+}
+
 async fn handle_decoded_input(
     input: DecodedInput,
     state: &FederationState,
@@ -1445,6 +1497,19 @@ async fn handle_decoded_input(
                 if let Some(key) = navigation {
                     return handle_input(key, state, transport_config, app).await;
                 }
+            }
+            // A multi-byte sequence here is a single reassembled escape
+            // sequence (arrow, Home/End, a function key, an Alt-combination),
+            // never a typed byte. Sending it to the pane one byte per message
+            // adds inter-message latency between the leading Escape and the
+            // rest on a remote target, which is enough for the target's own
+            // shell or readline to treat the Escape as standalone and type the
+            // remaining bytes literally. Keep it one message, but only in
+            // plain terminal passthrough — every modal overlay still consumes
+            // its bytes one at a time.
+            if bytes.len() > 1 && app.mode == InputMode::Terminal && !has_modal_overlay(app) {
+                forward_pane_bytes(bytes, state, app);
+                return Ok(false);
             }
             for byte in bytes {
                 if handle_input(byte, state, transport_config, app).await? {
@@ -2396,39 +2461,7 @@ async fn handle_input(
             app.selection_autoscroll = None;
             app.mode = InputMode::HerdrPrefix;
         }
-        InputMode::Terminal => {
-            app.selection = None;
-            app.selection_autoscroll = None;
-            let Some(selected) = app.selected_pane.clone() else {
-                app.message = Some("no terminal pane is selected".to_owned());
-                return Ok(false);
-            };
-            let Some(route) = app.routes.get(&selected) else {
-                app.message = Some("selected pane has no control route".to_owned());
-                return Ok(false);
-            };
-            let Some(target) = state.targets.get(&route.pane.target_session()) else {
-                app.routes.remove(&selected);
-                return Ok(false);
-            };
-            if !target.accepts_generation(route.generation) {
-                app.routes.remove(&selected);
-                app.message = Some("control route became stale".to_owned());
-                return Ok(false);
-            }
-            let controlling = app
-                .routes
-                .get(&selected)
-                .is_some_and(|route| route.access == TerminalAccess::Control);
-            let Some(client) = app.client.clone().filter(|_| controlling) else {
-                app.message = Some(
-                    "read-only: another Herdr client owns control; retrying automatically"
-                        .to_owned(),
-                );
-                return Ok(false);
-            };
-            client.send_input(selected.clone(), vec![key]);
-        }
+        InputMode::Terminal => forward_pane_bytes(vec![key], state, app),
         InputMode::Prefix => {
             match key {
                 b'q' => return Ok(true),
@@ -8367,7 +8400,8 @@ mod tests {
 
     use super::{
         AgentFilter, AgentNavigator, App, AttentionCenter, AttentionIndex, CellPosition,
-        ClipboardFeedback, ContextTarget, DecodedInput, HERDR_PREFIX_KEY, InputDecoder, InputMode,
+        ClipboardFeedback, ContextMenu, ContextTarget, DecodedInput, HERDR_PREFIX_KEY,
+        InputDecoder, InputMode,
         MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS, MOUSE_CAPTURE_ENABLE, MouseInput,
         PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH, SelectionAutoscroll,
         SelectionAutoscrollDirection, SelectionFinish, TUI_SNOOZE_MINUTES, TargetForm,
@@ -9238,6 +9272,67 @@ mod tests {
 
         assert_eq!(app.command_palette.as_ref().unwrap().selected, 1);
         assert!(app.message.is_none());
+    }
+
+    // A context menu consumes an unmapped escape sequence (anything but the
+    // Up/Down it recognises) one byte at a time, and its leading Escape byte
+    // closes the menu on its own. That is only true if this sequence still
+    // takes the per-byte path: were it wrongly fast-forwarded whole to the
+    // selected pane instead, the menu — untouched by that path — would stay
+    // open. This is the regression guard for routing a reassembled escape
+    // sequence atomically to the pane only in plain terminal passthrough.
+    #[tokio::test]
+    async fn an_unmapped_escape_sequence_still_closes_an_open_context_menu() {
+        let state = FederationState::default();
+        let transport = crate::config::TransportConfig::default();
+        let mut app = App {
+            context_menu: Some(ContextMenu {
+                title: "pane".to_owned(),
+                actions: Vec::new(),
+                target: ContextTarget::Pane(PaneId::new("host-a", "work", "w1:p1")),
+                selected: 0,
+                anchor: ratatui::layout::Position::new(0, 0),
+                pressed: None,
+            }),
+            ..App::default()
+        };
+
+        handle_decoded_input(
+            DecodedInput::Bytes(b"\x1b[H".to_vec()),
+            &state,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+
+        assert!(app.context_menu.is_none());
+    }
+
+    // The companion case: plain terminal passthrough with no overlay open and
+    // no selected pane takes the new atomic path for a reassembled escape
+    // sequence and reports exactly the same refusal a single keystroke would,
+    // rather than panicking or reporting it once per byte.
+    #[tokio::test]
+    async fn an_escape_sequence_in_plain_passthrough_is_refused_as_one_action() {
+        let state = FederationState::default();
+        let transport = crate::config::TransportConfig::default();
+        let mut app = App::default();
+        assert_eq!(app.mode, InputMode::Terminal);
+
+        handle_decoded_input(
+            DecodedInput::Bytes(b"\x1b[D".to_vec()),
+            &state,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.message.as_deref(),
+            Some("no terminal pane is selected")
+        );
     }
 
     #[test]
