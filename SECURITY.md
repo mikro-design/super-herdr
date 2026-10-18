@@ -36,6 +36,11 @@ the [remote development preview](REMOTE_PREVIEW.md).
   routing to OpenSSH.
 - Device pairing is for one operator's own devices. It is not team identity,
   delegated authorization, or an enterprise audit system.
+- Enabling Web Push adds a new outbound trust boundary: whichever push
+  service the browser's subscription names (a vendor choice, not this
+  daemon's). Every push this daemon sends is empty — the push service learns
+  that a device was woken and nothing else, never an agent, a pane, or any
+  notification content.
 
 More detail is in [ARCHITECTURE.md](ARCHITECTURE.md) and the
 [security summary in the README](README.md#security-summary).

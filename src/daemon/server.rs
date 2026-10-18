@@ -70,6 +70,11 @@ pub const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// past the moment it became due.
 const NOTIFICATION_TICK: Duration = Duration::from_millis(500);
 const MAX_PENDING_PAIRING_APPROVALS: usize = 16;
+/// How long a woken service worker's wake request may still show the last
+/// device alert. A push that finally lands after this long is late enough
+/// that the moment it was about may already have passed; showing nothing is
+/// more honest than showing something stale.
+const PUSH_WAKE_FRESHNESS: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -80,6 +85,14 @@ pub struct DaemonOptions {
     /// Where the durable agent marks live. `None` discovers the standard
     /// location; a test points this somewhere disposable.
     pub agent_marks: Option<PathBuf>,
+    /// Where paired devices' Web Push subscriptions live. `None` discovers the
+    /// standard location; a test points this somewhere disposable.
+    pub push_subscriptions: Option<PathBuf>,
+    /// Where this installation's VAPID keypair lives. `None` discovers the
+    /// standard location. Unlike every other path here, this one must never
+    /// resolve to a fresh location once subscriptions exist against the key
+    /// already there — see [`crate::push::VapidKeys`].
+    pub push_vapid_key: Option<PathBuf>,
     /// Where the durable attention index lives. `None` discovers the standard
     /// state path.
     pub attention_state: Option<PathBuf>,
@@ -118,6 +131,8 @@ impl DaemonOptions {
         Ok(Self {
             socket: root.join("super-herdr/daemon.sock"),
             agent_marks: None,
+            push_subscriptions: None,
+            push_vapid_key: None,
             aliases: None,
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
@@ -725,6 +740,19 @@ struct Daemon {
     /// here because the point of it is a phone learning that an agent is
     /// waiting while the desktop is asleep.
     device_notifications: NotificationQueue,
+    /// Devices that may be woken with no browser open at all. `None` means
+    /// push could not be set up this run; every device sink above still
+    /// works, since this is strictly an additional reach, never the only one.
+    push_subscription_store: Option<crate::push::PushSubscriptionStore>,
+    vapid_keys: Option<Arc<crate::push::VapidKeys>>,
+    /// Shared with the web layer, which answers a woken service worker's
+    /// request out of this without ever routing back through the event loop.
+    push_wake: Arc<Mutex<Option<(ServerMessage, Instant)>>>,
+    /// Reused across every push sent, rather than one per request: connection
+    /// pooling is the entire reason a client is a value instead of a
+    /// function, and push services are a handful of fixed hosts this daemon
+    /// will reach repeatedly.
+    push_client: reqwest::Client,
     command_timeout: Duration,
     inputs: mpsc::UnboundedSender<Input>,
     /// Queues handed over by connections, waiting for the broker to say whether
@@ -893,6 +921,7 @@ async fn terminated() {
 /// frontend named a port nothing was listening on. The browser client is an
 /// ordinary in-process attachment, so it speaks the same framing through the
 /// same handshake as every other client.
+#[allow(clippy::too_many_arguments)]
 async fn serve_web_client(
     options: &DaemonOptions,
     config: &Config,
@@ -901,6 +930,9 @@ async fn serve_web_client(
     inputs: &mpsc::UnboundedSender<Input>,
     pending_pairing: &Arc<Mutex<Option<PendingPairing>>>,
     bridge_pairing: &watch::Sender<Option<String>>,
+    push_subscriptions: Option<crate::push::PushSubscriptionStore>,
+    vapid_keys: Option<Arc<crate::push::VapidKeys>>,
+    push_wake: Arc<Mutex<Option<(ServerMessage, Instant)>>>,
 ) -> Result<Option<(std::net::SocketAddr, JoinHandle<()>, Option<JoinHandle<()>>)>> {
     let Some(port) = options.web_port else {
         return Ok(None);
@@ -927,6 +959,9 @@ async fn serve_web_client(
         inputs: inputs.clone(),
         pending: pending_pairing.clone(),
         bridge_pairing: options.web_bridge.as_ref().map(|_| bridge_pairing.clone()),
+        push_subscriptions,
+        vapid_keys,
+        push_wake,
     });
     let bridge = options
         .web_bridge
@@ -954,6 +989,28 @@ async fn run(
 ) -> Result<()> {
     let (bridge_pairing, _) = watch::channel::<Option<String>>(None);
     let (inputs, mut received) = mpsc::unbounded_channel();
+    let push_subscription_store = match options.push_subscriptions.clone() {
+        Some(path) => Some(crate::push::PushSubscriptionStore::at(path)),
+        None => crate::push::PushSubscriptionStore::discover().ok(),
+    };
+    // Generated once, eagerly, rather than lazily on whichever request asks
+    // first: lazy generation from both the web layer and this event loop
+    // could race to create the file, and the loser would go on signing with
+    // a keypair that is no longer the one on disk. One generation point here
+    // removes the race instead of guarding against it.
+    let vapid_key_path = match options.push_vapid_key.clone() {
+        Some(path) => Ok(path),
+        None => crate::push::PushSubscriptionStore::discover_vapid_key_path(),
+    };
+    let vapid_keys =
+        match vapid_key_path.and_then(|path| crate::push::VapidKeys::load_or_generate(&path)) {
+            Ok(keys) => Some(Arc::new(keys)),
+            Err(error) => {
+                eprintln!("push notifications disabled: {error:#}");
+                None
+            }
+        };
+    let push_wake: Arc<Mutex<Option<(ServerMessage, Instant)>>> = Arc::new(Mutex::new(None));
     // Before anything slow, because a browser client that cannot bind is a
     // pairing code that will name a port nothing answers on — and that is a
     // failure worth having at startup rather than at the pairing screen.
@@ -965,6 +1022,9 @@ async fn run(
         &inputs,
         &pending_pairing,
         &bridge_pairing,
+        push_subscription_store.clone(),
+        vapid_keys.clone(),
+        push_wake.clone(),
     )
     .await?;
     if listener.is_some() {
@@ -1076,6 +1136,10 @@ async fn run(
         aliases,
         alias_store,
         device_notifications: NotificationQueue::new(device_notifications, None),
+        push_subscription_store,
+        vapid_keys,
+        push_wake,
+        push_client: reqwest::Client::new(),
         command_timeout: Duration::from_secs(active.transport.command_timeout_seconds),
         inputs: inputs.clone(),
         offers: BTreeMap::new(),
@@ -1187,6 +1251,14 @@ struct DevicePolicy {
     inputs: mpsc::UnboundedSender<Input>,
     pending: Arc<Mutex<Option<PendingPairing>>>,
     bridge_pairing: Option<watch::Sender<Option<String>>>,
+    push_subscriptions: Option<crate::push::PushSubscriptionStore>,
+    vapid_keys: Option<Arc<crate::push::VapidKeys>>,
+    /// The most recent device alert, cached for whichever woken service
+    /// worker asks next. Shared with the event loop that produces it rather
+    /// than persisted: a daemon restart dropping it is a missed wake with a
+    /// harmless, obvious recovery — ask again next time — not a correctness
+    /// problem the way losing a subscription would be.
+    push_wake: Arc<Mutex<Option<(ServerMessage, Instant)>>>,
 }
 
 impl DevicePolicy {
@@ -1277,6 +1349,39 @@ impl web::Devices for DevicePolicy {
 
     fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_owned()
+    }
+
+    fn vapid_public_key(&self) -> Option<String> {
+        self.vapid_keys
+            .as_ref()
+            .map(|keys| keys.public_key_base64url().to_owned())
+    }
+
+    fn subscribe_push(
+        &self,
+        token: &str,
+        subscription: crate::push::PushSubscription,
+    ) -> Result<()> {
+        let Some(store) = self.push_subscriptions.as_ref() else {
+            anyhow::bail!("this daemon has no push subscription store configured");
+        };
+        store.set(&pairing::fingerprint(token), subscription)
+    }
+
+    fn unsubscribe_push(&self, token: &str) -> Result<()> {
+        let Some(store) = self.push_subscriptions.as_ref() else {
+            return Ok(());
+        };
+        store.remove(&pairing::fingerprint(token))
+    }
+
+    fn latest_push_notification(&self) -> Option<String> {
+        let held = self.push_wake.lock().ok()?;
+        let (message, at) = held.as_ref()?;
+        if at.elapsed() > PUSH_WAKE_FRESHNESS {
+            return None;
+        }
+        serde_json::to_string(message).ok()
     }
 }
 
@@ -3146,7 +3251,7 @@ impl Daemon {
         let Some(pane) = delivery.pane().cloned() else {
             return Vec::new();
         };
-        self.broker.notify_devices(ServerMessage::Notification {
+        let notification = ServerMessage::Notification {
             // Resolved now rather than when the event was recorded: the
             // identity a person taps should name the agent as it currently is,
             // and if it has gone the tap is refused rather than delivered
@@ -3154,7 +3259,42 @@ impl Daemon {
             agent: agent_key_for_pane(&self.state, &pane),
             title: delivery.title().to_owned(),
             body: delivery.body().to_owned(),
-        })
+        };
+        if let Ok(mut held) = self.push_wake.lock() {
+            *held = Some((notification.clone(), Instant::now()));
+        }
+        self.spawn_push_sweep();
+        self.broker.notify_devices(notification)
+    }
+
+    /// Wake every device holding a push subscription, live SSE connection or
+    /// not. Deduplicating a device that has both is the woken service
+    /// worker's job: it can ask the browser whether a window is actually
+    /// visible, which this daemon has no way to know from a connection alone
+    /// — a live subscription is just as likely a background tab as a visible
+    /// one.
+    fn spawn_push_sweep(&self) {
+        let (Some(store), Some(vapid)) = (
+            self.push_subscription_store.clone(),
+            self.vapid_keys.clone(),
+        ) else {
+            return;
+        };
+        let client = self.push_client.clone();
+        tokio::spawn(async move {
+            for (token_sha256, subscription) in store.current() {
+                // Each device is its own request and its own failure: one
+                // push service rejecting a stale endpoint must never stop
+                // another device's wake, and nothing here retries — the next
+                // attention event due this device tries again on its own.
+                match crate::push::wake(&client, &vapid, &subscription).await {
+                    Ok(outcome) if outcome.gone => {
+                        let _ = store.remove(&token_sha256);
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+        });
     }
 
     fn project_agent_cards(&mut self) -> Vec<Effect> {
@@ -3327,6 +3467,8 @@ mod tests {
         let options = DaemonOptions {
             socket: directory.path().join("daemon.sock"),
             agent_marks: None,
+            push_subscriptions: None,
+            push_vapid_key: None,
             aliases: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
@@ -3431,6 +3573,8 @@ mod tests {
             let options = DaemonOptions {
                 socket: directory.path().join("daemon.sock"),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
@@ -3688,6 +3832,8 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
@@ -3968,6 +4114,8 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
@@ -4336,6 +4484,8 @@ mod tests {
                 DaemonOptions {
                     socket: socket.clone(),
                     agent_marks: None,
+                    push_subscriptions: None,
+                    push_vapid_key: None,
                     aliases: None,
                     attention_state: Some(directory.path().join("attention.json")),
                     refresh_interval: Duration::from_secs(3600),
@@ -4439,6 +4589,8 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
@@ -5058,6 +5210,8 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
@@ -5138,6 +5292,8 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
@@ -5180,6 +5336,8 @@ mod tests {
         let options = DaemonOptions {
             socket: harness.socket(),
             agent_marks: None,
+            push_subscriptions: None,
+            push_vapid_key: None,
             aliases: None,
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
@@ -5209,6 +5367,8 @@ mod tests {
             DaemonOptions {
                 socket: socket.clone(),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),

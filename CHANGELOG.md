@@ -7,6 +7,12 @@ inferred from commit titles alone.
 
 ## Unreleased
 
+- A paired device can be woken by an agent needing you even with its browser
+  closed. Enabling "Notify when closed" registers a service worker and a Web
+  Push subscription; the push itself carries no payload, so the push service
+  only ever learns that a wake happened, never for which agent or what it
+  needs. The woken service worker asks this daemon directly, over the same
+  authenticated connection every other request uses, what to show.
 - Pane borders show the name Herdr reports, so a pane reads as
   `stil_utils-llm · w1C:p1` rather than `w1C:p1`. Both, because they answer
   different questions: the name is how you know which pane you are looking at,

@@ -35,7 +35,7 @@ pub const CODE_LIFETIME: Duration = super_herdr_bridge::PAIRING_CODE_LIFETIME;
 /// `/dev/urandom` rather than a crate: this is a Unix-only daemon, the file is
 /// the documented interface, and a dependency whose only job is to open it
 /// would be a supply chain for no benefit.
-fn secret_bytes(count: usize) -> Result<Vec<u8>> {
+pub(crate) fn secret_bytes(count: usize) -> Result<Vec<u8>> {
     let mut file = File::open("/dev/urandom").context("failed to open /dev/urandom")?;
     let mut bytes = vec![0_u8; count];
     file.read_exact(&mut bytes)

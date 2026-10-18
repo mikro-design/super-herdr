@@ -38,6 +38,10 @@ use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, encode
 /// client without an install step, a file path, or anything to keep in sync.
 const APP: &str = include_str!("app.html");
 
+/// The service worker that lets a push reach this browser with no tab open.
+/// Held in the binary for the same reason the page is.
+const SERVICE_WORKER: &str = include_str!("sw.js");
+
 /// A request line and its headers may not exceed this. A browser sends a few
 /// hundred bytes; anything approaching this is not one.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -149,6 +153,23 @@ pub trait Devices: Send + Sync {
     /// The daemon's own version, shown to a person so a stale daemon is
     /// visible where it would otherwise be invisible.
     fn version(&self) -> String;
+    /// This installation's VAPID public key, for `PushManager.subscribe`.
+    /// `None` when push could not be set up at all, which disables the
+    /// feature rather than the daemon.
+    fn vapid_public_key(&self) -> Option<String>;
+    /// Record this device's push subscription, replacing any earlier one.
+    fn subscribe_push(
+        &self,
+        token: &str,
+        subscription: crate::push::PushSubscription,
+    ) -> Result<()>;
+    /// Forget this device's push subscription.
+    fn unsubscribe_push(&self, token: &str) -> Result<()>;
+    /// The most recent device alert, as the same JSON the live event stream
+    /// would have carried, if one is still fresh enough to be worth a woken
+    /// service worker showing. `None` both when there has been no alert yet
+    /// and when the last one is now too old to show.
+    fn latest_push_notification(&self) -> Option<String>;
 }
 
 /// Browser sessions, each holding the writing half of its own attachment.
@@ -228,6 +249,10 @@ async fn handle(
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => write_page(&mut writer, APP).await,
+        // Servable the same as the page shell: the script is not sensitive,
+        // and registering it is how a browser learns whether push is worth
+        // offering at all, before it has necessarily paired.
+        ("GET", "/sw.js") => write_script(&mut writer, SERVICE_WORKER).await,
         ("GET", "/session") => {
             // What the page needs before it can decide what to show: whether
             // this browser is already paired, and which daemon it is talking
@@ -288,6 +313,43 @@ async fn handle(
             )
             .await
         }
+        ("GET", "/push/vapid_public_key") => match devices.vapid_public_key() {
+            Some(key) => write_json(&mut writer, &format!("{{\"key\":\"{key}\"}}")).await,
+            None => write_status(&mut writer, "404 Not Found", "push is not available").await,
+        },
+        ("POST", "/push/subscribe") => {
+            let token = request.token.as_deref().unwrap_or_default().to_owned();
+            let body = read_body(&mut reader, request.length).await?;
+            match serde_json::from_slice::<crate::push::PushSubscription>(&body) {
+                Ok(subscription) => match devices.subscribe_push(&token, subscription) {
+                    Ok(()) => write_status(&mut writer, "204 No Content", "").await,
+                    Err(error) => {
+                        write_status(&mut writer, "500 Internal Server Error", &error.to_string())
+                            .await
+                    }
+                },
+                Err(_) => {
+                    write_status(&mut writer, "400 Bad Request", "unreadable subscription").await
+                }
+            }
+        }
+        ("POST", "/push/unsubscribe") => {
+            let token = request.token.as_deref().unwrap_or_default().to_owned();
+            match devices.unsubscribe_push(&token) {
+                Ok(()) => write_status(&mut writer, "204 No Content", "").await,
+                Err(error) => {
+                    write_status(&mut writer, "500 Internal Server Error", &error.to_string()).await
+                }
+            }
+        }
+        // Fetched by the service worker on a `push` event, which carries no
+        // payload: this is where it learns what actually happened, over the
+        // same authenticated connection as every other request. No payload
+        // ever crosses through the push service itself.
+        ("GET", "/push/wake") => match devices.latest_push_notification() {
+            Some(body) => write_json(&mut writer, &body).await,
+            None => write_status(&mut writer, "204 No Content", "").await,
+        },
         ("GET", "/events") => {
             let Some(session) = request.session else {
                 return write_status(&mut writer, "400 Bad Request", "a session is required").await;
@@ -478,6 +540,19 @@ async fn write_page(writer: &mut OwnedWriteHalf, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// A service worker is fetched as a script, not a page: the wrong content
+/// type is enough for some browsers to refuse to register it at all.
+async fn write_script(writer: &mut OwnedWriteHalf, body: &str) -> Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/javascript; charset=utf-8\r\ncontent-length: {}\r\ncache-control: no-store\r\nservice-worker-allowed: /\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(head.as_bytes()).await?;
+    writer.write_all(body.as_bytes()).await?;
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
 async fn write_status(writer: &mut OwnedWriteHalf, status: &str, body: &str) -> Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -594,6 +669,7 @@ async fn stream_events(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -609,6 +685,9 @@ mod tests {
     struct TestDevices {
         admitted: Mutex<Vec<String>>,
         code: Mutex<Option<String>>,
+        vapid_public_key: Option<String>,
+        push_subscriptions: Mutex<BTreeMap<String, crate::push::PushSubscription>>,
+        wake: Mutex<Option<String>>,
     }
 
     const TEST_TOKEN: &str = "abababababababababababababababababababababababababababababababab";
@@ -618,6 +697,9 @@ mod tests {
             Self {
                 admitted: Mutex::new(vec![TEST_TOKEN.to_owned()]),
                 code: Mutex::new(None),
+                vapid_public_key: Some("test-vapid-public-key".to_owned()),
+                push_subscriptions: Mutex::new(BTreeMap::new()),
+                wake: Mutex::new(None),
             }
         }
     }
@@ -655,6 +737,32 @@ mod tests {
 
         fn version(&self) -> String {
             "0.0.0-test".to_owned()
+        }
+
+        fn vapid_public_key(&self) -> Option<String> {
+            self.vapid_public_key.clone()
+        }
+
+        fn subscribe_push(
+            &self,
+            token: &str,
+            subscription: crate::push::PushSubscription,
+        ) -> anyhow::Result<()> {
+            if let Ok(mut held) = self.push_subscriptions.lock() {
+                held.insert(token.to_owned(), subscription);
+            }
+            Ok(())
+        }
+
+        fn unsubscribe_push(&self, token: &str) -> anyhow::Result<()> {
+            if let Ok(mut held) = self.push_subscriptions.lock() {
+                held.remove(token);
+            }
+            Ok(())
+        }
+
+        fn latest_push_notification(&self) -> Option<String> {
+            self.wake.lock().ok().and_then(|held| held.clone())
         }
     }
 
@@ -746,6 +854,8 @@ mod tests {
             DaemonOptions {
                 socket: directory.path().join("unused.sock"),
                 agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
                 aliases: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
@@ -1236,6 +1346,137 @@ mod tests {
         // device.
         let response = request(port, &pair).await;
         assert!(response.contains("403"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_service_worker_is_served_without_pairing() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+
+        let response = request_body(port, "GET /sw.js HTTP/1.1\r\nhost: localhost\r\n\r\n").await;
+        assert!(response.contains("200"), "{response}");
+        assert!(response.contains("text/javascript"), "{response}");
+        assert!(response.contains("addEventListener"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn push_routes_are_refused_without_pairing() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+
+        for request_line in [
+            "GET /push/vapid_public_key HTTP/1.1\r\nhost: localhost\r\n\r\n".to_owned(),
+            "GET /push/wake HTTP/1.1\r\nhost: localhost\r\n\r\n".to_owned(),
+            "POST /push/unsubscribe HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n"
+                .to_owned(),
+        ] {
+            let response = request(port, &request_line).await;
+            assert!(response.contains("401"), "{request_line} -> {response}");
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_paired_device_can_fetch_the_vapid_public_key() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+
+        let response = request_body(
+            port,
+            &format!(
+                "GET /push/vapid_public_key HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.contains("200"), "{response}");
+        assert!(response.contains("test-vapid-public-key"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribing_and_unsubscribing_push_round_trips_through_the_policy() {
+        let (port, task, _directory, devices) = serve_test_daemon().await;
+
+        let body = r#"{"endpoint":"https://push.example/send/abc","p256dh":"key","auth":"secret"}"#;
+        let response = request(
+            port,
+            &format!(
+                "POST /push/subscribe HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(response.contains("204"), "{response}");
+        assert_eq!(
+            devices
+                .push_subscriptions
+                .lock()
+                .unwrap()
+                .get(TEST_TOKEN)
+                .map(|subscription| subscription.endpoint.as_str()),
+            Some("https://push.example/send/abc")
+        );
+
+        let response = request(
+            port,
+            &format!(
+                "POST /push/unsubscribe HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.contains("204"), "{response}");
+        assert!(
+            !devices
+                .push_subscriptions
+                .lock()
+                .unwrap()
+                .contains_key(TEST_TOKEN)
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_subscription_body_is_refused() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+
+        let body = "not json";
+        let response = request(
+            port,
+            &format!(
+                "POST /push/subscribe HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(response.contains("400"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_woken_service_worker_gets_the_latest_alert_or_nothing() {
+        let (port, task, _directory, devices) = serve_test_daemon().await;
+
+        let response = request(
+            port,
+            &format!(
+                "GET /push/wake HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.contains("204"), "{response}");
+
+        let notification = r#"{"type":"notification","agent":{"target":"a","session":"dev","resource":"builder"},"title":"Agent needs attention","body":"builder"}"#;
+        if let Ok(mut wake) = devices.wake.lock() {
+            *wake = Some(notification.to_owned());
+        }
+        let response = request_body(
+            port,
+            &format!(
+                "GET /push/wake HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.contains("200"), "{response}");
+        assert!(response.contains("Agent needs attention"), "{response}");
         task.abort();
     }
 
