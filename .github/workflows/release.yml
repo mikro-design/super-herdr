@@ -62,8 +62,14 @@ jobs:
 
       # Platform-gated code only compiles on its own target. Checking the macOS
       # target from here catches a path that no Linux build would ever reach.
+      # A transitive dependency's build script compiles a few self-contained C
+      # files for the target architecture; GCC rejects Apple's `-arch` driver
+      # flag, so this cross check needs Clang, not a full macOS SDK.
       - name: Lint macOS-only code paths
         shell: bash
+        env:
+          CC_x86_64_apple_darwin: clang
+          AR_x86_64_apple_darwin: llvm-ar
         run: |
           rustup target add x86_64-apple-darwin
           cargo clippy --locked --jobs 4 --target x86_64-apple-darwin --all-targets -- -D warnings
