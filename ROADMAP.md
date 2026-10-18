@@ -132,6 +132,18 @@ can test is a platform that is broken and does not know it.
   target-to-target movement without routing the bytes through the device.
 - Direct TUI file upload by dropping a file path onto the terminal, pasting a
   copied file, or entering a path explicitly.
+- Web Push delivery of attention events to a paired device whose browser is
+  closed, as a further sink under the existing filters, coalescing, and rate
+  limits. Native desktop delivery did not move with it: notifying a desktop
+  remains a desktop-session capability the client itself owns. A push carries
+  no payload — the push service learns only that a wake happened, never for
+  what — and the woken service worker asks this daemon directly, over the
+  same authenticated connection every other request uses, what to show. VAPID
+  keys are generated once per installation and persisted; a device's
+  subscription lives in its own durable store, never in `config.toml`.
+  Deduplicating a device that also holds a live connection is the service
+  worker's own decision, made from whether a window is actually visible,
+  which this daemon has no way to know from a connection alone.
 
 ## Next
 
@@ -184,12 +196,6 @@ does not prove that the browser path is reliable.
    that dies mid-file abandons whatever the host already staged: `upload.resume`
    and the host-reported offset it answers with are still unused by this
    client.
-6. Add push delivery of attention events to paired devices, as a further sink
-   under the existing filters, coalescing, and rate limits. Native desktop
-   delivery is not moving with it: notifying a desktop is a desktop-session
-   capability and stays with the client, for the same reason reading a
-   clipboard does. Push is the half that needs a process awake when no
-   frontend is.
 
 ## Blocked on Herdr
 

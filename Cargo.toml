@@ -39,6 +39,15 @@ anyhow = "1"
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+# VAPID (RFC 8292) signing for Web Push: an ECDSA P-256 keypair this daemon
+# generates once per installation. Pure Rust, no OpenSSL link dependency,
+# matching the project's existing crypto crates (sha2).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# Outbound HTTPS to whichever push service a browser's subscription names
+# (FCM, Mozilla's autopush, Apple's web push relay). Taken rather than
+# hand-rolled for the same reason qrcode was: a TLS client is exactly the kind
+# of thing that is easy to get subtly wrong in a way that looks like it works.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Rendering a pairing code as a QR. Taken rather than written because the parts
 # that are easy to get subtly wrong — Reed-Solomon and mask selection — fail by
 # producing a code that scans on one phone and not another, which looks like

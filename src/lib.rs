@@ -18,6 +18,7 @@ pub mod plugin;
 pub mod plugin_fleet;
 pub mod probe;
 pub mod protocol;
+pub mod push;
 pub mod remote_files;
 pub mod resource_action;
 pub mod screen;

@@ -284,8 +284,10 @@
       <h2>Agents</h2>
       <span id="inbox-count" class="note"></span>
       <button id="alerts" type="button" class="chip" aria-pressed="false" hidden>Alerts</button>
+      <button id="push" type="button" class="chip" aria-pressed="false" hidden>Notify when closed</button>
     </div>
     <p id="alert-note" class="note" role="status"></p>
+    <p id="push-note" class="note" role="status"></p>
     <div id="inbox-filters" class="chips" role="group" aria-label="Filter agents"></div>
     <div id="inbox-sections"></div>
     <p id="inbox-empty" class="empty">waiting for the daemon…</p>
@@ -1807,6 +1809,118 @@ function openAgentFromAlert(agent) {
     : 'That agent is no longer running.';
 }
 
+// Whether this device can be woken with no tab open at all. Distinct from
+// `alertsAvailable`: that is an in-page `Notification`, gone the moment this
+// tab closes, while this is a service worker the browser can wake on its
+// own. `isSecureContext` is the standard way to ask whether Push would even
+// be offered — it already accounts for https and for a loopback daemon
+// reached as localhost, which http elsewhere would not satisfy.
+function pushAvailable() {
+  return window.isSecureContext
+    && 'serviceWorker' in navigator
+    && 'PushManager' in window;
+}
+
+let pushOn = false;
+let vapidPublicKey = null;
+
+function renderPush() {
+  const button = el('push');
+  button.hidden = !pushAvailable();
+  button.setAttribute('aria-pressed', pushOn ? 'true' : 'false');
+  button.textContent = pushOn ? 'Notified when closed' : 'Notify when closed';
+}
+
+// Registered unconditionally and as early as possible, pairing or not: the
+// script itself is not sensitive, and a service worker that is not yet
+// registered by the time somebody asks to subscribe is one more round trip
+// before the first push can ever arrive.
+function registerServiceWorker() {
+  if (!pushAvailable()) return;
+  navigator.serviceWorker.register(endpoint('/sw.js')).catch(() => {});
+}
+
+// The browser's own subscription state is the source of truth, not a flag
+// this page remembers: a subscription survives this page closing, and a
+// person revoking the browser's notification permission ends it without ever
+// telling this page.
+async function initPush() {
+  if (!pushAvailable()) return;
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription();
+    pushOn = Boolean(subscription);
+  } catch (_) {
+    pushOn = false;
+  }
+  renderPush();
+}
+
+// A VAPID key arrives as base64url; `applicationServerKey` wants bytes.
+function urlBase64ToUint8Array(base64) {
+  const padded = base64.padEnd(base64.length + (4 - base64.length % 4) % 4, '=');
+  const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, character => character.charCodeAt(0));
+}
+
+async function togglePush() {
+  if (!pushAvailable()) return;
+  if (pushOn) {
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      await subscription?.unsubscribe();
+    } catch (_) {
+      // The browser's own state did not clear cleanly; the daemon's record
+      // is dropped regardless, so re-enabling starts from one clean state
+      // rather than whichever half succeeded.
+    }
+    await fetch(endpoint('/push/unsubscribe'), { method: 'POST' }).catch(() => {});
+    pushOn = false;
+    renderPush();
+    return;
+  }
+  try {
+    if (!vapidPublicKey) {
+      const response = await fetch(endpoint('/push/vapid_public_key'));
+      if (!response.ok) {
+        el('push-note').textContent = 'Push is not available on this daemon.';
+        return;
+      }
+      vapidPublicKey = (await response.json()).key;
+    }
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
+    });
+    // `toJSON()` rather than reading `getKey()` byte arrays directly: the
+    // nested `keys` it produces are already the base64url the daemon stores
+    // and (were payload encryption ever added) the exact encoding that
+    // format requires, flattened here into the one shape `/push/subscribe`
+    // accepts.
+    const json = subscription.toJSON();
+    const response = await fetch(endpoint('/push/subscribe'), {
+      method: 'POST',
+      body: JSON.stringify({
+        endpoint: json.endpoint,
+        p256dh: json.keys.p256dh,
+        auth: json.keys.auth,
+      }),
+    });
+    if (!response.ok) {
+      await subscription.unsubscribe().catch(() => {});
+      el('push-note').textContent = 'The daemon could not record this subscription.';
+      return;
+    }
+    el('push-note').textContent = '';
+    pushOn = true;
+  } catch (_) {
+    el('push-note').textContent = 'This browser declined to enable push.';
+  }
+  renderPush();
+}
+
 // The inbox exactly as the daemon built it. This page renders that answer and
 // never derives a second one: sections and ordering are the daemon's, so a
 // person moving between the TUI and this phone reads one inbox rather than two
@@ -2555,6 +2669,18 @@ el('fetch-accept').onclick = () => acceptFetch();
 el('fetch-refuse').onclick = () => cancelFetch('');
 el('fetch-discard').onclick = () => resetFetch('');
 el('alerts').onclick = () => { void toggleAlerts(); };
+el('push').onclick = () => { void togglePush(); };
+
+// A tap on a push notification reaches this page only through its own
+// service worker, which cannot run `openAgentFromAlert` itself — it has no
+// inbox state. It posts here instead, to the same page already holding one.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', event => {
+    if (event.data && event.data.type === 'open-agent-from-alert') {
+      openAgentFromAlert(event.data.agent);
+    }
+  });
+}
 el('stop').onclick = () => stopWatching('');
 
 // A rotation or a resize changes how much of the pane fits, not the pane.
@@ -2591,6 +2717,7 @@ function confirmationNumber() {
 // The version of the daemon, not of this page: the page ships inside that
 // binary, so a stale daemon is otherwise invisible from here.
 async function start() {
+  registerServiceWorker();
   let session_state = { paired: true, version: '' };
   try {
     session_state = await (await fetch(endpoint('/session'))).json();
@@ -2607,6 +2734,7 @@ async function start() {
   }
   document.querySelector('main').hidden = false;
   connect();
+  void initPush();
 }
 
 el('pair').onclick = async () => {

@@ -185,13 +185,19 @@ control lease.
 - [x] Document browser/platform requirements and a deterministic test path.
 - [x] Test duplicate delivery, unsubscribed devices, expired routes, target
       disconnects, and notification-click races.
-- [ ] Reach a device whose browser is closed. This needs Web Push: a service
+- [x] Reach a device whose browser is closed. This needs Web Push: a service
       worker, VAPID signing, and a third-party push service as a new outbound
       trust boundary whose endpoint the browser supplies. The design that fits
       here sends no payload and lets the woken service worker ask the daemon,
       so the push service learns that something happened and never what. It is
       a dependency and trust decision, not a detail of the sink, and wants its
-      own branch.
+      own branch. Shipped: an empty Web Push wakes the service worker, which
+      fetches `/push/wake` over the same authenticated connection as every
+      other request to learn what happened. VAPID keys are generated once and
+      persisted ([`src/push.rs`](src/push.rs)); subscriptions live in their own
+      durable store, never in `config.toml`. Deduplicating a device that also
+      holds a live connection is the service worker's job (it can see whether
+      a window is visible), not the daemon's.
 
 Exit condition: a paired device receives one useful attention alert under the
 same filters as the desktop and returns to the correct agent without exposing

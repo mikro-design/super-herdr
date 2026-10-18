@@ -224,6 +224,8 @@ async fn relay(
         DaemonOptions {
             socket: directory.path().join("unused.sock"),
             agent_marks: None,
+            push_subscriptions: None,
+            push_vapid_key: None,
             aliases: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: std::time::Duration::from_secs(3600),
