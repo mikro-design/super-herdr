@@ -1469,9 +1469,8 @@ fn forward_pane_bytes(bytes: Vec<u8>, state: &FederationState, app: &mut App) {
         .get(&selected)
         .is_some_and(|route| route.access == TerminalAccess::Control);
     let Some(client) = app.client.clone().filter(|_| controlling) else {
-        app.message = Some(
-            "read-only: another Herdr client owns control; retrying automatically".to_owned(),
-        );
+        app.message =
+            Some("read-only: another Herdr client owns control; retrying automatically".to_owned());
         return;
     };
     client.send_input(selected, bytes);
@@ -8401,15 +8400,14 @@ mod tests {
     use super::{
         AgentFilter, AgentNavigator, App, AttentionCenter, AttentionIndex, CellPosition,
         ClipboardFeedback, ContextMenu, ContextTarget, DecodedInput, HERDR_PREFIX_KEY,
-        InputDecoder, InputMode,
-        MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS, MOUSE_CAPTURE_ENABLE, MouseInput,
-        PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH, SelectionAutoscroll,
-        SelectionAutoscrollDirection, SelectionFinish, TUI_SNOOZE_MINUTES, TargetForm,
-        TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
-        TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
-        clamped_pane_position, command_palette_actions, context_menu_for_target, cycle_tab,
-        desired_access, displayed_message, encode_mouse_event, federation_routes_changed,
-        filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
+        InputDecoder, InputMode, MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS,
+        MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH,
+        SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish, TUI_SNOOZE_MINUTES,
+        TargetForm, TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent,
+        TargetTestState, TerminalSelection, agent_jump_entries, capture_screen_rows,
+        capture_selection_viewport, clamped_pane_position, command_palette_actions,
+        context_menu_for_target, cycle_tab, desired_access, displayed_message, encode_mouse_event,
+        federation_routes_changed, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
         handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
         handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
         jump_from_notification, mouse_event_allowed, mouse_passthrough_enabled,
@@ -9329,10 +9327,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            app.message.as_deref(),
-            Some("no terminal pane is selected")
-        );
+        assert_eq!(app.message.as_deref(), Some("no terminal pane is selected"));
     }
 
     #[test]
