@@ -60,23 +60,33 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --jobs 4 --all-targets -- -D warnings
 
-      # Platform-gated code only compiles on its own target. Checking the macOS
-      # target from here catches a path that no Linux build would ever reach.
-      # A transitive dependency's build script compiles a few self-contained C
-      # files for the target architecture; GCC rejects Apple's `-arch` driver
-      # flag, so this cross check needs Clang, not a full macOS SDK.
-      - name: Lint macOS-only code paths
-        shell: bash
-        env:
-          CC_x86_64_apple_darwin: clang
-          AR_x86_64_apple_darwin: llvm-ar
-        run: |
-          rustup target add x86_64-apple-darwin
-          cargo clippy --locked --jobs 4 --target x86_64-apple-darwin --all-targets -- -D warnings
+  # Platform-gated code only compiles on its own target, and a dependency's
+  # build script may need to compile real C for that target (as ring does for
+  # Web Push's TLS stack) — not something crossing from Linux can do without a
+  # macOS SDK. A native runner catches a macOS-only path the Linux job above
+  # never reaches, by actually building for macOS rather than pretending to.
+  quality-macos:
+    name: Quality gates (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Run Clippy
+        run: cargo clippy --locked --jobs 4 --all-targets -- -D warnings
 
   build:
     name: Build ${{ matrix.target }}
-    needs: quality
+    needs: [quality, quality-macos]
     runs-on: ${{ matrix.os }}
     # A build takes minutes. Without a ceiling, a runner that hangs installing a
     # package sits there until the six-hour default, so a release waits on a
