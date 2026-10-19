@@ -5,8 +5,14 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.34
 
+- Fixed shell history recall and arrow keys misbehaving in a pane reached over
+  real latency. The TUI reassembled a multi-byte escape sequence like Up or
+  Left correctly, then forwarded it to the pane one byte at a time, so the
+  target's own shell could see a bare Escape before the rest of the sequence
+  arrived. A reassembled sequence is now sent as the single message it always
+  was.
 - A paired device can be woken by an agent needing you even with its browser
   closed. Enabling "Notify when closed" registers a service worker and a Web
   Push subscription; the push itself carries no payload, so the push service
