@@ -590,6 +590,27 @@ impl AgentFilter {
     }
 }
 
+/// How the always-on sidebar presents federation and attention state. `List`
+/// is two scrollable panels (sessions, then waiting/history); `Diagram` is one
+/// tree of target → workspace → pane with attention state shown in place on
+/// each pane, so a federation with many panes reads at a glance instead of
+/// requiring a separate "waiting now" list to cross-reference against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SidebarMode {
+    #[default]
+    List,
+    Diagram,
+}
+
+impl SidebarMode {
+    fn next(self) -> Self {
+        match self {
+            Self::List => Self::Diagram,
+            Self::Diagram => Self::List,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AgentNavigator {
     filter: AgentFilter,
@@ -922,6 +943,7 @@ struct App {
     sidebar_last_selected: Option<PaneId>,
     sidebar_hit_areas: Vec<SidebarHitArea>,
     sidebar_press: Option<PaneId>,
+    sidebar_mode: SidebarMode,
     last_render_at: Option<Instant>,
     message: Option<String>,
     clipboard_feedback: Option<ClipboardFeedback>,
@@ -997,6 +1019,7 @@ impl Default for App {
             sidebar_last_selected: None,
             sidebar_hit_areas: Vec::new(),
             sidebar_press: None,
+            sidebar_mode: SidebarMode::default(),
             last_render_at: None,
             message: None,
             clipboard_feedback: None,
@@ -1674,11 +1697,18 @@ async fn handle_mouse(
 
     if sidebar_area.contains(outer) {
         if let Some(direction) = mouse.scroll_direction() {
-            let (sessions_area, attention_area) = sidebar_areas(sidebar_area);
-            if attention_area.contains(outer) {
-                scroll_attention_sidebar(state, app, sidebar_area, direction);
-            } else if sessions_area.contains(outer) {
-                scroll_session_sidebar(state, app, sidebar_area, direction);
+            match app.sidebar_mode {
+                SidebarMode::List => {
+                    let (sessions_area, attention_area) = sidebar_areas(sidebar_area);
+                    if attention_area.contains(outer) {
+                        scroll_attention_sidebar(state, app, sidebar_area, direction);
+                    } else if sessions_area.contains(outer) {
+                        scroll_session_sidebar(state, app, sidebar_area, direction);
+                    }
+                }
+                SidebarMode::Diagram => {
+                    scroll_diagram_sidebar(state, app, sidebar_area, direction);
+                }
             }
         } else if mouse.is_right_press() {
             if let Some((pane, target)) = app
@@ -2476,6 +2506,7 @@ async fn handle_input(
                 }
                 b'a' => app.agent_navigator = Some(AgentNavigator::default()),
                 b'e' => app.attention_center = Some(AttentionCenter::default()),
+                b'm' => app.sidebar_mode = app.sidebar_mode.next(),
                 // Pairing starts from a client that is already trusted, so the
                 // code appears on a screen someone already has rather than in a
                 // file or a log.
@@ -7349,6 +7380,170 @@ fn sidebar_attention_rows(
     rows
 }
 
+/// One tree of target → workspace → pane, replacing the separate "waiting
+/// now" and session lists with attention state shown in place on each pane,
+/// so a federation with many panes reads at a glance instead of a flat list
+/// that needs cross-referencing against a second one to see where it lives.
+fn sidebar_diagram_rows(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    attention: &AttentionIndex,
+) -> Vec<SidebarRow> {
+    let agents: BTreeMap<PaneId, AgentJumpEntry> = agent_jump_entries(state, AgentFilter::All)
+        .into_iter()
+        .map(|entry| (entry.pane.clone(), entry))
+        .collect();
+    let selected_target = selected.map(PaneId::target_session);
+    let selected_workspace = selected_workspace(state, selected);
+    let mut rows = Vec::new();
+    for target in state.targets.values() {
+        let is_selected_target = selected_target.as_ref() == Some(&target.key);
+        let (symbol, color) = target_status(target);
+        let target_style = Style::default()
+            .fg(color)
+            .add_modifier(if is_selected_target {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        let mut line = Line::from(vec![
+            Span::styled(if is_selected_target { ">" } else { " " }, target_style),
+            Span::styled(format!("{symbol} "), target_style),
+            Span::styled(safe_text(&target.key.target), target_style),
+            Span::styled(
+                format!("  {}", short_session(&target.key.session)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        if is_selected_target {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        let target_pane = (target.connection == TargetConnectionState::Live)
+            .then_some(target.snapshot.as_deref())
+            .flatten()
+            .and_then(|snapshot| {
+                snapshot
+                    .focused_pane
+                    .clone()
+                    .or_else(|| snapshot.panes.keys().next().cloned())
+            });
+        rows.push(SidebarRow {
+            line,
+            pane: target_pane,
+            context: Some(ContextTarget::Session(target.key.clone())),
+            selection_anchor: is_selected_target && selected_workspace.is_none(),
+        });
+        let Some(snapshot) = target.snapshot.as_deref() else {
+            continue;
+        };
+        let workspaces = snapshot.workspaces.values().collect::<Vec<_>>();
+        let workspace_count = workspaces.len();
+        for (workspace_index, workspace) in workspaces.into_iter().enumerate() {
+            let workspace_last = workspace_index + 1 == workspace_count;
+            let branch = if workspace_last { "└─" } else { "├─" };
+            let is_selected_workspace = selected_workspace.as_ref() == Some(&workspace.id);
+            let workspace_style = Style::default()
+                .fg(if is_selected_workspace {
+                    Color::White
+                } else {
+                    Color::Gray
+                })
+                .add_modifier(if is_selected_workspace {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
+            let mut line = Line::from(vec![
+                Span::styled(format!("{branch} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    status_symbol(workspace.agent_status.as_deref()),
+                    status_style(workspace.agent_status.as_deref()),
+                ),
+                Span::styled(
+                    format!(
+                        " {}",
+                        display_label(&workspace.id.resource, workspace.label.as_deref())
+                    ),
+                    workspace_style,
+                ),
+            ]);
+            if is_selected_workspace {
+                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            rows.push(SidebarRow {
+                line,
+                pane: (target.connection == TargetConnectionState::Live)
+                    .then(|| pane_for_workspace(snapshot, &workspace.id))
+                    .flatten(),
+                context: Some(ContextTarget::Workspace(workspace.id.clone())),
+                selection_anchor: is_selected_workspace,
+            });
+
+            let panes = snapshot
+                .panes
+                .values()
+                .filter(|pane| pane.workspace.as_ref() == Some(&workspace.id))
+                .collect::<Vec<_>>();
+            let pane_count = panes.len();
+            let continuation = if workspace_last { "  " } else { "│ " };
+            for (pane_index, pane) in panes.into_iter().enumerate() {
+                let pane_last = pane_index + 1 == pane_count;
+                let pane_branch = if pane_last { "└─" } else { "├─" };
+                let is_selected_pane = selected == Some(&pane.id);
+                let (glyph, style, label) = match agents.get(&pane.id) {
+                    Some(entry)
+                        if agent_needs_attention(&entry.status, entry.interactive_ready) =>
+                    {
+                        let unread = attention.has_unread_for_pane(&pane.id);
+                        (
+                            if unread { "●" } else { "!" },
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            entry.agent.clone(),
+                        )
+                    }
+                    Some(entry) => (
+                        status_symbol(Some(&entry.status)),
+                        status_style(Some(&entry.status)),
+                        entry.agent.clone(),
+                    ),
+                    None => (
+                        status_symbol(pane.agent_status.as_deref()),
+                        status_style(pane.agent_status.as_deref()),
+                        display_label(&pane.id.resource, pane.label.as_deref()),
+                    ),
+                };
+                let mut line = Line::from(vec![
+                    Span::styled(
+                        format!("{continuation}{pane_branch} "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(label, style),
+                ]);
+                if is_selected_pane {
+                    line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                rows.push(SidebarRow {
+                    line,
+                    pane: Some(pane.id.clone()),
+                    context: Some(ContextTarget::Pane(pane.id.clone())),
+                    selection_anchor: is_selected_pane,
+                });
+            }
+        }
+    }
+    rows.push(SidebarRow {
+        line: Line::styled(
+            " ^]e history · ^]m list",
+            Style::default().fg(Color::DarkGray),
+        ),
+        pane: None,
+        context: None,
+        selection_anchor: false,
+    });
+    rows
+}
+
 fn attention_event_symbol(kind: AttentionEventKind) -> &'static str {
     match kind {
         AttentionEventKind::NeedsAttention => "!",
@@ -7473,6 +7668,21 @@ fn sidebar_max_offset(row_count: usize, area: Rect) -> usize {
     row_count.saturating_sub(sidebar_content_height(area))
 }
 
+fn diagram_block() -> Block<'static> {
+    Block::default()
+        .title(Span::styled(" map ", Style::default().bold()))
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
+
+fn diagram_content_height(area: Rect) -> usize {
+    usize::from(diagram_block().inner(area).height)
+}
+
+fn diagram_max_offset(row_count: usize, area: Rect) -> usize {
+    row_count.saturating_sub(diagram_content_height(area))
+}
+
 fn scroll_session_sidebar(
     state: &FederationState,
     app: &mut App,
@@ -7510,13 +7720,31 @@ fn scroll_attention_sidebar(
     };
 }
 
-fn reconcile_sidebar_viewport(rows: &[SidebarRow], app: &mut App, area: Rect) {
+fn scroll_diagram_sidebar(
+    state: &FederationState,
+    app: &mut App,
+    area: Rect,
+    direction: TerminalScrollDirection,
+) {
+    let row_count = sidebar_diagram_rows(state, app.selected_pane.as_ref(), &app.attention).len();
+    let maximum = diagram_max_offset(row_count, area);
+    let amount = usize::from(MOUSE_SCROLL_LINES);
+    let next_offset = match direction {
+        TerminalScrollDirection::Up => app.sidebar_offset.saturating_sub(amount),
+        TerminalScrollDirection::Down => app.sidebar_offset.saturating_add(amount).min(maximum),
+    };
+    if next_offset != app.sidebar_offset {
+        app.sidebar_offset = next_offset;
+        app.sidebar_follow_selected = false;
+    }
+}
+
+fn reconcile_sidebar_viewport(rows: &[SidebarRow], app: &mut App, height: usize) {
     if app.sidebar_last_selected.as_ref() != app.selected_pane.as_ref() {
         app.sidebar_follow_selected = true;
         app.sidebar_last_selected = app.selected_pane.clone();
     }
 
-    let height = sidebar_content_height(area);
     let maximum = rows.len().saturating_sub(height);
     app.sidebar_offset = app.sidebar_offset.min(maximum);
     if height == 0 || !app.sidebar_follow_selected {
@@ -7539,30 +7767,46 @@ fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) 
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (sessions_area, attention_area) = sidebar_areas(area);
-    let sessions_content = sidebar_block().inner(sessions_area);
-    let session_rows = sidebar_session_rows(state, app.selected_pane.as_ref());
-    reconcile_sidebar_viewport(&session_rows, app, area);
-    append_sidebar_hit_areas(
-        &mut app.sidebar_hit_areas,
-        session_rows,
-        app.sidebar_offset,
-        sessions_content,
-    );
+    match app.sidebar_mode {
+        SidebarMode::List => {
+            let (sessions_area, attention_area) = sidebar_areas(area);
+            let sessions_content = sidebar_block().inner(sessions_area);
+            let session_rows = sidebar_session_rows(state, app.selected_pane.as_ref());
+            reconcile_sidebar_viewport(&session_rows, app, sidebar_content_height(area));
+            append_sidebar_hit_areas(
+                &mut app.sidebar_hit_areas,
+                session_rows,
+                app.sidebar_offset,
+                sessions_content,
+            );
 
-    let attention_content = attention_sidebar_block(&app.attention).inner(attention_area);
-    let attention_rows = sidebar_attention_rows(state, app.selected_pane.as_ref(), &app.attention);
-    app.attention_sidebar_offset = app.attention_sidebar_offset.min(
-        attention_rows
-            .len()
-            .saturating_sub(usize::from(attention_content.height)),
-    );
-    append_sidebar_hit_areas(
-        &mut app.sidebar_hit_areas,
-        attention_rows,
-        app.attention_sidebar_offset,
-        attention_content,
-    );
+            let attention_content = attention_sidebar_block(&app.attention).inner(attention_area);
+            let attention_rows =
+                sidebar_attention_rows(state, app.selected_pane.as_ref(), &app.attention);
+            app.attention_sidebar_offset = app.attention_sidebar_offset.min(
+                attention_rows
+                    .len()
+                    .saturating_sub(usize::from(attention_content.height)),
+            );
+            append_sidebar_hit_areas(
+                &mut app.sidebar_hit_areas,
+                attention_rows,
+                app.attention_sidebar_offset,
+                attention_content,
+            );
+        }
+        SidebarMode::Diagram => {
+            let content = diagram_block().inner(area);
+            let rows = sidebar_diagram_rows(state, app.selected_pane.as_ref(), &app.attention);
+            reconcile_sidebar_viewport(&rows, app, diagram_content_height(area));
+            append_sidebar_hit_areas(
+                &mut app.sidebar_hit_areas,
+                rows,
+                app.sidebar_offset,
+                content,
+            );
+        }
+    }
 }
 
 fn append_sidebar_hit_areas(
@@ -7594,6 +7838,30 @@ fn append_sidebar_hit_areas(
 }
 
 fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
+    if app.sidebar_mode == SidebarMode::Diagram {
+        let lines = sidebar_diagram_rows(state, app.selected_pane.as_ref(), &app.attention)
+            .into_iter()
+            .map(|row| row.line)
+            .collect::<Vec<_>>();
+        let row_count = lines.len();
+        let offset = u16::try_from(app.sidebar_offset).unwrap_or(u16::MAX);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((offset, 0))
+                .block(diagram_block()),
+            area,
+        );
+        render_sidebar_scrollbar(
+            frame,
+            area,
+            row_count,
+            diagram_content_height(area),
+            app.sidebar_offset,
+            Color::Blue,
+        );
+        return;
+    }
+
     let (sessions_area, attention_area) = sidebar_areas(area);
     let session_lines = sidebar_session_rows(state, app.selected_pane.as_ref())
         .into_iter()
@@ -8402,18 +8670,19 @@ mod tests {
         ClipboardFeedback, ContextMenu, ContextTarget, DecodedInput, HERDR_PREFIX_KEY,
         InputDecoder, InputMode, MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS,
         MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH,
-        SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish, TUI_SNOOZE_MINUTES,
-        TargetForm, TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent,
-        TargetTestState, TerminalSelection, agent_jump_entries, capture_screen_rows,
-        capture_selection_viewport, clamped_pane_position, command_palette_actions,
-        context_menu_for_target, cycle_tab, desired_access, displayed_message, encode_mouse_event,
-        federation_routes_changed, filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
-        handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
-        handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
-        jump_from_notification, mouse_event_allowed, mouse_passthrough_enabled,
-        pane_direction_score, reconcile_selection, refresh_attention, render_vt_screen, safe_text,
-        select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_areas,
-        sidebar_attention_rows, sidebar_block, sidebar_content_height, sidebar_pane_at_row,
+        SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish, SidebarMode,
+        TUI_SNOOZE_MINUTES, TargetForm, TargetManager, TargetManagerControl, TargetManagerMode,
+        TargetTestEvent, TargetTestState, TerminalSelection, agent_jump_entries,
+        capture_screen_rows, capture_selection_viewport, clamped_pane_position,
+        command_palette_actions, context_menu_for_target, cycle_tab, desired_access,
+        displayed_message, encode_mouse_event, federation_routes_changed, filtered_palette_actions,
+        finish_ui_left_gesture, fuzzy_score, handle_attention_center_input,
+        handle_context_menu_input, handle_decoded_input, handle_input, handle_mouse,
+        handle_target_manager_input, handle_target_manager_mouse, jump_from_notification,
+        mouse_event_allowed, mouse_passthrough_enabled, pane_direction_score, reconcile_selection,
+        refresh_attention, render_vt_screen, safe_text, select_neighbor_pane, select_pane,
+        select_workspace, selected_terminal_text, sidebar_areas, sidebar_attention_rows,
+        sidebar_block, sidebar_content_height, sidebar_diagram_rows, sidebar_pane_at_row,
         tab_at_column, target_manager_controls, terminal_paste_payload, ui_areas,
         update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
         visible_pane_areas,
@@ -9668,6 +9937,87 @@ mod tests {
                 .take_while(|row| !row.line.to_string().starts_with(" history"))
                 .all(|row| !row.line.to_string().contains("builder"))
         );
+    }
+
+    #[test]
+    fn the_diagram_sidebar_shows_the_federation_tree_with_attention_in_place() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w1", "label": "compiler"}],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "agent": "builder", "agent_status": "blocked"},
+                    {"pane_id": "w1:p2", "workspace_id": "w1", "agent": "idler", "agent_status": "idle"}
+                ],
+                "agents": [
+                    {"pane_id": "w1:p1", "name": "builder", "agent_status": "blocked"},
+                    {"pane_id": "w1:p2", "name": "idler", "agent_status": "idle"}
+                ]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+
+        let selected = PaneId::new("host-a", "work", "w1:p1");
+        let rows = sidebar_diagram_rows(&state, Some(&selected), &AttentionIndex::default());
+
+        assert!(
+            rows.iter()
+                .any(|row| row.line.to_string().contains("host-a"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.line.to_string().contains("compiler"))
+        );
+
+        let waiting = rows
+            .iter()
+            .find(|row| row.context == Some(ContextTarget::Pane(selected.clone())))
+            .expect("the blocked pane has a row");
+        assert!(waiting.line.to_string().contains("! builder"));
+        assert!(waiting.selection_anchor);
+
+        let idle = rows
+            .iter()
+            .find(|row| {
+                row.context == Some(ContextTarget::Pane(PaneId::new("host-a", "work", "w1:p2")))
+            })
+            .expect("the idle pane has a row");
+        assert!(idle.line.to_string().contains("✓ idler"));
+        assert!(!idle.selection_anchor);
+
+        assert!(rows.last().is_some_and(|row| {
+            let text = row.line.to_string();
+            text.contains("history") && text.contains("list")
+        }));
+    }
+
+    #[tokio::test]
+    async fn pressing_m_toggles_the_sidebar_between_list_and_diagram() {
+        let state = FederationState::default();
+        let transport = crate::config::TransportConfig::default();
+        let mut app = App::default();
+        assert_eq!(app.sidebar_mode, SidebarMode::List);
+
+        handle_input(PREFIX_KEY, &state, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_input(b'm', &state, &transport, &mut app)
+            .await
+            .unwrap();
+        assert_eq!(app.sidebar_mode, SidebarMode::Diagram);
+
+        handle_input(PREFIX_KEY, &state, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_input(b'm', &state, &transport, &mut app)
+            .await
+            .unwrap();
+        assert_eq!(app.sidebar_mode, SidebarMode::List);
     }
 
     #[test]
