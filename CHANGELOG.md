@@ -5,6 +5,13 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## Unreleased
+
+- The sidebar can show a diagram instead of its two lists: one tree of
+  target → workspace → pane, with attention state shown in place on each
+  pane rather than requiring a second "waiting now" list to cross-reference
+  against it. Toggle it with `^]m`; the two-panel list stays the default.
+
 ## 0.7.34
 
 - Fixed shell history recall and arrow keys misbehaving in a pane reached over

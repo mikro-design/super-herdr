@@ -144,6 +144,11 @@ can test is a platform that is broken and does not know it.
   Deduplicating a device that also holds a live connection is the service
   worker's own decision, made from whether a window is actually visible,
   which this daemon has no way to know from a connection alone.
+- An alternate sidebar view, toggled with `^]m`, drawing the federation as one
+  tree (target → workspace → pane) with attention state shown in place on
+  each pane instead of in a separate "waiting now" list. Clean-room: no code
+  or data model shared with any third-party project that drew a similar idea
+  from a different data source.
 
 ## Next
 
