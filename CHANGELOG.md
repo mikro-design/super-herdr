@@ -5,6 +5,13 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.36
+
+- The sidebar diagram added in 0.7.35 now draws as bordered boxes connected
+  by arrows — one box per workspace, listing its panes, with the border
+  turning red when something inside needs attention — rather than the plain
+  indented tree it shipped with.
+
 ## 0.7.35
 
 - The sidebar can show a diagram instead of its two lists: one tree of
