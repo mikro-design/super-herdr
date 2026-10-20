@@ -7380,10 +7380,59 @@ fn sidebar_attention_rows(
     rows
 }
 
-/// One tree of target → workspace → pane, replacing the separate "waiting
-/// now" and session lists with attention state shown in place on each pane,
-/// so a federation with many panes reads at a glance instead of a flat list
-/// that needs cross-referencing against a second one to see where it lives.
+/// Content width inside a diagram box, between its two vertical borders.
+const DIAGRAM_INNER_WIDTH: usize = 22;
+
+/// Pad or truncate (with `…`) to an exact character width, so a hand-drawn
+/// box's borders line up regardless of what the content is.
+fn fit_width(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < width {
+        let mut out: String = chars.into_iter().collect();
+        out.push_str(&" ".repeat(width - out.chars().count()));
+        out
+    } else if chars.len() == width {
+        chars.into_iter().collect()
+    } else if width == 0 {
+        String::new()
+    } else {
+        let mut out: String = chars[..width - 1].iter().collect();
+        out.push('…');
+        out
+    }
+}
+
+fn diagram_border_row(left: char, right: char, style: Style) -> SidebarRow {
+    SidebarRow {
+        line: Line::styled(
+            format!("{left}{}{right}", "─".repeat(DIAGRAM_INNER_WIDTH)),
+            style,
+        ),
+        pane: None,
+        context: None,
+        selection_anchor: false,
+    }
+}
+
+/// The arrow between two boxes, roughly centered under a box of
+/// `DIAGRAM_INNER_WIDTH` content columns.
+fn diagram_connector_rows() -> Vec<SidebarRow> {
+    let indent = " ".repeat(DIAGRAM_INNER_WIDTH / 2);
+    [format!("{indent}│"), format!("{indent}▼")]
+        .into_iter()
+        .map(|text| SidebarRow {
+            line: Line::styled(text, Style::default().fg(Color::DarkGray)),
+            pane: None,
+            context: None,
+            selection_anchor: false,
+        })
+        .collect()
+}
+
+/// A diagram of target → workspace boxes, each listing its panes with
+/// attention state shown in place, so a federation with many panes reads at a
+/// glance instead of a flat list that needs cross-referencing against a
+/// second one to see where it lives.
 fn sidebar_diagram_rows(
     state: &FederationState,
     selected: Option<&PaneId>,
@@ -7436,42 +7485,53 @@ fn sidebar_diagram_rows(
         let Some(snapshot) = target.snapshot.as_deref() else {
             continue;
         };
-        let workspaces = snapshot.workspaces.values().collect::<Vec<_>>();
-        let workspace_count = workspaces.len();
-        for (workspace_index, workspace) in workspaces.into_iter().enumerate() {
-            let workspace_last = workspace_index + 1 == workspace_count;
-            let branch = if workspace_last { "└─" } else { "├─" };
-            let is_selected_workspace = selected_workspace.as_ref() == Some(&workspace.id);
-            let workspace_style = Style::default()
-                .fg(if is_selected_workspace {
-                    Color::White
-                } else {
-                    Color::Gray
+        for workspace in snapshot.workspaces.values() {
+            rows.extend(diagram_connector_rows());
+
+            let panes = snapshot
+                .panes
+                .values()
+                .filter(|pane| pane.workspace.as_ref() == Some(&workspace.id))
+                .collect::<Vec<_>>();
+            let workspace_needs_attention = panes.iter().any(|pane| {
+                agents.get(&pane.id).is_some_and(|entry| {
+                    agent_needs_attention(&entry.status, entry.interactive_ready)
                 })
-                .add_modifier(if is_selected_workspace {
+            });
+            let border_style = Style::default().fg(if workspace_needs_attention {
+                Color::Red
+            } else {
+                Color::DarkGray
+            });
+            rows.push(diagram_border_row('┌', '┐', border_style));
+
+            let is_selected_workspace = selected_workspace.as_ref() == Some(&workspace.id);
+            let title_style = Style::default()
+                .fg(if workspace_needs_attention {
+                    Color::Red
+                } else {
+                    Color::White
+                })
+                .add_modifier(if workspace_needs_attention || is_selected_workspace {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 });
-            let mut line = Line::from(vec![
-                Span::styled(format!("{branch} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    status_symbol(workspace.agent_status.as_deref()),
-                    status_style(workspace.agent_status.as_deref()),
-                ),
-                Span::styled(
-                    format!(
-                        " {}",
-                        display_label(&workspace.id.resource, workspace.label.as_deref())
-                    ),
-                    workspace_style,
-                ),
+            let title_text = format!(
+                " {} {}",
+                status_symbol(workspace.agent_status.as_deref()),
+                display_label(&workspace.id.resource, workspace.label.as_deref())
+            );
+            let mut title_line = Line::from(vec![
+                Span::styled("│", border_style),
+                Span::styled(fit_width(&title_text, DIAGRAM_INNER_WIDTH), title_style),
+                Span::styled("│", border_style),
             ]);
             if is_selected_workspace {
-                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                title_line = title_line.style(Style::default().add_modifier(Modifier::REVERSED));
             }
             rows.push(SidebarRow {
-                line,
+                line: title_line,
                 pane: (target.connection == TargetConnectionState::Live)
                     .then(|| pane_for_workspace(snapshot, &workspace.id))
                     .flatten(),
@@ -7479,16 +7539,22 @@ fn sidebar_diagram_rows(
                 selection_anchor: is_selected_workspace,
             });
 
-            let panes = snapshot
-                .panes
-                .values()
-                .filter(|pane| pane.workspace.as_ref() == Some(&workspace.id))
-                .collect::<Vec<_>>();
-            let pane_count = panes.len();
-            let continuation = if workspace_last { "  " } else { "│ " };
-            for (pane_index, pane) in panes.into_iter().enumerate() {
-                let pane_last = pane_index + 1 == pane_count;
-                let pane_branch = if pane_last { "└─" } else { "├─" };
+            if panes.is_empty() {
+                rows.push(SidebarRow {
+                    line: Line::from(vec![
+                        Span::styled("│", border_style),
+                        Span::styled(
+                            fit_width(" no agents", DIAGRAM_INNER_WIDTH),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled("│", border_style),
+                    ]),
+                    pane: None,
+                    context: None,
+                    selection_anchor: false,
+                });
+            }
+            for pane in panes {
                 let is_selected_pane = selected == Some(&pane.id);
                 let (glyph, style, label) = match agents.get(&pane.id) {
                     Some(entry)
@@ -7512,13 +7578,11 @@ fn sidebar_diagram_rows(
                         display_label(&pane.id.resource, pane.label.as_deref()),
                     ),
                 };
+                let body_text = format!(" {glyph} {label}");
                 let mut line = Line::from(vec![
-                    Span::styled(
-                        format!("{continuation}{pane_branch} "),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(format!("{glyph} "), style),
-                    Span::styled(label, style),
+                    Span::styled("│", border_style),
+                    Span::styled(fit_width(&body_text, DIAGRAM_INNER_WIDTH), style),
+                    Span::styled("│", border_style),
                 ]);
                 if is_selected_pane {
                     line = line.style(Style::default().add_modifier(Modifier::REVERSED));
@@ -7530,6 +7594,7 @@ fn sidebar_diagram_rows(
                     selection_anchor: is_selected_pane,
                 });
             }
+            rows.push(diagram_border_row('└', '┘', border_style));
         }
     }
     rows.push(SidebarRow {
@@ -8667,24 +8732,24 @@ mod tests {
 
     use super::{
         AgentFilter, AgentNavigator, App, AttentionCenter, AttentionIndex, CellPosition,
-        ClipboardFeedback, ContextMenu, ContextTarget, DecodedInput, HERDR_PREFIX_KEY,
-        InputDecoder, InputMode, MAX_CLIPBOARD_BYTES, MAX_CONTEXT_MENU_MOVE_DESTINATIONS,
-        MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY, PaneDirection, PluginCatalog, SIDEBAR_WIDTH,
-        SelectionAutoscroll, SelectionAutoscrollDirection, SelectionFinish, SidebarMode,
-        TUI_SNOOZE_MINUTES, TargetForm, TargetManager, TargetManagerControl, TargetManagerMode,
-        TargetTestEvent, TargetTestState, TerminalSelection, agent_jump_entries,
-        capture_screen_rows, capture_selection_viewport, clamped_pane_position,
-        command_palette_actions, context_menu_for_target, cycle_tab, desired_access,
-        displayed_message, encode_mouse_event, federation_routes_changed, filtered_palette_actions,
-        finish_ui_left_gesture, fuzzy_score, handle_attention_center_input,
-        handle_context_menu_input, handle_decoded_input, handle_input, handle_mouse,
-        handle_target_manager_input, handle_target_manager_mouse, jump_from_notification,
-        mouse_event_allowed, mouse_passthrough_enabled, pane_direction_score, reconcile_selection,
-        refresh_attention, render_vt_screen, safe_text, select_neighbor_pane, select_pane,
-        select_workspace, selected_terminal_text, sidebar_areas, sidebar_attention_rows,
-        sidebar_block, sidebar_content_height, sidebar_diagram_rows, sidebar_pane_at_row,
-        tab_at_column, target_manager_controls, terminal_paste_payload, ui_areas,
-        update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
+        ClipboardFeedback, ContextMenu, ContextTarget, DIAGRAM_INNER_WIDTH, DecodedInput,
+        HERDR_PREFIX_KEY, InputDecoder, InputMode, MAX_CLIPBOARD_BYTES,
+        MAX_CONTEXT_MENU_MOVE_DESTINATIONS, MOUSE_CAPTURE_ENABLE, MouseInput, PREFIX_KEY,
+        PaneDirection, PluginCatalog, SIDEBAR_WIDTH, SelectionAutoscroll,
+        SelectionAutoscrollDirection, SelectionFinish, SidebarMode, TUI_SNOOZE_MINUTES, TargetForm,
+        TargetManager, TargetManagerControl, TargetManagerMode, TargetTestEvent, TargetTestState,
+        TerminalSelection, agent_jump_entries, capture_screen_rows, capture_selection_viewport,
+        clamped_pane_position, command_palette_actions, context_menu_for_target, cycle_tab,
+        desired_access, displayed_message, encode_mouse_event, federation_routes_changed,
+        filtered_palette_actions, finish_ui_left_gesture, fuzzy_score,
+        handle_attention_center_input, handle_context_menu_input, handle_decoded_input,
+        handle_input, handle_mouse, handle_target_manager_input, handle_target_manager_mouse,
+        jump_from_notification, mouse_event_allowed, mouse_passthrough_enabled,
+        pane_direction_score, reconcile_selection, refresh_attention, render_vt_screen, safe_text,
+        select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_areas,
+        sidebar_attention_rows, sidebar_block, sidebar_content_height, sidebar_diagram_rows,
+        sidebar_pane_at_row, tab_at_column, target_manager_controls, terminal_paste_payload,
+        ui_areas, update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
         visible_pane_areas,
     };
     use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
@@ -9940,7 +10005,7 @@ mod tests {
     }
 
     #[test]
-    fn the_diagram_sidebar_shows_the_federation_tree_with_attention_in_place() {
+    fn the_diagram_sidebar_draws_boxed_workspaces_with_attention_in_place() {
         let key = TargetSession::new("host-a", "work");
         let snapshot = NormalizedSnapshot::from_value(
             &key,
@@ -9980,6 +10045,8 @@ mod tests {
             .expect("the blocked pane has a row");
         assert!(waiting.line.to_string().contains("! builder"));
         assert!(waiting.selection_anchor);
+        assert!(waiting.line.to_string().starts_with('│'));
+        assert!(waiting.line.to_string().ends_with('│'));
 
         let idle = rows
             .iter()
@@ -9989,6 +10056,23 @@ mod tests {
             .expect("the idle pane has a row");
         assert!(idle.line.to_string().contains("✓ idler"));
         assert!(!idle.selection_anchor);
+
+        // A box, not a tree: a top border, a boxed title line, the two boxed
+        // pane lines, and a bottom border, with no tree branch characters
+        // (├/└ paired with ─ as a connector) left over from the old layout.
+        assert!(
+            rows.iter()
+                .any(|row| row.line.to_string() == format!("┌{}┐", "─".repeat(DIAGRAM_INNER_WIDTH)))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.line.to_string() == format!("└{}┘", "─".repeat(DIAGRAM_INNER_WIDTH)))
+        );
+        assert!(
+            rows.iter().any(|row| row.line.to_string().contains('│')
+                && row.line.to_string().contains("compiler"))
+        );
+        assert!(!rows.iter().any(|row| row.line.to_string().contains("├─")));
 
         assert!(rows.last().is_some_and(|row| {
             let text = row.line.to_string();
