@@ -5,7 +5,7 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
-## Unreleased
+## 0.7.35
 
 - The sidebar can show a diagram instead of its two lists: one tree of
   target → workspace → pane, with attention state shown in place on each
