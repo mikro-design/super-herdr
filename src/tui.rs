@@ -7381,7 +7381,7 @@ fn sidebar_attention_rows(
 }
 
 /// Content width inside a diagram box, between its two vertical borders.
-const DIAGRAM_INNER_WIDTH: usize = 22;
+const DIAGRAM_INNER_WIDTH: usize = 24;
 
 /// Pad or truncate (with `…`) to an exact character width, so a hand-drawn
 /// box's borders line up regardless of what the content is.
@@ -7415,18 +7415,17 @@ fn diagram_border_row(left: char, right: char, style: Style) -> SidebarRow {
 }
 
 /// The arrow between two boxes, roughly centered under a box of
-/// `DIAGRAM_INNER_WIDTH` content columns.
-fn diagram_connector_rows() -> Vec<SidebarRow> {
+/// `DIAGRAM_INNER_WIDTH` content columns. A single row, not a pair, so the
+/// diagram doesn't burn an extra line of scroll per workspace just to draw
+/// an arrow.
+fn diagram_connector_row() -> SidebarRow {
     let indent = " ".repeat(DIAGRAM_INNER_WIDTH / 2);
-    [format!("{indent}│"), format!("{indent}▼")]
-        .into_iter()
-        .map(|text| SidebarRow {
-            line: Line::styled(text, Style::default().fg(Color::DarkGray)),
-            pane: None,
-            context: None,
-            selection_anchor: false,
-        })
-        .collect()
+    SidebarRow {
+        line: Line::styled(format!("{indent}▼"), Style::default().fg(Color::DarkGray)),
+        pane: None,
+        context: None,
+        selection_anchor: false,
+    }
 }
 
 /// A diagram of target → workspace boxes, each listing its panes with
@@ -7486,7 +7485,7 @@ fn sidebar_diagram_rows(
             continue;
         };
         for workspace in snapshot.workspaces.values() {
-            rows.extend(diagram_connector_rows());
+            rows.push(diagram_connector_row());
 
             let panes = snapshot
                 .panes
@@ -7556,7 +7555,7 @@ fn sidebar_diagram_rows(
             }
             for pane in panes {
                 let is_selected_pane = selected == Some(&pane.id);
-                let (glyph, style, label) = match agents.get(&pane.id) {
+                let (glyph, style, label, status_text) = match agents.get(&pane.id) {
                     Some(entry)
                         if agent_needs_attention(&entry.status, entry.interactive_ready) =>
                     {
@@ -7565,20 +7564,28 @@ fn sidebar_diagram_rows(
                             if unread { "●" } else { "!" },
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                             entry.agent.clone(),
+                            entry.status.clone(),
                         )
                     }
                     Some(entry) => (
                         status_symbol(Some(&entry.status)),
                         status_style(Some(&entry.status)),
                         entry.agent.clone(),
+                        entry.status.clone(),
                     ),
                     None => (
                         status_symbol(pane.agent_status.as_deref()),
                         status_style(pane.agent_status.as_deref()),
                         display_label(&pane.id.resource, pane.label.as_deref()),
+                        pane.agent_status
+                            .clone()
+                            .unwrap_or_else(|| "unknown".into()),
                     ),
                 };
-                let body_text = format!(" {glyph} {label}");
+                // The agent's own status word (working/blocked/idle/…), not
+                // just the coarse glyph, so the box shows what the agent is
+                // actually doing right now, not only whether it needs you.
+                let body_text = format!(" {glyph} {label} {status_text}");
                 let mut line = Line::from(vec![
                     Span::styled("│", border_style),
                     Span::styled(fit_width(&body_text, DIAGRAM_INNER_WIDTH), style),
@@ -10044,6 +10051,11 @@ mod tests {
             .find(|row| row.context == Some(ContextTarget::Pane(selected.clone())))
             .expect("the blocked pane has a row");
         assert!(waiting.line.to_string().contains("! builder"));
+        assert!(
+            waiting.line.to_string().contains("blocked"),
+            "box should show the agent's actual status word, not just a glyph: {}",
+            waiting.line
+        );
         assert!(waiting.selection_anchor);
         assert!(waiting.line.to_string().starts_with('│'));
         assert!(waiting.line.to_string().ends_with('│'));
@@ -10055,6 +10067,7 @@ mod tests {
             })
             .expect("the idle pane has a row");
         assert!(idle.line.to_string().contains("✓ idler"));
+        assert!(idle.line.to_string().contains("idle"));
         assert!(!idle.selection_anchor);
 
         // A box, not a tree: a top border, a boxed title line, the two boxed
