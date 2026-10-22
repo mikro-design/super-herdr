@@ -5,6 +5,14 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.37
+
+- The sidebar diagram's pane boxes now show the agent's own status word
+  (e.g. `working`, `blocked`, `idle`), not just a glyph, so the diagram
+  reflects what an agent is actually doing rather than only whether it needs
+  you. The connector between a target and its workspace boxes is also down
+  to a single row, condensing the diagram.
+
 ## 0.7.36
 
 - The sidebar diagram added in 0.7.35 now draws as bordered boxes connected
