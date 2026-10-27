@@ -368,6 +368,7 @@ mod tests {
             herdr_bins: Vec::new(),
             roots: roots.iter().map(|root| (*root).to_owned()).collect(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }
     }
 

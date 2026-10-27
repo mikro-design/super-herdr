@@ -2343,6 +2343,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }
     }
 
