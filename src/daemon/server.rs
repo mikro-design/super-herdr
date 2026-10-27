@@ -224,6 +224,22 @@ enum Input {
         expires_at: SystemTime,
         decision: oneshot::Sender<std::result::Result<String, String>>,
     },
+    /// A paired device asked to preview one port on one target. The web layer
+    /// has already confirmed the device is admitted; what's checked here is
+    /// whether that target and port are configured for preview at all. See
+    /// `REMOTE_PREVIEW.md`.
+    ///
+    /// Not yet constructed anywhere: the web-layer bridge that sends this
+    /// lands in the next branch, alongside the `/preview/*` routes. This one
+    /// adds the grant store and daemon-side handling with no new HTTP
+    /// surface, so it is reviewable and testable on its own.
+    #[allow(dead_code)]
+    PreviewGrantRequested {
+        device_fingerprint: String,
+        target: TargetSession,
+        port: u16,
+        decision: oneshot::Sender<std::result::Result<crate::preview::PreviewGrant, String>>,
+    },
     /// Stop serving. The loop leaves through the same exit a closed input
     /// channel uses, so shutdown has one path rather than two.
     Shutdown,
@@ -785,6 +801,10 @@ struct Daemon {
     refresh_inflight: bool,
     store: Option<FederationStore>,
     watcher: Option<JoinHandle<()>>,
+    /// In-memory remote-preview grants. See `REMOTE_PREVIEW.md` and
+    /// `src/preview.rs`: never persisted, never longer-lived than this
+    /// process.
+    preview_grants: crate::preview::PreviewGrants,
 }
 
 struct PendingPairingApproval {
@@ -1153,6 +1173,7 @@ async fn run(
         refresh_inflight: false,
         store: None,
         watcher: None,
+        preview_grants: crate::preview::PreviewGrants::new(),
     };
     daemon.start_federation();
 
@@ -1833,6 +1854,29 @@ impl Daemon {
                     )
                 }
             }
+            Input::PreviewGrantRequested {
+                device_fingerprint,
+                target,
+                port,
+                decision,
+            } => {
+                let allowed = self
+                    .targets
+                    .get(&target)
+                    .is_some_and(|configured| configured.preview_ports.contains(&port));
+                let result = if allowed {
+                    Ok(self.preview_grants.grant(
+                        SystemTime::now(),
+                        device_fingerprint,
+                        target,
+                        port,
+                    ))
+                } else {
+                    Err("that target or port is not configured for preview".to_owned())
+                };
+                let _ = decision.send(result);
+                Vec::new()
+            }
             // The loop intercepts this before it reaches here; the arm exists so
             // adding a shutdown path later cannot silently do nothing.
             Input::Shutdown => Vec::new(),
@@ -2181,6 +2225,15 @@ impl Daemon {
         self.transport = refreshed.transport.clone();
         self.command_timeout = Duration::from_secs(refreshed.transport.command_timeout_seconds);
         self.active = refreshed;
+        // A target that disappeared, or a `preview_ports` allowlist that
+        // narrowed, ends its grants immediately rather than leaving them to
+        // expire on their own clock. See REMOTE_PREVIEW.md T8.
+        let targets = &self.targets;
+        self.preview_grants.retain_allowed(|session, port| {
+            targets
+                .get(session)
+                .is_some_and(|target| target.preview_ports.contains(&port))
+        });
         self.start_federation();
         effects
     }
