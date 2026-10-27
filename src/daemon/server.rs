@@ -3540,6 +3540,7 @@ mod tests {
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
                 roots: Vec::new(),
                 tags: Vec::new(),
+                preview_ports: Vec::new(),
             }],
             ..empty_config()
         }
@@ -3559,6 +3560,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         });
         config
     }
@@ -3755,6 +3757,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }
     }
 
@@ -4104,6 +4107,7 @@ mod tests {
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
                 roots: Vec::new(),
                 tags: Vec::new(),
+                preview_ports: Vec::new(),
             }],
             devices: Vec::new(),
             quick_replies: None,
@@ -5011,6 +5015,7 @@ mod tests {
                 herdr_bins: vec!["/nonexistent/herdr".to_owned()],
                 roots: Vec::new(),
                 tags: Vec::new(),
+                preview_ports: Vec::new(),
             },
             &Default::default(),
             crate::clipboard::OPAQUE,
@@ -5030,6 +5035,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         let error = super::accept_copy(
             &destination,

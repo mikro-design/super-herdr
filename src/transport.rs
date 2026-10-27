@@ -154,8 +154,10 @@ fn targets_for_discovered_sessions(
             herdr_bins: target.herdr_bins.clone(),
             roots: target.roots.clone(),
             // Discovery splits one configured target into one per session.
-            // They are the same machine, so they carry the same groupings.
+            // They are the same machine, so they carry the same groupings and
+            // the same preview allowlist.
             tags: target.tags.clone(),
+            preview_ports: target.preview_ports.clone(),
         })
         .collect()
 }
@@ -953,6 +955,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
 
         assert_eq!(
@@ -997,6 +1000,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
 
         assert!(targets_for_discovered_sessions(&target, Vec::new()).is_empty());
