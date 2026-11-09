@@ -103,6 +103,12 @@ globalThis.fetch = (url, init) => {
       text: () => Promise.resolve('Choose a different device name and try this code again.'),
     });
   }
+  if (url.endsWith('/preview/grant')) {
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({ grant_id: 'abc123', expires_in_seconds: 90 }),
+    });
+  }
   return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
 };
 // A notification the page raised, and the permission it was raised under.
@@ -166,6 +172,23 @@ const check = (what, condition) => {
     console.log(`ok: ${what}`);
   }
 };
+
+// Static check against the real markup, not the simulated DOM: the stub
+// `document.createElement` cannot tell an `<iframe>` from a `<div>`, so a
+// script-execution assertion could never catch `allow-same-origin` creeping
+// into the preview frame's sandbox (REMOTE_PREVIEW.md gate #2 — the frame
+// must never be able to read the page that embeds it).
+for (const match of html.matchAll(/<iframe\b[^>]*>/gi)) {
+  const tag = match[0];
+  const sandbox = (tag.match(/\bsandbox\s*=\s*"([^"]*)"/i) || [])[1];
+  check(`${tag} declares a sandbox attribute`, typeof sandbox === 'string');
+  if (typeof sandbox !== 'string') continue;
+  const tokens = sandbox.split(/\s+/).filter(Boolean);
+  for (const forbidden of ['allow-same-origin', 'allow-top-navigation', 'allow-popups']) {
+    check(`${tag} withholds ${forbidden}`, !tokens.includes(forbidden));
+  }
+}
+
 // A tap the way a phone makes one: pointerdown, pointerup, and — on iOS, once
 // pointerdown's default is prevented — no click at all. Calling onclick() is
 // what this harness used to do, which is the one sequence a phone may never
@@ -1076,6 +1099,77 @@ check('choosing a search result fills the whole path',
 // The picker belongs to the pane being watched.
 page.observe({ target: 'first', session: 'main', resource: 'w1:p2' }, 'other');
 check('watching another pane clears the picker', entries().length === 0);
+
+// Previewing a development server on a target: a port from configuration,
+// never a URL, and the frame's sandbox never relaxes (REMOTE_PREVIEW.md
+// T1/T7 — covered structurally here, not just by the static check above).
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'first', session: 'main' }, connection: 'live',
+      roots: [], preview_ports: [3000, 4000],
+      snapshot: { workspaces: [], panes: [], agents: [] },
+    }],
+  },
+});
+const sessionSummaryRow = () =>
+  page.el('panes').children[0].children[0].children[1].children[0].children[0];
+const previewButton = () => sessionSummaryRow().children[2];
+check('a target with preview ports offers a Preview action',
+  Boolean(previewButton()) && previewButton().textContent === 'Preview');
+
+previewButton().onclick({ preventDefault() {}, stopPropagation() {} });
+check('opening preview shows the panel', page.el('preview').hidden === false);
+check('the panel starts on the setup step, not the frame',
+  page.el('preview-setup').hidden === false && page.el('preview-frame').hidden === true);
+const portChips = () => page.el('preview-ports').children;
+check('every configured port is offered as a chip', portChips().length === 2);
+check('the first port is selected by default', portChips()[0]['aria-pressed'] === 'true');
+
+portChips()[1].onclick();
+check('choosing a port selects it', portChips()[1]['aria-pressed'] === 'true');
+check('choosing a port deselects the other', portChips()[0]['aria-pressed'] === 'false');
+
+sent.length = 0;
+await page.el('preview-open').onclick();
+const granted = sent.find(one => one.url.endsWith('/preview/grant'));
+check('opening a preview grants the chosen target, session and port',
+  granted.body.target === 'first' && granted.body.session === 'main' && granted.body.port === 4000);
+check('granting switches from setup to the frame',
+  page.el('preview-setup').hidden === true && page.el('preview-frame').hidden === false);
+check('the frame is navigated to the granted id',
+  page.el('preview-frame').src === '/preview/abc123');
+
+sent.length = 0;
+page.el('preview-stop').onclick();
+check('closing a preview hides the panel and the frame',
+  page.el('preview').hidden === true && page.el('preview-frame').hidden === true);
+const revoked = sent.find(one => one.url.endsWith('/preview/revoke'));
+check('closing a preview revokes its grant', revoked.body.grant_id === 'abc123');
+
+// The pane viewer and the preview panel are both full-screen overlays, so
+// opening one puts the other away rather than stacking silently under it.
+previewButton().onclick({ preventDefault() {}, stopPropagation() {} });
+page.observe(pane, 'first/main/w1:p1');
+check('watching a pane closes an open preview', page.el('preview').hidden === true);
+previewButton().onclick({ preventDefault() {}, stopPropagation() {} });
+check('opening a preview closes the pane viewer', page.el('viewer').hidden === true);
+page.el('preview-stop').onclick();
+
+// A target with no preview ports offers no action at all.
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'first', session: 'main' }, connection: 'live',
+      roots: [], preview_ports: [],
+      snapshot: { workspaces: [], panes: [], agents: [] },
+    }],
+  },
+});
+check('a target with no preview ports offers no Preview action',
+  sessionSummaryRow().children.length === 2);
 
 // A local name is shown over the host's own word and never instead of the
 // identity, and a favourite is one more thing this installation remembers.

@@ -201,7 +201,7 @@
   }
   #viewing { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
   #screen-note { color: var(--dim); font-size: .78rem; white-space: nowrap; }
-  #viewer {
+  #viewer, #preview {
     position: fixed; top: 0; right: 0; bottom: auto; left: 0; z-index: 5;
     height: 100dvh; overflow: hidden;
     display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: .65rem;
@@ -211,8 +211,13 @@
              calc(.7rem + env(safe-area-inset-left));
     background: var(--bg);
   }
-  #viewer[hidden] { display: none; }
-  #viewer > * { width: 100%; max-width: 70rem; margin-left: auto; margin-right: auto; }
+  #viewer[hidden], #preview[hidden] { display: none; }
+  #viewer > *, #preview > * { width: 100%; max-width: 70rem; margin-left: auto; margin-right: auto; }
+  #preview-frame {
+    width: 100%; height: 100%; min-height: 0; border: 1px solid var(--line);
+    border-radius: .7rem; background: #fff;
+  }
+  #preview-error:empty { display: none; }
   .viewer-head { display: flex; align-items: center; gap: .6rem; min-width: 0; }
   .viewer-head #stop { margin-left: auto; flex: none; }
   .viewer-controls { min-width: 0; }
@@ -384,6 +389,29 @@
         <span id="fetch-note" class="note" role="status"></span>
       </div>
     </div>
+  </section>
+
+  <section id="preview" hidden>
+    <div class="viewer-head">
+      <strong id="preview-title"></strong>
+      <button id="preview-stop">Done</button>
+    </div>
+    <div id="preview-setup">
+      <div id="preview-ports" class="chips" role="group" aria-label="Ports"></div>
+      <p class="note">
+        This opens a live connection to the development server on this port,
+        separate from the terminal connection. It renders in a locked-down frame
+        that can run its own scripts but cannot read this device's pairing or
+        reach any other target.
+      </p>
+      <p class="note" id="preview-bridge-note" hidden>
+        This connects through the hosted bridge, so this traffic is decrypted at
+        the relay for that one hop, the same as the terminal connection.
+      </p>
+      <div class="actions"><button id="preview-open" type="button" disabled>Open preview</button></div>
+    </div>
+    <iframe id="preview-frame" sandbox="allow-scripts allow-forms" title="Preview" hidden></iframe>
+    <p class="note" id="preview-error" role="status"></p>
   </section>
 </main>
 
@@ -976,6 +1004,9 @@ function acknowledge() {
 }
 
 function observe(pane, label) {
+  // Both the pane viewer and the preview panel are full-screen overlays;
+  // opening one puts the other away rather than stacking silently under it.
+  revokePreview();
   // A fetch belongs to the pane it was asked for. Watching something else
   // abandons it rather than letting bytes from one host arrive under another
   // host's heading.
@@ -1397,6 +1428,88 @@ function entryRow(kind, name, chosen) {
   else button.disabled = true;
   item.append(button);
   return item;
+}
+
+// Previewing a development server on a target.
+//
+// Never a URL: only a target, a session and a port from configuration reach
+// the daemon, and the daemon alone decides what gets fetched. The grant is
+// re-disclosed every time (REMOTE_PREVIEW.md T10) and the frame below is
+// never given `allow-same-origin`, or it could read this device's cookie.
+let preview = null;
+
+function openPreview(target, session, ports) {
+  revokePreview();
+  stopWatching('');
+  preview = { target, session, port: ports[0] || null, grantId: null };
+  el('preview-title').textContent = `${target}/${session}`;
+  el('preview-error').textContent = '';
+  el('preview-frame').hidden = true;
+  el('preview-frame').src = 'about:blank';
+  el('preview-setup').hidden = false;
+  el('preview-bridge-note').hidden = !bridged;
+  renderPreviewPorts(ports);
+  el('preview').hidden = false;
+}
+
+function renderPreviewPorts(ports) {
+  const strip = el('preview-ports');
+  strip.innerHTML = '';
+  for (const port of ports) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'chip';
+    button.textContent = String(port);
+    button.setAttribute('aria-pressed', preview && preview.port === port ? 'true' : 'false');
+    button.onclick = () => {
+      preview.port = port;
+      renderPreviewPorts(ports);
+    };
+    strip.append(button);
+  }
+  el('preview-open').disabled = !ports.length;
+}
+
+async function grantPreview() {
+  if (!preview || preview.port == null) return;
+  el('preview-open').disabled = true;
+  el('preview-error').textContent = '';
+  try {
+    const response = await fetch(endpoint('/preview/grant'), {
+      method: 'POST',
+      body: JSON.stringify({ target: preview.target, session: preview.session, port: preview.port }),
+    });
+    if (!response.ok) {
+      el('preview-error').textContent = await response.text();
+      el('preview-open').disabled = false;
+      return;
+    }
+    const granted = await response.json();
+    if (!preview) return;
+    preview.grantId = granted.grant_id;
+    el('preview-setup').hidden = true;
+    const frame = el('preview-frame');
+    frame.hidden = false;
+    frame.src = endpoint(`/preview/${granted.grant_id}`);
+  } catch (_) {
+    el('preview-error').textContent = 'The preview could not be opened. Try again.';
+    el('preview-open').disabled = false;
+  }
+}
+
+function revokePreview() {
+  if (!preview) return;
+  const grantId = preview.grantId;
+  preview = null;
+  el('preview').hidden = true;
+  el('preview-frame').src = 'about:blank';
+  el('preview-frame').hidden = true;
+  if (grantId) {
+    fetch(endpoint('/preview/revoke'), {
+      method: 'POST',
+      body: JSON.stringify({ grant_id: grantId }),
+    }).catch(() => {});
+  }
 }
 
 // Fetching a file off a target.
@@ -2281,6 +2394,19 @@ function renderPanes() {
         : Object.keys(runtime.connection || {})[0] || 'unknown';
       connection.classList.add(live ? 'work' : 'wait');
       summaryRow.append(sessionName, connection);
+      const ports = Array.isArray(runtime.preview_ports) ? runtime.preview_ports : [];
+      if (ports.length) {
+        const previewButton = document.createElement('button');
+        previewButton.type = 'button';
+        previewButton.className = 'chip';
+        previewButton.textContent = 'Preview';
+        previewButton.onclick = event => {
+          event.preventDefault();
+          event.stopPropagation();
+          openPreview(target, session, ports);
+        };
+        summaryRow.append(previewButton);
+      }
       summary.append(summaryRow);
       details.append(summary);
 
@@ -2682,6 +2808,8 @@ if ('serviceWorker' in navigator) {
   });
 }
 el('stop').onclick = () => stopWatching('');
+el('preview-stop').onclick = () => revokePreview();
+el('preview-open').onclick = () => grantPreview();
 
 // A rotation or a resize changes how much of the pane fits, not the pane.
 window.addEventListener('resize', () => {

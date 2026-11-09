@@ -289,6 +289,11 @@ pub struct TargetRuntimeState {
     /// needs to offer the picker at all, and it is not a secret: it is the
     /// list somebody wrote down as the places worth browsing.
     pub roots: Vec<String>,
+    /// Ports this target allows a remote preview grant against, from
+    /// configuration. Carried in the federation so a client can show a
+    /// "Preview" action at all; it is not a secret, and granting a preview
+    /// still requires a separate round trip through the daemon.
+    pub preview_ports: Vec<u16>,
     pub snapshot: Option<Arc<NormalizedSnapshot>>,
     pub last_error: Option<String>,
     pub last_success: Option<SystemTime>,
@@ -315,6 +320,7 @@ impl TargetRuntimeState {
             || self.connection_generation != other.connection_generation
             || self.selected_herdr_bin != other.selected_herdr_bin
             || self.roots != other.roots
+            || self.preview_ports != other.preview_ports
             || self.snapshot != other.snapshot
             || self.last_error != other.last_error
     }
@@ -329,6 +335,7 @@ impl TargetRuntimeState {
             connection_generation: 0,
             selected_herdr_bin: None,
             roots: target.roots.clone(),
+            preview_ports: target.preview_ports.clone(),
             snapshot: None,
             last_error: None,
             last_success: None,
