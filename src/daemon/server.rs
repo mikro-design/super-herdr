@@ -228,17 +228,27 @@ enum Input {
     /// has already confirmed the device is admitted; what's checked here is
     /// whether that target and port are configured for preview at all. See
     /// `REMOTE_PREVIEW.md`.
-    ///
-    /// Not yet constructed anywhere: the web-layer bridge that sends this
-    /// lands in the next branch, alongside the `/preview/*` routes. This one
-    /// adds the grant store and daemon-side handling with no new HTTP
-    /// surface, so it is reviewable and testable on its own.
-    #[allow(dead_code)]
     PreviewGrantRequested {
         device_fingerprint: String,
         target: TargetSession,
         port: u16,
         decision: oneshot::Sender<std::result::Result<crate::preview::PreviewGrant, String>>,
+    },
+    /// A device asked to end a preview grant. Refused, indistinguishably
+    /// from "no such grant", unless the grant belongs to this device.
+    PreviewRevokeRequested {
+        device_fingerprint: String,
+        grant_id: String,
+        decision: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// The web layer is about to fetch through a grant and needs it
+    /// revalidated live, immediately before use, rather than trusted from
+    /// grant time (`REMOTE_PREVIEW.md` T8). On success, carries what is
+    /// needed to open the forward: a target and a port, never a URL.
+    PreviewFetchRequested {
+        device_fingerprint: String,
+        grant_id: String,
+        decision: oneshot::Sender<std::result::Result<web::PreviewFetchTarget, String>>,
     },
     /// Stop serving. The loop leaves through the same exit a closed input
     /// channel uses, so shutdown has one path rather than two.
@@ -973,7 +983,7 @@ async fn serve_web_client(
     // Devices are not affected by session discovery, so the configuration is
     // read as given rather than expanded a second time — discovery reaches
     // every host, and doing it twice at startup would double that for nothing.
-    let policy: std::sync::Arc<dyn web::Devices> = std::sync::Arc::new(DevicePolicy {
+    let policy = std::sync::Arc::new(DevicePolicy {
         config_path: config_path.map(Path::to_path_buf),
         devices: Mutex::new(config.devices.clone()),
         inputs: inputs.clone(),
@@ -983,13 +993,15 @@ async fn serve_web_client(
         vapid_keys,
         push_wake,
     });
+    let devices: std::sync::Arc<dyn web::Devices> = policy.clone();
+    let previews: std::sync::Arc<dyn web::Previews> = policy;
     let bridge = options
         .web_bridge
         .clone()
         .map(|route| crate::bridge::spawn_connector(route, address, bridge_pairing.subscribe()));
     Ok(Some((
         address,
-        tokio::spawn(web::serve(listener, open, policy)),
+        tokio::spawn(web::serve(listener, open, devices, previews)),
         bridge,
     )))
 }
@@ -1403,6 +1415,57 @@ impl web::Devices for DevicePolicy {
             return None;
         }
         serde_json::to_string(message).ok()
+    }
+}
+
+/// `Previews` is implemented on the same type as `Devices`, but never added
+/// as methods to that trait: a caller holding only an `Arc<dyn web::Previews>`
+/// has no way to reach pairing, push, or any pane-shaped capability, which
+/// keeps that separation (`REMOTE_PREVIEW.md` T7) a fact in the type rather
+/// than one a reviewer has to trust a runtime check for.
+impl web::Previews for DevicePolicy {
+    fn grant(
+        &self,
+        token: &str,
+        target: TargetSession,
+        port: u16,
+    ) -> oneshot::Receiver<std::result::Result<crate::preview::PreviewGrant, String>> {
+        let (decision, receiver) = oneshot::channel();
+        let _ = self.inputs.send(Input::PreviewGrantRequested {
+            device_fingerprint: pairing::fingerprint(token),
+            target,
+            port,
+            decision,
+        });
+        receiver
+    }
+
+    fn revoke(
+        &self,
+        token: &str,
+        grant_id: &str,
+    ) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (decision, receiver) = oneshot::channel();
+        let _ = self.inputs.send(Input::PreviewRevokeRequested {
+            device_fingerprint: pairing::fingerprint(token),
+            grant_id: grant_id.to_owned(),
+            decision,
+        });
+        receiver
+    }
+
+    fn fetch(
+        &self,
+        token: &str,
+        grant_id: &str,
+    ) -> oneshot::Receiver<std::result::Result<web::PreviewFetchTarget, String>> {
+        let (decision, receiver) = oneshot::channel();
+        let _ = self.inputs.send(Input::PreviewFetchRequested {
+            device_fingerprint: pairing::fingerprint(token),
+            grant_id: grant_id.to_owned(),
+            decision,
+        });
+        receiver
     }
 }
 
@@ -1873,6 +1936,60 @@ impl Daemon {
                     ))
                 } else {
                     Err("that target or port is not configured for preview".to_owned())
+                };
+                let _ = decision.send(result);
+                Vec::new()
+            }
+            Input::PreviewRevokeRequested {
+                device_fingerprint,
+                grant_id,
+                decision,
+            } => {
+                let now = SystemTime::now();
+                let result =
+                    if self
+                        .preview_grants
+                        .revoke_owned(now, &grant_id, &device_fingerprint)
+                    {
+                        Ok(())
+                    } else {
+                        Err("no such grant".to_owned())
+                    };
+                let _ = decision.send(result);
+                Vec::new()
+            }
+            Input::PreviewFetchRequested {
+                device_fingerprint,
+                grant_id,
+                decision,
+            } => {
+                let now = SystemTime::now();
+                let targets = &self.targets;
+                let outcome = self.preview_grants.begin_fetch(
+                    now,
+                    &grant_id,
+                    &device_fingerprint,
+                    |session, port| {
+                        targets
+                            .get(session)
+                            .is_some_and(|configured| configured.preview_ports.contains(&port))
+                    },
+                );
+                let result = match outcome {
+                    Ok(grant) => match self.targets.get(grant.target()) {
+                        Some(configured) => Ok(web::PreviewFetchTarget {
+                            target: configured.clone(),
+                            transport: self.transport.clone(),
+                            port: grant.port(),
+                        }),
+                        None => Err("that target is no longer configured".to_owned()),
+                    },
+                    Err(crate::preview::PreviewFetchError::NotFound) => {
+                        Err("that preview grant is not available".to_owned())
+                    }
+                    Err(crate::preview::PreviewFetchError::TooSoon) => {
+                        Err("fetched too recently; wait before trying again".to_owned())
+                    }
                 };
                 let _ = decision.send(result);
                 Vec::new()
@@ -4748,6 +4865,169 @@ mod tests {
         let loaded = Config::load(Some(&config_path)).unwrap().0;
         assert_eq!(loaded.devices.len(), 1);
         assert_eq!(loaded.devices[0].name, "tablet");
+
+        let _ = stop.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+    }
+
+    /// Exercises the real wiring end to end: `DevicePolicy`'s `Previews`
+    /// impl, `Input::PreviewGrantRequested`/`PreviewFetchRequested`/
+    /// `PreviewRevokeRequested`, and `Daemon::handle`'s arms for them —
+    /// nothing here is a fake standing in for the daemon. The web-layer
+    /// tests in `daemon::web` cover the HTTP relay's own bounds and
+    /// allowlists against a `Previews` test double; this one proves that
+    /// double matches what the real daemon actually does.
+    #[tokio::test]
+    async fn a_paired_browser_grants_fetches_and_revokes_a_preview_through_the_real_daemon() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        const TOKEN: &str = "cdef0123456789cdef0123456789cdef0123456789cdef0123456789cdef0123";
+
+        let dev_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dev_port = dev_server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = dev_server.accept().await {
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let mut config = local_target_config();
+        config.targets[0].preview_ports = vec![dev_port];
+        config.devices = vec![Device {
+            name: "tablet".to_owned(),
+            token_sha256: crate::pairing::fingerprint(TOKEN),
+            paired_at_ms: 1,
+        }];
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(
+            config,
+            None,
+            DaemonOptions {
+                socket: directory.path().join("daemon.sock"),
+                agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
+                aliases: None,
+                attention_state: Some(directory.path().join("attention.json")),
+                refresh_interval: Duration::from_secs(3600),
+                web_port: Some(port),
+                web_address: None,
+                web_url: None,
+                web_bridge: None,
+            },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        /// Retries only the connection, the same way `Harness::connect` does:
+        /// the listener is bound before the daemon task is first polled, but
+        /// polling it still takes a moment.
+        async fn once(port: u16, request: &str) -> Vec<u8> {
+            let mut stream = None;
+            for _ in 0..200 {
+                match TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(connected) => {
+                        stream = Some(connected);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+            let mut stream = stream.expect("the web listener never came up");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        }
+
+        // A port not on the allowlist is refused.
+        let body = r#"{"target":"first","session":"default","port":1}"#;
+        let request = format!(
+            "POST /preview/grant HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TOKEN}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let grant_response = once(port, &request).await;
+        let grant_text = String::from_utf8_lossy(&grant_response);
+        assert!(grant_text.starts_with("HTTP/1.1 403"), "{grant_text}");
+
+        // The real grant, now that the allowlisted port is correct and the
+        // listener is confirmed up.
+        let body = format!(r#"{{"target":"first","session":"default","port":{dev_port}}}"#);
+        let request = format!(
+            "POST /preview/grant HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TOKEN}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = once(port, &request).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        let json = text.rsplit_once("\r\n\r\n").map(|(_, body)| body).unwrap();
+        let grant_id = json
+            .split("\"grant_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a grant id");
+
+        let fetch = format!(
+            "GET /preview/{grant_id} HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TOKEN}\r\nconnection: close\r\n\r\n"
+        );
+        let response = once(port, &fetch).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.ends_with("ok"), "{text}");
+
+        // A device that was never paired at all cannot revoke this grant —
+        // refused by the `admitted` guard before preview-specific ownership
+        // is even considered.
+        const OTHER_TOKEN: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let revoke_body = format!(r#"{{"grant_id":"{grant_id}"}}"#);
+        let revoke_by_other = format!(
+            "POST /preview/revoke HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={OTHER_TOKEN}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{revoke_body}",
+            revoke_body.len()
+        );
+        // Not a paired device at all, so this is 401, not 404 — a stronger
+        // guarantee than the ownership check alone, and worth asserting.
+        let response = once(port, &revoke_by_other).await;
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 401"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let revoke_by_owner = format!(
+            "POST /preview/revoke HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TOKEN}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{revoke_body}",
+            revoke_body.len()
+        );
+        let response = once(port, &revoke_by_owner).await;
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 204"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let response = once(port, &fetch).await;
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"),
+            "a revoked grant must be refused at fetch time: {}",
+            String::from_utf8_lossy(&response)
+        );
 
         let _ = stop.send(());
         let _ = tokio::time::timeout(Duration::from_secs(10), server).await;

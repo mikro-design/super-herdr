@@ -32,6 +32,8 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::config::{Target, TransportConfig};
+use crate::model::TargetSession;
 use crate::protocol::{ClientMessage, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, encode};
 
 /// The page and everything it needs. Held in the binary so a daemon serves a
@@ -98,6 +100,50 @@ const COOKIE_LIFETIME_SECONDS: u64 = 60 * 60 * 24 * 30;
 /// Kept below common proxy request deadlines so the original pairing request
 /// can wait for the trusted TUI's answer without a second bearer cookie.
 pub const PAIRING_APPROVAL_LIFETIME: Duration = Duration::from_secs(60);
+
+/// How long the web layer waits for the daemon's broker to decide a preview
+/// grant, revoke, or fetch. Every one of those is resolved synchronously
+/// inside `Daemon::handle`, so this bounds a stuck or shut-down daemon, not
+/// ordinary work.
+const PREVIEW_DECISION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds on opening the forward and getting a first byte back, and on the
+/// whole fetch end to end (`REMOTE_PREVIEW.md` T5).
+const PREVIEW_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const PREVIEW_TOTAL_DURATION: Duration = Duration::from_secs(30);
+
+/// Short enough that the test asserting a never-finishing preview is bounded
+/// costs nothing, the same reasoning as `KEEPALIVE_INTERVAL`'s test override.
+#[cfg(test)]
+const PREVIEW_TOTAL_DURATION: Duration = Duration::from_millis(200);
+
+/// A request line and headers from the previewed server may not exceed this,
+/// the same bound `read_request` places on a browser's own request.
+const PREVIEW_MAX_HEADER_BYTES: usize = 16 * 1024;
+
+/// A preview is a page, not a download: this is a low ceiling on purpose
+/// (`REMOTE_PREVIEW.md` T5).
+const PREVIEW_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Content types a sandboxed frame may be shown as-is. Everything else is
+/// described, never rendered (`REMOTE_PREVIEW.md` T6).
+const PREVIEW_CONTENT_TYPES: &[&str] = &[
+    "text/html",
+    "text/plain",
+    "text/css",
+    "text/javascript",
+    "application/javascript",
+    "application/json",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/svg+xml",
+    "image/webp",
+    "image/x-icon",
+    "font/woff",
+    "font/woff2",
+];
 
 pub type PairingDecision = oneshot::Receiver<std::result::Result<String, String>>;
 
@@ -172,6 +218,50 @@ pub trait Devices: Send + Sync {
     fn latest_push_notification(&self) -> Option<String>;
 }
 
+/// What the web layer asks of remote-preview grants, kept off `Devices` on
+/// purpose: a type that only ever receives an `Arc<dyn Previews>` has no way
+/// to reach pairing, push, or any pane-shaped capability, which keeps that
+/// separation (`REMOTE_PREVIEW.md` T7) a fact in a signature rather than one
+/// a reviewer has to trust a runtime check for.
+pub trait Previews: Send + Sync {
+    /// Ask to preview one port on one target. The caller is already known
+    /// paired by the time this is called (see the `admitted` guard in
+    /// `handle`); what is decided here is whether that target and port are
+    /// configured for preview at all.
+    fn grant(
+        &self,
+        token: &str,
+        target: TargetSession,
+        port: u16,
+    ) -> oneshot::Receiver<std::result::Result<crate::preview::PreviewGrant, String>>;
+
+    /// End a grant, but only the one this device itself holds.
+    fn revoke(
+        &self,
+        token: &str,
+        grant_id: &str,
+    ) -> oneshot::Receiver<std::result::Result<(), String>>;
+
+    /// Re-validate a grant live, immediately before using it, and return what
+    /// is needed to open the forward: a target and a port, never a URL
+    /// (`REMOTE_PREVIEW.md` T2, T8).
+    fn fetch(
+        &self,
+        token: &str,
+        grant_id: &str,
+    ) -> oneshot::Receiver<std::result::Result<PreviewFetchTarget, String>>;
+}
+
+/// What a validated fetch needs to open its own forward. Carries a whole
+/// `Target` rather than just an SSH destination so this stays the same shape
+/// `crate::transport::open_tcp_endpoint` already takes; nothing here is a URL
+/// or a host chosen by the request (T2).
+pub struct PreviewFetchTarget {
+    pub target: Target,
+    pub transport: TransportConfig,
+    pub port: u16,
+}
+
 /// Browser sessions, each holding the writing half of its own attachment.
 ///
 /// A stream and the posts that steer it are separate requests, so they are
@@ -196,7 +286,12 @@ pub async fn bind(address: SocketAddr) -> Result<TcpListener> {
         .with_context(|| format!("failed to serve the web client on {address}"))
 }
 
-pub async fn serve(listener: TcpListener, attach: Attach, devices: Arc<dyn Devices>) {
+pub async fn serve(
+    listener: TcpListener,
+    attach: Attach,
+    devices: Arc<dyn Devices>,
+    previews: Arc<dyn Previews>,
+) {
     let sessions = Arc::new(Sessions::default());
     loop {
         match listener.accept().await {
@@ -204,8 +299,9 @@ pub async fn serve(listener: TcpListener, attach: Attach, devices: Arc<dyn Devic
                 let attach = attach.clone();
                 let sessions = sessions.clone();
                 let devices = devices.clone();
+                let previews = previews.clone();
                 tokio::spawn(async move {
-                    let _ = handle(stream, peer, attach, sessions, devices).await;
+                    let _ = handle(stream, peer, attach, sessions, devices, previews).await;
                 });
             }
             // One failed accept must not end the server.
@@ -231,6 +327,7 @@ async fn handle(
     attach: Attach,
     sessions: Arc<Sessions>,
     devices: Arc<dyn Devices>,
+    previews: Arc<dyn Previews>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -312,6 +409,112 @@ async fn handle(
                 "this device is not paired with this daemon",
             )
             .await
+        }
+        ("POST", "/preview/grant") => {
+            let body = read_body(&mut reader, request.length).await?;
+            let text = String::from_utf8_lossy(&body);
+            let target_name = json_field(&text, "target").unwrap_or_default();
+            let session = json_field(&text, "session").unwrap_or_default();
+            let Some(port) = json_number_field(&text, "port") else {
+                return write_status(&mut writer, "400 Bad Request", "a numeric port is required")
+                    .await;
+            };
+            let token = request.token.as_deref().unwrap_or_default();
+            let target = TargetSession::new(&target_name, &session);
+            match tokio::time::timeout(
+                PREVIEW_DECISION_TIMEOUT,
+                previews.grant(token, target, port),
+            )
+            .await
+            {
+                Ok(Ok(Ok(grant))) => {
+                    let body = format!(
+                        "{{\"grant_id\":\"{}\",\"expires_in_seconds\":{}}}",
+                        grant.id(),
+                        crate::preview::GRANT_LIFETIME.as_secs()
+                    );
+                    write_json(&mut writer, &body).await
+                }
+                Ok(Ok(Err(message))) => write_status(&mut writer, "403 Forbidden", &message).await,
+                Ok(Err(_)) => {
+                    write_status(
+                        &mut writer,
+                        "503 Service Unavailable",
+                        "the preview decision was lost",
+                    )
+                    .await
+                }
+                Err(_) => {
+                    write_status(
+                        &mut writer,
+                        "503 Service Unavailable",
+                        "the daemon did not answer in time",
+                    )
+                    .await
+                }
+            }
+        }
+        ("POST", "/preview/revoke") => {
+            let body = read_body(&mut reader, request.length).await?;
+            let text = String::from_utf8_lossy(&body);
+            let grant_id = json_field(&text, "grant_id").unwrap_or_default();
+            let token = request.token.as_deref().unwrap_or_default();
+            match tokio::time::timeout(PREVIEW_DECISION_TIMEOUT, previews.revoke(token, &grant_id))
+                .await
+            {
+                Ok(Ok(Ok(()))) => write_status(&mut writer, "204 No Content", "").await,
+                Ok(Ok(Err(message))) => write_status(&mut writer, "404 Not Found", &message).await,
+                Ok(Err(_)) => {
+                    write_status(
+                        &mut writer,
+                        "503 Service Unavailable",
+                        "the preview decision was lost",
+                    )
+                    .await
+                }
+                Err(_) => {
+                    write_status(
+                        &mut writer,
+                        "503 Service Unavailable",
+                        "the daemon did not answer in time",
+                    )
+                    .await
+                }
+            }
+        }
+        (method, path) if method == "GET" && path.starts_with("/preview/") => {
+            let grant_id = sanitized_grant_id(&path["/preview/".len()..]);
+            let token = request.token.as_deref().unwrap_or_default();
+            match tokio::time::timeout(PREVIEW_DECISION_TIMEOUT, previews.fetch(token, &grant_id))
+                .await
+            {
+                Ok(Ok(Ok(fetch_target))) => {
+                    relay_preview(
+                        &mut writer,
+                        &fetch_target.target,
+                        &fetch_target.transport,
+                        fetch_target.port,
+                    )
+                    .await
+                }
+                Ok(Ok(Err(message))) => write_status(&mut writer, "403 Forbidden", &message).await,
+                Ok(Err(_)) => {
+                    write_status(
+                        &mut writer,
+                        "503 Service Unavailable",
+                        "the preview decision was lost",
+                    )
+                    .await
+                }
+                Err(_) => {
+                    write_status(
+                        &mut writer,
+                        "503 Service Unavailable",
+                        "the daemon did not answer in time",
+                    )
+                    .await
+                }
+            }
         }
         ("GET", "/push/vapid_public_key") => match devices.vapid_public_key() {
             Some(key) => write_json(&mut writer, &format!("{{\"key\":\"{key}\"}}")).await,
@@ -485,6 +688,30 @@ fn sanitized_token(value: &str) -> String {
         .collect()
 }
 
+/// A preview grant id is hex from this daemon too, the same shape as a device
+/// token, so it is sanitized the same way.
+fn sanitized_grant_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(128)
+        .collect()
+}
+
+/// Read one integer field out of a small JSON object, the numeric sibling of
+/// `json_field`.
+fn json_number_field(text: &str, field: &str) -> Option<u16> {
+    let key = format!("\"{field}\"");
+    let start = text.find(&key)? + key.len();
+    let rest = text
+        .get(start..)?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let end = rest.find(|character: char| !character.is_ascii_digit())?;
+    rest.get(..end)?.parse().ok()
+}
+
 /// Read one string field out of a small JSON object.
 ///
 /// The pairing request is two short fields from a page this daemon served, so
@@ -562,6 +789,239 @@ async fn write_status(writer: &mut OwnedWriteHalf, status: &str, body: &str) -> 
     writer.write_all(body.as_bytes()).await?;
     let _ = writer.shutdown().await;
     Ok(())
+}
+
+fn previewable_content_type(declared: &str) -> bool {
+    let base = declared
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    PREVIEW_CONTENT_TYPES.contains(&base.as_str())
+}
+
+struct PreviewSuccess {
+    status_code: u16,
+    reason: String,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+/// Why a fetch did not produce a page to render, each reported to the person
+/// rather than silently dropped or truncated (`REMOTE_PREVIEW.md` T5).
+enum PreviewOutcome {
+    /// Reported as a redirect, with its status; the body is discarded and
+    /// nothing is followed (T3).
+    Redirected(u16),
+    /// Outside the content-type allowlist, or missing one entirely (T6).
+    NotPreviewable(String),
+    /// Declared or actual body size exceeded the ceiling (T5).
+    TooLarge,
+    /// A network- or protocol-level failure talking to the previewed server.
+    Failed(String),
+}
+
+/// Connect to one target's previewed port and relay exactly one bounded
+/// response. No credential is ever sent (T4); a redirect is reported rather
+/// than followed (T3); and nothing is written to the browser until the whole
+/// body is known to fit the bound, so a bound that is hit is reported rather
+/// than quietly truncated (T5).
+async fn relay_preview(
+    writer: &mut OwnedWriteHalf,
+    target: &Target,
+    transport: &TransportConfig,
+    port: u16,
+) -> Result<()> {
+    #[cfg(unix)]
+    let connected =
+        match crate::transport::open_tcp_endpoint(target, transport, port, PREVIEW_CONNECT_TIMEOUT)
+            .await
+        {
+            Ok(endpoint) => endpoint.connect(PREVIEW_CONNECT_TIMEOUT).await,
+            Err(error) => Err(error),
+        };
+    #[cfg(not(unix))]
+    let connected: std::result::Result<TcpStream, crate::transport::SnapshotError> = {
+        let _ = (target, transport, port);
+        Err(crate::transport::SnapshotError::unavailable(
+            "preview is not available on this platform",
+        ))
+    };
+
+    let stream = match connected {
+        Ok(stream) => stream,
+        Err(error) => {
+            return write_status(writer, "503 Service Unavailable", &error.to_string()).await;
+        }
+    };
+    relay_preview_response(writer, stream).await
+}
+
+/// Issue one plain `GET /` with no cookies, no `Authorization`, and nothing
+/// forwarded from the browser's own request, then read exactly one bounded
+/// response and relay it — or describe why it isn't being relayed.
+async fn relay_preview_response(writer: &mut OwnedWriteHalf, mut stream: TcpStream) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + PREVIEW_TOTAL_DURATION;
+    let outcome = tokio::time::timeout_at(deadline, async move {
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: text/html,*/*\r\n\r\n",
+            )
+            .await
+            .map_err(|_| {
+                PreviewOutcome::Failed("failed to ask the previewed server for its page".to_owned())
+            })?;
+
+        let mut reader = BufReader::new(stream);
+        let mut head = Vec::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let remaining = PREVIEW_MAX_HEADER_BYTES.saturating_sub(head.len());
+            if remaining == 0 {
+                return Err(PreviewOutcome::Failed(
+                    "the previewed server's headers were too large".to_owned(),
+                ));
+            }
+            let read = (&mut reader)
+                .take(remaining as u64)
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|_| {
+                    PreviewOutcome::Failed(
+                        "failed to read the previewed server's headers".to_owned(),
+                    )
+                })?;
+            if read == 0 {
+                return Err(PreviewOutcome::Failed(
+                    "the previewed server closed the connection before answering".to_owned(),
+                ));
+            }
+            let blank = line == b"\r\n" || line == b"\n";
+            head.extend_from_slice(&line);
+            if blank {
+                break;
+            }
+        }
+
+        let text = String::from_utf8_lossy(&head).into_owned();
+        let mut lines = text.lines();
+        let status_line = lines.next().unwrap_or_default();
+        let mut parts = status_line.splitn(3, ' ');
+        let _version = parts.next();
+        let status_code: u16 = parts.next().and_then(|code| code.parse().ok()).unwrap_or(0);
+        let reason = parts.next().unwrap_or("").trim().to_owned();
+
+        if (300..400).contains(&status_code) {
+            return Err(PreviewOutcome::Redirected(status_code));
+        }
+
+        let mut content_type = None;
+        let mut content_length = None;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("content-type") {
+                content_type = Some(value.trim().to_owned());
+            }
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().ok();
+            }
+            // Every other header — including Set-Cookie — is read and
+            // discarded here: nothing from the previewed response is ever
+            // relayed except its content type and body (T4).
+        }
+
+        let Some(content_type) = content_type else {
+            return Err(PreviewOutcome::NotPreviewable(
+                "the previewed response had no content type".to_owned(),
+            ));
+        };
+        if !previewable_content_type(&content_type) {
+            return Err(PreviewOutcome::NotPreviewable(format!(
+                "the previewed response has content type '{content_type}', which is not previewable"
+            )));
+        }
+        if content_length.is_some_and(|length| length > PREVIEW_MAX_BODY_BYTES) {
+            return Err(PreviewOutcome::TooLarge);
+        }
+
+        let mut body = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            if body.len() > PREVIEW_MAX_BODY_BYTES {
+                return Err(PreviewOutcome::TooLarge);
+            }
+            let read = reader.read(&mut buffer).await.map_err(|_| {
+                PreviewOutcome::Failed("failed to read the previewed server's response".to_owned())
+            })?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buffer[..read]);
+        }
+
+        Ok(PreviewSuccess {
+            status_code,
+            reason,
+            content_type,
+            body,
+        })
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(success)) => {
+            let status = if success.reason.is_empty() {
+                format!("{} OK", success.status_code)
+            } else {
+                format!("{} {}", success.status_code, success.reason)
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {}\r\nx-content-type-options: nosniff\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                success.content_type,
+                success.body.len()
+            );
+            writer.write_all(head.as_bytes()).await?;
+            writer.write_all(&success.body).await?;
+            let _ = writer.shutdown().await;
+            Ok(())
+        }
+        Ok(Err(PreviewOutcome::Redirected(status_code))) => {
+            write_status(
+                writer,
+                "200 OK",
+                &format!(
+                    "the previewed server answered with a {status_code} redirect; redirects are not followed"
+                ),
+            )
+            .await
+        }
+        Ok(Err(PreviewOutcome::NotPreviewable(message))) => {
+            write_status(writer, "200 OK", &message).await
+        }
+        Ok(Err(PreviewOutcome::TooLarge)) => {
+            write_status(
+                writer,
+                "200 OK",
+                "the previewed response is larger than the preview size limit",
+            )
+            .await
+        }
+        Ok(Err(PreviewOutcome::Failed(message))) => {
+            write_status(writer, "502 Bad Gateway", &message).await
+        }
+        Err(_) => {
+            write_status(
+                writer,
+                "504 Gateway Timeout",
+                "the previewed server did not answer in time",
+            )
+            .await
+        }
+    }
 }
 
 /// Carry one attachment's messages as server-sent events.
@@ -766,6 +1226,100 @@ mod tests {
         }
     }
 
+    /// Stands in for `DevicePolicy`'s `Previews` impl, backed by a real
+    /// `PreviewGrants` store so these tests exercise the same revalidation
+    /// and rate-limiting logic the daemon does. The raw token is used
+    /// directly as the device fingerprint — these tests control exactly what
+    /// token is presented, so there is nothing for a real fingerprint to buy.
+    #[derive(Default)]
+    struct TestPreviews {
+        grants: Mutex<crate::preview::PreviewGrants>,
+    }
+
+    /// A target with no `ssh` destination previews its port by connecting to
+    /// it directly, the same as `transport::open_tcp_endpoint`'s own test for
+    /// a local target — which lets these tests stand a plain local listener
+    /// in for "a target's previewed port" with no SSH involved at all.
+    fn test_target(port: u16) -> crate::config::Target {
+        crate::config::Target {
+            name: "preview-test".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: Vec::new(),
+            tags: Vec::new(),
+            roots: Vec::new(),
+            preview_ports: vec![port],
+        }
+    }
+
+    impl super::Previews for TestPreviews {
+        fn grant(
+            &self,
+            token: &str,
+            target: crate::model::TargetSession,
+            port: u16,
+        ) -> tokio::sync::oneshot::Receiver<std::result::Result<crate::preview::PreviewGrant, String>>
+        {
+            let (decision, receiver) = tokio::sync::oneshot::channel();
+            let grant = self.grants.lock().unwrap().grant(
+                std::time::SystemTime::now(),
+                token.to_owned(),
+                target,
+                port,
+            );
+            let _ = decision.send(Ok(grant));
+            receiver
+        }
+
+        fn revoke(
+            &self,
+            token: &str,
+            grant_id: &str,
+        ) -> tokio::sync::oneshot::Receiver<std::result::Result<(), String>> {
+            let (decision, receiver) = tokio::sync::oneshot::channel();
+            let now = std::time::SystemTime::now();
+            let result = if self
+                .grants
+                .lock()
+                .unwrap()
+                .revoke_owned(now, grant_id, token)
+            {
+                Ok(())
+            } else {
+                Err("no such grant".to_owned())
+            };
+            let _ = decision.send(result);
+            receiver
+        }
+
+        fn fetch(
+            &self,
+            token: &str,
+            grant_id: &str,
+        ) -> tokio::sync::oneshot::Receiver<std::result::Result<super::PreviewFetchTarget, String>>
+        {
+            let (decision, receiver) = tokio::sync::oneshot::channel();
+            let now = std::time::SystemTime::now();
+            let outcome = self
+                .grants
+                .lock()
+                .unwrap()
+                .begin_fetch(now, grant_id, token, |_, _| true);
+            let result = match outcome {
+                Ok(grant) => Ok(super::PreviewFetchTarget {
+                    target: test_target(grant.port()),
+                    transport: crate::config::TransportConfig::default(),
+                    port: grant.port(),
+                }),
+                Err(_) => Err("that preview grant is not available".to_owned()),
+            };
+            let _ = decision.send(result);
+            receiver
+        }
+    }
+
     #[test]
     fn a_session_identifier_is_only_ever_a_map_key() {
         assert_eq!(sanitized_session("abc-123"), "abc-123");
@@ -871,7 +1425,8 @@ mod tests {
         let daemon = std::sync::Arc::new(daemon);
         let attach: super::Attach = std::sync::Arc::new(move || daemon.attach());
         let devices = Arc::new(TestDevices::default());
-        let task = tokio::spawn(super::serve(listener, attach, devices.clone()));
+        let previews = Arc::new(TestPreviews::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices.clone(), previews));
         // The directory is returned rather than leaked, so a test run does not
         // accumulate state directories.
         (port, task, directory, devices)
@@ -975,7 +1530,8 @@ mod tests {
         let listener = super::bind(loopback(0)).await.expect("binds loopback");
         let port = listener.local_addr().expect("a bound address").port();
         let devices = Arc::new(TestDevices::default());
-        let task = tokio::spawn(super::serve(listener, attach, devices));
+        let previews = Arc::new(TestPreviews::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices, previews));
 
         let mut events = TcpStream::connect(loopback(port)).await.expect("connects");
         events
@@ -1117,7 +1673,8 @@ mod tests {
         let listener = super::bind(loopback(0)).await.expect("binds loopback");
         let port = listener.local_addr().expect("a bound address").port();
         let devices = Arc::new(TestDevices::default());
-        let task = tokio::spawn(super::serve(listener, attach, devices));
+        let previews = Arc::new(TestPreviews::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices, previews));
 
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
@@ -1185,7 +1742,8 @@ mod tests {
         let listener = super::bind(loopback(0)).await.expect("binds loopback");
         let port = listener.local_addr().expect("a bound address").port();
         let devices = Arc::new(TestDevices::default());
-        let task = tokio::spawn(super::serve(listener, attach, devices));
+        let previews = Arc::new(TestPreviews::default());
+        let task = tokio::spawn(super::serve(listener, attach, devices, previews));
 
         let mut stream = TcpStream::connect(loopback(port)).await.expect("connects");
         stream
@@ -1522,5 +2080,271 @@ mod tests {
     #[test]
     fn the_default_port_is_loopback_only() {
         assert!(loopback(DEFAULT_WEB_PORT).ip().is_loopback());
+    }
+
+    #[test]
+    fn one_json_number_field_is_read_without_a_parser() {
+        let text = r#"{"target":"host-a","session":"work","port":3000}"#;
+        assert_eq!(super::json_number_field(text, "port"), Some(3000));
+        assert!(super::json_number_field(text, "absent").is_none());
+        assert!(super::json_number_field(r#"{"port":"not-a-number"}"#, "port").is_none());
+    }
+
+    /// Stands in for "a target's dev server" the way `REMOTE_PREVIEW.md`'s
+    /// own test plan describes: a bare listener that answers its one
+    /// connection with exactly the raw bytes given, then closes.
+    async fn stub_server(response: &'static [u8]) -> u16 {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind(loopback(0))
+            .await
+            .expect("binds loopback");
+        let port = listener.local_addr().expect("a bound address").port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        port
+    }
+
+    /// Grants, then fetches, a preview of a stub server's port, returning the
+    /// whole HTTP response the browser side received.
+    async fn fetch_preview(daemon_port: u16, dev_server_port: u16) -> String {
+        let grant_body =
+            format!(r#"{{"target":"host-a","session":"work","port":{dev_server_port}}}"#);
+        let response = request_body(
+            daemon_port,
+            &format!(
+                "POST /preview/grant HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{grant_body}",
+                grant_body.len()
+            ),
+        )
+        .await;
+        let grant_id = response
+            .rsplit_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .and_then(|body| super::json_field(body, "grant_id"))
+            .unwrap_or_else(|| panic!("no grant_id in {response:?}"));
+
+        request_body(
+            daemon_port,
+            &format!(
+                "GET /preview/{grant_id} HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn granting_and_fetching_a_preview_relays_an_allowlisted_body() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let dev_server = stub_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<h1>hi</h1>\r\n",
+        )
+        .await;
+
+        let response = fetch_preview(port, dev_server).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("content-type: text/html"), "{response}");
+        assert!(
+            response.contains("x-content-type-options: nosniff"),
+            "{response}"
+        );
+        assert!(response.contains("<h1>hi</h1>"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_reported_rather_than_followed() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let dev_server = stub_server(
+            b"HTTP/1.1 302 Found\r\nLocation: http://internal-admin.example/\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+
+        let response = fetch_preview(port, dev_server).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("redirect"), "{response}");
+        assert!(
+            !response.contains("internal-admin"),
+            "the redirect target must never be relayed: {response}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_set_cookie_header_is_never_relayed() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let dev_server = stub_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: session=secret\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .await;
+
+        let response = fetch_preview(port, dev_server).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            !response.to_ascii_lowercase().contains("set-cookie"),
+            "{response}"
+        );
+        assert!(response.contains("ok"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_content_type_outside_the_allowlist_is_described_not_rendered() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let dev_server = stub_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: 6\r\n\r\nbinary",
+        )
+        .await;
+
+        let response = fetch_preview(port, dev_server).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("not previewable"), "{response}");
+        assert!(
+            !response.contains("binary"),
+            "the disallowed body must never be rendered: {response}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_body_declared_over_the_ceiling_is_refused_without_being_sent() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let oversized = super::PREVIEW_MAX_BODY_BYTES + 1;
+        let dev_server = stub_server(Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {oversized}\r\n\r\n"
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        ))
+        .await;
+
+        let response = fetch_preview(port, dev_server).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("size limit"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_finishes_is_bounded_and_reported() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let listener = tokio::net::TcpListener::bind(loopback(0))
+            .await
+            .expect("binds loopback");
+        let dev_server = listener.local_addr().expect("a bound address").port();
+        // Accepts the connection and then answers nothing at all, ever.
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accepts");
+            std::future::pending::<()>().await;
+        });
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), fetch_preview(port, dev_server))
+                .await
+                .expect("a hung preview must still bound its own fetch");
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_second_fetch_before_the_minimum_interval_is_refused() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let dev_server = stub_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .await;
+
+        let grant_body = format!(r#"{{"target":"host-a","session":"work","port":{dev_server}}}"#);
+        let response = request_body(
+            port,
+            &format!(
+                "POST /preview/grant HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{grant_body}",
+                grant_body.len()
+            ),
+        )
+        .await;
+        let grant_id = response
+            .rsplit_once("\r\n\r\n")
+            .and_then(|(_, body)| super::json_field(body, "grant_id"))
+            .expect("a grant id");
+
+        let fetch = format!(
+            "GET /preview/{grant_id} HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+        );
+        let first = request(port, &fetch).await;
+        assert!(first.contains("200"), "{first}");
+        // The stub server only ever answers once, so a second connection
+        // attempt would hang or fail outright were it allowed through —
+        // instead the rate limit refuses it before any connection is made.
+        let second = request(port, &fetch).await;
+        assert!(second.contains("403"), "{second}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_preview_grant_can_be_revoked_and_then_refuses_a_fetch() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+        let dev_server = stub_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .await;
+
+        let grant_body = format!(r#"{{"target":"host-a","session":"work","port":{dev_server}}}"#);
+        let response = request_body(
+            port,
+            &format!(
+                "POST /preview/grant HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{grant_body}",
+                grant_body.len()
+            ),
+        )
+        .await;
+        let grant_id = response
+            .rsplit_once("\r\n\r\n")
+            .and_then(|(_, body)| super::json_field(body, "grant_id"))
+            .expect("a grant id");
+
+        let revoke_body = format!(r#"{{"grant_id":"{grant_id}"}}"#);
+        let revoked = request(
+            port,
+            &format!(
+                "POST /preview/revoke HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\ncontent-length: {}\r\n\r\n{revoke_body}",
+                revoke_body.len()
+            ),
+        )
+        .await;
+        assert!(revoked.contains("204"), "{revoked}");
+
+        let fetch = request(
+            port,
+            &format!(
+                "GET /preview/{grant_id} HTTP/1.1\r\nhost: localhost\r\ncookie: sh_device={TEST_TOKEN}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(fetch.contains("403"), "{fetch}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn preview_routes_are_refused_without_pairing() {
+        let (port, task, _directory, _devices) = serve_test_daemon().await;
+
+        for request_line in [
+            "POST /preview/grant HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n"
+                .to_owned(),
+            "POST /preview/revoke HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n"
+                .to_owned(),
+            "GET /preview/anything HTTP/1.1\r\nhost: localhost\r\n\r\n".to_owned(),
+        ] {
+            let response = request(port, &request_line).await;
+            assert!(response.contains("401"), "{request_line} -> {response}");
+        }
+        task.abort();
     }
 }
