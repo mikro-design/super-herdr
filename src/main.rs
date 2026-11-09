@@ -789,6 +789,7 @@ async fn run_target_command(
                 // read back, rather than a flag typed once while adding one.
                 roots: Vec::new(),
                 tags: Vec::new(),
+                preview_ports: Vec::new(),
             };
             let path = Config::add_target_file(config_path, target)?;
             stdout_line(format_args!("added target {name:?} to {}", path.display()))?;
@@ -940,6 +941,7 @@ async fn run_target_command(
                     herdr_bins: vec!["herdr".to_owned()],
                     roots: Vec::new(),
                     tags: tags.clone(),
+                    preview_ports: Vec::new(),
                 });
             }
 

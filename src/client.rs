@@ -718,6 +718,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }
     }
 
@@ -810,6 +811,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }]);
         let _ = directory;
 
@@ -861,6 +863,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }]);
 
         // Bigger than one chunk and bigger than the pipe between the two, so
@@ -925,6 +928,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }]);
 
         let length = 40 * 1024 * 1024_u64;
@@ -995,6 +999,7 @@ mod tests {
             herdr_bins: vec!["/nonexistent/herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         }]);
 
         let source = directory.path().join("shrinking.bin");

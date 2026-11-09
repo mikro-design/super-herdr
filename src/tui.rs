@@ -406,6 +406,8 @@ struct TargetForm {
     /// form that dropped it would quietly empty a picker on the next save.
     roots: Vec<String>,
     tags: Vec<String>,
+    /// Carried, never edited, for the same reason as `roots`.
+    preview_ports: Vec<u16>,
     field: TargetFormField,
     error: Option<String>,
     test_state: TargetTestState,
@@ -426,6 +428,7 @@ impl TargetForm {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
             field: TargetFormField::Name,
             error: None,
             test_state: TargetTestState::Untested,
@@ -446,6 +449,7 @@ impl TargetForm {
             herdr_bins: target.herdr_bins.clone(),
             roots: target.roots.clone(),
             tags: target.tags.clone(),
+            preview_ports: target.preview_ports.clone(),
             field: TargetFormField::Name,
             error: None,
             test_state: TargetTestState::Untested,
@@ -469,6 +473,7 @@ impl TargetForm {
             // empty a picker on the next save.
             roots: self.roots.clone(),
             tags: self.tags.clone(),
+            preview_ports: self.preview_ports.clone(),
         }
     }
 
@@ -8696,6 +8701,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         let key = TargetSession::new("workstation", "example-session");
 
@@ -9737,6 +9743,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         Config::add_target_file(Some(&path), existing.clone()).unwrap();
         let mut app = App {
@@ -9777,6 +9784,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         let mut duplicate = TargetForm::add();
         duplicate.name = "existing".to_owned();
@@ -9894,6 +9902,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         let frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
         let mut app = App {

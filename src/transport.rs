@@ -10,6 +10,8 @@ use serde_json::Value;
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
+use tokio::net::TcpStream;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
 use tokio::process::Child;
@@ -154,8 +156,10 @@ fn targets_for_discovered_sessions(
             herdr_bins: target.herdr_bins.clone(),
             roots: target.roots.clone(),
             // Discovery splits one configured target into one per session.
-            // They are the same machine, so they carry the same groupings.
+            // They are the same machine, so they carry the same groupings and
+            // the same preview allowlist.
             tags: target.tags.clone(),
+            preview_ports: target.preview_ports.clone(),
         })
         .collect()
 }
@@ -586,6 +590,132 @@ async fn open_socket_endpoint(
     }
 }
 
+// Not yet called from production code: the `/preview/*` routes that open one
+// of these land in the next branch, alongside the web-layer bridge into
+// `Input::PreviewGrantRequested`. This branch adds the transport primitive
+// and its own test with no new HTTP surface.
+#[cfg(unix)]
+#[allow(dead_code)]
+struct SshTcpForward {
+    child: Child,
+}
+
+#[cfg(unix)]
+impl Drop for SshTcpForward {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+/// A local TCP port reaching one port on one target's own loopback interface,
+/// for the remote development preview (`REMOTE_PREVIEW.md`). The forward
+/// names a port, never a host: there is nothing here to resolve, rebind, or
+/// redirect (T2). The forwarding child, if any, stays alive with the
+/// endpoint, the same as [`SocketEndpoint`]'s.
+///
+/// Used only by this file's own test for now; the `/preview/*` route that
+/// calls this in production lands in the next branch.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) struct TcpEndpoint {
+    port: u16,
+    _forward: Option<SshTcpForward>,
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl TcpEndpoint {
+    pub(crate) async fn connect(
+        &self,
+        connect_timeout: Duration,
+    ) -> Result<TcpStream, SnapshotError> {
+        timeout(
+            connect_timeout,
+            TcpStream::connect(("127.0.0.1", self.port)),
+        )
+        .await
+        .map_err(|_| SnapshotError::timed_out(connect_timeout))?
+        .map_err(|_| SnapshotError::unavailable("failed to connect to the previewed port"))
+    }
+}
+
+/// Open (or, for a local target, simply name) the loopback endpoint a
+/// preview fetch connects to. `remote_port` is never taken from anywhere but
+/// a target's configured `preview_ports`; this function does not check that
+/// allowlist itself — the caller already did, and checks again on every
+/// fetch per `REMOTE_PREVIEW.md` T8.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) async fn open_tcp_endpoint(
+    target: &Target,
+    config: &TransportConfig,
+    remote_port: u16,
+    connect_timeout: Duration,
+) -> Result<TcpEndpoint, SnapshotError> {
+    let Some(destination) = target.ssh.as_deref() else {
+        return Ok(TcpEndpoint {
+            port: remote_port,
+            _forward: None,
+        });
+    };
+
+    // A free local port, found by briefly binding one ourselves and handing
+    // the number to ssh. The small window between that bind and ssh's own is
+    // inherent to this technique, the same way it is for any tool that picks
+    // an ephemeral port this way; the forward is short-lived and per-fetch.
+    let local_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .map_err(|_| SnapshotError::unavailable("failed to reserve a local port"))?;
+
+    let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
+    let mut command = Command::new(&config.ssh_bin);
+    if config.batch_mode {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    command
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", config.connect_timeout_seconds))
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-N")
+        .arg("-L")
+        .arg(forward)
+        .arg("--")
+        .arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|_| SnapshotError::unavailable("failed to start SSH port forwarding"))?;
+    let mut guard = SshTcpForward { child };
+    let deadline = Instant::now() + connect_timeout;
+    loop {
+        if guard
+            .child
+            .try_wait()
+            .map_err(|_| SnapshotError::unavailable("failed to inspect SSH port forwarding"))?
+            .is_some()
+        {
+            return Err(SnapshotError::unavailable(
+                "SSH port forwarding exited (diagnostics redacted)",
+            ));
+        }
+        match TcpStream::connect(("127.0.0.1", local_port)).await {
+            Ok(_) => {
+                return Ok(TcpEndpoint {
+                    port: local_port,
+                    _forward: Some(guard),
+                });
+            }
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
+            Err(_) => return Err(SnapshotError::timed_out(connect_timeout)),
+        }
+    }
+}
+
 const MAX_API_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// A private Herdr API endpoint that carries several documented requests.
@@ -931,9 +1061,10 @@ mod tests {
 
     use super::{
         EVENT_SUBSCRIPTIONS, SessionList, api_failure, event_subscription_request, herdr_args,
-        parse_last_json, quote_posix, targets_for_discovered_sessions, valid_discovered_session,
+        open_tcp_endpoint, parse_last_json, quote_posix, targets_for_discovered_sessions,
+        valid_discovered_session,
     };
-    use crate::config::Target;
+    use crate::config::{Target, TransportConfig};
 
     #[test]
     fn quotes_remote_arguments_without_shell_injection() {
@@ -953,6 +1084,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
 
         assert_eq!(
@@ -997,6 +1129,7 @@ mod tests {
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
 
         assert!(targets_for_discovered_sessions(&target, Vec::new()).is_empty());
@@ -1152,6 +1285,37 @@ mod tests {
         )
         .await
         .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_local_target_is_previewed_by_connecting_directly_with_no_forward() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+        });
+
+        let target = Target {
+            name: "local".to_owned(),
+            ssh: None,
+            discover_sessions: false,
+            session: None,
+            socket: None,
+            herdr_bins: Vec::new(),
+            roots: Vec::new(),
+            tags: Vec::new(),
+            preview_ports: vec![port],
+        };
+        let config = TransportConfig::default();
+
+        let endpoint = open_tcp_endpoint(&target, &config, port, std::time::Duration::from_secs(1))
+            .await
+            .expect("a local target needs no forward to connect");
+        endpoint
+            .connect(std::time::Duration::from_secs(1))
+            .await
+            .expect("the previewed port is reachable directly");
         server.await.unwrap();
     }
 }

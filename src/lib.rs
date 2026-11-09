@@ -16,6 +16,7 @@ pub mod operation;
 pub mod pairing;
 pub mod plugin;
 pub mod plugin_fleet;
+pub mod preview;
 pub mod probe;
 pub mod protocol;
 pub mod push;

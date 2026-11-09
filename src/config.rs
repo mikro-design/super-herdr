@@ -598,6 +598,12 @@ pub struct Target {
     /// can, so a root here is a place to look rather than a permission.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<String>,
+    /// Ports on this target's loopback interface a paired device may ask to
+    /// preview. Empty means nothing is previewable, which is the default: see
+    /// `REMOTE_PREVIEW.md` T2 for why this is a port allowlist and never a URL
+    /// or host — there is nothing here to resolve, rebind, or redirect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_ports: Vec<u16>,
 }
 
 impl Target {
@@ -1609,6 +1615,7 @@ name = "local"
                 herdr_bins: vec!["herdr".to_owned()],
                 roots: Vec::new(),
                 tags: Vec::new(),
+                preview_ports: Vec::new(),
             },
         )
         .unwrap();
@@ -1982,6 +1989,7 @@ name = "local"
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         Config::add_target_file(Some(&path), first).unwrap();
 
@@ -1998,6 +2006,7 @@ name = "local"
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         Config::add_target_file(Some(&path), second).unwrap();
 
@@ -2021,6 +2030,7 @@ name = "local"
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
         Config::add_target_file(Some(&path), target.clone()).unwrap();
         let before = fs::read(&path).unwrap();
@@ -2060,6 +2070,7 @@ ssh = "build-host"
             herdr_bins: vec!["herdr".to_owned()],
             roots: Vec::new(),
             tags: Vec::new(),
+            preview_ports: Vec::new(),
         };
 
         Config::replace_target_file(Some(&path), "development", replacement).unwrap();
@@ -2214,6 +2225,7 @@ ssh = "build-host"
                 herdr_bins: vec!["herdr".to_owned()],
                 roots: Vec::new(),
                 tags: Vec::new(),
+                preview_ports: Vec::new(),
             },
         )
         .unwrap();
