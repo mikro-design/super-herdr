@@ -1183,6 +1183,7 @@ mod tests {
             connection_generation: 5,
             selected_herdr_bin: Some("herdr".to_owned()),
             roots: Vec::new(),
+            preview_ports: Vec::new(),
             snapshot: Some(Arc::new(snapshot)),
             last_error: Some("connection reset".to_owned()),
             last_success: None,

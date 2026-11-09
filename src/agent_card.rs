@@ -1670,6 +1670,7 @@ mod tests {
             connection_generation: 1,
             selected_herdr_bin: Some("herdr".to_owned()),
             roots: Vec::new(),
+            preview_ports: Vec::new(),
             snapshot: snapshot.map(|value| Arc::new(NormalizedSnapshot::from_value(&key, &value))),
             last_error: None,
             last_success: None,
