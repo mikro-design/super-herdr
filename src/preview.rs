@@ -20,6 +20,12 @@ use crate::pairing;
 /// that a forgotten grant does not outlive the reason it was made.
 pub const GRANT_LIFETIME: Duration = Duration::from_secs(90);
 
+/// The shortest gap between two fetches through the same grant. A page that
+/// polls on a timer, or a `<script>` tag retrying in a loop, turns one
+/// preview into a sustained tunnel otherwise — see `REMOTE_PREVIEW.md` T5's
+/// "one connection per grant."
+pub const MIN_FETCH_INTERVAL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewGrant {
     id: String,
@@ -27,6 +33,21 @@ pub struct PreviewGrant {
     target: TargetSession,
     port: u16,
     expires_at: SystemTime,
+    last_fetch: Option<SystemTime>,
+}
+
+/// Why a fetch through a grant was refused, kept distinct from `validate`'s
+/// plain `None` only where the caller needs to answer differently: a rate
+/// limit is reported so the device can slow down, where "no such grant" is
+/// not distinguished by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewFetchError {
+    /// Does not exist, has expired, belongs to another device, or the
+    /// target or port is no longer configured for preview — these are not
+    /// distinguished, for the same anti-enumeration reason as `validate`.
+    NotFound,
+    /// Fetched again before `MIN_FETCH_INTERVAL` has passed.
+    TooSoon,
 }
 
 impl PreviewGrant {
@@ -80,6 +101,7 @@ impl PreviewGrants {
             target,
             port,
             expires_at: now + GRANT_LIFETIME,
+            last_fetch: None,
         };
         self.grants.push(grant.clone());
         grant
@@ -104,6 +126,48 @@ impl PreviewGrants {
 
     pub fn revoke(&mut self, id: &str) {
         self.grants.retain(|grant| grant.id != id);
+    }
+
+    /// Ends a grant, but only the one `device_fingerprint` itself holds.
+    /// Returns whether a grant was actually ended, without distinguishing
+    /// "no such grant" from "that grant belongs to another device" — the
+    /// same anti-enumeration reasoning as `validate`.
+    pub fn revoke_owned(&mut self, now: SystemTime, id: &str, device_fingerprint: &str) -> bool {
+        self.purge_expired(now);
+        let before = self.grants.len();
+        self.grants
+            .retain(|grant| !(grant.id == id && grant.device_fingerprint == device_fingerprint));
+        self.grants.len() != before
+    }
+
+    /// Re-validates a grant immediately before it is used to fetch, and — if
+    /// it is still good — records this instant as its last fetch. `allowed`
+    /// is the caller's live recheck of the target and its `preview_ports`
+    /// allowlist (this module only tracks presence and expiry; see the
+    /// module doc comment).
+    pub fn begin_fetch(
+        &mut self,
+        now: SystemTime,
+        id: &str,
+        device_fingerprint: &str,
+        allowed: impl FnOnce(&TargetSession, u16) -> bool,
+    ) -> Result<PreviewGrant, PreviewFetchError> {
+        self.purge_expired(now);
+        let grant = self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == id && grant.device_fingerprint == device_fingerprint)
+            .ok_or(PreviewFetchError::NotFound)?;
+        if !allowed(&grant.target, grant.port) {
+            return Err(PreviewFetchError::NotFound);
+        }
+        if let Some(last) = grant.last_fetch
+            && now.duration_since(last).unwrap_or(Duration::ZERO) < MIN_FETCH_INTERVAL
+        {
+            return Err(PreviewFetchError::TooSoon);
+        }
+        grant.last_fetch = Some(now);
+        Ok(grant.clone())
     }
 
     /// Ends every grant held by one device, e.g. when it is unpaired.
@@ -145,7 +209,7 @@ fn grant_id() -> String {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::{GRANT_LIFETIME, PreviewGrants};
+    use super::{GRANT_LIFETIME, MIN_FETCH_INTERVAL, PreviewFetchError, PreviewGrants};
     use crate::model::TargetSession;
 
     fn target() -> TargetSession {
@@ -199,6 +263,22 @@ mod tests {
     }
 
     #[test]
+    fn revoking_a_grant_requires_owning_it() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut grants = PreviewGrants::new();
+        let theirs = grants.grant(now, "device-b".to_owned(), target(), 3000);
+
+        assert!(!grants.revoke_owned(now, theirs.id(), "device-a"));
+        assert_eq!(
+            grants.validate(now, theirs.id(), "device-b"),
+            Some(theirs.clone())
+        );
+
+        assert!(grants.revoke_owned(now, theirs.id(), "device-b"));
+        assert_eq!(grants.validate(now, theirs.id(), "device-b"), None);
+    }
+
+    #[test]
     fn revoking_a_device_ends_every_grant_it_holds_but_no_others() {
         let now = SystemTime::UNIX_EPOCH;
         let mut grants = PreviewGrants::new();
@@ -227,6 +307,59 @@ mod tests {
         assert_eq!(grants.validate(now, dropped_port.id(), "device-a"), None);
         assert_eq!(grants.validate(now, dropped_target.id(), "device-a"), None);
         let _ = other_target;
+    }
+
+    #[test]
+    fn a_fetch_revalidates_against_the_live_allowlist_not_just_expiry() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut grants = PreviewGrants::new();
+        let grant = grants.grant(now, "device-a".to_owned(), target(), 3000);
+
+        assert_eq!(
+            grants
+                .begin_fetch(now, grant.id(), "device-a", |session, port| {
+                    *session == target() && port == 3000
+                })
+                .map(|grant| grant.id().to_owned()),
+            Ok(grant.id().to_owned())
+        );
+
+        // The port the caller's live recheck no longer allows is refused
+        // even though the grant itself has not expired or been revoked.
+        assert_eq!(
+            grants.begin_fetch(now + MIN_FETCH_INTERVAL, grant.id(), "device-a", |_, _| {
+                false
+            }),
+            Err(PreviewFetchError::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_fetch_is_refused_before_the_minimum_interval_has_passed() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut grants = PreviewGrants::new();
+        let grant = grants.grant(now, "device-a".to_owned(), target(), 3000);
+        let allowed = |session: &TargetSession, port: u16| *session == target() && port == 3000;
+
+        assert!(
+            grants
+                .begin_fetch(now, grant.id(), "device-a", allowed)
+                .is_ok()
+        );
+        assert_eq!(
+            grants.begin_fetch(
+                now + MIN_FETCH_INTERVAL - Duration::from_millis(1),
+                grant.id(),
+                "device-a",
+                allowed
+            ),
+            Err(PreviewFetchError::TooSoon)
+        );
+        assert!(
+            grants
+                .begin_fetch(now + MIN_FETCH_INTERVAL, grant.id(), "device-a", allowed)
+                .is_ok()
+        );
     }
 
     #[test]

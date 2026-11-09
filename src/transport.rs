@@ -590,12 +590,7 @@ async fn open_socket_endpoint(
     }
 }
 
-// Not yet called from production code: the `/preview/*` routes that open one
-// of these land in the next branch, alongside the web-layer bridge into
-// `Input::PreviewGrantRequested`. This branch adds the transport primitive
-// and its own test with no new HTTP surface.
 #[cfg(unix)]
-#[allow(dead_code)]
 struct SshTcpForward {
     child: Child,
 }
@@ -612,18 +607,13 @@ impl Drop for SshTcpForward {
 /// names a port, never a host: there is nothing here to resolve, rebind, or
 /// redirect (T2). The forwarding child, if any, stays alive with the
 /// endpoint, the same as [`SocketEndpoint`]'s.
-///
-/// Used only by this file's own test for now; the `/preview/*` route that
-/// calls this in production lands in the next branch.
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) struct TcpEndpoint {
     port: u16,
     _forward: Option<SshTcpForward>,
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 impl TcpEndpoint {
     pub(crate) async fn connect(
         &self,
@@ -645,7 +635,6 @@ impl TcpEndpoint {
 /// allowlist itself — the caller already did, and checks again on every
 /// fetch per `REMOTE_PREVIEW.md` T8.
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) async fn open_tcp_endpoint(
     target: &Target,
     config: &TransportConfig,
