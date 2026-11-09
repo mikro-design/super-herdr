@@ -327,17 +327,27 @@ hand-writing TOML and can understand which network trust boundary they chose.
       item below is conditioned on that, and the document lists seven things
       that must be true before an implementation branch opens.
 
-The items below stay closed pending the design review this document is the
-input to. The backlog already required that review; the threat model is what it
-reviews.
-- [ ] Require an explicit, expiring grant for one target-local origin.
-- [ ] Restrict the first version to configured loopback origins on the selected
-      target.
-- [ ] Bound connections, redirects, headers, bodies, frame rates, and lifetime.
-- [ ] Keep preview traffic isolated from terminal control and other targets.
-- [ ] Do not log URLs containing secrets, headers, cookies, or response bodies.
-- [ ] Revoke the preview immediately when the device, route, or grant is
-      revoked.
+- [x] Require an explicit, expiring grant for one target-local origin.
+      `PreviewGrants` (`src/preview.rs`) issues a short-lived, in-memory
+      `(device, target, port, expiry)` grant; nothing is persisted.
+- [x] Restrict the first version to configured loopback origins on the selected
+      target. The TCP forward always targets `127.0.0.1:<port>` on the remote
+      side, and the port must be in that target's configured `preview_ports`
+      allowlist.
+- [x] Bound connections, redirects, headers, bodies, frame rates, and lifetime.
+      `src/daemon/web.rs` bounds header size, connect time, total duration, and
+      body size; refuses a body over the ceiling rather than truncating it
+      silently; reports a redirect rather than following it; and enforces a
+      minimum interval between fetches on top of the grant's own expiry.
+- [x] Keep preview traffic isolated from terminal control and other targets.
+      The `Previews` trait is deliberately separate from `Devices`, and a
+      `PreviewGrant` never touches a pane lease, subscription, or route.
+- [x] Do not log URLs containing secrets, headers, cookies, or response bodies.
+      Nothing on the preview path logs a path, header, or body.
+- [x] Revoke the preview immediately when the device, route, or grant is
+      revoked. `begin_fetch` revalidates the device, the live `preview_ports`
+      allowlist, and the grant's own revocation at fetch time, not only at
+      grant time.
 
 Exit condition: a paired device can deliberately open one approved development
 origin without becoming a general-purpose proxy into the target network.
@@ -379,7 +389,11 @@ Keep each branch small enough to review and qualify independently:
 11. `feat/ssh-target-import`
 
 Remote development preview and native Windows support require separate design
-reviews before an implementation branch is opened.
+reviews before an implementation branch is opened. Remote development preview
+shipped as its own four-branch sequence (`feat/preview-grants-and-transport`,
+`feat/preview-web-routes`, `feat/preview-browser-frame`,
+`docs/remote-preview-shipped`), each reviewed and merged before the next
+started.
 
 ## Research signals
 

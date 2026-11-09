@@ -61,6 +61,11 @@ discover_sessions = true
 # reading — a paired device already holds pane control and can read anything
 # its user can, so a root is a place to look rather than a permission.
 #roots = ["/srv/build", "/home/example/work"]
+# Ports on this target's loopback interface a paired device may ask to
+# preview, such as a dev server at 127.0.0.1:3000. Absent means nothing is
+# previewable, which is the default — see REMOTE_PREVIEW.md for why this is a
+# port allowlist and never a URL or host.
+#preview_ports = [3000]
 # Local groupings for filtering — work, home, lab, a pod name. A tag never
 # reaches a host and never takes part in identity: two hosts tagged "work" are
 # still two entirely separate targets.

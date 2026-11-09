@@ -241,6 +241,9 @@ same metadata for a support bundle.
   byte moves, verified on arrival, with text and image previews
 - A bounded remote file picker over directories you configure, with literal or
   opt-in pattern search that never leaves those roots
+- A sandboxed preview of a development server on a target's loopback
+  interface, limited to ports you configure, with an explicit expiring grant
+  and no access to pane control or the terminal session
 - Desktop save from a target and host-to-host transfer that never touches this
   machine, both from the same right-click menus
 - `super-herdr doctor`: one read-only pass over every layer, with redacted
@@ -325,6 +328,9 @@ See the [architecture](ARCHITECTURE.md) for those trust boundaries and the
 - Control must be requested explicitly, and lease changes are visible.
 - IDs are qualified by target and session before they are used.
 - Network, clipboard, and transfer operations are bounded by time or size.
+- A development-server preview is an explicit, expiring, revocable grant to a
+  configured port, rendered in a sandboxed frame with no access to pane
+  control; see [REMOTE_PREVIEW.md](REMOTE_PREVIEW.md).
 
 Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
