@@ -42,6 +42,7 @@ use crate::agent_marks::AgentMarkRequest;
 use crate::aliases::ResourceRef;
 use crate::attention::AttentionEvent;
 use crate::config::QuickReply;
+use crate::display_order::{DisplayOrderEntry, OrderScope};
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginAction, PluginRun, PluginRunId};
@@ -413,6 +414,18 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<ResourceRef>,
     },
+    /// Set the custom display order for one sibling list (sessions under a
+    /// target, workspaces under a session, or panes under a workspace).
+    ///
+    /// Super-Herdr's own arrangement, not Herdr's: nothing here reaches a
+    /// host, and the order is shared by every client attached to this
+    /// daemon, not kept per-device.
+    #[serde(rename = "display_order.set")]
+    SetDisplayOrder {
+        request: u64,
+        scope: OrderScope,
+        order: Vec<String>,
+    },
     #[serde(rename = "files.search")]
     SearchRemoteFiles {
         request: u64,
@@ -669,6 +682,15 @@ pub enum ServerMessage {
     /// costs less than a way to desynchronize from it.
     #[serde(rename = "attention.history")]
     AttentionHistory { events: Vec<AttentionEvent> },
+    /// Every scope with a custom display order, sent when a client subscribes
+    /// and again whenever a reorder changes, removes, or compacts one.
+    ///
+    /// Separate from `FederationState`/`TargetState`: those are republished on
+    /// every structural tick, which a reorder is not — it is rare and
+    /// user-initiated, and piggybacking it on per-target diffing would mean
+    /// resending it on noise it has nothing to do with.
+    #[serde(rename = "display_order.state")]
+    DisplayOrderState { entries: Vec<DisplayOrderEntry> },
     /// A failure that is scoped to one request when `request` is present, and
     /// to the connection otherwise. Diagnostics are summarized here; raw
     /// command output never crosses this boundary.
@@ -752,6 +774,7 @@ mod tests {
     use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
     use crate::aliases::ResourceRef;
     use crate::attention::{AttentionEvent, AttentionEventKind};
+    use crate::display_order::{DisplayOrderEntry, OrderScope};
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::operation::Operation;
     use crate::plugin::{
@@ -918,6 +941,14 @@ mod tests {
             request: 19,
             slot: 3,
             resource: Some(ResourceRef::Target(TargetSession::new("first", "default"))),
+        });
+        round_trip_client(ClientMessage::SetDisplayOrder {
+            request: 20,
+            scope: OrderScope::WorkspacesInSession {
+                target: "first".to_owned(),
+                session: "default".to_owned(),
+            },
+            order: vec!["w2".to_owned(), "w1".to_owned()],
         });
         round_trip_client(ClientMessage::UnsubscribeNotifications);
         round_trip_client(ClientMessage::ListRemoteDirectory {
@@ -1089,6 +1120,14 @@ mod tests {
             bytes: 2048,
         });
         round_trip_server(ServerMessage::AttentionHistory { events: Vec::new() });
+        round_trip_server(ServerMessage::DisplayOrderState {
+            entries: vec![DisplayOrderEntry {
+                scope: OrderScope::SessionsInTarget {
+                    target: "first".to_owned(),
+                },
+                order: vec!["default".to_owned()],
+            }],
+        });
         round_trip_server(ServerMessage::PairingCode {
             request: 9,
             code: "ABCD-2345".to_owned(),

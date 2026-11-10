@@ -13,7 +13,7 @@
 //! until then the daemon inherits SSH's authentication rather than inventing
 //! its own.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -43,6 +43,7 @@ use crate::clipboard;
 use crate::config::{Config, Device, Target, TransportConfig};
 use crate::daemon::broker::{Broker, ClientId, Effect, LocalChange};
 use crate::daemon::web;
+use crate::display_order::{DisplayOrderStore, DisplayOrders};
 use crate::model::{PaneId, TargetSession};
 use crate::notifications::NotificationQueue;
 use crate::operation::Operation;
@@ -82,6 +83,9 @@ pub struct DaemonOptions {
     /// Where local names, favourites and jump slots live. `None` discovers the
     /// standard location.
     pub aliases: Option<PathBuf>,
+    /// Where the custom sidebar display order lives. `None` discovers the
+    /// standard location; a test points this somewhere disposable.
+    pub display_order: Option<PathBuf>,
     /// Where the durable agent marks live. `None` discovers the standard
     /// location; a test points this somewhere disposable.
     pub agent_marks: Option<PathBuf>,
@@ -134,6 +138,7 @@ impl DaemonOptions {
             push_subscriptions: None,
             push_vapid_key: None,
             aliases: None,
+            display_order: None,
             attention_state: None,
             refresh_interval: CONFIG_REFRESH_INTERVAL,
             web_port: None,
@@ -761,6 +766,11 @@ struct Daemon {
     /// name rather than each keeping its own list.
     aliases: Aliases,
     alias_store: Option<AliasStore>,
+    /// The custom sidebar display order. Held here for the same reason as
+    /// `aliases`: it is shared display state every client should agree on,
+    /// not something each client keeps its own copy of.
+    display_order: DisplayOrders,
+    display_order_store: Option<DisplayOrderStore>,
     /// Alerts for paired devices. A second sink beside the desktop's own,
     /// which the frontend runs against its attention mirror — this one lives
     /// here because the point of it is a phone learning that an agent is
@@ -1136,6 +1146,26 @@ async fn run(
     if forgot_any && let Some(store) = alias_store.as_ref() {
         let _ = store.save(&aliases);
     }
+    let display_order_store = match options.display_order.clone() {
+        Some(path) => Some(DisplayOrderStore::at(path)),
+        None => DisplayOrderStore::discover().ok(),
+    };
+    let mut display_order = display_order_store
+        .as_ref()
+        .and_then(|store| store.load().ok())
+        .unwrap_or_default();
+    let mut forgot_order = false;
+    for stale in display_order
+        .sessions()
+        .into_iter()
+        .filter(|session| !configured.contains(session))
+        .collect::<Vec<_>>()
+    {
+        forgot_order |= display_order.forget_session(&stale);
+    }
+    if forgot_order && let Some(store) = display_order_store.as_ref() {
+        let _ = store.save(&display_order);
+    }
     let mut device_notifications = active.notifications.clone();
     device_notifications.enabled = device_notifications.devices;
     let notify_devices = device_notifications.enabled;
@@ -1167,6 +1197,8 @@ async fn run(
         agent_mark_store,
         aliases,
         alias_store,
+        display_order,
+        display_order_store,
         device_notifications: NotificationQueue::new(device_notifications, None),
         push_subscription_store,
         vapid_keys,
@@ -1816,6 +1848,9 @@ impl Daemon {
                 // state of its agent, so projecting first would publish an
                 // inbox that disagreed with the events sent alongside it.
                 effects.extend(self.project_agent_cards());
+                if self.display_order.compact_against(&self.state) {
+                    effects.extend(self.display_order_changed());
+                }
                 effects
             }
             Input::Frame {
@@ -2203,6 +2238,27 @@ impl Daemon {
                         Err(error) => self.refuse(client, request, error.to_string()),
                     }
                 }
+                Effect::SetDisplayOrder {
+                    client,
+                    request,
+                    scope,
+                    order,
+                } => match self.display_order.set(scope, order) {
+                    Ok(changed) => {
+                        if changed {
+                            pending.extend(self.display_order_changed());
+                        }
+                        if let Some(outbox) = self.outboxes.get(&client) {
+                            let _ = outbox.send(ServerMessage::OperationResult {
+                                request,
+                                applied: true,
+                                message: String::new(),
+                                plugin_run: None,
+                            });
+                        }
+                    }
+                    Err(error) => self.refuse(client, request, error.to_string()),
+                },
                 Effect::ListRemoteDirectory {
                     client,
                     request,
@@ -2273,6 +2329,13 @@ impl Daemon {
                     if let Some(outbox) = self.outboxes.get(&client) {
                         let _ = outbox.send(ServerMessage::AttentionHistory {
                             events: self.attention.events().cloned().collect(),
+                        });
+                    }
+                }
+                Effect::SendDisplayOrder { client } => {
+                    if let Some(outbox) = self.outboxes.get(&client) {
+                        let _ = outbox.send(ServerMessage::DisplayOrderState {
+                            entries: self.display_order.snapshot_entries(&self.state),
                         });
                     }
                 }
@@ -2351,6 +2414,25 @@ impl Daemon {
                 .get(session)
                 .is_some_and(|target| target.preview_ports.contains(&port))
         });
+        // A removed host's custom order follows the same decision, rather
+        // than waiting for its sessions to simply stop appearing in a
+        // snapshot that will never arrive.
+        let configured_targets: BTreeSet<&str> =
+            self.targets.keys().map(|key| key.target.as_str()).collect();
+        let stale_targets: BTreeSet<String> = self
+            .display_order
+            .sessions()
+            .into_iter()
+            .map(|session| session.target)
+            .filter(|target| !configured_targets.contains(target.as_str()))
+            .collect();
+        let mut order_changed = false;
+        for target in stale_targets {
+            order_changed |= self.display_order.forget_target(&target);
+        }
+        if order_changed {
+            effects.extend(self.display_order_changed());
+        }
         self.start_federation();
         effects
     }
@@ -3364,6 +3446,16 @@ impl Daemon {
         effects
     }
 
+    /// Persist the display order and republish it, so every attached client
+    /// sees the same arrangement rather than its own guess at the result.
+    fn display_order_changed(&mut self) -> Vec<Effect> {
+        if let Some(store) = self.display_order_store.as_ref() {
+            let _ = store.save(&self.display_order);
+        }
+        let entries = self.display_order.snapshot_entries(&self.state);
+        self.broker.display_order_changed(entries)
+    }
+
     /// Rebuild the inbox and publish it if it moved.
     ///
     /// The projection is derived, never stored durably: it is a view of the
@@ -3608,6 +3700,7 @@ mod tests {
 
     use super::{DaemonOptions, MAX_RETAINED_TRANSFERS, invalidated_routes, serve, serve_until};
     use crate::config::{Config, Device, Target};
+    use crate::display_order::OrderScope;
     use crate::model::PaneId;
     use crate::protocol::{
         ClientMessage, PROTOCOL_VERSION, PaneRepresentation, ServerMessage, decode, encode,
@@ -3640,6 +3733,7 @@ mod tests {
             push_subscriptions: None,
             push_vapid_key: None,
             aliases: None,
+            display_order: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: Some(port),
@@ -3748,6 +3842,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 // Pinned: these tests are about the socket, not the file.
                 refresh_interval: Duration::from_secs(3600),
@@ -4008,6 +4103,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_millis(50),
                 web_port: None,
@@ -4056,6 +4152,89 @@ mod tests {
 
         server.abort();
         assert!(found, "the added target reached a subscribed client");
+    }
+
+    #[tokio::test]
+    async fn a_target_removed_from_the_file_prunes_its_display_order_without_a_restart() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[targets]]\nname = \"first\"\nherdr_bins = [\"/nonexistent/herdr\"]\n\n\
+             [[targets]]\nname = \"second\"\nherdr_bins = [\"/nonexistent/herdr\"]\n",
+        )
+        .expect("the configuration is written");
+        let (config, _) = Config::load(Some(&path)).expect("the configuration loads");
+        let socket = directory.path().join("daemon.sock");
+        let server = tokio::spawn(serve(
+            config,
+            Some(path.clone()),
+            DaemonOptions {
+                socket: socket.clone(),
+                agent_marks: None,
+                push_subscriptions: None,
+                push_vapid_key: None,
+                aliases: None,
+                display_order: Some(directory.path().join("display-order.json")),
+                attention_state: Some(directory.path().join("attention.json")),
+                refresh_interval: Duration::from_millis(50),
+                web_port: None,
+                web_address: None,
+                web_url: None,
+                web_bridge: None,
+            },
+        ));
+
+        let mut connection = None;
+        for _ in 0..200 {
+            if let Ok(stream) = UnixStream::connect(&socket).await {
+                connection = Some(Connection {
+                    reader: BufReader::new(stream),
+                });
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut connection = connection.expect("the daemon accepts a connection");
+        connection.hello().await;
+        connection.send(ClientMessage::SubscribeState).await;
+        connection
+            .send(ClientMessage::SetDisplayOrder {
+                request: 1,
+                scope: OrderScope::SessionsInTarget {
+                    target: "second".to_owned(),
+                },
+                order: vec!["default".to_owned()],
+            })
+            .await;
+
+        std::fs::write(
+            &path,
+            "[[targets]]\nname = \"first\"\nherdr_bins = [\"/nonexistent/herdr\"]\n",
+        )
+        .expect("the configuration is rewritten");
+
+        let pruned = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match connection.receive().await {
+                    Some(ServerMessage::DisplayOrderState { entries })
+                        if entries.iter().all(|entry| entry.scope.target() != "second") =>
+                    {
+                        return true;
+                    }
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .expect("the daemon prunes the removed target's order within the timeout");
+
+        server.abort();
+        assert!(
+            pruned,
+            "the removed target's display order is gone without a restart"
+        );
     }
 
     #[tokio::test]
@@ -4291,6 +4470,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -4661,6 +4841,7 @@ mod tests {
                     push_subscriptions: None,
                     push_vapid_key: None,
                     aliases: None,
+                    display_order: None,
                     attention_state: Some(directory.path().join("attention.json")),
                     refresh_interval: Duration::from_secs(3600),
                     web_port: None,
@@ -4766,6 +4947,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: Some(port),
@@ -4924,6 +5106,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: Some(port),
@@ -5552,6 +5735,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -5634,6 +5818,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
@@ -5678,6 +5863,7 @@ mod tests {
             push_subscriptions: None,
             push_vapid_key: None,
             aliases: None,
+            display_order: None,
             attention_state: Some(harness.directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
@@ -5709,6 +5895,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,

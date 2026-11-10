@@ -1411,6 +1411,7 @@ mod tests {
                 push_subscriptions: None,
                 push_vapid_key: None,
                 aliases: None,
+                display_order: None,
                 attention_state: Some(directory.path().join("attention.json")),
                 refresh_interval: Duration::from_secs(3600),
                 web_port: None,
