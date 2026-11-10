@@ -149,6 +149,15 @@ can test is a platform that is broken and does not know it.
   each pane instead of in a separate "waiting now" list. Clean-room: no code
   or data model shared with any third-party project that drew a similar idea
   from a different data source.
+- A sandboxed browser preview of a development server on a target, after a
+  dedicated threat model (`REMOTE_PREVIEW.md`): an explicit, expiring,
+  in-memory grant naming a configured loopback port and never a URL or host;
+  a bounded manual relay that refuses redirects, strips cookies, checks
+  content type against an allowlist, and reports rather than truncates a
+  response over its size or time ceiling; revalidated live at fetch time, not
+  only at grant time; and rendered in a `sandbox="allow-scripts allow-forms"`
+  frame that can never carry the paired device's own cookie back to this
+  daemon.
 
 ## Next
 
