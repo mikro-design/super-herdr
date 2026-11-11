@@ -31,6 +31,7 @@ use crate::client::{Client, ClientCommands};
 use crate::clipboard;
 use crate::config::{Config, Target, TransportConfig};
 use crate::daemon::server::{DaemonOptions, spawn_in_process};
+use crate::display_order::{OrderScope, merge_order};
 use crate::file_save::{self, FileSave, SaveProgress};
 use crate::model::{AgentId, PaneId, TabId, TargetSession, WorkspaceId};
 use crate::notifications::{self, NotificationDelivery, NotificationQueue};
@@ -39,8 +40,8 @@ use crate::plugin::{PluginAction, PluginActionContext, PluginInvocationTarget};
 use crate::protocol::ServerMessage;
 use crate::resource_action::{ResourceAction, SplitDirection};
 use crate::state::{
-    FederationState, NormalizedSnapshot, TargetConnectionState, TargetRuntimeState,
-    TargetUpdateMode,
+    FederationState, NormalizedSnapshot, PaneState, TargetConnectionState, TargetRuntimeState,
+    TargetUpdateMode, WorkspaceState,
 };
 use crate::terminal::{TerminalAccess, TerminalScrollDirection};
 use crate::transport::{
@@ -693,6 +694,77 @@ impl ContextTarget {
     }
 }
 
+/// Which custom order a context target belongs to, and its own id within it.
+///
+/// `Tab` has no entry: pane order is already flattened across tabs for
+/// display, so a tab is never itself reorderable. A pane's scope needs its
+/// workspace, which the id alone does not carry, so this looks it up in the
+/// live snapshot rather than keeping it on `ContextTarget`.
+fn context_order_scope(
+    context: &ContextTarget,
+    state: &FederationState,
+) -> Option<(OrderScope, String)> {
+    match context {
+        ContextTarget::Session(session) => Some((
+            OrderScope::SessionsInTarget {
+                target: session.target.clone(),
+            },
+            session.session.clone(),
+        )),
+        ContextTarget::Workspace(workspace) => Some((
+            OrderScope::WorkspacesInSession {
+                target: workspace.target.clone(),
+                session: workspace.session.clone(),
+            },
+            workspace.resource.clone(),
+        )),
+        ContextTarget::Pane(pane) => {
+            let snapshot = state
+                .targets
+                .get(&pane.target_session())?
+                .snapshot
+                .as_deref()?;
+            let workspace = snapshot.panes.get(pane)?.workspace.as_ref()?;
+            Some((
+                OrderScope::PanesInWorkspace {
+                    target: pane.target.clone(),
+                    session: pane.session.clone(),
+                    workspace: workspace.resource.clone(),
+                },
+                pane.resource.clone(),
+            ))
+        }
+        ContextTarget::Tab(_) => None,
+    }
+}
+
+/// A sidebar row being dragged to a new position among its siblings.
+///
+/// `order` is the sibling order as rendered when the drag started — rows do
+/// not reorder live while dragging (only the dragged and hovered rows are
+/// styled differently), so this stays valid for the whole gesture and is
+/// only turned into a new order, and sent, on release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarDrag {
+    scope: OrderScope,
+    dragged: String,
+    order: Vec<String>,
+    hover: usize,
+}
+
+impl SidebarDrag {
+    /// The order to send: `dragged` moved to sit at `hover`'s position.
+    fn resulting_order(&self) -> Vec<String> {
+        let mut order = self.order.clone();
+        let Some(from) = order.iter().position(|id| id == &self.dragged) else {
+            return order;
+        };
+        let item = order.remove(from);
+        order.insert(self.hover.min(order.len()), item);
+        order
+    }
+}
+
 /// A pane this frontend is watching.
 ///
 /// The terminal itself lives with the daemon; what is local is the screen model
@@ -948,6 +1020,17 @@ struct App {
     sidebar_last_selected: Option<PaneId>,
     sidebar_hit_areas: Vec<SidebarHitArea>,
     sidebar_press: Option<PaneId>,
+    /// The row a sidebar left-press landed on, held until the gesture
+    /// resolves into either a click (via `sidebar_press`) or a drag (once
+    /// motion crosses `sidebar_press_origin` by a row).
+    sidebar_press_context: Option<ContextTarget>,
+    sidebar_press_origin: Option<Position>,
+    sidebar_drag: Option<SidebarDrag>,
+    /// The daemon's custom display order, mirrored from
+    /// `ServerMessage::DisplayOrderState`. Merged against each scope's live
+    /// siblings at render time — never trusted as already-pruned, since a
+    /// broadcast can be a tick stale.
+    display_order: BTreeMap<OrderScope, Vec<String>>,
     sidebar_mode: SidebarMode,
     last_render_at: Option<Instant>,
     message: Option<String>,
@@ -1024,6 +1107,10 @@ impl Default for App {
             sidebar_last_selected: None,
             sidebar_hit_areas: Vec::new(),
             sidebar_press: None,
+            sidebar_press_context: None,
+            sidebar_press_origin: None,
+            sidebar_drag: None,
+            display_order: BTreeMap::new(),
             sidebar_mode: SidebarMode::default(),
             last_render_at: None,
             message: None,
@@ -1635,7 +1722,9 @@ async fn handle_mouse(
     let outer = Position::new(mouse.column.saturating_sub(1), mouse.row.saturating_sub(1));
 
     if app.swallow_left_gesture {
-        if mouse.is_left_release() {
+        if mouse.is_left_motion() {
+            update_sidebar_drag(state, app, outer);
+        } else if mouse.is_left_release() {
             finish_ui_left_gesture(app);
         }
         return Ok(());
@@ -1729,11 +1818,19 @@ async fn handle_mouse(
                 open_context_menu(state, target, outer, app);
             }
         } else if mouse.is_left_press() {
-            app.sidebar_press = app
+            let hit = app
                 .sidebar_hit_areas
                 .iter()
-                .find(|hit| hit.area.contains(outer))
-                .and_then(|hit| hit.pane.clone());
+                .find(|hit| hit.area.contains(outer));
+            app.sidebar_press = hit.and_then(|hit| hit.pane.clone());
+            // The attention panel is its own list, not a sibling order of
+            // anything — a press there can only ever become a click.
+            let in_attention_panel = app.sidebar_mode == SidebarMode::List
+                && sidebar_areas(sidebar_area).1.contains(outer);
+            app.sidebar_press_context = (!in_attention_panel)
+                .then(|| hit.and_then(|hit| hit.context.clone()))
+                .flatten();
+            app.sidebar_press_origin = Some(outer);
             app.swallow_left_gesture = true;
         }
         return Ok(());
@@ -1832,9 +1929,97 @@ async fn handle_mouse(
 
 fn finish_ui_left_gesture(app: &mut App) {
     app.swallow_left_gesture = false;
+    app.sidebar_press_context = None;
+    app.sidebar_press_origin = None;
+    if let Some(drag) = app.sidebar_drag.take() {
+        app.sidebar_press = None;
+        let order = drag.resulting_order();
+        if order != drag.order
+            && let Some(client) = app.client.as_ref()
+        {
+            client.set_display_order(drag.scope, order);
+        }
+        return;
+    }
     if let Some(pane) = app.sidebar_press.take() {
         select_pane(app, pane);
     }
+}
+
+/// Promote a sidebar press into a drag once motion crosses it by a row, and
+/// while dragging, track which sibling the pointer is currently over.
+///
+/// Rows do not reorder live during the gesture, so `app.sidebar_hit_areas`
+/// stays exactly as it was when the drag started — hover is just "which hit
+/// area is the pointer over right now", looked up fresh on every motion
+/// event.
+fn update_sidebar_drag(state: &FederationState, app: &mut App, outer: Position) {
+    if app.sidebar_drag.is_none() {
+        let Some(origin) = app.sidebar_press_origin else {
+            return;
+        };
+        if outer.y == origin.y {
+            return;
+        }
+        let Some(context) = app.sidebar_press_context.clone() else {
+            return;
+        };
+        start_sidebar_drag(&context, state, app);
+    }
+    let Some(scope) = app.sidebar_drag.as_ref().map(|drag| drag.scope.clone()) else {
+        return;
+    };
+    let hovered_id = app
+        .sidebar_hit_areas
+        .iter()
+        .find(|hit| hit.area.contains(outer))
+        .and_then(|hit| hit.context.as_ref())
+        .and_then(|context| context_order_scope(context, state))
+        .filter(|(hit_scope, _)| hit_scope == &scope)
+        .map(|(_, id)| id);
+    if let Some(id) = hovered_id
+        && let Some(drag) = app.sidebar_drag.as_mut()
+        && let Some(index) = drag.order.iter().position(|held| held == &id)
+    {
+        drag.hover = index;
+    }
+}
+
+/// Resolve a press into a drag: which scope it belongs to, and the sibling
+/// order (already merged with any stored custom order) to permute.
+///
+/// A scope with fewer than two live siblings has nothing to reorder, so the
+/// press stays a plain click candidate instead.
+fn start_sidebar_drag(context: &ContextTarget, state: &FederationState, app: &mut App) {
+    let Some((scope, dragged)) = context_order_scope(context, state) else {
+        return;
+    };
+    let live: Vec<String> = app
+        .sidebar_hit_areas
+        .iter()
+        .filter_map(|hit| hit.context.as_ref())
+        .filter_map(|context| context_order_scope(context, state))
+        .filter(|(hit_scope, _)| hit_scope == &scope)
+        .map(|(_, id)| id)
+        .collect();
+    if live.len() < 2 {
+        return;
+    }
+    let stored = app
+        .display_order
+        .get(&scope)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let order = merge_order(stored, &live);
+    let Some(hover) = order.iter().position(|id| id == &dragged) else {
+        return;
+    };
+    app.sidebar_drag = Some(SidebarDrag {
+        scope,
+        dragged,
+        order,
+        hover,
+    });
 }
 
 fn pane_reports_mouse(app: &App, pane: &PaneId) -> bool {
@@ -5854,10 +6039,12 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App, state: &Federation
         ServerMessage::AttentionHistory { events } => {
             app.attention = AttentionIndex::mirror(events);
         }
-        // The custom sidebar order is not rendered yet — that is the TUI
-        // drag-and-drop branch. Received and dropped here so a daemon that
-        // has it configured does not desync an older-shaped client.
-        ServerMessage::DisplayOrderState { .. } => {}
+        ServerMessage::DisplayOrderState { entries } => {
+            app.display_order = entries
+                .into_iter()
+                .map(|entry| (entry.scope, entry.order))
+                .collect();
+        }
         // The hierarchy stays the TUI's navigation, and the agent list it
         // renders is still its own. What the projection is read for here is
         // the marks a person put on a card, so a context menu can offer the
@@ -7147,15 +7334,113 @@ fn sidebar_pane_at_row(
 
 #[cfg(test)]
 fn sidebar_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<SidebarRow> {
-    sidebar_session_rows(state, selected)
+    sidebar_session_rows(state, selected, &BTreeMap::new())
 }
 
-fn sidebar_session_rows(state: &FederationState, selected: Option<&PaneId>) -> Vec<SidebarRow> {
+/// The target's own sessions, reordered within each target by any stored
+/// `SessionsInTarget` order — grouping and relative target-to-target order
+/// stay exactly as `state.targets` gives them, since that part (host order)
+/// already comes from the configuration file and is not this feature's
+/// concern.
+fn ordered_targets<'a>(
+    state: &'a FederationState,
+    order: &BTreeMap<OrderScope, Vec<String>>,
+) -> Vec<&'a TargetRuntimeState> {
+    let values: Vec<&TargetRuntimeState> = state.targets.values().collect();
+    let mut ordered = Vec::with_capacity(values.len());
+    let mut start = 0;
+    while start < values.len() {
+        let name = &values[start].key.target;
+        let mut end = start + 1;
+        while end < values.len() && &values[end].key.target == name {
+            end += 1;
+        }
+        let group = &values[start..end];
+        let live: Vec<String> = group.iter().map(|t| t.key.session.clone()).collect();
+        let stored = order
+            .get(&OrderScope::SessionsInTarget {
+                target: name.clone(),
+            })
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for session in merge_order(stored, &live) {
+            if let Some(target) = group.iter().find(|t| t.key.session == session) {
+                ordered.push(*target);
+            }
+        }
+        start = end;
+    }
+    ordered
+}
+
+/// A target's workspaces, reordered by any stored `WorkspacesInSession` order.
+fn ordered_workspaces<'a>(
+    snapshot: &'a NormalizedSnapshot,
+    target: &TargetSession,
+    order: &BTreeMap<OrderScope, Vec<String>>,
+) -> Vec<&'a WorkspaceState> {
+    let live: Vec<String> = snapshot
+        .workspaces
+        .keys()
+        .map(|id| id.resource.clone())
+        .collect();
+    let stored = order
+        .get(&OrderScope::WorkspacesInSession {
+            target: target.target.clone(),
+            session: target.session.clone(),
+        })
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    merge_order(stored, &live)
+        .iter()
+        .filter_map(|id| {
+            snapshot
+                .workspaces
+                .get(&WorkspaceId::new(&target.target, &target.session, id))
+        })
+        .collect()
+}
+
+/// A workspace's panes, reordered by any stored `PanesInWorkspace` order.
+fn ordered_panes<'a>(
+    snapshot: &'a NormalizedSnapshot,
+    workspace: &WorkspaceId,
+    order: &BTreeMap<OrderScope, Vec<String>>,
+) -> Vec<&'a PaneState> {
+    let live: Vec<String> = snapshot
+        .panes
+        .values()
+        .filter(|pane| pane.workspace.as_ref() == Some(workspace))
+        .map(|pane| pane.id.resource.clone())
+        .collect();
+    let stored = order
+        .get(&OrderScope::PanesInWorkspace {
+            target: workspace.target.clone(),
+            session: workspace.session.clone(),
+            workspace: workspace.resource.clone(),
+        })
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    merge_order(stored, &live)
+        .iter()
+        .filter_map(|id| {
+            snapshot
+                .panes
+                .get(&PaneId::new(&workspace.target, &workspace.session, id))
+        })
+        .collect()
+}
+
+fn sidebar_session_rows(
+    state: &FederationState,
+    selected: Option<&PaneId>,
+    order: &BTreeMap<OrderScope, Vec<String>>,
+) -> Vec<SidebarRow> {
     let selected_target = selected.map(PaneId::target_session);
     let selected_workspace = selected_workspace(state, selected);
     let mut rows = Vec::new();
     let mut workspace_index = 1_usize;
-    for target in state.targets.values() {
+    for target in ordered_targets(state, order) {
         let is_selected_target = selected_target.as_ref() == Some(&target.key);
         let (symbol, color) = target_status(target);
         let target_style = Style::default()
@@ -7212,7 +7497,7 @@ fn sidebar_session_rows(state: &FederationState, selected: Option<&PaneId>) -> V
             });
         }
         if let Some(snapshot) = target.snapshot.as_deref() {
-            for workspace in snapshot.workspaces.values() {
+            for workspace in ordered_workspaces(snapshot, &target.key, order) {
                 let is_selected = selected_workspace.as_ref() == Some(&workspace.id);
                 let workspace_style = Style::default()
                     .fg(if is_selected {
@@ -7445,6 +7730,7 @@ fn sidebar_diagram_rows(
     state: &FederationState,
     selected: Option<&PaneId>,
     attention: &AttentionIndex,
+    order: &BTreeMap<OrderScope, Vec<String>>,
 ) -> Vec<SidebarRow> {
     let agents: BTreeMap<PaneId, AgentJumpEntry> = agent_jump_entries(state, AgentFilter::All)
         .into_iter()
@@ -7453,7 +7739,7 @@ fn sidebar_diagram_rows(
     let selected_target = selected.map(PaneId::target_session);
     let selected_workspace = selected_workspace(state, selected);
     let mut rows = Vec::new();
-    for target in state.targets.values() {
+    for target in ordered_targets(state, order) {
         let is_selected_target = selected_target.as_ref() == Some(&target.key);
         let (symbol, color) = target_status(target);
         let target_style = Style::default()
@@ -7493,14 +7779,10 @@ fn sidebar_diagram_rows(
         let Some(snapshot) = target.snapshot.as_deref() else {
             continue;
         };
-        for workspace in snapshot.workspaces.values() {
+        for workspace in ordered_workspaces(snapshot, &target.key, order) {
             rows.push(diagram_connector_row());
 
-            let panes = snapshot
-                .panes
-                .values()
-                .filter(|pane| pane.workspace.as_ref() == Some(&workspace.id))
-                .collect::<Vec<_>>();
+            let panes = ordered_panes(snapshot, &workspace.id, order);
             let workspace_needs_attention = panes.iter().any(|pane| {
                 agents.get(&pane.id).is_some_and(|entry| {
                     agent_needs_attention(&entry.status, entry.interactive_ready)
@@ -7770,7 +8052,8 @@ fn scroll_session_sidebar(
     area: Rect,
     direction: TerminalScrollDirection,
 ) {
-    let row_count = sidebar_session_rows(state, app.selected_pane.as_ref()).len();
+    let row_count =
+        sidebar_session_rows(state, app.selected_pane.as_ref(), &app.display_order).len();
     let maximum = sidebar_max_offset(row_count, area);
     let amount = usize::from(MOUSE_SCROLL_LINES);
     let next_offset = match direction {
@@ -7807,7 +8090,13 @@ fn scroll_diagram_sidebar(
     area: Rect,
     direction: TerminalScrollDirection,
 ) {
-    let row_count = sidebar_diagram_rows(state, app.selected_pane.as_ref(), &app.attention).len();
+    let row_count = sidebar_diagram_rows(
+        state,
+        app.selected_pane.as_ref(),
+        &app.attention,
+        &app.display_order,
+    )
+    .len();
     let maximum = diagram_max_offset(row_count, area);
     let amount = usize::from(MOUSE_SCROLL_LINES);
     let next_offset = match direction {
@@ -7852,7 +8141,8 @@ fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) 
         SidebarMode::List => {
             let (sessions_area, attention_area) = sidebar_areas(area);
             let sessions_content = sidebar_block().inner(sessions_area);
-            let session_rows = sidebar_session_rows(state, app.selected_pane.as_ref());
+            let session_rows =
+                sidebar_session_rows(state, app.selected_pane.as_ref(), &app.display_order);
             reconcile_sidebar_viewport(&session_rows, app, sidebar_content_height(area));
             append_sidebar_hit_areas(
                 &mut app.sidebar_hit_areas,
@@ -7878,7 +8168,12 @@ fn update_sidebar_hit_areas(state: &FederationState, app: &mut App, area: Rect) 
         }
         SidebarMode::Diagram => {
             let content = diagram_block().inner(area);
-            let rows = sidebar_diagram_rows(state, app.selected_pane.as_ref(), &app.attention);
+            let rows = sidebar_diagram_rows(
+                state,
+                app.selected_pane.as_ref(),
+                &app.attention,
+                &app.display_order,
+            );
             reconcile_sidebar_viewport(&rows, app, diagram_content_height(area));
             append_sidebar_hit_areas(
                 &mut app.sidebar_hit_areas,
@@ -7918,12 +8213,53 @@ fn append_sidebar_hit_areas(
     }
 }
 
+/// Highlight the dragged row and whichever sibling it currently hovers,
+/// without touching row order — the gesture itself never reorders rows live,
+/// only this styling shows it is in progress.
+fn style_sidebar_drag(
+    rows: &mut [SidebarRow],
+    drag: Option<&SidebarDrag>,
+    state: &FederationState,
+) {
+    let Some(drag) = drag else {
+        return;
+    };
+    let hovered = drag.order.get(drag.hover);
+    for row in rows.iter_mut() {
+        let Some((scope, id)) = row
+            .context
+            .as_ref()
+            .and_then(|context| context_order_scope(context, state))
+        else {
+            continue;
+        };
+        if scope != drag.scope {
+            continue;
+        }
+        if id == drag.dragged {
+            row.line.style = row
+                .line
+                .style
+                .patch(Style::default().add_modifier(Modifier::DIM));
+        } else if hovered == Some(&id) {
+            row.line.style = row
+                .line
+                .style
+                .patch(Style::default().add_modifier(Modifier::UNDERLINED));
+        }
+    }
+}
+
 fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: Rect) {
     if app.sidebar_mode == SidebarMode::Diagram {
-        let lines = sidebar_diagram_rows(state, app.selected_pane.as_ref(), &app.attention)
-            .into_iter()
-            .map(|row| row.line)
-            .collect::<Vec<_>>();
+        let mut rows = sidebar_diagram_rows(
+            state,
+            app.selected_pane.as_ref(),
+            &app.attention,
+            &app.display_order,
+        );
+        style_sidebar_drag(&mut rows, app.sidebar_drag.as_ref(), state);
+        let lines = rows.into_iter().map(|row| row.line).collect::<Vec<_>>();
         let row_count = lines.len();
         let offset = u16::try_from(app.sidebar_offset).unwrap_or(u16::MAX);
         frame.render_widget(
@@ -7944,7 +8280,10 @@ fn render_sidebar(frame: &mut Frame, state: &FederationState, app: &App, area: R
     }
 
     let (sessions_area, attention_area) = sidebar_areas(area);
-    let session_lines = sidebar_session_rows(state, app.selected_pane.as_ref())
+    let mut session_rows =
+        sidebar_session_rows(state, app.selected_pane.as_ref(), &app.display_order);
+    style_sidebar_drag(&mut session_rows, app.sidebar_drag.as_ref(), state);
+    let session_lines = session_rows
         .into_iter()
         .map(|row| row.line)
         .collect::<Vec<_>>();
@@ -8765,12 +9104,13 @@ mod tests {
         pane_direction_score, reconcile_selection, refresh_attention, render_vt_screen, safe_text,
         select_neighbor_pane, select_pane, select_workspace, selected_terminal_text, sidebar_areas,
         sidebar_attention_rows, sidebar_block, sidebar_content_height, sidebar_diagram_rows,
-        sidebar_pane_at_row, tab_at_column, target_manager_controls, terminal_paste_payload,
-        ui_areas, update_selection_after_frame, update_sidebar_hit_areas, viewport_shift_distance,
-        visible_pane_areas,
+        sidebar_pane_at_row, sidebar_session_rows, tab_at_column, target_manager_controls,
+        terminal_paste_payload, ui_areas, update_selection_after_frame, update_sidebar_hit_areas,
+        viewport_shift_distance, visible_pane_areas,
     };
     use crate::agent_marks::{AgentMarkRequest, AgentMarkState, NotifyMode};
     use crate::config::{Config, Target};
+    use crate::display_order::OrderScope;
     use crate::model::{AgentId, PaneId, TargetSession, WorkspaceId};
     use crate::plugin::{PluginAction, PluginActionContext, PluginActionId};
     use crate::resource_action::ResourceAction;
@@ -10048,7 +10388,12 @@ mod tests {
         );
 
         let selected = PaneId::new("host-a", "work", "w1:p1");
-        let rows = sidebar_diagram_rows(&state, Some(&selected), &AttentionIndex::default());
+        let rows = sidebar_diagram_rows(
+            &state,
+            Some(&selected),
+            &AttentionIndex::default(),
+            &BTreeMap::new(),
+        );
 
         assert!(
             rows.iter()
@@ -11285,6 +11630,375 @@ mod tests {
         assert!(app.selection_explicit);
         assert!(!app.swallow_left_gesture);
         assert!(app.sidebar_press.is_none());
+    }
+
+    fn mouse_at(hit: &super::SidebarHitArea, code: u16, release: bool) -> MouseInput {
+        MouseInput {
+            code,
+            column: hit.area.x + 1,
+            row: hit.area.y + 1,
+            release,
+        }
+    }
+
+    #[tokio::test]
+    async fn dragging_a_session_row_reorders_its_targets_sibling_sessions() {
+        let mut state = FederationState::default();
+        for session in ["alpha", "beta"] {
+            let key = TargetSession::new("host-a", session);
+            state
+                .targets
+                .insert(key.clone(), runtime(key, TargetConnectionState::Live, None));
+        }
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 10);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let hits = app.sidebar_hit_areas.clone();
+        assert_eq!(hits.len(), 2, "one row per session, no workspaces yet");
+        let transport = crate::config::TransportConfig::default();
+
+        handle_mouse(mouse_at(&hits[0], 0, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_mouse(mouse_at(&hits[1], 32, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+
+        let drag = app
+            .sidebar_drag
+            .clone()
+            .expect("motion past a row starts a drag");
+        assert_eq!(
+            drag.scope,
+            OrderScope::SessionsInTarget {
+                target: "host-a".to_owned()
+            }
+        );
+        assert_eq!(drag.dragged, "alpha");
+        assert_eq!(
+            drag.resulting_order(),
+            vec!["beta".to_owned(), "alpha".to_owned()]
+        );
+
+        handle_mouse(mouse_at(&hits[1], 0, true), &state, &transport, &mut app)
+            .await
+            .unwrap();
+        assert!(app.sidebar_drag.is_none());
+        assert!(!app.swallow_left_gesture);
+    }
+
+    #[tokio::test]
+    async fn dragging_a_workspace_row_reorders_its_sessions_sibling_workspaces() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({"workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}]}),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 10);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let hits = app.sidebar_hit_areas.clone();
+        assert_eq!(hits.len(), 3, "the target row plus its two workspaces");
+        let transport = crate::config::TransportConfig::default();
+
+        handle_mouse(mouse_at(&hits[1], 0, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_mouse(mouse_at(&hits[2], 32, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+
+        let drag = app
+            .sidebar_drag
+            .clone()
+            .expect("motion past a row starts a drag");
+        assert_eq!(
+            drag.scope,
+            OrderScope::WorkspacesInSession {
+                target: "host-a".to_owned(),
+                session: "work".to_owned(),
+            }
+        );
+        assert_eq!(drag.dragged, "w1");
+        assert_eq!(
+            drag.resulting_order(),
+            vec!["w2".to_owned(), "w1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn dragging_a_pane_row_in_diagram_mode_reorders_its_workspaces_sibling_panes() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w1"}],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1"},
+                    {"pane_id": "w1:p2", "workspace_id": "w1"}
+                ]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 20);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            last_frame_area: Some(frame_area),
+            sidebar_mode: SidebarMode::Diagram,
+            ..App::default()
+        };
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let pane_hits: Vec<_> = app
+            .sidebar_hit_areas
+            .iter()
+            .filter(|hit| matches!(hit.context, Some(ContextTarget::Pane(_))))
+            .cloned()
+            .collect();
+        assert_eq!(pane_hits.len(), 2);
+        let transport = crate::config::TransportConfig::default();
+
+        handle_mouse(
+            mouse_at(&pane_hits[0], 0, false),
+            &state,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+        handle_mouse(
+            mouse_at(&pane_hits[1], 32, false),
+            &state,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+
+        let drag = app
+            .sidebar_drag
+            .clone()
+            .expect("motion past a row starts a drag");
+        assert_eq!(
+            drag.scope,
+            OrderScope::PanesInWorkspace {
+                target: "host-a".to_owned(),
+                session: "work".to_owned(),
+                workspace: "w1".to_owned(),
+            }
+        );
+        assert_eq!(drag.dragged, "w1:p1");
+        assert_eq!(
+            drag.resulting_order(),
+            vec!["w1:p2".to_owned(), "w1:p1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sidebar_press_released_without_moving_a_row_stays_a_click() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({"workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}]}),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 10);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let hits = app.sidebar_hit_areas.clone();
+        let transport = crate::config::TransportConfig::default();
+
+        handle_mouse(mouse_at(&hits[1], 0, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_mouse(mouse_at(&hits[1], 0, true), &state, &transport, &mut app)
+            .await
+            .unwrap();
+
+        assert!(
+            app.sidebar_drag.is_none(),
+            "a press released on the same row never starts a drag"
+        );
+        assert!(!app.swallow_left_gesture);
+    }
+
+    #[tokio::test]
+    async fn a_drag_that_ends_over_a_different_targets_sessions_is_a_no_op() {
+        let mut state = FederationState::default();
+        for session in ["alpha", "beta"] {
+            let key = TargetSession::new("host-a", session);
+            state
+                .targets
+                .insert(key.clone(), runtime(key, TargetConnectionState::Live, None));
+        }
+        let other = TargetSession::new("host-b", "gamma");
+        state.targets.insert(
+            other.clone(),
+            runtime(other, TargetConnectionState::Live, None),
+        );
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 10);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let hits = app.sidebar_hit_areas.clone();
+        assert_eq!(hits.len(), 3);
+        let transport = crate::config::TransportConfig::default();
+
+        // host-a/alpha is pressed, then motion lands on host-b's own row —
+        // a different target's `SessionsInTarget` scope entirely.
+        handle_mouse(mouse_at(&hits[0], 0, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+        handle_mouse(mouse_at(&hits[2], 32, false), &state, &transport, &mut app)
+            .await
+            .unwrap();
+
+        let drag = app
+            .sidebar_drag
+            .clone()
+            .expect("motion past a row still starts the drag");
+        assert_eq!(
+            drag.resulting_order(),
+            drag.order,
+            "hovering a foreign scope never moves the dragged row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attention_panel_never_starts_a_drag() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "panes": [{"pane_id": "w1:p1", "agent": "builder", "agent_status": "blocked"}],
+                "agents": [{"pane_id": "w1:p1", "name": "builder", "agent_status": "blocked"}]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 20);
+        let sidebar_area = ui_areas(frame_area).0;
+        let mut app = App {
+            last_frame_area: Some(frame_area),
+            ..App::default()
+        };
+        update_sidebar_hit_areas(&state, &mut app, sidebar_area);
+        let attention_area = sidebar_areas(sidebar_area).1;
+        let waiting_hit = app
+            .sidebar_hit_areas
+            .iter()
+            .find(|hit| {
+                attention_area.contains(ratatui::layout::Position::new(hit.area.x, hit.area.y))
+            })
+            .cloned()
+            .expect("the waiting agent has a row in the attention panel");
+        let transport = crate::config::TransportConfig::default();
+
+        handle_mouse(
+            mouse_at(&waiting_hit, 0, false),
+            &state,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.sidebar_press_context.is_none(),
+            "the attention panel is not a sibling order, so a press there is never a drag candidate"
+        );
+
+        handle_mouse(
+            MouseInput {
+                code: 32,
+                column: waiting_hit.area.x + 1,
+                row: waiting_hit.area.y + 2,
+                release: false,
+            },
+            &state,
+            &transport,
+            &mut app,
+        )
+        .await
+        .unwrap();
+        assert!(app.sidebar_drag.is_none());
+    }
+
+    #[test]
+    fn a_stored_display_order_reorders_the_rendered_sidebar_rows() {
+        let key = TargetSession::new("host-a", "work");
+        let snapshot = NormalizedSnapshot::from_value(
+            &key,
+            &json!({
+                "workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1"},
+                    {"pane_id": "w2:p1", "workspace_id": "w2"}
+                ]
+            }),
+        );
+        let mut state = FederationState::default();
+        state.targets.insert(
+            key.clone(),
+            runtime(key, TargetConnectionState::Live, Some(snapshot)),
+        );
+        let mut order = BTreeMap::new();
+        order.insert(
+            OrderScope::WorkspacesInSession {
+                target: "host-a".to_owned(),
+                session: "work".to_owned(),
+            },
+            vec!["w2".to_owned(), "w1".to_owned()],
+        );
+
+        let rows = sidebar_session_rows(&state, None, &order);
+        let workspace_order: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row.context.as_ref() {
+                Some(ContextTarget::Workspace(id)) => Some(id.resource.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(workspace_order, vec!["w2".to_owned(), "w1".to_owned()]);
+
+        let diagram_rows = sidebar_diagram_rows(&state, None, &AttentionIndex::default(), &order);
+        let diagram_order: Vec<_> = diagram_rows
+            .iter()
+            .filter_map(|row| match row.context.as_ref() {
+                Some(ContextTarget::Workspace(id)) => Some(id.resource.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diagram_order, vec!["w2".to_owned(), "w1".to_owned()]);
     }
 
     #[tokio::test]

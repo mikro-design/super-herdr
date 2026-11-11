@@ -315,17 +315,7 @@ impl DisplayOrders {
     /// appears.
     pub fn merged(&self, scope: &OrderScope, live_natural: &[String]) -> Vec<String> {
         let stored = self.orders.get(scope).map(Vec::as_slice).unwrap_or(&[]);
-        let mut result: Vec<String> = stored
-            .iter()
-            .filter(|id| live_natural.contains(*id))
-            .cloned()
-            .collect();
-        for id in live_natural {
-            if !result.contains(id) {
-                result.push(id.clone());
-            }
-        }
-        result
+        merge_order(stored, live_natural)
     }
 
     /// Every stored scope, merged against `state` for broadcasting.
@@ -348,6 +338,26 @@ impl DisplayOrders {
             })
             .collect()
     }
+}
+
+/// Stored ids still live, in stored order, then anything live that was never
+/// stored, in its own order. The one piece of merge logic every holder of a
+/// display order runs: the daemon's [`DisplayOrders::merged`] before every
+/// broadcast, and each client again before every paint, since a broadcast can
+/// be a tick stale by the time a workspace or pane it never mentioned
+/// appears.
+pub fn merge_order(stored: &[String], live_natural: &[String]) -> Vec<String> {
+    let mut result: Vec<String> = stored
+        .iter()
+        .filter(|id| live_natural.contains(*id))
+        .cloned()
+        .collect();
+    for id in live_natural {
+        if !result.contains(id) {
+            result.push(id.clone());
+        }
+    }
+    result
 }
 
 /// The live sibling ids for a scope, or `None` if the scope's parent
