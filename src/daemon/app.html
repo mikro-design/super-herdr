@@ -85,6 +85,9 @@
   .workspace-title .where { margin-left: auto; }
   .pane-list li { margin-bottom: .35rem; padding: .55rem .65rem; background: var(--bg); }
   .pane-list li:last-child { margin-bottom: 0; }
+  [data-order-kind] { cursor: grab; }
+  .drag-source { opacity: .4; }
+  .drag-over { outline: 2px dashed var(--accent); outline-offset: 2px; }
   button {
     font: inherit; color: var(--accent); background: none;
     border: 1px solid var(--line); border-radius: .55rem;
@@ -436,6 +439,16 @@ let attentionAutoOpened = false;
 const openTargets = new Set();
 const openSessions = new Set();
 
+// The daemon's own arrangement for sessions/workspaces/panes, keyed by
+// `scopeKey()` of the scope it applies to. Never derived locally — a stored
+// order is only ever replaced wholesale by the next `display_order.state`.
+let displayOrder = new Map();
+
+// The sidebar row currently being dragged, or null. While this is set,
+// `renderPanes()` no-ops so the drag's own DOM nodes are not torn down
+// mid-gesture; `dragend` clears it and renders once to reconcile.
+let paneDrag = null;
+
 // Plugin registries are server-local, so the browser caches one only beside
 // the exact target/session generation it came from. Runs are metadata-only;
 // commands and process output never arrive in this page.
@@ -693,6 +706,107 @@ function sameId(left, right) {
     && left.target === right.target
     && left.session === right.session
     && left.resource === right.resource;
+}
+
+// These three mirror `OrderScope`'s own wire shape exactly (key order
+// included, since `scopeKey` is a plain `JSON.stringify`), so a scope built
+// here and one parsed from a `display_order.state` broadcast key the same.
+function sessionsScope(target) {
+  return { kind: 'sessions_in_target', target };
+}
+function workspacesScope(target, sessionName) {
+  return { kind: 'workspaces_in_session', target, session: sessionName };
+}
+function panesScope(target, sessionName, workspace) {
+  return { kind: 'panes_in_workspace', target, session: sessionName, workspace };
+}
+function scopeKey(scope) {
+  return JSON.stringify(scope);
+}
+
+// The JS twin of `DisplayOrders::merged` / `merge_order` in
+// `src/display_order.rs`: stored ids still live, in stored order, then any
+// live id missing from the stored list, in its own order. Run on every
+// paint rather than trusted from the last broadcast, since a sibling can
+// appear or disappear between one `display_order.state` and the next.
+function mergeOrder(stored, liveNatural) {
+  const known = new Set(liveNatural);
+  const result = (stored || []).filter(id => known.has(id));
+  const placed = new Set(result);
+  for (const id of liveNatural) {
+    if (!placed.has(id)) {
+      result.push(id);
+      placed.add(id);
+    }
+  }
+  return result;
+}
+
+// Clears the drag in progress, if any, and re-renders once to reconcile
+// `renderPanes()`'s no-op guard — the drop may have changed nothing (a
+// cancelled drag, or a sibling order the daemon echoes right back), but the
+// guard still needs lifting either way.
+function endPaneDrag() {
+  if (!paneDrag) return;
+  paneDrag.el.classList.remove('drag-source');
+  if (paneDrag.overEl) paneDrag.overEl.classList.remove('drag-over');
+  paneDrag = null;
+  renderPanes();
+}
+
+// Wires one sidebar row (a session, a workspace, or a pane) as a drag
+// source and drop target for its own sibling list. `siblingIds` is the
+// exact array `renderPanes()` used to order this row's siblings — shared by
+// reference across every row in the same list, so comparing `paneDrag.
+// siblingIds !== siblingIds` is how a drop recognises a foreign scope
+// without needing to compare `scope` structurally on every event.
+//
+// No delegation: each row's own listeners rely on normal bubbling from its
+// children, and sibling rows never nest inside one another, so there is
+// nothing here that needs `closest()`/`querySelectorAll()` to disambiguate.
+function wireDraggable(row, scope, siblingIds, id) {
+  row.draggable = true;
+  row.dataset.orderId = id;
+  row.addEventListener('dragstart', () => {
+    paneDrag = { scope, siblingIds, id, el: row, overEl: null };
+    row.classList.add('drag-source');
+  });
+  row.addEventListener('dragover', event => {
+    if (!paneDrag || paneDrag.siblingIds !== siblingIds || row === paneDrag.el) return;
+    // Required for `drop` to fire here at all — the browser's default is
+    // to refuse a drop on any element that never called this.
+    event.preventDefault();
+    if (paneDrag.overEl && paneDrag.overEl !== row) paneDrag.overEl.classList.remove('drag-over');
+    row.classList.add('drag-over');
+    paneDrag.overEl = row;
+  });
+  row.addEventListener('drop', event => {
+    event.preventDefault();
+    if (!paneDrag || paneDrag.siblingIds !== siblingIds) return endPaneDrag();
+    const drag = paneDrag;
+    if (row !== drag.el) {
+      // Indices read from the pre-drop snapshot, then applied in sequence —
+      // the same two-step `remove` then `insert` the TUI's own drag uses, so
+      // a drop onto row N always lands the dragged item at row N's spot.
+      const from = drag.siblingIds.indexOf(drag.id);
+      const to = drag.siblingIds.indexOf(id);
+      if (from !== -1 && to !== -1 && from !== to) {
+        const order = drag.siblingIds.slice();
+        order.splice(from, 1);
+        order.splice(to, 0, drag.id);
+        void postCommand({
+          type: 'display_order.set',
+          request: nextCommandRequest++,
+          scope: drag.scope,
+          order,
+        }).catch(error => {
+          console.error('display order change did not reach the daemon', error);
+        });
+      }
+    }
+    endPaneDrag();
+  });
+  row.addEventListener('dragend', () => endPaneDrag());
 }
 
 function targetKey(id) {
@@ -2327,6 +2441,10 @@ function renderInbox() {
 }
 
 function renderPanes() {
+  // A full rebuild mid-drag would tear out the very node the pointer is
+  // holding. The drag's own state is captured already, so this frame is
+  // simply skipped; `dragend` renders once more to reconcile.
+  if (paneDrag) return;
   const list = el('panes');
   list.innerHTML = '';
   if (!targets.size) {
@@ -2367,7 +2485,12 @@ function renderPanes() {
 
     runtimes.sort((left, right) =>
       text(left.key && left.key.session).localeCompare(text(right.key && right.key.session)));
-    for (const runtime of runtimes) {
+    const sessionIds = runtimes.map(runtime => text(runtime.key && runtime.key.session));
+    const sessionOrder = mergeOrder(displayOrder.get(scopeKey(sessionsScope(target))), sessionIds);
+    const orderedRuntimes = sessionOrder
+      .map(id => runtimes.find(runtime => text(runtime.key && runtime.key.session) === id))
+      .filter(Boolean);
+    for (const runtime of orderedRuntimes) {
       const session = text(runtime.key && runtime.key.session) || 'default';
       const sessionKey = `${target}/${session}`;
       const details = document.createElement('details');
@@ -2408,6 +2531,9 @@ function renderPanes() {
         summaryRow.append(previewButton);
       }
       summary.append(summaryRow);
+      summary.dataset.orderKind = 'sessions_in_target';
+      summary.dataset.orderTarget = target;
+      wireDraggable(summary, sessionsScope(target), sessionOrder, session);
       details.append(summary);
 
       const snapshot = runtime.snapshot;
@@ -2434,12 +2560,23 @@ function renderPanes() {
         empty.textContent = 'no panes';
         details.append(empty);
       }
-      for (const [workspaceId, panes] of [...workspaces.entries()].sort()) {
+      const workspaceEntries = [...workspaces.entries()].sort();
+      const workspaceIds = workspaceEntries.map(([id]) => id);
+      const workspaceOrder = mergeOrder(
+        displayOrder.get(scopeKey(workspacesScope(target, session))), workspaceIds);
+      const orderedWorkspaceEntries = workspaceOrder
+        .map(id => workspaceEntries.find(([entryId]) => entryId === id))
+        .filter(Boolean);
+      for (const [workspaceId, panes] of orderedWorkspaceEntries) {
         const workspace = workspaceStates.get(workspaceId);
         const workspaceGroup = document.createElement('section');
         workspaceGroup.className = 'workspace-group';
         const workspaceTitle = document.createElement('div');
         workspaceTitle.className = 'workspace-title';
+        workspaceTitle.dataset.orderKind = 'workspaces_in_session';
+        workspaceTitle.dataset.orderTarget = target;
+        workspaceTitle.dataset.orderSession = session;
+        wireDraggable(workspaceTitle, workspacesScope(target, session), workspaceOrder, workspaceId);
         const workspaceName = document.createElement('span');
         workspaceName.className = 'name';
         workspaceName.textContent = workspace && workspace.label || workspaceId;
@@ -2452,10 +2589,21 @@ function renderPanes() {
         const paneList = document.createElement('ul');
         paneList.className = 'pane-list';
         panes.sort((left, right) => text(left.id.resource).localeCompare(text(right.id.resource)));
-        for (const pane of panes) {
+        const paneIds = panes.map(pane => text(pane.id.resource));
+        const paneOrder = mergeOrder(
+          displayOrder.get(scopeKey(panesScope(target, session, workspaceId))), paneIds);
+        const orderedPanes = paneOrder
+          .map(resource => panes.find(pane => text(pane.id.resource) === resource))
+          .filter(Boolean);
+        for (const pane of orderedPanes) {
           const id = pane.id;
           const item = document.createElement('li');
           item.className = 'tap';
+          item.dataset.orderKind = 'panes_in_workspace';
+          item.dataset.orderTarget = target;
+          item.dataset.orderSession = session;
+          item.dataset.orderWorkspace = workspaceId;
+          wireDraggable(item, panesScope(target, session, workspaceId), paneOrder, text(id.resource));
           const row = document.createElement('div');
           row.className = 'row';
           const paneName = document.createElement('span');
@@ -2716,6 +2864,10 @@ function apply(message) {
         break;
       }
       if (!signalUpload(message)) el('screen-note').textContent = message.message || 'daemon request failed';
+      break;
+    case 'display_order.state':
+      displayOrder = new Map((message.entries || []).map(entry => [scopeKey(entry.scope), entry.order]));
+      renderPanes();
       break;
     case 'attention.history':
       attention = message.events;
