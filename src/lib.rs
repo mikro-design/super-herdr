@@ -7,6 +7,7 @@ pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod daemon;
+pub mod display_order;
 pub mod doctor;
 pub mod file_save;
 pub mod herdr_support;

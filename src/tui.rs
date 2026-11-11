@@ -5854,6 +5854,10 @@ fn handle_daemon_event(message: ServerMessage, app: &mut App, state: &Federation
         ServerMessage::AttentionHistory { events } => {
             app.attention = AttentionIndex::mirror(events);
         }
+        // The custom sidebar order is not rendered yet — that is the TUI
+        // drag-and-drop branch. Received and dropped here so a daemon that
+        // has it configured does not desync an older-shaped client.
+        ServerMessage::DisplayOrderState { .. } => {}
         // The hierarchy stays the TUI's navigation, and the agent list it
         // renders is still its own. What the projection is read for here is
         // the marks a person put on a card, so a context menu can offer the

@@ -27,6 +27,7 @@ use crate::agent_marks::AgentMarkRequest;
 use crate::aliases::ResourceRef;
 use crate::attention::AttentionEvent;
 use crate::config::QuickReply;
+use crate::display_order::{DisplayOrderEntry, OrderScope};
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::{PluginRun, PluginRunId};
@@ -239,6 +240,21 @@ pub enum Effect {
     /// Send this client the durable history. The broker does not hold it, so
     /// the I/O layer fills it in.
     SendAttentionHistory {
+        client: ClientId,
+    },
+    /// Set the custom display order for one sibling list. Routed and not
+    /// decided: the daemon owns the durable order, for the same reason it
+    /// owns attention history and local naming — two writers would overwrite
+    /// each other's file, and every client must see the same arrangement.
+    SetDisplayOrder {
+        client: ClientId,
+        request: u64,
+        scope: OrderScope,
+        order: Vec<String>,
+    },
+    /// Send this client every scope with a custom order. The broker does not
+    /// hold it, so the I/O layer fills it in.
+    SendDisplayOrder {
         client: ClientId,
     },
 }
@@ -526,6 +542,7 @@ impl Broker {
                 // A client renders attention it did not derive, so it needs the
                 // history before the next event rather than after it.
                 effects.push(Effect::SendAttentionHistory { client });
+                effects.push(Effect::SendDisplayOrder { client });
             }
             ClientMessage::MarkAgent {
                 request,
@@ -583,6 +600,16 @@ impl Broker {
                 client,
                 request,
                 change: LocalChange::Slot { slot, resource },
+            }),
+            ClientMessage::SetDisplayOrder {
+                request,
+                scope,
+                order,
+            } => effects.push(Effect::SetDisplayOrder {
+                client,
+                request,
+                scope,
+                order,
             }),
             ClientMessage::ListRemoteDirectory {
                 request,
@@ -1236,6 +1263,15 @@ impl Broker {
         effects
     }
 
+    /// Republish every scope with a custom order to everyone watching. A
+    /// reorder, like a read-state change, touches the authoritative result
+    /// rather than one change a client could reproduce on its own.
+    pub fn display_order_changed(&mut self, entries: Vec<DisplayOrderEntry>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.broadcast_state(ServerMessage::DisplayOrderState { entries }, &mut effects);
+        effects
+    }
+
     pub fn pairing_approval_required(
         &self,
         attempt: String,
@@ -1624,6 +1660,7 @@ mod tests {
     use crate::agent_marks::AgentMarkRequest;
     use crate::attention::{AttentionEvent, AttentionEventKind};
     use crate::config::QuickReply;
+    use crate::display_order::{DisplayOrderEntry, OrderScope};
     use crate::model::{AgentId, PaneId, TargetSession};
     use crate::operation::Operation;
     use crate::plugin::PluginRunId;
@@ -3637,6 +3674,69 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::SendAttentionHistory { .. })),
             "a client that does not derive attention is given it"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendDisplayOrder { .. })),
+            "a client that does not derive display order is given it"
+        );
+    }
+
+    #[test]
+    fn a_reorder_is_routed_and_not_decided_by_the_broker() {
+        let mut broker = broker();
+        let client = greet(&mut broker);
+
+        let effects = broker.handle(
+            client,
+            ClientMessage::SetDisplayOrder {
+                request: 1,
+                scope: OrderScope::WorkspacesInSession {
+                    target: "first".to_owned(),
+                    session: "default".to_owned(),
+                },
+                order: vec!["w2".to_owned(), "w1".to_owned()],
+            },
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::SetDisplayOrder {
+                client,
+                request: 1,
+                scope: OrderScope::WorkspacesInSession {
+                    target: "first".to_owned(),
+                    session: "default".to_owned(),
+                },
+                order: vec!["w2".to_owned(), "w1".to_owned()],
+            }],
+            "the broker routes the request; the daemon owns the durable order"
+        );
+    }
+
+    #[test]
+    fn a_display_order_change_republishes_to_every_state_subscriber() {
+        let mut broker = broker();
+        let subscribed = greet(&mut broker);
+        let silent = greet(&mut broker);
+        broker.handle(subscribed, ClientMessage::SubscribeState);
+
+        let entries = vec![DisplayOrderEntry {
+            scope: OrderScope::SessionsInTarget {
+                target: "first".to_owned(),
+            },
+            order: vec!["default".to_owned()],
+        }];
+        let effects = broker.display_order_changed(entries.clone());
+
+        assert!(matches!(
+            messages_for(&effects, subscribed).as_slice(),
+            [ServerMessage::DisplayOrderState { entries: got }] if got == &entries
+        ));
+        assert!(
+            messages_for(&effects, silent).is_empty(),
+            "only the state-subscribed client hears about it"
         );
     }
 

@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent_marks::AgentMarkRequest;
 use crate::daemon::server::DaemonHandle;
+use crate::display_order::OrderScope;
 use crate::model::{AgentId, PaneId, TargetSession};
 use crate::operation::Operation;
 use crate::plugin::PluginRunId;
@@ -666,6 +667,19 @@ impl ClientCommands {
         request
     }
 
+    /// Set the custom display order for one sibling list in the sidebar.
+    /// Super-Herdr's own arrangement, shared by every client of this daemon —
+    /// never sent to Herdr.
+    pub fn set_display_order(&self, scope: OrderScope, order: Vec<String>) -> u64 {
+        let request = self.next_request();
+        self.send(ClientMessage::SetDisplayOrder {
+            request,
+            scope,
+            order,
+        });
+        request
+    }
+
     pub fn subscribe_agent_cards(&self) {
         self.send(ClientMessage::SubscribeAgentCards);
     }
@@ -740,6 +754,7 @@ mod tests {
             push_subscriptions: None,
             push_vapid_key: None,
             aliases: None,
+            display_order: None,
             attention_state: Some(directory.path().join("attention.json")),
             refresh_interval: Duration::from_secs(3600),
             web_port: None,
