@@ -5,6 +5,21 @@ Tagged releases and their generated change lists are available on the
 The notes below retain upgrade and security information that should not be
 inferred from commit titles alone.
 
+## 0.7.38
+
+- Added a sandboxed browser preview of a development server running on a
+  target, after a dedicated threat model (`REMOTE_PREVIEW.md`). A preview
+  needs an explicit, expiring grant naming one configured loopback port on
+  one target; the daemon relays the response itself, stripping cookies and
+  refusing redirects, and renders it in a sandboxed frame that can never
+  carry the paired device's own session cookie back to this daemon.
+- Added a shared display order for sessions within a target, workspaces
+  within a session, and panes within a workspace. The order is owned by the
+  daemon and broadcast to every connected client, not kept as a private
+  per-device preference, so reordering a row in the TUI sidebar or the
+  browser sidebar updates both. A newly discovered row is placed after the
+  ones with a stored position, in its own natural order.
+
 ## 0.7.37
 
 - The sidebar diagram's pane boxes now show the agent's own status word
