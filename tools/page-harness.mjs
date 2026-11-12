@@ -35,6 +35,13 @@ const node = id => {
         held.className = [...new Set(`${held.className} ${names.join(' ')}`.trim().split(/\s+/))]
           .filter(Boolean).join(' ');
       },
+      remove(...names) {
+        held.className = held.className.split(/\s+/)
+          .filter(name => name && !names.includes(name)).join(' ');
+      },
+      contains(name) {
+        return held.className.split(/\s+/).includes(name);
+      },
     };
     // A real element drops its children when its markup is replaced. The stub
     // has to as well: rendering a list twice would otherwise report the sum of
@@ -1207,3 +1214,116 @@ storageWorks = false;
 chipFor('state', 'all').onclick();
 check('a browser that will not remember still filters', sections().length >= 1);
 storageWorks = true;
+
+// Display order: dragging a sidebar row posts the daemon's shared order for
+// exactly the siblings it was dropped among, a render that lands mid-drag
+// is skipped rather than tearing out the node the pointer is holding, and
+// only the daemon's own broadcast — never a local guess — reorders what is
+// shown.
+deliver({
+  type: 'state.full',
+  state: {
+    targets: [{
+      key: { target: 'orderly', session: 'alpha' }, connection: 'live',
+      snapshot: {
+        workspaces: [
+          { id: { target: 'orderly', session: 'alpha', resource: 'wsA' }, label: 'A' },
+          { id: { target: 'orderly', session: 'alpha', resource: 'wsB' }, label: 'B' },
+        ],
+        panes: [
+          {
+            id: { target: 'orderly', session: 'alpha', resource: 'wsA:p1' },
+            workspace: { target: 'orderly', session: 'alpha', resource: 'wsA' },
+            tab: { target: 'orderly', session: 'alpha', resource: 'wsA:t1' }, label: 'one',
+          },
+          {
+            id: { target: 'orderly', session: 'alpha', resource: 'wsA:p2' },
+            workspace: { target: 'orderly', session: 'alpha', resource: 'wsA' },
+            tab: { target: 'orderly', session: 'alpha', resource: 'wsA:t1' }, label: 'two',
+          },
+          {
+            id: { target: 'orderly', session: 'alpha', resource: 'wsB:p1' },
+            workspace: { target: 'orderly', session: 'alpha', resource: 'wsB' },
+            tab: { target: 'orderly', session: 'alpha', resource: 'wsB:t1' }, label: 'three',
+          },
+        ],
+      },
+    }, {
+      key: { target: 'orderly', session: 'beta' }, connection: 'live',
+      snapshot: { workspaces: [], panes: [] },
+    }],
+  },
+});
+
+const orderlyDetails = () => page.el('panes').children[0].children[0];
+const sessionDetails = index => orderlyDetails().children[1 + index];
+const sessionSummary = index => sessionDetails(index).children[0];
+const workspaceGroup = (sessionIndex, workspaceIndex) =>
+  sessionDetails(sessionIndex).children[1 + workspaceIndex];
+const workspaceTitleNode = (sessionIndex, workspaceIndex) =>
+  workspaceGroup(sessionIndex, workspaceIndex).children[0];
+const paneItem = (sessionIndex, workspaceIndex, paneIndex) =>
+  workspaceGroup(sessionIndex, workspaceIndex).children[1].children[paneIndex];
+const lastOrderSet = () => sent.filter(one => one.body.type === 'display_order.set').at(-1);
+
+check('sets up two sessions under the orderly target', orderlyDetails().children.length === 3);
+check('names the first session alpha', sessionSummary(0).dataset.orderId === 'alpha');
+check('names the second session beta', sessionSummary(1).dataset.orderId === 'beta');
+
+// An unrelated federation update landing mid-drag must not tear out the
+// dragged node; it only catches up once the drag itself ends.
+sent.length = 0;
+sessionSummary(1).ondragstart({});
+const panesBeforeRerender = page.el('panes').children;
+page.renderPanes();
+check('a render that lands mid-drag is skipped', page.el('panes').children === panesBeforeRerender);
+sessionSummary(0).ondragover({ preventDefault() {} });
+sessionSummary(0).ondrop({ preventDefault() {} });
+check('a render catches up once the drag ends', page.el('panes').children !== panesBeforeRerender);
+check('dragging a session names its scope',
+  lastOrderSet().body.scope.kind === 'sessions_in_target'
+  && lastOrderSet().body.scope.target === 'orderly');
+check('dragging a session onto its sibling moves it to that spot',
+  lastOrderSet().body.order.join(',') === 'beta,alpha');
+
+// Dragging a workspace row, within session alpha.
+sent.length = 0;
+workspaceTitleNode(0, 1).ondragstart({});
+workspaceTitleNode(0, 0).ondragover({ preventDefault() {} });
+workspaceTitleNode(0, 0).ondrop({ preventDefault() {} });
+check('dragging a workspace names its scope',
+  lastOrderSet().body.scope.kind === 'workspaces_in_session'
+  && lastOrderSet().body.scope.target === 'orderly'
+  && lastOrderSet().body.scope.session === 'alpha');
+check('dragging a workspace onto its sibling moves it to that spot',
+  lastOrderSet().body.order.join(',') === 'wsB,wsA');
+
+// Dragging a pane row, within workspace wsA.
+sent.length = 0;
+paneItem(0, 0, 1).ondragstart({});
+paneItem(0, 0, 0).ondragover({ preventDefault() {} });
+paneItem(0, 0, 0).ondrop({ preventDefault() {} });
+check('dragging a pane names its scope',
+  lastOrderSet().body.scope.kind === 'panes_in_workspace'
+  && lastOrderSet().body.scope.target === 'orderly'
+  && lastOrderSet().body.scope.session === 'alpha'
+  && lastOrderSet().body.scope.workspace === 'wsA');
+check('dragging a pane onto its sibling moves it to that spot',
+  lastOrderSet().body.order.join(',') === 'wsA:p2,wsA:p1');
+
+// A drop onto a row from a different sibling list is rejected outright:
+// nothing is sent, and the drag still cleans itself up rather than sticking.
+sent.length = 0;
+sessionSummary(0).ondragstart({});
+workspaceTitleNode(0, 0).ondragover({ preventDefault() {} });
+workspaceTitleNode(0, 0).ondrop({ preventDefault() {} });
+check('a drop onto a foreign sibling list sends nothing', lastOrderSet() === undefined);
+
+// The daemon's own broadcast is what actually reorders the rendered rows —
+// never derived locally ahead of it, even right after sending a change.
+deliver({
+  type: 'display_order.state',
+  entries: [{ scope: { kind: 'sessions_in_target', target: 'orderly' }, order: ['beta', 'alpha'] }],
+});
+check('a stored order reorders the rendered sessions',
+  sessionSummary(0).dataset.orderId === 'beta' && sessionSummary(1).dataset.orderId === 'alpha');
