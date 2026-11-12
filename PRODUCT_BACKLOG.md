@@ -395,6 +395,12 @@ shipped as its own four-branch sequence (`feat/preview-grants-and-transport`,
 `docs/remote-preview-shipped`), each reviewed and merged before the next
 started.
 
+Drag-and-drop display ordering for sessions, workspaces, and panes shipped as
+its own four-branch sequence (`feat/display-order-foundation`,
+`feat/display-order-tui-drag`, `feat/display-order-browser-drag`,
+`docs/display-order-shipped`), each reviewed and merged before the next
+started.
+
 ## Research signals
 
 - Herdr users repeatedly describe mobile SSH/TUI use as painful and want a

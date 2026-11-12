@@ -252,6 +252,8 @@ same metadata for a support bundle.
   install plan that runs nothing
 - Local names, favourites and jump slots that never rename a Herdr resource and
   are never trusted onto a reused id
+- Drag-and-drop sidebar ordering for sessions, workspaces, and panes, shared
+  across the TUI and every paired browser
 - OpenSSH config import with a preview, per-host probing, and local tags
 - Configurable browser quick replies, terminal keys, a soft-keyboard dock, and
   a file picker
