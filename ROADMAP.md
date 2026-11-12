@@ -158,6 +158,14 @@ can test is a platform that is broken and does not know it.
   only at grant time; and rendered in a `sandbox="allow-scripts allow-forms"`
   frame that can never carry the paired device's own cookie back to this
   daemon.
+- A daemon-owned display order for sessions within a target, workspaces
+  within a session, and panes within a workspace, shared by every connected
+  client rather than kept as a private per-device preference. A stored order
+  is merged against the live set on every change: known ids keep their
+  stored position, and anything new lands after them in its own natural
+  order. Reorder by dragging a row in the TUI sidebar or the browser
+  sidebar; both send the same `display_order.set` command and both
+  re-render from the same `display_order.state` broadcast.
 
 ## Next
 
